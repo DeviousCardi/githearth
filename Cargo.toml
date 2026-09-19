@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/githearth-core", "crates/githearth-git"]
+members = ["crates/githearth-core", "crates/githearth-git", "crates/githearth-cli"]
 resolver = "3"
 
 [workspace.package]

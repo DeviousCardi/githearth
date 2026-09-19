@@ -1,0 +1,17 @@
+[package]
+name = "githearth-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "githearth"
+path = "src/main.rs"
+
+[dependencies]
+githearth-core = { path = "../githearth-core" }
+githearth-git = { path = "../githearth-git" }
+
+[lints]
+workspace = true
