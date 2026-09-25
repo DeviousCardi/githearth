@@ -1,0 +1,40 @@
+name: githearth-metadata-bench
+services:
+  postgres:
+    image: postgres:18.6-bookworm@sha256:bbf83594798e144bff365a9c191c5d779f181fb3135902064ab8ff11918020fc
+    network_mode: host
+    cpus: 4
+    mem_limit: 3g
+    environment:
+      POSTGRES_USER: githearth_bench
+      POSTGRES_PASSWORD: local-benchmark-only
+      POSTGRES_DB: githearth_bench
+    command: [postgres, -p, '15432', -c, listen_addresses=127.0.0.1, -c, shared_buffers=512MB, -c, max_connections=100, -c, fsync=on, -c, synchronous_commit=on, -c, full_page_writes=on]
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -p, '15432', -U, githearth_bench]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    logging:
+      options:
+        max-size: 10m
+        max-file: '2'
+  foundationdb:
+    image: foundationdb/foundationdb:7.3.77@sha256:559b178a137bbe09272ad6e3752531aa04e2ddacab8ccfa4ffa86467db033bea
+    network_mode: host
+    cpus: 4
+    mem_limit: 3g
+    entrypoint: [/bin/sh, /config/fdb-start.sh]
+    volumes:
+      - ./fdb.cluster:/config/fdb.cluster:ro
+      - ./fdb-start.sh:/config/fdb-start.sh:ro
+      - fdbdata:/var/lib/foundationdb/data
+    logging:
+      options:
+        max-size: 10m
+        max-file: '2'
+volumes:
+  pgdata:
+  fdbdata:
