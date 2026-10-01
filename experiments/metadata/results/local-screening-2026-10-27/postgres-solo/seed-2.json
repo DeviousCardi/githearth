@@ -1,0 +1,13 @@
+{
+  "backend": "postgres",
+  "dataset": {
+    "issues_per_repo": 100,
+    "repos_per_tenant": 10,
+    "tenants": 1,
+    "total_issues": 1000,
+    "users": 1
+  },
+  "profile": "solo",
+  "recorded_utc": "2026-10-27T07:36:45.142853+00:00",
+  "seed_seconds": 0.269
+}
