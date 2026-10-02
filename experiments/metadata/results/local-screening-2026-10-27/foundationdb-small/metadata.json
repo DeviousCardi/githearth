@@ -1,0 +1,7 @@
+{
+  "api_version": 730,
+  "recorded_utc": "2026-10-27T07:40:30.600887+00:00",
+  "redundancy": "single",
+  "storage_engine": "ssd-2",
+  "version": "7.3.77"
+}
