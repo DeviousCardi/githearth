@@ -1,0 +1,8 @@
+{
+  "acknowledged_markers": 100,
+  "backend": "foundationdb",
+  "fault": "database process SIGKILL; host and disk remain intact",
+  "lost_markers": 0,
+  "recorded_utc": "2026-10-27T07:45:45.121857+00:00",
+  "restart_and_verify_seconds": 1.483
+}

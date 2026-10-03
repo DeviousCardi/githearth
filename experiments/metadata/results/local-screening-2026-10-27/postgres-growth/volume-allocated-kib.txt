@@ -1,0 +1,1 @@
+550740	/var/lib/postgresql
