@@ -1,0 +1,24 @@
+{
+  "backend": "foundationdb",
+  "checks": [
+    "concurrent_duplicate_comment",
+    "exclusive_concurrent_job_claims",
+    "idempotency_payload_binding",
+    "pagination",
+    "unknown_user_denied",
+    "unknown_repo_denied",
+    "unauthorized_write_denied",
+    "duplicate_enqueue",
+    "duplicate_claim",
+    "event_and_counter_invariants"
+  ],
+  "invariants": {
+    "bad_claims": 0,
+    "bad_comments": 0,
+    "comment_count": 1,
+    "comment_events": 1,
+    "comments": 1
+  },
+  "profile": "enterprise",
+  "recorded_utc": "2026-10-27T07:47:16.203648+00:00"
+}

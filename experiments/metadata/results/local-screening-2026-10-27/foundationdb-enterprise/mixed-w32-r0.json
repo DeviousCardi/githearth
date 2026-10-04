@@ -1,0 +1,84 @@
+{
+  "attempts": 21063,
+  "backend": "foundationdb",
+  "client_cpu_seconds_including_warmup": 42.485,
+  "dataset": {
+    "issues_per_repo": 100,
+    "repos_per_tenant": 10000,
+    "tenants": 1,
+    "total_issues": 1000000,
+    "users": 100000
+  },
+  "duration_requested_seconds": 6.0,
+  "elapsed_seconds": 6.105,
+  "errors": {},
+  "failed_latency": {
+    "count": 0,
+    "max_ms": null,
+    "p50_ms": null,
+    "p95_ms": null,
+    "p99_ms": null
+  },
+  "host": {
+    "logical_cpus": 16,
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "latency": {
+    "count": 21063,
+    "max_ms": 354.281,
+    "p50_ms": 7.642,
+    "p95_ms": 16.028,
+    "p99_ms": 47.306
+  },
+  "load_model": "closed-loop",
+  "operations": {
+    "claim": {
+      "count": 2080,
+      "max_ms": 354.281,
+      "p50_ms": 13.547,
+      "p95_ms": 62.573,
+      "p99_ms": 137.928
+    },
+    "comment": {
+      "count": 5256,
+      "max_ms": 26.08,
+      "p50_ms": 12.503,
+      "p95_ms": 16.169,
+      "p99_ms": 18.492
+    },
+    "enqueue": {
+      "count": 2107,
+      "max_ms": 24.571,
+      "p50_ms": 10.995,
+      "p95_ms": 13.942,
+      "p99_ms": 16.596
+    },
+    "list": {
+      "count": 5278,
+      "max_ms": 16.582,
+      "p50_ms": 6.216,
+      "p95_ms": 9.367,
+      "p99_ms": 11.357
+    },
+    "permission": {
+      "count": 6342,
+      "max_ms": 9.299,
+      "p50_ms": 2.76,
+      "p95_ms": 4.591,
+      "p99_ms": 5.655
+    }
+  },
+  "outcomes": {
+    "completed": 21063
+  },
+  "profile": "enterprise",
+  "recorded_utc": "2026-10-27T07:47:42.123185+00:00",
+  "retries_on_successful_operations": 1004,
+  "run_id": "a5b6e1b17123409dad7511d11a6e9976",
+  "scenario": "mixed",
+  "schema": 1,
+  "successful_operations_per_second": 3450.19,
+  "warmup_seconds": 2.0,
+  "workers": 32
+}

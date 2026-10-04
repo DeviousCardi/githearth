@@ -1,0 +1,1 @@
+2478836	/var/lib/foundationdb/data
