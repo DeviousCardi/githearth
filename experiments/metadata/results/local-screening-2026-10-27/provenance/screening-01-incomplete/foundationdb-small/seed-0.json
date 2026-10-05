@@ -1,0 +1,12 @@
+{
+  "backend": "foundationdb",
+  "dataset": {
+    "issues_per_repo": 100,
+    "repos_per_tenant": 50,
+    "tenants": 1,
+    "total_issues": 5000,
+    "users": 100
+  },
+  "profile": "small",
+  "seed_seconds": 0.379
+}

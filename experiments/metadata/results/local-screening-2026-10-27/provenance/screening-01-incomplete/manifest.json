@@ -1,0 +1,20 @@
+{
+  "started_utc": "2026-10-27T07:29:40.652781+00:00",
+  "command": [
+    "experiments/metadata/suite.py",
+    "--output",
+    ".bench/results/screening-01",
+    "--seconds",
+    "6",
+    "--repetitions",
+    "3"
+  ],
+  "db_cpu_limit": 4,
+  "db_memory_limit_gib": 3,
+  "fdb_processes": 4,
+  "failure_domains": 1,
+  "warmup_seconds": 2,
+  "status": "failed",
+  "error": "RuntimeError('Hot-workload operation errors')",
+  "finished_utc": "2026-10-27T07:34:20.292008+00:00"
+}

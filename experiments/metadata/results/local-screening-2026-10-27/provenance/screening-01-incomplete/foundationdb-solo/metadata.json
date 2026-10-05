@@ -1,0 +1,6 @@
+{
+  "api_version": 730,
+  "redundancy": "single",
+  "storage_engine": "ssd-2",
+  "version": "7.3.77"
+}

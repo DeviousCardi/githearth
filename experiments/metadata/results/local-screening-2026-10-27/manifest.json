@@ -1,0 +1,20 @@
+{
+  "status": "completed",
+  "assembly": "Seven backend/profile groups from screening-02; PostgreSQL enterprise group from screening-03 after increasing only the bulk fixture-load timeout. Measured transaction logic and timing configuration are unchanged.",
+  "started_utc": "2026-10-27T07:35:49.362849+00:00",
+  "finished_utc": "2026-10-27T07:58:20.497011+00:00",
+  "measured_runs": 84,
+  "repetitions": 3,
+  "measurement_seconds": 6,
+  "warmup_seconds": 2,
+  "operation_errors": 8,
+  "db_cpu_limit": 4,
+  "db_memory_limit_gib": 3,
+  "fdb_processes": 4,
+  "failure_domains": 1,
+  "provenance": [
+    "provenance/screening-02-manifest.json",
+    "provenance/screening-03-manifest.json"
+  ],
+  "initial_attempt": "provenance/screening-01-incomplete/manifest.json"
+}

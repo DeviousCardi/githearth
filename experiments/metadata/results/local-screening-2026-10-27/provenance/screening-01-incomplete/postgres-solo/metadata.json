@@ -1,0 +1,11 @@
+{
+  "database_bytes": 34731711,
+  "settings": {
+    "default_transaction_isolation": "serializable",
+    "fsync": "on",
+    "full_page_writes": "on",
+    "shared_buffers": "65536",
+    "synchronous_commit": "on"
+  },
+  "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"
+}

@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/home/aarav/Aarav/Github/githearth/experiments/metadata/bench.py", line 240, in <module>
+    main()
+  File "/home/aarav/Aarav/Github/githearth/experiments/metadata/bench.py", line 224, in main
+    db.seed(PROFILES[args.profile])
+  File "/home/aarav/Aarav/Github/githearth/experiments/metadata/adapters.py", line 48, in seed
+    with self.conn.cursor().copy("COPY issues FROM STDIN") as c:
+  File "/usr/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/home/aarav/Aarav/Github/githearth/.bench/python/psycopg/cursor.py", line 330, in copy
+    raise ex.with_traceback(None)
+psycopg.errors.QueryCanceled: canceling statement due to statement timeout
+CONTEXT:  COPY issues, line 565696

@@ -1,0 +1,24 @@
+{
+  "started_utc": "2026-10-27T07:55:31.502076+00:00",
+  "command": [
+    "experiments/metadata/suite.py",
+    "--output",
+    ".bench/results/screening-03",
+    "--profiles",
+    "enterprise",
+    "--backends",
+    "postgres",
+    "--seconds",
+    "6",
+    "--repetitions",
+    "3"
+  ],
+  "db_cpu_limit": 4,
+  "db_memory_limit_gib": 3,
+  "fdb_processes": 4,
+  "failure_domains": 1,
+  "warmup_seconds": 2,
+  "status": "completed",
+  "operation_errors": 2,
+  "finished_utc": "2026-10-27T07:58:20.497011+00:00"
+}

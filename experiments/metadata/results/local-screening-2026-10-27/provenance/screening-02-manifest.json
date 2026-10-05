@@ -1,0 +1,21 @@
+{
+  "started_utc": "2026-10-27T07:35:49.362849+00:00",
+  "command": [
+    "experiments/metadata/suite.py",
+    "--output",
+    ".bench/results/screening-02",
+    "--seconds",
+    "6",
+    "--repetitions",
+    "3"
+  ],
+  "db_cpu_limit": 4,
+  "db_memory_limit_gib": 3,
+  "fdb_processes": 4,
+  "failure_domains": 1,
+  "warmup_seconds": 2,
+  "status": "failed",
+  "operation_errors": 6,
+  "error": "RuntimeError('postgres/enterprise/seed failed: Traceback (most recent call last):\\n  File \"/home/aarav/Aarav/Github/githearth/experiments/metadata/bench.py\", line 240, in <module>\\n    main()\\n  File \"/home/aarav/Aarav/Github/githearth/experiments/metadata/bench.py\", line 224, in main\\n    db.seed(PROFILES[args.profile])\\n  File \"/home/aarav/Aarav/Github/githearth/experiments/metadata/adapters.py\", line 48, in seed\\n    with self.conn.cursor().copy(\"COPY issues FROM STDIN\") as c:\\n  File \"/usr/lib/python3.12/contextlib.py\", line 144, in __exit__\\n    next(self.gen)\\n  File \"/home/aarav/Aarav/Github/githearth/.bench/python/psycopg/cursor.py\", line 330, in copy\\n    raise ex.with_traceback(None)\\npsycopg.errors.QueryCanceled: canceling statement due to statement timeout\\nCONTEXT:  COPY issues, line 565696\\n')",
+  "finished_utc": "2026-10-27T07:52:36.168957+00:00"
+}
