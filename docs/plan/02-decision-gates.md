@@ -58,6 +58,8 @@ After the provisional metadata decision, implement an experimental slice with re
 
 The first distributed slice adds replica membership, data catch-up, committed reference ordering, fencing, routing, and tested node failure. Expand CI, planning, delivery, enterprise capabilities, security, and ecosystem features using these established contracts.
 
+The next coding gate is specified in [M1](05-first-milestone.md). The full sequence and required capability families are now recorded in [the roadmap](04-forge-roadmap.md) and [inventory](06-capability-inventory.md). The [qualification/decision register](07-qualification-and-decisions.md) identifies when each remaining choice becomes blocking. These replace the earlier instruction to wait for more planning after the local screening.
+
 ## Decisions still proposed
 
 | Decision | Current position | When it must be resolved |

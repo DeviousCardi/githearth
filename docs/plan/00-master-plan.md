@@ -1,6 +1,6 @@
 # GitHearth master plan
 
-Status: proposed design, revision 3; local database screening completed. Planning date: 2026-10-27.
+Status: proposed design, revision 4; local screening complete and application foundation verified. Planning date: 2026-10-27.
 
 ## 1. Objective
 
@@ -8,7 +8,7 @@ Build a freely usable, self-hostable development platform with a path from a per
 
 The founder has explicitly confirmed that **one product must support single-node and distributed deployment modes**. The distributed requirement refers to one logical GitHearth installation spread across machines. Federation between independent installations is a separate, later capability.
 
-The initial deliverable is a reliable Git storage foundation. It is the first part of the full forge, not a permanent reduction of the product vision.
+The initial experiments established a Git reader and metadata baseline. The next deliverable is an executable application foundation, followed by the complete Git-and-issues workflow. The full scope and gated sequence are in [the implementation roadmap](04-forge-roadmap.md).
 
 ## 2. Priority order
 
@@ -43,7 +43,7 @@ A cluster is not healthy merely because three application processes are running.
 
 ## 4. Scope boundaries and parity
 
-The intended product scope includes repositories, review and merge queues, issues and projects, discussions and wikis, search and navigation, notifications, CI/CD, packages and releases, static sites, application security, enterprise identity and policy, audit and retention, migration/export, APIs, and integrations. Detailed capability acceptance criteria follow the foundation experiments; none of these domains is silently dropped from the long-term goal.
+The intended product scope includes repositories, review and merge queues, issues and projects, discussions and wikis, search and navigation, notifications, CI/CD, packages and releases, static sites, application security, enterprise identity and policy, audit and retention, migration/export, APIs, and integrations. The [capability inventory](06-capability-inventory.md) allocates required domains to milestones; none is silently dropped from the long-term goal.
 
 “GitHub/GitLab-style capability” means comparable user outcomes. It does not imply copying branding, replicating proprietary implementation details, providing every changing vendor API, funding a public compute fleet, or reproducing a commercial AI model. Exact import formats, workflow compatibility, and integration APIs require explicit matrices.
 
@@ -53,7 +53,7 @@ Managed hosting, payments, marketplace commerce, and an organization-operated pu
 
 - Rust for application services, Git orchestration, search workers, scheduling logic, CLI, and runner agent.
 - Tokio, axum, and tonic as the initial runtime, HTTP, and internal RPC stack, subject to pinned-version review.
-- Benchmark PostgreSQL and FoundationDB before choosing the common metadata engine. Tenant ownership is explicit from the first schema. PostgreSQL read replicas alone do not provide horizontal write scaling; a FoundationDB design needs its own query and index layer. Add another candidate only for a concrete advantage not covered by these two.
+- Use the provisional PostgreSQL decision from the completed PostgreSQL/FoundationDB screening for the first application milestone. Tenant ownership is explicit from the first schema. PostgreSQL read replicas alone do not provide horizontal write scaling; a FoundationDB design needs its own query and index layer. Add another candidate only for a concrete advantage not covered by these two.
 - A Git service that owns every repository mutation. Native Git is the initial wire-protocol baseline; gitoxide is used for supported read operations after conformance testing.
 - A durable repository journal in single-node mode that can become a replicated group without changing repository identity or client URLs.
 - Local immutable object files for Git; filesystem or S3-compatible storage for LFS, uploads, packages, logs, and artifacts.
@@ -91,6 +91,6 @@ Before assigning calendar dates, finish the foundation experiments, measure avai
 
 ## 9. How to use this plan
 
-Read this document and the metadata contract first. Review the decision gates next. Complete the database evaluation and Git integration experiment, resolve their blocking decisions, then expand the detailed product roadmap around the selected contracts.
+Read this document and the metadata contract, then the [full roadmap](04-forge-roadmap.md), [M1 acceptance specification](05-first-milestone.md), [capability inventory](06-capability-inventory.md), and [qualification/decision register](07-qualification-and-decisions.md). The database is provisionally selected. Complete each milestone against its recorded evidence rather than repeating the completed screening.
 
 Record design changes as new revisions of the relevant decision. Keep future capability inventories and compatibility matrices synchronized with actual tests. Use statuses `planned`, `experimental`, `beta`, and `stable`; the current executable components are experimental.

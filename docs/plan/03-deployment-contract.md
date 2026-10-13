@@ -1,6 +1,6 @@
 # Deployment and failure contract
 
-Status: architecture requirements for the foundation experiments. No product installer or distributed service is implemented.
+Status: architecture requirements for the foundation experiments. An experimental M1 server/development Compose setup exists; no production installer or distributed service is implemented.
 
 ## One product, different placement
 
