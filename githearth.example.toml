@@ -1,0 +1,9 @@
+# Copy to a private location; prefer GITHEARTH_DATABASE_URL for the secret URL.
+# database_url = "postgres://githearth:GENERATED_LOCAL_PASSWORD@127.0.0.1:54329/githearth"
+bind = "127.0.0.1:8080"
+database_max_connections = 10
+database_timeout_seconds = 3
+request_timeout_seconds = 15
+token_ttl_seconds = 3600
+body_limit_bytes = 16384
+auth_concurrency = 2
