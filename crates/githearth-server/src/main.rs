@@ -1,0 +1,108 @@
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use githearth_server::{AppState, MIGRATOR, bootstrap_admin, config::Config, connect, router};
+use std::{
+    io::{self, Read},
+    path::PathBuf,
+};
+
+#[derive(Parser)]
+#[command(about = "Experimental GitHearth foundation server")]
+struct Args {
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+#[derive(Subcommand)]
+enum Command {
+    Serve,
+    Migrate,
+    /// Create the first admin; password is read from stdin (never command arguments).
+    BootstrapAdmin {
+        #[arg(long)]
+        username: String,
+    },
+}
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter("githearth_server=info")
+        .init();
+    if let Err(error) = run().await {
+        // Only configuration and explicitly sanitized application errors are printed here.
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+async fn run() -> Result<()> {
+    let args = Args::parse();
+    let config = Config::load(args.config.as_deref())?;
+    let pool = connect(&config).await?;
+    match args.command {
+        Command::Migrate => {
+            MIGRATOR.run(&pool).await.map_err(|_| {
+                anyhow::anyhow!(
+                    "migration failed; inspect database availability and migration history"
+                )
+            })?;
+            tracing::info!("schema migrated");
+        }
+        Command::BootstrapAdmin { username } => {
+            let mut password = String::new();
+            io::stdin()
+                .take(1026)
+                .read_to_string(&mut password)
+                .context("cannot read password from stdin")?;
+            if password.len() > 1025 {
+                bail!("password input exceeds limit");
+            }
+            let password = password.trim_end_matches(['\r', '\n']).to_owned();
+            // Preserve actionable duplicate errors without displaying SQL driver data.
+            match bootstrap_admin(&pool, &username, password).await {
+                Ok(id) => tracing::info!(%id, "administrator created"),
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.starts_with("an administrator already exists")
+                        || message.starts_with("username must")
+                        || message.starts_with("password must")
+                    {
+                        bail!("{message}");
+                    }
+                    bail!("bootstrap failed; check schema, database, and username availability");
+                }
+            }
+        }
+        Command::Serve => {
+            let state = AppState::new(pool, config.clone())
+                .await
+                .context("cannot initialize authentication")?;
+            let listener = tokio::net::TcpListener::bind(config.bind)
+                .await
+                .context("cannot bind HTTP listener")?;
+            tracing::info!(bind = %config.bind, "HTTP server listening; use loopback or a trusted TLS proxy");
+            axum::serve(listener, router(state))
+                .with_graceful_shutdown(shutdown())
+                .await
+                .context("HTTP server failed")?;
+        }
+    }
+    Ok(())
+}
+
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
