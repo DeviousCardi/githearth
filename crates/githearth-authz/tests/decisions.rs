@@ -1,15 +1,19 @@
 //! Expected decisions for the built-in roles and policies, the hostile
-//! custom-role check, and fail-closed behavior.
+//! custom-role check, anonymous visitors, fresh authentication, and
+//! fail-closed behavior.
+
+use std::time::Duration;
 
 use githearth_authz::{
-    Account, Action, BuiltinRole, Decision, Engine, Grant, Issue, Merge, Organization, Protection,
-    PullRequest, Ref, Repository, Request, Resource, Role, Scope, Subject, Team, Visibility,
+    Account, Action, BuiltinRole, Decision, Engine, Grant, Issue, Merge, Organization, Principal,
+    Protection, PullRequest, Ref, Repository, Request, Resource, Role, Scope, Subject, Team,
+    Visibility,
 };
 use uuid::Uuid;
 
 /// Who, doing what, in which organization, to what, with which merge facts.
 type Case<'a> = (
-    &'a Account,
+    Principal<'a>,
     Action,
     &'a Organization,
     Resource<'a>,
@@ -193,21 +197,130 @@ impl World {
         resource: Resource<'_>,
         merge: Option<Merge>,
     ) -> Decision {
-        let teams = self.teams();
-        let teams: Vec<Team> = teams
-            .into_iter()
-            .filter(|t| who.organizations.contains(&t.organization))
-            .collect();
         engine.authorize(&Request {
-            principal: who,
-            teams: &teams,
+            principal: Principal::Account(who),
+            teams: &self.accountable_teams(who),
             grants: &self.grants,
             action,
             organization: org,
             resource,
             merge,
+            auth_age: Some(Duration::ZERO),
         })
     }
+
+    /// An unauthenticated visitor: never grants, never teams.
+    fn anonymous(
+        &self,
+        engine: &Engine,
+        action: Action,
+        org: &Organization,
+        resource: Resource<'_>,
+        merge: Option<Merge>,
+    ) -> Decision {
+        engine.authorize(&Request {
+            principal: Principal::Anonymous,
+            teams: &[],
+            grants: &[],
+            action,
+            organization: org,
+            resource,
+            merge,
+            auth_age: None,
+        })
+    }
+
+    fn accountable_teams(&self, who: &Account) -> Vec<Team> {
+        self.teams()
+            .into_iter()
+            .filter(|t| who.organizations.contains(&t.organization))
+            .collect()
+    }
+}
+
+/// A repository to act on, with a ref, an issue and a pull request inside,
+/// for tests that walk every action over one repository.
+struct Site<'a> {
+    repository: &'a Repository,
+    reference: Ref,
+    issue: Issue,
+    pr: PullRequest,
+}
+
+impl Site<'_> {
+    /// The resource `action` names here, with the merge facts a merge carries.
+    fn resource(&self, action: Action) -> (Resource<'_>, Option<Merge>) {
+        let merge = (action == Action::PullRequestMerge).then_some(Merge {
+            approvals: 1,
+            checks_passed: true,
+        });
+        use Action::*;
+        let repository = self.repository;
+        let resource = match action {
+            OrganizationRead
+            | OrganizationUpdate
+            | OrganizationManageMembers
+            | OrganizationDelete
+            | OrganizationSuspend
+            | OrganizationUnsuspend
+            | TeamCreate
+            | RepositoryCreate => Resource::Organization,
+            RepositoryRead
+            | RepositoryClone
+            | RepositoryUpdate
+            | RepositoryManageAccess
+            | RepositoryManageProtection
+            | RepositoryArchive
+            | RepositoryUnarchive
+            | RepositoryDelete
+            | IssueCreate
+            | PullRequestCreate => Resource::Repository(repository),
+            RefPush | RefForcePush | RefDelete => Resource::Ref(repository, &self.reference),
+            IssueRead | IssueComment | IssueLabel | IssueAssign | IssueClose => {
+                Resource::Issue(repository, &self.issue)
+            }
+            PullRequestRead | PullRequestComment | PullRequestClose | PullRequestApprove
+            | PullRequestMerge => Resource::PullRequest(repository, &self.pr),
+        };
+        (resource, merge)
+    }
+}
+
+/// A site on the given repository, containing only facts the caller loads.
+fn site_on<'a>(repository: &'a Repository, author: Uuid, branch: &str) -> Site<'a> {
+    let reference = Ref {
+        repository: repository.id,
+        name: branch.into(),
+        protection: None,
+    };
+    let issue = Issue {
+        id: Uuid::new_v4(),
+        repository: repository.id,
+        author,
+    };
+    let pr = PullRequest {
+        id: Uuid::new_v4(),
+        repository: repository.id,
+        author,
+        target: reference.clone(),
+    };
+    Site {
+        repository,
+        reference,
+        issue,
+        pr,
+    }
+}
+
+/// The `public_read` actions.
+fn is_public_read(action: Action) -> bool {
+    matches!(
+        action,
+        Action::RepositoryRead
+            | Action::RepositoryClone
+            | Action::IssueRead
+            | Action::PullRequestRead
+    )
 }
 
 #[test]
@@ -230,55 +343,58 @@ fn decision_table() {
     #[rustfmt::skip]
     let cases: Vec<(&str, Case<'_>, bool)> = vec![
         // Organization membership
-        ("owner reads org", (&w.owner, OrganizationRead, &w.acme, Resource::Organization, None), true),
-        ("owner deletes org", (&w.owner, OrganizationDelete, &w.acme, Resource::Organization, None), true),
-        ("member reads org", (&w.member, OrganizationRead, &w.acme, Resource::Organization, None), true),
-        ("member creates repo", (&w.member, RepositoryCreate, &w.acme, Resource::Organization, None), true),
-        ("member cannot manage members", (&w.member, OrganizationManageMembers, &w.acme, Resource::Organization, None), false),
-        ("outsider cannot read org", (&w.outsider, OrganizationRead, &w.acme, Resource::Organization, None), false),
-        ("collaborator cannot read org", (&w.collaborator, OrganizationRead, &w.acme, Resource::Organization, None), false),
-        ("owner role does not cross orgs", (&w.outsider, RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
-        ("owner of other org reads own repo", (&w.outsider, RepositoryRead, &w.other, Resource::Repository(&w.foreign), None), true),
-        ("acme owner cannot read other org", (&w.owner, RepositoryRead, &w.other, Resource::Repository(&w.foreign), None), false),
+        ("owner reads org", (Principal::Account(&w.owner), OrganizationRead, &w.acme, Resource::Organization, None), true),
+        ("owner deletes org", (Principal::Account(&w.owner), OrganizationDelete, &w.acme, Resource::Organization, None), true),
+        ("member reads org", (Principal::Account(&w.member), OrganizationRead, &w.acme, Resource::Organization, None), true),
+        ("member creates repo", (Principal::Account(&w.member), RepositoryCreate, &w.acme, Resource::Organization, None), true),
+        ("member cannot manage members", (Principal::Account(&w.member), OrganizationManageMembers, &w.acme, Resource::Organization, None), false),
+        ("outsider cannot read org", (Principal::Account(&w.outsider), OrganizationRead, &w.acme, Resource::Organization, None), false),
+        ("collaborator cannot read org", (Principal::Account(&w.collaborator), OrganizationRead, &w.acme, Resource::Organization, None), false),
+        ("owner role does not cross orgs", (Principal::Account(&w.outsider), RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
+        ("owner of other org reads own repo", (Principal::Account(&w.outsider), RepositoryRead, &w.other, Resource::Repository(&w.foreign), None), true),
+        ("acme owner cannot read other org", (Principal::Account(&w.owner), RepositoryRead, &w.other, Resource::Repository(&w.foreign), None), false),
         // Visibility
-        ("anyone reads public repo", (&w.outsider, RepositoryClone, &w.acme, Resource::Repository(&w.public), None), true),
-        ("public read is not write", (&w.outsider, IssueCreate, &w.acme, Resource::Repository(&w.public), None), false),
-        ("member reads internal repo", (&w.member, RepositoryRead, &w.acme, Resource::Repository(&w.internal), None), true),
-        ("outsider cannot read internal repo", (&w.outsider, RepositoryRead, &w.acme, Resource::Repository(&w.internal), None), false),
-        ("member cannot read private repo", (&w.member, RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
-        ("owner reads private repo", (&w.owner, RepositoryRead, &w.acme, Resource::Repository(&w.private), None), true),
-        ("collaborator reads private repo", (&w.collaborator, RepositoryClone, &w.acme, Resource::Repository(&w.private), None), true),
-        ("collaborator cannot push", (&w.collaborator, RefPush, &w.acme, Resource::Ref(&w.private, &w.feature), None), false),
+        ("anyone reads public repo", (Principal::Account(&w.outsider), RepositoryClone, &w.acme, Resource::Repository(&w.public), None), true),
+        ("public read is not write", (Principal::Account(&w.outsider), IssueCreate, &w.acme, Resource::Repository(&w.public), None), false),
+        ("member reads internal repo", (Principal::Account(&w.member), RepositoryRead, &w.acme, Resource::Repository(&w.internal), None), true),
+        ("outsider cannot read internal repo", (Principal::Account(&w.outsider), RepositoryRead, &w.acme, Resource::Repository(&w.internal), None), false),
+        ("member cannot read private repo", (Principal::Account(&w.member), RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
+        ("owner reads private repo", (Principal::Account(&w.owner), RepositoryRead, &w.acme, Resource::Repository(&w.private), None), true),
+        ("collaborator reads private repo", (Principal::Account(&w.collaborator), RepositoryClone, &w.acme, Resource::Repository(&w.private), None), true),
+        ("collaborator cannot push", (Principal::Account(&w.collaborator), RefPush, &w.acme, Resource::Ref(&w.private, &w.feature), None), false),
         // Nested teams
-        ("nested team member pushes feature", (&w.developer, RefPush, &w.acme, Resource::Ref(&w.private, &w.feature), None), true),
-        ("nested team member labels issue", (&w.developer, IssueLabel, &w.acme, Resource::Issue(&w.private, &w.issue), None), true),
-        ("write cannot change settings", (&w.developer, RepositoryUpdate, &w.acme, Resource::Repository(&w.private), None), false),
-        ("write cannot read other repos", (&w.developer, RepositoryRead, &w.acme, Resource::Repository(&w.archived), None), false),
+        ("nested team member pushes feature", (Principal::Account(&w.developer), RefPush, &w.acme, Resource::Ref(&w.private, &w.feature), None), true),
+        ("nested team member labels issue", (Principal::Account(&w.developer), IssueLabel, &w.acme, Resource::Issue(&w.private, &w.issue), None), true),
+        ("write cannot change settings", (Principal::Account(&w.developer), RepositoryUpdate, &w.acme, Resource::Repository(&w.private), None), false),
+        ("write cannot read other repos", (Principal::Account(&w.developer), RepositoryRead, &w.acme, Resource::Repository(&w.archived), None), false),
         // Branch protection
-        ("unprotected force push", (&w.developer, RefForcePush, &w.acme, Resource::Ref(&w.private, &w.feature), None), true),
-        ("protected requires pull request", (&w.developer, RefPush, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
-        ("owner bound by protection too", (&w.owner, RefPush, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
-        ("protected no force push", (&w.owner, RefForcePush, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
-        ("protected no deletion", (&w.owner, RefDelete, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
-        ("merge with approvals and checks", (&w.owner, PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), approved), true),
-        ("merge short of approvals", (&w.owner, PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), unapproved), false),
-        ("merge with failing checks", (&w.owner, PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), failing), false),
-        ("author cannot approve own PR", (&w.developer, PullRequestApprove, &w.acme, Resource::PullRequest(&w.private, &w.pr), None), false),
-        ("other writer approves", (&w.owner, PullRequestApprove, &w.acme, Resource::PullRequest(&w.private, &w.pr), None), true),
+        ("unprotected force push", (Principal::Account(&w.developer), RefForcePush, &w.acme, Resource::Ref(&w.private, &w.feature), None), true),
+        ("protected requires pull request", (Principal::Account(&w.developer), RefPush, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
+        ("owner bound by protection too", (Principal::Account(&w.owner), RefPush, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
+        ("protected no force push", (Principal::Account(&w.owner), RefForcePush, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
+        ("protected no deletion", (Principal::Account(&w.owner), RefDelete, &w.acme, Resource::Ref(&w.private, &w.main), None), false),
+        ("merge with approvals and checks", (Principal::Account(&w.owner), PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), approved), true),
+        ("merge short of approvals", (Principal::Account(&w.owner), PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), unapproved), false),
+        ("merge with failing checks", (Principal::Account(&w.owner), PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), failing), false),
+        ("author cannot approve own PR", (Principal::Account(&w.developer), PullRequestApprove, &w.acme, Resource::PullRequest(&w.private, &w.pr), None), false),
+        ("other writer approves", (Principal::Account(&w.owner), PullRequestApprove, &w.acme, Resource::PullRequest(&w.private, &w.pr), None), true),
         // Archived repositories
-        ("archived is readable", (&w.owner, RepositoryRead, &w.acme, Resource::Repository(&w.archived), None), true),
-        ("archived refuses new issues", (&w.owner, IssueCreate, &w.acme, Resource::Repository(&w.archived), None), false),
-        ("archived refuses settings", (&w.owner, RepositoryUpdate, &w.acme, Resource::Repository(&w.archived), None), false),
-        ("admin unarchives", (&w.owner, RepositoryUnarchive, &w.acme, Resource::Repository(&w.archived), None), true),
+        ("archived is readable", (Principal::Account(&w.owner), RepositoryRead, &w.acme, Resource::Repository(&w.archived), None), true),
+        ("archived refuses new issues", (Principal::Account(&w.owner), IssueCreate, &w.acme, Resource::Repository(&w.archived), None), false),
+        ("archived refuses settings", (Principal::Account(&w.owner), RepositoryUpdate, &w.acme, Resource::Repository(&w.archived), None), false),
+        ("admin unarchives", (Principal::Account(&w.owner), RepositoryUnarchive, &w.acme, Resource::Repository(&w.archived), None), true),
         // Accounts and site administration
-        ("suspended account denied", (&w.suspended, OrganizationRead, &w.acme, Resource::Organization, None), false),
-        ("site admin suspends org", (&w.site_admin, OrganizationSuspend, &w.acme, Resource::Organization, None), true),
-        ("site admin cannot read private repo", (&w.site_admin, RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
-        ("owner cannot suspend org", (&w.owner, OrganizationSuspend, &w.acme, Resource::Organization, None), false),
+        ("suspended account denied", (Principal::Account(&w.suspended), OrganizationRead, &w.acme, Resource::Organization, None), false),
+        ("site admin suspends org", (Principal::Account(&w.site_admin), OrganizationSuspend, &w.acme, Resource::Organization, None), true),
+        ("site admin cannot read private repo", (Principal::Account(&w.site_admin), RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
+        ("owner cannot suspend org", (Principal::Account(&w.owner), OrganizationSuspend, &w.acme, Resource::Organization, None), false),
     ];
     let mut failures = Vec::new();
     for (name, (who, action, org, resource, merge), expected) in cases {
-        let decision = w.decide(&engine, who, action, org, resource, merge);
+        let decision = match who {
+            Principal::Account(who) => w.decide(&engine, who, action, org, resource, merge),
+            Principal::Anonymous => w.anonymous(&engine, action, org, resource, merge),
+        };
         if decision.is_allowed() != expected || matches!(decision, Decision::Invalid(_)) {
             failures.push(format!(
                 "{name}: expected allow={expected}, got {decision:?}"
@@ -352,19 +468,22 @@ fn hostile_custom_role_cannot_override_built_in_forbids() {
     use Action::*;
     #[rustfmt::skip]
     let forbidden: Vec<(Case<'_>, &str)> = vec![
-        ((&w.suspended, OrganizationRead, &w.acme, Resource::Organization, None), "suspended-account"),
-        ((&w.developer, IssueCreate, &w.acme, Resource::Repository(&w.archived), None), "archived-no-new-content"),
-        ((&w.developer, RepositoryUpdate, &w.acme, Resource::Repository(&w.archived), None), "archived-read-only"),
-        ((&w.developer, RefForcePush, &w.acme, Resource::Ref(&w.private, &w.main), None), "protected-no-force-push"),
-        ((&w.developer, RefDelete, &w.acme, Resource::Ref(&w.private, &w.main), None), "protected-no-deletion"),
-        ((&w.developer, RefPush, &w.acme, Resource::Ref(&w.private, &w.main), None), "protected-requires-pull-request"),
-        ((&w.developer, PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), unapproved), "merge-requires-approvals"),
-        ((&w.developer, PullRequestApprove, &w.acme, Resource::PullRequest(&w.private, &w.pr), None), "no-self-approval"),
-        ((&w.member, OrganizationSuspend, &w.acme, Resource::Organization, None), "site-admin-only"),
-        ((&w.member, RepositoryRead, &w.other, Resource::Repository(&w.foreign), None), ""),
+        ((Principal::Account(&w.suspended), OrganizationRead, &w.acme, Resource::Organization, None), "suspended-account"),
+        ((Principal::Account(&w.developer), IssueCreate, &w.acme, Resource::Repository(&w.archived), None), "archived-no-new-content"),
+        ((Principal::Account(&w.developer), RepositoryUpdate, &w.acme, Resource::Repository(&w.archived), None), "archived-read-only"),
+        ((Principal::Account(&w.developer), RefForcePush, &w.acme, Resource::Ref(&w.private, &w.main), None), "protected-no-force-push"),
+        ((Principal::Account(&w.developer), RefDelete, &w.acme, Resource::Ref(&w.private, &w.main), None), "protected-no-deletion"),
+        ((Principal::Account(&w.developer), RefPush, &w.acme, Resource::Ref(&w.private, &w.main), None), "protected-requires-pull-request"),
+        ((Principal::Account(&w.developer), PullRequestMerge, &w.acme, Resource::PullRequest(&w.private, &w.pr), unapproved), "merge-requires-approvals"),
+        ((Principal::Account(&w.developer), PullRequestApprove, &w.acme, Resource::PullRequest(&w.private, &w.pr), None), "no-self-approval"),
+        ((Principal::Account(&w.member), OrganizationSuspend, &w.acme, Resource::Organization, None), "site-admin-only"),
+        ((Principal::Account(&w.member), RepositoryRead, &w.other, Resource::Repository(&w.foreign), None), ""),
     ];
     for ((who, action, org, resource, merge), forbid) in forbidden {
-        let d = w.decide(&engine, who, action, org, resource, merge);
+        let d = match who {
+            Principal::Account(who) => w.decide(&engine, who, action, org, resource, merge),
+            Principal::Anonymous => w.anonymous(&engine, action, org, resource, merge),
+        };
         match d {
             Decision::Deny(ids) if forbid.is_empty() || ids.iter().any(|id| id == forbid) => {}
             other => panic!("{action:?}: expected deny by {forbid:?}, got {other:?}"),
@@ -441,24 +560,69 @@ fn inconsistent_or_incomplete_facts_fail_closed() {
     ));
     // A principal team whose facts were not loaded.
     invalid(engine.authorize(&Request {
-        principal: &w.developer,
+        principal: Principal::Account(&w.developer),
         teams: &[],
         grants: &w.grants,
         action: Action::RefPush,
         organization: &w.acme,
         resource: Resource::Ref(&w.private, &w.feature),
         merge: None,
+        auth_age: Some(Duration::ZERO),
     }));
     // A team whose parent was not loaded.
     invalid(engine.authorize(&Request {
-        principal: &w.developer,
+        principal: Principal::Account(&w.developer),
         teams: std::slice::from_ref(&w.devs),
         grants: &w.grants,
         action: Action::RefPush,
         organization: &w.acme,
         resource: Resource::Ref(&w.private, &w.feature),
         merge: None,
+        auth_age: Some(Duration::ZERO),
     }));
+    let push = |principal: &Account, teams: &[Team]| {
+        engine.authorize(&Request {
+            principal: Principal::Account(principal),
+            teams,
+            grants: &w.grants,
+            action: Action::RefPush,
+            organization: &w.acme,
+            resource: Resource::Ref(&w.private, &w.feature),
+            merge: None,
+            auth_age: Some(Duration::ZERO),
+        })
+    };
+    // The same team loaded twice.
+    let mut doubled = w.teams();
+    doubled.push(w.devs.clone());
+    invalid(push(&w.developer, &doubled));
+    // A principal team in an organization the principal does not belong to.
+    let stranger = Account {
+        organizations: vec![w.other.id],
+        ..w.developer.clone()
+    };
+    invalid(push(&stranger, &w.teams()));
+    // A parent team in another organization.
+    let crossed: Vec<Team> = w
+        .teams()
+        .into_iter()
+        .map(|team| match team.parent {
+            None => Team {
+                organization: w.other.id,
+                ..team
+            },
+            Some(_) => team,
+        })
+        .collect();
+    invalid(push(&w.developer, &crossed));
+}
+
+#[test]
+fn engine_errors_are_reported() {
+    let mut engine = Engine::new().unwrap();
+    let huge = "x".repeat(githearth_authz::MAX_ROLE_BYTES + 1);
+    let error = engine.add_custom_role("huge", &huge).unwrap_err();
+    assert_eq!(error.to_string(), "custom role: template too large");
 }
 
 #[test]
@@ -481,13 +645,228 @@ fn unusable_grants_grant_nothing() {
         },
     ];
     let d = engine.authorize(&Request {
-        principal: &member,
+        principal: Principal::Account(&member),
         teams: &[],
         grants: &grants,
         action: Action::RepositoryRead,
         organization: &w.acme,
         resource: Resource::Repository(&w.private),
         merge: None,
+        auth_age: Some(Duration::ZERO),
     });
     assert_eq!(d, Decision::Deny(vec![]));
+}
+
+/// Public repositories are readable and clonable without signing in; an
+/// anonymous visitor can do nothing else, even where suspensions say yes.
+#[test]
+fn anonymous_reads_public_repositories_only() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let site = site_on(&w.public, w.member.id, "refs/heads/main");
+    for action in [
+        Action::RepositoryRead,
+        Action::RepositoryClone,
+        Action::IssueRead,
+        Action::PullRequestRead,
+    ] {
+        let (resource, _) = site.resource(action);
+        let d = w.anonymous(&engine, action, &w.acme, resource, None);
+        assert!(d.is_allowed(), "{action:?}: {d:?}");
+    }
+    for repository in [&w.internal, &w.private] {
+        let d = w.anonymous(
+            &engine,
+            Action::RepositoryRead,
+            &w.acme,
+            Resource::Repository(repository),
+            None,
+        );
+        assert_eq!(d, Decision::Deny(vec![]), "{repository:?}: {d:?}");
+    }
+    for &action in Action::ALL {
+        if is_public_read(action) {
+            continue;
+        }
+        let (resource, merge) = site.resource(action);
+        let d = w.anonymous(&engine, action, &w.acme, resource, merge);
+        assert!(
+            matches!(d, Decision::Deny(_)),
+            "{action:?}: expected clean deny, got {d:?}"
+        );
+    }
+}
+
+#[test]
+fn anonymous_reads_nothing_in_a_suspended_organization() {
+    let engine = Engine::new().unwrap();
+    let mut w = World::new();
+    w.acme.suspended = true;
+    let d = w.anonymous(
+        &engine,
+        Action::RepositoryRead,
+        &w.acme,
+        Resource::Repository(&w.public),
+        None,
+    );
+    assert_eq!(d, Decision::Deny(vec!["suspended-organization".into()]));
+}
+
+#[test]
+fn anonymous_cannot_carry_grants_or_teams() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let teams = w.teams();
+    let invalid = |d: Decision| assert!(matches!(d, Decision::Invalid(_)), "{d:?}");
+    let grants = [grant(
+        BuiltinRole::Read,
+        Subject::Account(Uuid::new_v4()),
+        Scope::Organization(w.acme.id),
+    )];
+    // Grants with an anonymous principal are a caller bug.
+    invalid(engine.authorize(&Request {
+        principal: Principal::Anonymous,
+        teams: &[],
+        grants: &grants,
+        action: Action::RepositoryRead,
+        organization: &w.acme,
+        resource: Resource::Repository(&w.public),
+        merge: None,
+        auth_age: None,
+    }));
+    // So are teams.
+    invalid(engine.authorize(&Request {
+        principal: Principal::Anonymous,
+        teams: &teams,
+        grants: &[],
+        action: Action::RepositoryRead,
+        organization: &w.acme,
+        resource: Resource::Repository(&w.public),
+        merge: None,
+        auth_age: None,
+    }));
+}
+
+/// Even with a permit-everything role in the policy set, anonymous requests
+/// can never link it: whatever else forbids, they deny cleanly.
+#[test]
+fn hostile_custom_role_reaches_no_anonymous_principal() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .add_custom_role(
+            "everything",
+            "permit (principal in ?principal, action, resource in ?resource);",
+        )
+        .unwrap();
+    let w = World::new();
+    let site = site_on(&w.public, w.member.id, "refs/heads/main");
+    for &action in Action::ALL {
+        if is_public_read(action) {
+            continue;
+        }
+        let (resource, merge) = site.resource(action);
+        let d = w.anonymous(&engine, action, &w.acme, resource, merge);
+        match d {
+            Decision::Deny(ids) if ids.iter().any(|id| id == "anonymous-public-read-only") => {}
+            other => panic!("{action:?}: expected anonymous-public-read-only, got {other:?}"),
+        }
+    }
+}
+
+/// Owned by the schema, not by the Rust table: a permit naming only the
+/// schema's `sensitive` group allows exactly what `is_sensitive` says.
+#[test]
+fn rust_sensitivity_matches_the_schema_sensitive_group() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .add_custom_role(
+            "sensitive_only",
+            r#"permit (principal in ?principal, action in [GitHearth::Action::"sensitive"], resource in ?resource);"#,
+        )
+        .unwrap();
+    let w = World::new();
+    // A site administrator: the site-admin-only forbid otherwise denies the
+    // suspend and unsuspend actions, which also live in the sensitive group.
+    let who = Account {
+        site_admin: true,
+        ..account(&[w.acme.id], &[])
+    };
+    // A private repository: no built-in permit matches, so only a permit
+    // naming the sensitive group can allow anything.
+    let site = site_on(&w.private, who.id, "refs/heads/pending");
+    let grants = [Grant {
+        role: Role::Custom("sensitive_only".into()),
+        subject: Subject::Account(who.id),
+        scope: Scope::Organization(w.acme.id),
+    }];
+    for &action in Action::ALL {
+        let (resource, merge) = site.resource(action);
+        let d = engine.authorize(&Request {
+            principal: Principal::Account(&who),
+            teams: &[],
+            grants: &grants,
+            action,
+            organization: &w.acme,
+            resource,
+            merge,
+            auth_age: Some(Duration::ZERO),
+        });
+        assert_eq!(d.is_allowed(), action.is_sensitive(), "{action:?}: {d:?}");
+    }
+}
+
+/// Sudo mode: sensitive actions demand recently presented credentials from
+/// the account; non-sensitive ones never do.
+#[test]
+fn sensitive_actions_require_fresh_authentication() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let fresh = |engine: &Engine, age: Option<Duration>| -> Decision {
+        engine.authorize(&Request {
+            principal: Principal::Account(&w.owner),
+            teams: &[],
+            grants: &[grant(
+                BuiltinRole::Owner,
+                Subject::Account(w.owner.id),
+                Scope::Organization(w.acme.id),
+            )],
+            action: Action::OrganizationUpdate,
+            organization: &w.acme,
+            resource: Resource::Organization,
+            merge: None,
+            auth_age: age,
+        })
+    };
+    assert!(fresh(&engine, Some(Duration::from_secs(60))).is_allowed());
+    assert_eq!(
+        fresh(&engine, Some(Duration::from_secs(16 * 60))),
+        Decision::Deny(vec!["sensitive-requires-fresh-auth".into()])
+    );
+    // Unknown recency counts as stale.
+    assert_eq!(
+        fresh(&engine, None),
+        Decision::Deny(vec!["sensitive-requires-fresh-auth".into()])
+    );
+    let longer = Engine::new()
+        .unwrap()
+        .with_fresh_auth(Duration::from_secs(60 * 60));
+    assert!(fresh(&longer, Some(Duration::from_secs(30 * 60))).is_allowed());
+    // Saturating beyond `Long` denies without panicking.
+    assert!(!fresh(&engine, Some(Duration::MAX)).is_allowed());
+    // Non-sensitive actions stay available without any recency.
+    let d = engine.authorize(&Request {
+        principal: Principal::Account(&w.owner),
+        teams: &[],
+        grants: &[grant(
+            BuiltinRole::Owner,
+            Subject::Account(w.owner.id),
+            Scope::Organization(w.acme.id),
+        )],
+        action: Action::OrganizationRead,
+        organization: &w.acme,
+        resource: Resource::Organization,
+        merge: None,
+        auth_age: None,
+    });
+    assert!(d.is_allowed(), "{d:?}");
 }

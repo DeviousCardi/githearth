@@ -33,8 +33,11 @@ Actions are named `object.verb` and grouped. Templates name only groups, so a ne
 | `admin` | `repository.manage_access`, `manage_protection`, `archive`, `unarchive`, `delete` |
 | `owner` | `organization.update`, `manage_members`, `delete`, `team.create` |
 | `site_admin` | `organization.suspend`, `organization.unsuspend` |
+| `sensitive` | sudo mode: an action here also sits in its functional group above — `organization.update`, `manage_members`, `delete`, `organization.suspend`, `unsuspend`, `team.create`, `repository.manage_access`, `manage_protection`, `archive`, `unarchive`, `delete`, `ref.force_push`, `ref.delete` |
 
 Built-in roles: `member` and `owner` (organization scope only), plus `read`, `triage`, `write`, `maintain` and `admin` (organization or repository scope). Each role includes the groups below it. The M1 membership values `owner`/`member` map onto the first two.
+
+The principal of every action is a signed-in `Account` or the unauthenticated `Anonymous`, which has no attributes, no parents and may carry no grants or teams.
 
 ## Built-in forbids
 
@@ -43,10 +46,14 @@ These hold whatever any role, built-in or custom, permits:
 - `site-admin-only`: instance administration requires a site administrator.
 - `suspended-account`: a suspended account can do nothing.
 - `suspended-organization`: nothing happens inside a suspended organization except site administration.
+- `anonymous-public-read-only`: an anonymous visitor only reaches the `public_read` group, so no misconfiguration or custom role can let it write.
+- `sensitive-requires-fresh-auth`: sensitive actions are forbidden when the time since the account last presented its password exceeds the engine's fresh-auth window (`DEFAULT_FRESH_AUTH`, 15 minutes; configurable with `Engine::with_fresh_auth`). Unknown recency counts as stale. Non-sensitive actions never require it.
 - `archived-read-only`, `archived-no-new-content`: archived repositories accept no triage, write, maintain, issues, pull requests or comments. Admin actions such as unarchive remain.
 - `protected-no-force-push`, `protected-no-deletion`, `protected-requires-pull-request`: branch protection binds owners and admins too. There is no bypass role yet; adding one is a separate decision.
 - `merge-requires-approvals`, `merge-requires-checks`: merge context (`approvals`, `checks_passed`) is computed by the service for the exact head and target revisions being merged, so a stale approval or check cannot authorize different code (roadmap M3).
 - `no-self-approval`: a pull request's author cannot approve it.
+
+The engine fills every action's context (`auth_age_seconds`, `fresh_auth_seconds`, and merge facts for merges); callers never build context.
 
 `tests/decisions.rs` holds the expected decision table. Its hostile test grants a custom permit-everything role and proves every forbid above still denies and that the role does not cross organizations.
 
@@ -66,7 +73,6 @@ Cedar answers "may X do Y to Z", not "which Z may X see". List, search and dashb
 
 ## Open items
 
-- **Anonymous access.** Public repositories need an anonymous principal for unauthenticated clone. Add an `Anonymous` entity type before public Git HTTP in M2.
 - **Revocation and caching.** Decisions currently load facts per request from PostgreSQL, so a committed revocation applies to the next admitted request. Any cache, or the M5 storage nodes authorizing pushes locally, needs a versioned change feed and a stated maximum staleness before it ships.
 - **Performance.** Each decision clones the policy set and links one template per grant. Measure decision latency at the enterprise profile (large single organization, many teams and grants) before M4. If needed, cache linked sets per principal keyed by a grant version.
 - **Persistence.** Tables for teams, team membership, grants and protection rules land with M2 repositories and M3 reviews. Grant writes validate the scope against the role's assignability, and that the subject belongs to the scope's organization.

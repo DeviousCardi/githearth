@@ -14,17 +14,18 @@ when {
 @id("internal-read")
 permit (principal, action in GitHearth::Action::"public_read", resource)
 when {
-  (resource is GitHearth::Repository &&
-    resource.visibility == "internal" &&
-    principal in resource.organization) ||
-  (resource has repository &&
-    resource.repository.visibility == "internal" &&
-    principal in resource.organization)
+  principal is GitHearth::Account &&
+  ((resource is GitHearth::Repository &&
+     resource.visibility == "internal" &&
+     principal in resource.organization) ||
+   (resource has repository &&
+     resource.repository.visibility == "internal" &&
+     principal in resource.organization))
 };
 
 @id("site-admin")
 permit (principal, action in GitHearth::Action::"site_admin", resource)
-when { principal.site_admin };
+when { principal is GitHearth::Account && principal.site_admin };
 
 // --- Boundaries --------------------------------------------------------
 
@@ -32,11 +33,23 @@ when { principal.site_admin };
 // an organization's roles say.
 @id("site-admin-only")
 forbid (principal, action in GitHearth::Action::"site_admin", resource)
-unless { principal.site_admin };
+unless { principal is GitHearth::Account && principal.site_admin };
 
 @id("suspended-account")
 forbid (principal, action, resource)
-when { principal.suspended };
+when { principal is GitHearth::Account && principal.suspended };
+
+// Unauthenticated visitors get public reading and nothing else, whatever
+// any role or misconfiguration permits.
+@id("anonymous-public-read-only")
+forbid (principal is GitHearth::Anonymous, action, resource)
+unless { action in GitHearth::Action::"public_read" };
+
+// Sudo mode: changing access, administering and destroying require an
+// authentication fresher than the engine's window.
+@id("sensitive-requires-fresh-auth")
+forbid (principal, action in GitHearth::Action::"sensitive", resource)
+when { context.auth_age_seconds > context.fresh_auth_seconds };
 
 @id("suspended-organization")
 forbid (principal, action, resource)

@@ -8,6 +8,19 @@
 // protection) are copied onto each entity by the engine from loaded facts.
 
 namespace GitHearth {
+  // Request context, always filled by the engine and never by the caller.
+  // auth_age_seconds is the time since the account last presented its
+  // password; fresh_auth_seconds is the engine's sudo-mode window.
+  type Auth = { auth_age_seconds: Long, fresh_auth_seconds: Long };
+  type MergeAuth = {
+    auth_age_seconds: Long,
+    fresh_auth_seconds: Long,
+    approvals: Long,
+    checks_passed: Bool,
+  };
+
+  // Unauthenticated visitor: no attributes, no parents.
+  entity Anonymous;
   entity Organization = {
     suspended: Bool,
   };
@@ -59,82 +72,206 @@ namespace GitHearth {
   action "admin";
   action "owner";
   action "site_admin";
+  // Sudo mode: an action that is also in "sensitive" changes access,
+  // administers or destroys, and needs a recent authentication (see the
+  // fresh-auth forbid in builtin.cedar).
+  action "sensitive";
 
   // Organization
   action "organization.read" in ["member", "read"]
-    appliesTo { principal: Account, resource: Organization };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
   action "repository.create" in ["member"]
-    appliesTo { principal: Account, resource: Organization };
-  action "organization.update" in ["owner"]
-    appliesTo { principal: Account, resource: Organization };
-  action "organization.manage_members" in ["owner"]
-    appliesTo { principal: Account, resource: Organization };
-  action "organization.delete" in ["owner"]
-    appliesTo { principal: Account, resource: Organization };
-  action "team.create" in ["owner"]
-    appliesTo { principal: Account, resource: Organization };
-  action "organization.suspend" in ["site_admin"]
-    appliesTo { principal: Account, resource: Organization };
-  action "organization.unsuspend" in ["site_admin"]
-    appliesTo { principal: Account, resource: Organization };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "organization.update" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "organization.manage_members" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "organization.delete" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "team.create" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "organization.suspend" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "organization.unsuspend" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
 
   // Repository
   action "repository.read" in ["public_read", "read"]
-    appliesTo { principal: Account, resource: Repository };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
   action "repository.clone" in ["public_read", "read"]
-    appliesTo { principal: Account, resource: Repository };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
   action "issue.create" in ["read"]
-    appliesTo { principal: Account, resource: Repository };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
   action "pull_request.create" in ["read"]
-    appliesTo { principal: Account, resource: Repository };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
   action "repository.update" in ["maintain"]
-    appliesTo { principal: Account, resource: Repository };
-  action "repository.manage_access" in ["admin"]
-    appliesTo { principal: Account, resource: Repository };
-  action "repository.manage_protection" in ["admin"]
-    appliesTo { principal: Account, resource: Repository };
-  action "repository.archive" in ["admin"]
-    appliesTo { principal: Account, resource: Repository };
-  action "repository.unarchive" in ["admin"]
-    appliesTo { principal: Account, resource: Repository };
-  action "repository.delete" in ["admin"]
-    appliesTo { principal: Account, resource: Repository };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
+  action "repository.manage_access" in ["admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
+  action "repository.manage_protection" in ["admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
+  action "repository.archive" in ["admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
+  action "repository.unarchive" in ["admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
+  action "repository.delete" in ["admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
 
   // Refs
   action "ref.push" in ["write"]
-    appliesTo { principal: Account, resource: Ref };
-  action "ref.force_push" in ["write"]
-    appliesTo { principal: Account, resource: Ref };
-  action "ref.delete" in ["write"]
-    appliesTo { principal: Account, resource: Ref };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Ref,
+      context: Auth,
+    };
+  action "ref.force_push" in ["write", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Ref,
+      context: Auth,
+    };
+  action "ref.delete" in ["write", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Ref,
+      context: Auth,
+    };
 
   // Issues
   action "issue.read" in ["public_read", "read"]
-    appliesTo { principal: Account, resource: Issue };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Issue,
+      context: Auth,
+    };
   action "issue.comment" in ["read"]
-    appliesTo { principal: Account, resource: Issue };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Issue,
+      context: Auth,
+    };
   action "issue.label" in ["triage"]
-    appliesTo { principal: Account, resource: Issue };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Issue,
+      context: Auth,
+    };
   action "issue.assign" in ["triage"]
-    appliesTo { principal: Account, resource: Issue };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Issue,
+      context: Auth,
+    };
   action "issue.close" in ["triage"]
-    appliesTo { principal: Account, resource: Issue };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Issue,
+      context: Auth,
+    };
 
   // Pull requests
   action "pull_request.read" in ["public_read", "read"]
-    appliesTo { principal: Account, resource: PullRequest };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: PullRequest,
+      context: Auth,
+    };
   action "pull_request.comment" in ["read"]
-    appliesTo { principal: Account, resource: PullRequest };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: PullRequest,
+      context: Auth,
+    };
   action "pull_request.close" in ["triage"]
-    appliesTo { principal: Account, resource: PullRequest };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: PullRequest,
+      context: Auth,
+    };
   action "pull_request.approve" in ["write"]
-    appliesTo { principal: Account, resource: PullRequest };
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: PullRequest,
+      context: Auth,
+    };
   // approvals and checks_passed are computed by the service for the exact
   // head and target revisions being merged, never taken from the caller.
   action "pull_request.merge" in ["write"]
     appliesTo {
-      principal: Account,
+      principal: [Account, Anonymous],
       resource: PullRequest,
-      context: { approvals: Long, checks_passed: Bool },
+      context: MergeAuth,
     };
 }

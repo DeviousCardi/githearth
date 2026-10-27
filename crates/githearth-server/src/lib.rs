@@ -444,7 +444,7 @@ async fn read_organization(
         teams: vec![],
     };
     let decision = state.authz.authorize(&githearth_authz::Request {
-        principal: &principal,
+        principal: githearth_authz::Principal::Account(&principal),
         teams: &[],
         grants: &grants,
         action: githearth_authz::Action::OrganizationRead,
@@ -454,6 +454,7 @@ async fn read_organization(
         },
         resource: Resource::Organization,
         merge: None,
+        auth_age: None,
     });
     match (decision.is_allowed(), role) {
         (true, Some(role)) => Ok(Json(Organization {

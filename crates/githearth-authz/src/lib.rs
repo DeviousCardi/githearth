@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use cedar_policy::{
     Authorizer, Context, Decision as CedarDecision, Effect, Entities, Entity, EntityId,
@@ -31,8 +32,21 @@ pub const BUILTINS: &str = include_str!("../policies/builtin.cedar");
 /// Largest custom role template accepted.
 pub const MAX_ROLE_BYTES: usize = 16 * 1024;
 
+/// How long after the last password entry an account may start sensitive
+/// actions (sudo mode).
+pub const DEFAULT_FRESH_AUTH: Duration = Duration::from_secs(15 * 60);
+
+macro_rules! sensitivity {
+    (sensitive) => {
+        true
+    };
+    (routine) => {
+        false
+    };
+}
+
 macro_rules! actions {
-    ($($variant:ident => $name:literal,)*) => {
+    ($($variant:ident => $name:literal, $sensitivity:ident,)*) => {
         /// Every action a request can name. Group actions (`read`, `write`, …)
         /// exist only in the schema; policies use them, requests never do.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -42,41 +56,46 @@ macro_rules! actions {
             pub fn name(self) -> &'static str {
                 match self { $(Action::$variant => $name,)* }
             }
+            /// Whether the action changes access, administers or destroys,
+            /// and so requires fresh authentication.
+            pub fn is_sensitive(self) -> bool {
+                match self { $(Action::$variant => sensitivity!($sensitivity),)* }
+            }
         }
     };
 }
 actions! {
-    OrganizationRead => "organization.read",
-    OrganizationUpdate => "organization.update",
-    OrganizationManageMembers => "organization.manage_members",
-    OrganizationDelete => "organization.delete",
-    OrganizationSuspend => "organization.suspend",
-    OrganizationUnsuspend => "organization.unsuspend",
-    TeamCreate => "team.create",
-    RepositoryCreate => "repository.create",
-    RepositoryRead => "repository.read",
-    RepositoryClone => "repository.clone",
-    RepositoryUpdate => "repository.update",
-    RepositoryManageAccess => "repository.manage_access",
-    RepositoryManageProtection => "repository.manage_protection",
-    RepositoryArchive => "repository.archive",
-    RepositoryUnarchive => "repository.unarchive",
-    RepositoryDelete => "repository.delete",
-    RefPush => "ref.push",
-    RefForcePush => "ref.force_push",
-    RefDelete => "ref.delete",
-    IssueCreate => "issue.create",
-    IssueRead => "issue.read",
-    IssueComment => "issue.comment",
-    IssueLabel => "issue.label",
-    IssueAssign => "issue.assign",
-    IssueClose => "issue.close",
-    PullRequestCreate => "pull_request.create",
-    PullRequestRead => "pull_request.read",
-    PullRequestComment => "pull_request.comment",
-    PullRequestClose => "pull_request.close",
-    PullRequestApprove => "pull_request.approve",
-    PullRequestMerge => "pull_request.merge",
+    OrganizationRead => "organization.read", routine,
+    OrganizationUpdate => "organization.update", sensitive,
+    OrganizationManageMembers => "organization.manage_members", sensitive,
+    OrganizationDelete => "organization.delete", sensitive,
+    OrganizationSuspend => "organization.suspend", sensitive,
+    OrganizationUnsuspend => "organization.unsuspend", sensitive,
+    TeamCreate => "team.create", sensitive,
+    RepositoryCreate => "repository.create", routine,
+    RepositoryRead => "repository.read", routine,
+    RepositoryClone => "repository.clone", routine,
+    RepositoryUpdate => "repository.update", routine,
+    RepositoryManageAccess => "repository.manage_access", sensitive,
+    RepositoryManageProtection => "repository.manage_protection", sensitive,
+    RepositoryArchive => "repository.archive", sensitive,
+    RepositoryUnarchive => "repository.unarchive", sensitive,
+    RepositoryDelete => "repository.delete", sensitive,
+    RefPush => "ref.push", routine,
+    RefForcePush => "ref.force_push", sensitive,
+    RefDelete => "ref.delete", sensitive,
+    IssueCreate => "issue.create", routine,
+    IssueRead => "issue.read", routine,
+    IssueComment => "issue.comment", routine,
+    IssueLabel => "issue.label", routine,
+    IssueAssign => "issue.assign", routine,
+    IssueClose => "issue.close", routine,
+    PullRequestCreate => "pull_request.create", routine,
+    PullRequestRead => "pull_request.read", routine,
+    PullRequestComment => "pull_request.comment", routine,
+    PullRequestClose => "pull_request.close", routine,
+    PullRequestApprove => "pull_request.approve", routine,
+    PullRequestMerge => "pull_request.merge", routine,
 }
 
 impl Action {
@@ -310,9 +329,17 @@ pub struct Merge {
     pub checks_passed: bool,
 }
 
+/// The requesting principal: a signed-in account, or an unauthenticated
+/// visitor, who carries no grants, no teams and no account attributes.
+#[derive(Clone, Copy, Debug)]
+pub enum Principal<'a> {
+    Account(&'a Account),
+    Anonymous,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    pub principal: &'a Account,
+    pub principal: Principal<'a>,
     /// Every team in `principal.teams` and all of their ancestors.
     pub teams: &'a [Team],
     /// Grants whose subject is the principal or one of those teams.
@@ -323,6 +350,9 @@ pub struct Request<'a> {
     pub resource: Resource<'a>,
     /// Required for `pull_request.merge`, refused otherwise.
     pub merge: Option<Merge>,
+    /// Time since the account last presented its password; `None` for
+    /// anonymous or unknown recency, which counts as stale.
+    pub auth_age: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -359,6 +389,8 @@ pub struct Engine {
     /// Built-ins plus every role template, ready for linking.
     base: PolicySet,
     custom: HashSet<String>,
+    /// Sudo-mode window for sensitive actions.
+    fresh_auth: Duration,
     authorizer: Authorizer,
 }
 
@@ -389,10 +421,17 @@ impl Engine {
             validator,
             base,
             custom: HashSet::new(),
+            fresh_auth: DEFAULT_FRESH_AUTH,
             authorizer: Authorizer::new(),
         };
         engine.validate(&engine.base)?;
         Ok(engine)
+    }
+
+    /// Move the sudo-mode window for sensitive actions.
+    pub fn with_fresh_auth(mut self, window: Duration) -> Self {
+        self.fresh_auth = window;
+        self
     }
 
     /// Add an organization-defined role. The template must be a single
@@ -468,29 +507,35 @@ impl Engine {
         let (resource, entities) = build_entities(request);
         let entities = Entities::from_entities(entities, Some(&self.schema))
             .map_err(|_| "entities do not match the schema")?;
-        let context = match request.merge {
-            Some(merge) => Context::from_pairs([
-                (
-                    "approvals".to_owned(),
-                    RestrictedExpression::new_long(i64::from(merge.approvals)),
-                ),
-                (
-                    "checks_passed".to_owned(),
-                    RestrictedExpression::new_bool(merge.checks_passed),
-                ),
-            ])
-            .map_err(|_| "invalid context")?,
-            None => Context::empty(),
-        };
+        let mut context_pairs = vec![
+            (
+                "auth_age_seconds".to_owned(),
+                RestrictedExpression::new_long(request.auth_age.map_or(i64::MAX, duration_seconds)),
+            ),
+            (
+                "fresh_auth_seconds".to_owned(),
+                RestrictedExpression::new_long(duration_seconds(self.fresh_auth)),
+            ),
+        ];
+        if let Some(merge) = request.merge {
+            context_pairs.push((
+                "approvals".to_owned(),
+                RestrictedExpression::new_long(i64::from(merge.approvals)),
+            ));
+            context_pairs.push((
+                "checks_passed".to_owned(),
+                RestrictedExpression::new_bool(merge.checks_passed),
+            ));
+        }
+        let context = Context::from_pairs(context_pairs).map_err(|_| "invalid context")?;
         let action = uid("Action", request.action.name().to_owned());
-        let cedar_request = cedar_policy::Request::new(
-            uid("Account", request.principal.id.to_string()),
-            action,
-            resource,
-            context,
-            Some(&self.schema),
-        )
-        .map_err(|_| "request does not match the schema")?;
+        let principal = match request.principal {
+            Principal::Account(account) => uid("Account", account.id.to_string()),
+            Principal::Anonymous => uid("Anonymous", String::new()),
+        };
+        let cedar_request =
+            cedar_policy::Request::new(principal, action, resource, context, Some(&self.schema))
+                .map_err(|_| "request does not match the schema")?;
         let response = self
             .authorizer
             .is_authorized(&cedar_request, &policies, &entities);
@@ -578,9 +623,14 @@ fn check_facts(request: &Request<'_>) -> Result<(), &'static str> {
     if teams.len() != request.teams.len() {
         return Err("duplicate team");
     }
-    for id in &request.principal.teams {
+    let (principal_teams, organizations): (&[Uuid], &[Uuid]) = match request.principal {
+        Principal::Account(account) => (&account.teams, &account.organizations),
+        Principal::Anonymous if request.grants.is_empty() && request.teams.is_empty() => (&[], &[]),
+        Principal::Anonymous => return Err("anonymous principal carries no grants or teams"),
+    };
+    for id in principal_teams {
         let team = teams.get(id).ok_or("principal team missing")?;
-        if !request.principal.organizations.contains(&team.organization) {
+        if !organizations.contains(&team.organization) {
             return Err("team outside the principal's organizations");
         }
     }
@@ -599,6 +649,11 @@ fn uid(kind: &str, id: String) -> EntityUid {
     let name = EntityTypeName::from_str(&format!("GitHearth::{kind}"))
         .expect("schema entity type names are valid");
     EntityUid::from_type_name_and_id(name, EntityId::new(id))
+}
+
+/// Seconds of a duration, saturating beyond what Cedar's `Long` holds.
+fn duration_seconds(duration: Duration) -> i64 {
+    duration.as_secs().try_into().unwrap_or(i64::MAX)
 }
 
 fn entity(
@@ -625,22 +680,28 @@ fn build_entities(request: &Request<'_>) -> (EntityUid, Vec<Entity>) {
     let ref_ = RestrictedExpression::new_entity_uid;
     let org = request.organization;
     let org_uid = uid("Organization", org.id.to_string());
-    let principal = request.principal;
-    let mut entities = vec![
-        entity(org_uid.clone(), [("suspended", bool_(org.suspended))], []),
-        entity(
-            uid("Account", principal.id.to_string()),
+    let mut entities = vec![entity(
+        org_uid.clone(),
+        [("suspended", bool_(org.suspended))],
+        [],
+    )];
+    match request.principal {
+        Principal::Account(account) => entities.push(entity(
+            uid("Account", account.id.to_string()),
             [
-                ("suspended", bool_(principal.suspended)),
-                ("site_admin", bool_(principal.site_admin)),
+                ("suspended", bool_(account.suspended)),
+                ("site_admin", bool_(account.site_admin)),
             ],
-            principal
+            account
                 .organizations
                 .iter()
                 .map(|id| uid("Organization", id.to_string()))
-                .chain(principal.teams.iter().map(|id| uid("Team", id.to_string()))),
-        ),
-    ];
+                .chain(account.teams.iter().map(|id| uid("Team", id.to_string()))),
+        )),
+        Principal::Anonymous => {
+            entities.push(entity(uid("Anonymous", String::new()), [], []));
+        }
+    }
     for team in request.teams {
         let team_org = uid("Organization", team.organization.to_string());
         entities.push(entity(
@@ -752,6 +813,7 @@ mod tests {
             "admin",
             "owner",
             "site_admin",
+            "sensitive",
         ];
         let in_schema: HashSet<String> = schema
             .actions()
