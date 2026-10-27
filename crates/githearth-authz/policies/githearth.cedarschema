@@ -1,0 +1,140 @@
+// GitHearth authorization schema. See docs/decisions/0002-authorization.md.
+//
+// Entity parents carry the hierarchy that role templates match with `in`:
+// an account is in its teams and organizations, a team in its parent team
+// and organization, a repository in its organization, and every
+// repository-owned object in its repository. Attributes that policies read
+// across the hierarchy (suspension, visibility, archival, branch
+// protection) are copied onto each entity by the engine from loaded facts.
+
+namespace GitHearth {
+  entity Organization = {
+    suspended: Bool,
+  };
+  entity Team in [Team, Organization] = {
+    organization: Organization,
+  };
+  entity Account in [Team, Organization] = {
+    suspended: Bool,
+    site_admin: Bool,
+  };
+  // visibility: "public", "internal" (members of the owning organization) or "private".
+  entity Repository in [Organization] = {
+    organization: Organization,
+    visibility: String,
+    archived: Bool,
+  };
+  // A branch or tag. Unprotected refs have protected == false and the
+  // remaining protection fields at their permissive values.
+  entity Ref in [Repository] = {
+    organization: Organization,
+    repository: Repository,
+    protected: Bool,
+    allow_force_push: Bool,
+    allow_deletion: Bool,
+    require_pull_request: Bool,
+    required_approvals: Long,
+    require_checks: Bool,
+  };
+  entity Issue in [Repository] = {
+    organization: Organization,
+    repository: Repository,
+    author: Account,
+  };
+  entity PullRequest in [Repository] = {
+    organization: Organization,
+    repository: Repository,
+    author: Account,
+    target: Ref,
+  };
+
+  // Action groups. Role templates name groups, never single actions, so a
+  // new action joins its group here and no template changes.
+  action "public_read";
+  action "member";
+  action "read";
+  action "triage";
+  action "write";
+  action "maintain";
+  action "admin";
+  action "owner";
+  action "site_admin";
+
+  // Organization
+  action "organization.read" in ["member", "read"]
+    appliesTo { principal: Account, resource: Organization };
+  action "repository.create" in ["member"]
+    appliesTo { principal: Account, resource: Organization };
+  action "organization.update" in ["owner"]
+    appliesTo { principal: Account, resource: Organization };
+  action "organization.manage_members" in ["owner"]
+    appliesTo { principal: Account, resource: Organization };
+  action "organization.delete" in ["owner"]
+    appliesTo { principal: Account, resource: Organization };
+  action "team.create" in ["owner"]
+    appliesTo { principal: Account, resource: Organization };
+  action "organization.suspend" in ["site_admin"]
+    appliesTo { principal: Account, resource: Organization };
+  action "organization.unsuspend" in ["site_admin"]
+    appliesTo { principal: Account, resource: Organization };
+
+  // Repository
+  action "repository.read" in ["public_read", "read"]
+    appliesTo { principal: Account, resource: Repository };
+  action "repository.clone" in ["public_read", "read"]
+    appliesTo { principal: Account, resource: Repository };
+  action "issue.create" in ["read"]
+    appliesTo { principal: Account, resource: Repository };
+  action "pull_request.create" in ["read"]
+    appliesTo { principal: Account, resource: Repository };
+  action "repository.update" in ["maintain"]
+    appliesTo { principal: Account, resource: Repository };
+  action "repository.manage_access" in ["admin"]
+    appliesTo { principal: Account, resource: Repository };
+  action "repository.manage_protection" in ["admin"]
+    appliesTo { principal: Account, resource: Repository };
+  action "repository.archive" in ["admin"]
+    appliesTo { principal: Account, resource: Repository };
+  action "repository.unarchive" in ["admin"]
+    appliesTo { principal: Account, resource: Repository };
+  action "repository.delete" in ["admin"]
+    appliesTo { principal: Account, resource: Repository };
+
+  // Refs
+  action "ref.push" in ["write"]
+    appliesTo { principal: Account, resource: Ref };
+  action "ref.force_push" in ["write"]
+    appliesTo { principal: Account, resource: Ref };
+  action "ref.delete" in ["write"]
+    appliesTo { principal: Account, resource: Ref };
+
+  // Issues
+  action "issue.read" in ["public_read", "read"]
+    appliesTo { principal: Account, resource: Issue };
+  action "issue.comment" in ["read"]
+    appliesTo { principal: Account, resource: Issue };
+  action "issue.label" in ["triage"]
+    appliesTo { principal: Account, resource: Issue };
+  action "issue.assign" in ["triage"]
+    appliesTo { principal: Account, resource: Issue };
+  action "issue.close" in ["triage"]
+    appliesTo { principal: Account, resource: Issue };
+
+  // Pull requests
+  action "pull_request.read" in ["public_read", "read"]
+    appliesTo { principal: Account, resource: PullRequest };
+  action "pull_request.comment" in ["read"]
+    appliesTo { principal: Account, resource: PullRequest };
+  action "pull_request.close" in ["triage"]
+    appliesTo { principal: Account, resource: PullRequest };
+  action "pull_request.approve" in ["write"]
+    appliesTo { principal: Account, resource: PullRequest };
+  // approvals and checks_passed are computed by the service for the exact
+  // head and target revisions being merged, never taken from the caller.
+  action "pull_request.merge" in ["write"]
+    appliesTo {
+      principal: Account,
+      resource: PullRequest,
+      context: { approvals: Long, checks_passed: Bool },
+    };
+}
