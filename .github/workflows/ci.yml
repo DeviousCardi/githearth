@@ -64,7 +64,7 @@ jobs:
       - name: Tests with coverage, including PostgreSQL contract tests
         run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info -- --include-ignored
       - name: Coverage gate
-        run: cargo llvm-cov report --summary-only --fail-under-lines 85
+        run: cargo llvm-cov report --summary-only --fail-under-lines 95
       - uses: actions/upload-artifact@v4
         with:
           name: coverage

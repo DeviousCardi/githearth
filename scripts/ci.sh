@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export RUSTFLAGS="-D warnings"
-min_lines="${GITHEARTH_MIN_LINE_COVERAGE:-85}"
+min_lines="${GITHEARTH_MIN_LINE_COVERAGE:-95}"
 
 container=""
 cleanup() { [ -n "$container" ] && docker rm -f "$container" >/dev/null; }
