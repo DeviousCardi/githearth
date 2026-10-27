@@ -62,7 +62,7 @@ Unknown write outcomes require eventual operation-ID support. M1 organization cr
 
 ## M2 first task breakdown
 
-1. ADR for Git receive journal/acknowledgement boundary and repository lifecycle reconciliation.
+1. [ADR 0003](../decisions/0003-git-push-and-repository-lifecycle.md) for the Git receive journal/acknowledgement boundary and repository lifecycle reconciliation (accepted).
 2. Harden native Git process limits, environment, object formats and storage ownership.
 3. Repository metadata, team/grant/protection and operation-ID tables/migrations; every check through the [ADR 0002](../decisions/0002-authorization.md) engine.
 4. Private repository API and Git smart HTTP adapters with durable write handling.
