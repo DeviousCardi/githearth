@@ -10,6 +10,7 @@ anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+githearth-authz = { path = "../githearth-authz" }
 hex = "0.4"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

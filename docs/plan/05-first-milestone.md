@@ -64,7 +64,7 @@ Unknown write outcomes require eventual operation-ID support. M1 organization cr
 
 1. ADR for Git receive journal/acknowledgement boundary and repository lifecycle reconciliation.
 2. Harden native Git process limits, environment, object formats and storage ownership.
-3. Repository metadata, authorization and operation-ID tables/migrations.
+3. Repository metadata, team/grant/protection and operation-ID tables/migrations; every check through the [ADR 0002](../decisions/0002-authorization.md) engine.
 4. Private repository API and Git smart HTTP adapters with durable write handling.
 5. Files/commits/diffs browsing and basic accessible login/navigation UI.
 6. Issues/comments with atomic idempotency/outbox and cursor pagination.

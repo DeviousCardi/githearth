@@ -33,6 +33,7 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [Deployment contract](docs/plan/03-deployment-contract.md) | Single-node/cluster behavior, failure semantics, expansion, and merge requirements |
 | [Database experiment](experiments/metadata/README.md) | Reproducible lab setup, workload runner, and result interpretation |
 | [Database decision](docs/decisions/0001-metadata-database.md) | Provisional PostgreSQL selection, measured evidence, and remaining qualification gates |
+| [Authorization decision](docs/decisions/0002-authorization.md) | Cedar policy-based authorization: roles, built-in forbids, failing closed |
 | [Local results](experiments/metadata/results/local-screening-2026-10-27/REPORT.md) | 84 measured runs, errors, resource observations, and process recovery |
 | [Git prototype](docs/git-prototype.md) | Working local commands, tests, and current limitations |
 

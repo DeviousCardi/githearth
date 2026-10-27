@@ -61,7 +61,7 @@ Expansion gate: version/storage preflight, current backup, establish replicas, v
 | License | MIT OR Apache-2.0 proposed, not adopted | Final files and dependency notices before external distribution |
 | Metadata | PostgreSQL provisional | Rust workload, restore, HA and sustained load before production |
 | Application | Rust, axum/Tokio, SQLx for M1 | Pinned compatible versions and tests; alternatives need evidence |
-| Authorization | Rust membership core; richer versioned policy | Revocation/role inheritance contract before protected writes/team features |
+| Authorization | Cedar PBAC engine ([ADR 0002](../decisions/0002-authorization.md)) | Grant/team/protection tables, anonymous principal and list-filter tests before M2 public access; revocation/cache contract before any decision cache or M5 local checks |
 | Git write protocol | Native Git + owned journal/intents proposed | ADR before M2 public push; crash tests before release |
 | Git consensus | Library/protocol not selected | Object/log durability, membership/snapshot/GC proof sketch and faults before M5 |
 | Metadata HA | Synchronous replication + qualified failover/fencing | Select manager/topology in M5 ADR; failover tests required |

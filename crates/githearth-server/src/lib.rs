@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use config::Config;
+use githearth_authz::{BuiltinRole, Engine, Grant, Resource, Role, Scope, Subject};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +33,7 @@ pub struct AppState {
     config: Config,
     auth_slots: Arc<Semaphore>,
     dummy_hash: Arc<String>,
+    authz: Arc<Engine>,
 }
 impl AppState {
     pub async fn new(pool: PgPool, config: Config) -> anyhow::Result<Self> {
@@ -44,6 +46,7 @@ impl AppState {
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
             config,
             dummy_hash: Arc::new(dummy_hash),
+            authz: Arc::new(Engine::new()?),
         })
     }
 }
@@ -418,8 +421,56 @@ async fn read_organization(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Organization>> {
     let account = authenticate(&state.pool, &headers).await?;
-    Ok(Json(sqlx::query_as::<_, Organization>("SELECT o.id,o.slug,o.name,m.role FROM organizations o JOIN memberships m ON m.organization_id=o.id WHERE m.account_id=$1 AND o.id=$2")
-        .bind(account.id).bind(id).fetch_optional(&state.pool).await?.ok_or(ApiError(StatusCode::NOT_FOUND, "organization not found"))?))
+    let not_found = || ApiError(StatusCode::NOT_FOUND, "organization not found");
+    // Load, then authorize: a denial and a missing organization look the same.
+    let row = sqlx::query("SELECT o.id,o.slug,o.name,m.role FROM organizations o LEFT JOIN memberships m ON m.organization_id=o.id AND m.account_id=$1 WHERE o.id=$2")
+        .bind(account.id).bind(id).fetch_optional(&state.pool).await?.ok_or_else(not_found)?;
+    let role: Option<String> = row.get("role");
+    let grants: Vec<Grant> = role
+        .as_deref()
+        .and_then(membership_role)
+        .map(|role| Grant {
+            role: Role::Builtin(role),
+            subject: Subject::Account(account.id),
+            scope: Scope::Organization(id),
+        })
+        .into_iter()
+        .collect();
+    let principal = githearth_authz::Account {
+        id: account.id,
+        suspended: false,
+        site_admin: account.is_admin,
+        organizations: if grants.is_empty() { vec![] } else { vec![id] },
+        teams: vec![],
+    };
+    let decision = state.authz.authorize(&githearth_authz::Request {
+        principal: &principal,
+        teams: &[],
+        grants: &grants,
+        action: githearth_authz::Action::OrganizationRead,
+        organization: &githearth_authz::Organization {
+            id,
+            suspended: false,
+        },
+        resource: Resource::Organization,
+        merge: None,
+    });
+    match (decision.is_allowed(), role) {
+        (true, Some(role)) => Ok(Json(Organization {
+            id,
+            slug: row.get("slug"),
+            name: row.get("name"),
+            role,
+        })),
+        _ => Err(not_found()),
+    }
+}
+fn membership_role(role: &str) -> Option<BuiltinRole> {
+    match role {
+        "owner" => Some(BuiltinRole::Owner),
+        "member" => Some(BuiltinRole::Member),
+        _ => None,
+    }
 }
 async fn event(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
