@@ -898,6 +898,7 @@ dependencies = [
  "axum",
  "clap",
  "githearth-authz",
+ "githearth-core",
  "hex",
  "http-body-util",
  "rand",

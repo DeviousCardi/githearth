@@ -78,6 +78,47 @@ pub trait RepositoryReader {
     ) -> Result<Vec<u8>, Self::Error>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RepositoryStatus {
+    Creating,
+    Active,
+    Deleting,
+    Deleted,
+    Failed,
+}
+
+impl RepositoryStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Active => "active",
+            Self::Deleting => "deleting",
+            Self::Deleted => "deleted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for RepositoryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RepositoryStatus {
+    type Err = InvalidId;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "creating" => Ok(Self::Creating),
+            "active" => Ok(Self::Active),
+            "deleting" => Ok(Self::Deleting),
+            "deleted" => Ok(Self::Deleted),
+            "failed" => Ok(Self::Failed),
+            _ => Err(InvalidId("unknown repository status")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +145,27 @@ mod tests {
         );
         assert!("a".repeat(40).parse::<ObjectId>().is_ok());
         assert!("b".repeat(64).parse::<ObjectId>().is_ok());
+    }
+
+    #[test]
+    fn repository_status_round_trip() {
+        for status in [
+            RepositoryStatus::Creating,
+            RepositoryStatus::Active,
+            RepositoryStatus::Deleting,
+            RepositoryStatus::Deleted,
+            RepositoryStatus::Failed,
+        ] {
+            let s = status.as_str();
+            assert_eq!(s.parse::<RepositoryStatus>().unwrap(), status);
+            assert_eq!(s, status.to_string());
+        }
+    }
+
+    #[test]
+    fn repository_status_rejects_unknown() {
+        assert!("unknown".parse::<RepositoryStatus>().is_err());
+        assert!("ACTIVE".parse::<RepositoryStatus>().is_err());
+        assert!("".parse::<RepositoryStatus>().is_err());
     }
 }

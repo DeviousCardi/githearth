@@ -1,5 +1,6 @@
 pub mod config;
 pub mod facts;
+pub mod repositories;
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
