@@ -1,4 +1,5 @@
 pub mod config;
+pub mod facts;
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
@@ -12,7 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use config::Config;
-use githearth_authz::{BuiltinRole, Engine, Grant, Resource, Role, Scope, Subject};
+use githearth_authz::{Engine, Resource};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -322,15 +323,28 @@ struct Account {
     username: String,
     is_admin: bool,
 }
-async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResult<Account> {
-    sqlx::query_as::<_, Account>("SELECT a.id, a.username, a.is_admin FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp()")
-        .bind(bearer(headers)?).fetch_optional(pool).await?.ok_or_else(unauthorized)
+async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResult<(Account, u64)> {
+    let row = sqlx::query_as::<_, (Uuid, String, bool, i64)>(
+        "SELECT a.id, a.username, a.is_admin, EXTRACT(EPOCH FROM clock_timestamp() - s.authenticated_at)::bigint AS auth_age FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp()",
+    )
+    .bind(bearer(headers)?)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(unauthorized)?;
+    Ok((
+        Account {
+            id: row.0,
+            username: row.1,
+            is_admin: row.2,
+        },
+        row.3.max(0) as u64,
+    ))
 }
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Account>> {
-    Ok(Json(authenticate(&state.pool, &headers).await?))
+    Ok(Json(authenticate(&state.pool, &headers).await?.0))
 }
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<StatusCode> {
-    let account = authenticate(&state.pool, &headers).await?;
+    let (account, _) = authenticate(&state.pool, &headers).await?;
     let mut tx = state.pool.begin().await?;
     sqlx::query("DELETE FROM sessions WHERE token_hash=$1")
         .bind(bearer(&headers)?)
@@ -359,7 +373,7 @@ async fn create_organization(
     headers: HeaderMap,
     Json(input): Json<NewOrganization>,
 ) -> ApiResult<(StatusCode, Json<Organization>)> {
-    let account = authenticate(&state.pool, &headers).await?;
+    let (account, _) = authenticate(&state.pool, &headers).await?;
     if input.slug.is_empty()
         || input.slug.len() > 64
         || !input
@@ -382,6 +396,11 @@ async fn create_organization(
     sqlx::query("INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'owner')")
         .bind(id)
         .bind(account.id)
+        .execute(&mut *tx)
+        .await?;
+    // Authorization reads only grants; the membership role stays for display.
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'owner','account',$2,'organization',$3,$2)")
+        .bind(Uuid::new_v4()).bind(account.id).bind(id)
         .execute(&mut *tx)
         .await?;
     event(&mut tx, Some(id), account.id, "organization.created").await?;
@@ -407,7 +426,7 @@ async fn list_organizations(
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> ApiResult<Json<Vec<Organization>>> {
-    let account = authenticate(&state.pool, &headers).await?;
+    let (account, _) = authenticate(&state.pool, &headers).await?;
     let limit = page.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
         return Err(invalid());
@@ -420,58 +439,24 @@ async fn read_organization(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Organization>> {
-    let account = authenticate(&state.pool, &headers).await?;
+    let (account, auth_age) = authenticate(&state.pool, &headers).await?;
     let not_found = || ApiError(StatusCode::NOT_FOUND, "organization not found");
     // Load, then authorize: a denial and a missing organization look the same.
-    let row = sqlx::query("SELECT o.id,o.slug,o.name,m.role FROM organizations o LEFT JOIN memberships m ON m.organization_id=o.id AND m.account_id=$1 WHERE o.id=$2")
-        .bind(account.id).bind(id).fetch_optional(&state.pool).await?.ok_or_else(not_found)?;
-    let role: Option<String> = row.get("role");
-    let grants: Vec<Grant> = role
-        .as_deref()
-        .and_then(membership_role)
-        .map(|role| Grant {
-            role: Role::Builtin(role),
-            subject: Subject::Account(account.id),
-            scope: Scope::Organization(id),
-        })
-        .into_iter()
-        .collect();
-    let principal = githearth_authz::Account {
-        id: account.id,
-        suspended: false,
-        site_admin: account.is_admin,
-        organizations: if grants.is_empty() { vec![] } else { vec![id] },
-        teams: vec![],
+    let mut conn = state.pool.acquire().await?;
+    let Some(facts) = facts::load(&mut conn, account.id, id).await? else {
+        return Err(not_found());
     };
-    let decision = state.authz.authorize(&githearth_authz::Request {
-        principal: githearth_authz::Principal::Account(&principal),
-        teams: &[],
-        grants: &grants,
-        action: githearth_authz::Action::OrganizationRead,
-        organization: &githearth_authz::Organization {
-            id,
-            suspended: false,
-        },
-        resource: Resource::Organization,
-        merge: None,
-        auth_age: None,
-    });
-    match (decision.is_allowed(), role) {
-        (true, Some(role)) => Ok(Json(Organization {
-            id,
-            slug: row.get("slug"),
-            name: row.get("name"),
-            role,
-        })),
-        _ => Err(not_found()),
+    let decision = state.authz.authorize(&facts.request(
+        githearth_authz::Action::OrganizationRead,
+        Resource::Organization,
+        Some(Duration::from_secs(auth_age)),
+    ));
+    if !decision.is_allowed() {
+        return Err(not_found());
     }
-}
-fn membership_role(role: &str) -> Option<BuiltinRole> {
-    match role {
-        "owner" => Some(BuiltinRole::Owner),
-        "member" => Some(BuiltinRole::Member),
-        _ => None,
-    }
+    let row = sqlx::query_as::<_, Organization>("SELECT o.id,o.slug,o.name,m.role FROM organizations o JOIN memberships m ON m.organization_id=o.id AND m.account_id=$1 WHERE o.id=$2")
+        .bind(account.id).bind(id).fetch_optional(&mut *conn).await?.ok_or_else(not_found)?;
+    Ok(Json(row))
 }
 async fn event(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

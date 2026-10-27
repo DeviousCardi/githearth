@@ -1,0 +1,172 @@
+//! Loading persisted authorization facts for one decision
+//! (docs/decisions/0002-authorization.md).
+
+use std::time::Duration;
+
+use githearth_authz::{
+    Account, Action, BuiltinRole, Grant, Organization, Principal, Request, Resource, Role, Scope,
+    Subject, Team,
+};
+use sqlx::{Connection, PgConnection, Row};
+use uuid::Uuid;
+
+pub struct Facts {
+    pub account: Account,
+    pub teams: Vec<Team>,
+    pub grants: Vec<Grant>,
+    pub organization: Organization,
+}
+
+impl Facts {
+    pub fn request<'a>(
+        &'a self,
+        action: Action,
+        resource: Resource<'a>,
+        auth_age: Option<Duration>,
+    ) -> Request<'a> {
+        Request {
+            principal: Principal::Account(&self.account),
+            teams: &self.teams,
+            grants: &self.grants,
+            action,
+            organization: &self.organization,
+            resource,
+            merge: None,
+            auth_age,
+        }
+    }
+}
+
+/// The account's direct teams plus all of their ancestors.
+const TEAMS_CTE: &str = "WITH RECURSIVE tree AS (\
+ SELECT t.id, t.organization_id, t.parent_id FROM teams t \
+ JOIN team_members m ON m.team_id = t.id \
+ WHERE m.account_id = $1 AND t.organization_id = $2 \
+ UNION \
+ SELECT p.id, p.organization_id, p.parent_id FROM teams p \
+ JOIN tree c ON p.id = c.parent_id WHERE p.organization_id = $2) ";
+
+/// One consistent snapshot per decision: the facts a request needs must not
+/// straddle a committed change.
+pub async fn load(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+) -> Result<Option<Facts>, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let organization = match sqlx::query("SELECT suspended FROM organizations WHERE id = $1")
+        .bind(organization_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        Some(row) => Organization {
+            id: organization_id,
+            suspended: row.get("suspended"),
+        },
+        None => return Ok(None),
+    };
+    let Some(account) = sqlx::query("SELECT suspended, is_admin FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM memberships WHERE account_id = $1 AND organization_id = $2)",
+    )
+    .bind(account_id)
+    .bind(organization_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    // The engine links Team grants through the Account's direct teams even
+    // when the grant sits on an ancestor.
+    let direct: Vec<Uuid> = sqlx::query(
+        "SELECT t.id FROM teams t JOIN team_members m ON m.team_id = t.id \
+ WHERE m.account_id = $1 AND t.organization_id = $2 ORDER BY t.id",
+    )
+    .bind(account_id)
+    .bind(organization_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|row| row.get("id"))
+    .collect();
+    let account = Account {
+        id: account_id,
+        suspended: account.get("suspended"),
+        site_admin: account.get("is_admin"),
+        organizations: if member {
+            vec![organization_id]
+        } else {
+            vec![]
+        },
+        teams: direct,
+    };
+    let teams: Vec<Team> = sqlx::query(&format!(
+        "{TEAMS_CTE} SELECT id, organization_id, parent_id FROM tree ORDER BY id"
+    ))
+    .bind(account_id)
+    .bind(organization_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|row| Team {
+        id: row.get("id"),
+        organization: row.get("organization_id"),
+        parent: row.get("parent_id"),
+    })
+    .collect();
+    let mut grants = Vec::new();
+    for row in sqlx::query(&format!(
+        "{TEAMS_CTE} SELECT role, subject_kind, subject_id FROM grants \
+ WHERE scope_kind = 'organization' AND scope_id = $2 AND revoked_at IS NULL \
+ AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
+ AND ((subject_kind = 'account' AND subject_id = $1) \
+ OR (subject_kind = 'team' AND subject_id IN (SELECT id FROM tree))) \
+ ORDER BY id"
+    ))
+    .bind(account_id)
+    .bind(organization_id)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let role = match row.get::<String, _>("role").as_str() {
+            "member" => Some(BuiltinRole::Member),
+            "read" => Some(BuiltinRole::Read),
+            "triage" => Some(BuiltinRole::Triage),
+            "write" => Some(BuiltinRole::Write),
+            "maintain" => Some(BuiltinRole::Maintain),
+            "admin" => Some(BuiltinRole::Admin),
+            "owner" => Some(BuiltinRole::Owner),
+            role => {
+                tracing::warn!(role, %organization_id, "unknown grant role ignored");
+                None
+            }
+        };
+        let Some(role) = role else { continue };
+        let subject = match row.get::<String, _>("subject_kind").as_str() {
+            "account" => Subject::Account(row.get("subject_id")),
+            "team" => Subject::Team(row.get("subject_id")),
+            kind => {
+                tracing::warn!(kind, %organization_id, "unknown grant subject ignored");
+                continue;
+            }
+        };
+        grants.push(Grant {
+            role: Role::Builtin(role),
+            subject,
+            scope: Scope::Organization(organization_id),
+        });
+    }
+    tx.commit().await?;
+    Ok(Some(Facts {
+        account,
+        teams,
+        grants,
+        organization,
+    }))
+}
