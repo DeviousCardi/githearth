@@ -884,6 +884,9 @@ name = "githearth-git"
 version = "0.0.1"
 dependencies = [
  "githearth-core",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

@@ -11,6 +11,8 @@ Status: experimental, operator-only, Linux-oriented. This is a foundation experi
 - Blob reads by full SHA-1/SHA-256 hexadecimal ID, with an 8 MiB CLI limit.
 - Ambient Git configuration/environment isolation for child processes.
 - Tests using an actual local Git commit/push, binary blob content, size rejection, missing/non-blob objects, and repository symlink rejection.
+- A `layout` module implementing the ADR 0003 storage layout (`repositories/<id[0..2]>/<id>.git`, `tmp/`, `trash/`, `orphans/`): bare repository creation with SHA-1/SHA-256 object formats, the repository config table, idempotent creation, and lifecycle helpers (trash/restore/orphan/purge/scan/clean_tmp), plus root/symlink containment checks.
+- A `journal` module implementing the ADR 0003 append-only push journal: CRC-32C-framed JSON records, torn-tail recovery, corruption detection, rotation, and ref/marker recovery classification.
 
 ## Try it
 

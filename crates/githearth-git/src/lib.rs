@@ -1,4 +1,7 @@
 //! Local, operator-only Git read prototype. No network or push service is exposed.
+pub mod journal;
+pub mod layout;
+
 use githearth_core::{GitRef, ObjectId, RepositoryId, RepositoryReader};
 use std::{
     error::Error,
