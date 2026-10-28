@@ -22,7 +22,7 @@ From the [metadata contract](../plan/01-metadata-contract.md) and [deployment co
   orphans/<id>.<unix-seconds>.git     directories found with no metadata row; never deleted automatically
 ```
 
-Paths derive only from the repository UUID, never from names, so rename and transfer are metadata changes. The existing `NativeGitStorage` checks (no symlinks, canonical path inside the root) apply to every path above. The storage root is owned by the service user, mode `0700`.
+Paths derive only from the repository UUID, never from names, so rename and transfer are metadata changes. The storage layer's containment checks (no symlinks, canonical path inside the root) apply to every path above. The storage root is owned by the service user, mode `0700`.
 
 Every repository is created with:
 
@@ -36,7 +36,7 @@ Every repository is created with:
 | `receive.maxInputSize` | configured pack limit | Bounded uploads |
 | `gc.auto` | `0` | Maintenance is scheduled, never inline in a push |
 
-Git runs with the sanitized environment already used by `NativeGitStorage` (`env_clear`, no system or global config, fixed `PATH`, `LC_ALL=C`). Object format is detected from the repository (`extensions.objectFormat`); new repositories default to SHA-1 and may be created as SHA-256. The supported Git range is 2.36 or newer, checked at startup.
+Git runs with the sanitized environment (`env_clear`, no system or global config, fixed `PATH`, `LC_ALL=C`). Object format is detected from the repository (`extensions.objectFormat`); new repositories default to SHA-1 and may be created as SHA-256. The supported Git range is 2.36 or newer, checked at startup.
 
 ## Push transaction
 

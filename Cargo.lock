@@ -879,6 +879,7 @@ version = "0.0.1"
 dependencies = [
  "githearth-core",
  "githearth-git",
+ "uuid",
 ]
 
 [[package]]
