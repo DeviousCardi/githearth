@@ -6,7 +6,7 @@ use axum::{
 };
 use githearth_server::{AppState, MIGRATOR, config::Config, connect, router};
 use http_body_util::BodyExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{Connection, PgPool};
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -298,19 +298,23 @@ async fn tampering_is_detected_with_first_bad_seq() {
     let (rows_n, ok, _bad) = verify_chain(&pool, Some(org_id)).await;
     assert_eq!((rows_n, ok), (5, true));
     // Tamper with seq 3 as superuser, bypassing the append-only UPDATE trigger.
-    sqlx::query("ALTER TABLE audit_events DISABLE TRIGGER audit_events_reject_update")
-        .execute(&pool)
+    // SET LOCAL session_replication_role=replica skips triggers only inside this
+    // transaction, so no other test (or pooled connection) ever sees them
+    // disabled. The ALTER TABLE ... DISABLE TRIGGER it replaces is table-wide
+    // and races concurrent tests sharing the database.
+    let mut conn = pool.acquire().await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
         .await
         .unwrap();
     sqlx::query("UPDATE audit_events SET hash = decode(repeat('11',32),'hex') WHERE organization_id=$1 AND seq=3")
         .bind(org_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("ALTER TABLE audit_events ENABLE TRIGGER audit_events_reject_update")
-        .execute(&pool)
-        .await
-        .unwrap();
+    tx.commit().await.unwrap();
+    drop(conn);
     let (rows_n, ok, first_bad) = verify_chain(&pool, Some(org_id)).await;
     assert_eq!(rows_n, 5);
     assert!(!ok);
@@ -512,12 +516,100 @@ async fn api_paging_and_permission_errors() {
     pool.close().await;
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn verify_endpoint_never_false_alarms_under_concurrent_writes() {
+    let (app, pool, storage_root, owner, slug, org_id) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+
+    // Writers stream new events while the verify endpoint runs repeatedly. The
+    // endpoint must always report ok: it reads the head first and bounds the
+    // stream by it at REPEATABLE READ, so a concurrent writer cannot make a
+    // freshly-committed row look like a tamper (the chain row lock serializes
+    // writers, so rows always appear gap-free committed in seq order).
+    let mut writers = Vec::new();
+    for i in 0..8 {
+        let pool = pool.clone();
+        writers.push(tokio::spawn(async move {
+            for j in 0..25 {
+                insert_event(&pool, Some(org_id), owner, &format!("race.{i}.{j}")).await;
+            }
+        }));
+    }
+
+    for _ in 0..20 {
+        let (status, body) = request(
+            &app,
+            "GET",
+            &format!("/api/v1/organizations/{slug}/audit/verify"),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert!(body["first_bad_seq"].is_null());
+    }
+
+    for h in writers {
+        h.await.unwrap();
+    }
+    // After all writers finish, the chain is complete and still verifies.
+    let (status, body) = request(
+        &app,
+        "GET",
+        &format!("/api/v1/organizations/{slug}/audit/verify"),
+        Some(&token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["rows"], json!(200));
+    assert!(body["first_bad_seq"].is_null());
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn verify_first_insert_never_false_alarms() {
+    let (_, pool, storage_root, owner, _slug, org_id) = setup().await;
+
+    // An organization with no events yet has no audit_chain head. While the
+    // first event is being inserted, verify (at READ COMMITTED) must keep
+    // reporting ok: the empty-chain bound (seq <= 0) excludes the in-flight
+    // first row instead of streaming it against a None head.
+    let pool2 = pool.clone();
+    let writer = tokio::spawn(async move {
+        for j in 0..10 {
+            insert_event(&pool2, Some(org_id), owner, &format!("first.{j}")).await;
+        }
+    });
+
+    for _ in 0..50 {
+        let (_, ok, first_bad) = verify_chain(&pool, Some(org_id)).await;
+        assert!(
+            ok,
+            "verify must not report tampering while the first event lands: {first_bad:?}"
+        );
+    }
+
+    writer.await.unwrap();
+    // The chain is complete and still verifies.
+    let (rows_n, ok, first_bad) = verify_chain(&pool, Some(org_id)).await;
+    assert_eq!((rows_n, ok, first_bad), (10, true, None));
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
 fn violation(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
         .is_some_and(|e| e.code().as_deref() == Some("23514"))
 }
-
 /// A database this test always starts empty, dropped and recreated per run.
 async fn fresh_database(name: &str) -> String {
     let url = std::env::var("GITHEARTH_TEST_DATABASE_URL")

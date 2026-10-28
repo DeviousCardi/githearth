@@ -1,3 +1,11 @@
+//! Audit chain endpoints.
+//!
+//! # Limits
+//! A database owner can disable the triggers and rewrite the whole chain, so
+//! tamper evidence against them requires exporting/anchoring the head outside
+//! the database (follow-up). Every audited write serializes on its
+//! organization's chain row until commit (measure before M4).
+
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -89,14 +97,27 @@ pub async fn verify(
     chain: Option<Uuid>,
 ) -> Result<Verification, sqlx::Error> {
     let chain = chain.unwrap_or(SITE_CHAIN);
+    // Read the head first and bound the stream by it: under READ COMMITTED the
+    // rows and the head would otherwise come from different snapshots, so a
+    // concurrent writer could commit new rows with an old head (false alarm).
+    // A missing head is an empty chain; bound to 0 so a concurrently inserted
+    // first row is not streamed against a `None` head (which would also alarm).
+    let head: Option<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT last_seq, last_hash FROM audit_chain WHERE chain = $1")
+            .bind(chain)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let head_seq = head.as_ref().map_or(0, |(s, _)| *s);
     let mut rows = sqlx::query(
         "SELECT seq, id, organization_id, actor_id, kind, \
          (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS micros, prev_hash, hash \
          FROM audit_events \
-         WHERE COALESCE(organization_id, $2) = $1 ORDER BY seq",
+         WHERE COALESCE(organization_id, $2) = $1 \
+         AND seq <= $3 ORDER BY seq",
     )
     .bind(chain)
     .bind(SITE_CHAIN)
+    .bind(head_seq)
     .fetch(&mut *conn);
 
     let mut count = 0u64;
@@ -126,11 +147,6 @@ pub async fn verify(
     }
     drop(rows);
 
-    let head: Option<(i64, Vec<u8>)> =
-        sqlx::query_as("SELECT last_seq, last_hash FROM audit_chain WHERE chain = $1")
-            .bind(chain)
-            .fetch_optional(&mut *conn)
-            .await?;
     if ok {
         let head_matches = match (&head, last_hash) {
             (Some((s, h)), Some(lh)) => {
@@ -246,6 +262,9 @@ async fn verify_endpoint(
     let (org_id, _facts) = authorize(&state, actor.id, auth_age, &org_slug).await?;
     let mut conn = state.pool.acquire().await?;
     let mut tx = conn.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let verification = verify(&mut tx, Some(org_id)).await?;
     tx.commit().await?;
     Ok(Json(verification))

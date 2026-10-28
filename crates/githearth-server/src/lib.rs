@@ -517,6 +517,7 @@ pub(crate) async fn event(
     actor: Uuid,
     kind: &str,
 ) -> Result<(), sqlx::Error> {
+    // At most one audit chain per transaction, or the site chain last (lock order).
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO audit_events (id,organization_id,actor_id,kind) VALUES ($1,$2,$3,$4)")
         .bind(id)
