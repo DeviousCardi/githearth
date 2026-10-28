@@ -611,3 +611,167 @@ async fn delete_resume_targets_original_not_name_reuse() {
     cleanup(&storage_root);
     pool.close().await;
 }
+
+/// A resumed create refreshes `updated_at` in the pre-storage transaction: even
+/// when the storage stage fails (so the final mark-active never runs), the row's
+/// timestamp is bumped before storage, keeping the reconciler's grace check off
+/// the in-flight tmp directory. This proves the refresh precedes storage rather
+/// than being a side effect of `set_status` at success.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn create_resume_refreshes_updated_at_before_storage() {
+    let (app, pool, storage_root, owner, org_slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+
+    let key = tag("idem-touch-cr");
+    let repo_name = tag("touch-cr-repo");
+    let operation_id = Uuid::new_v4();
+    let repo_id = Uuid::new_v4();
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // A `creating` row whose first attempt crashed long ago: old updated_at.
+    sqlx::query(
+        "INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,'creating','private',clock_timestamp() - interval '500 seconds')",
+    )
+    .bind(repo_id)
+    .bind(org_id)
+    .bind(&repo_name)
+    .bind(owner)
+    .bind(operation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Force the storage stage to fail: occupy the tmp path with a file so
+    // `create_dir` inside Storage::create errors instead of succeeding.
+    let tmp = storage_root
+        .join("tmp")
+        .join(operation_id.simple().to_string());
+    std::fs::write(&tmp, b"").unwrap();
+
+    let path = format!("/api/v1/organizations/{org_slug}/repositories");
+    let body = json!({"name": &repo_name});
+    let hash = idempotency::request_hash("POST", &path, body.to_string().as_bytes());
+    sqlx::query(
+        "INSERT INTO operations (actor_id, key, request_hash, status, operation_id, expires_at, created_at) \
+         VALUES ($1,$2,$3,'running',$4,clock_timestamp() + interval '24 hours',clock_timestamp() - interval '120 seconds')",
+    )
+    .bind(owner)
+    .bind(&key)
+    .bind(&hash)
+    .bind(operation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        &path,
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // The row is still `creating`, but updated_at was already bumped by the
+    // pre-storage transaction, not by a set_status that never ran.
+    let row: (String, bool) = sqlx::query_as(
+        "SELECT status, updated_at > clock_timestamp() - interval '5 seconds' FROM repositories WHERE id=$1",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "creating");
+    assert!(row.1, "updated_at was not refreshed before storage");
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+/// A resumed delete refreshes `updated_at` in the pre-storage transaction: even
+/// when the trash stage fails (so the final mark-deleted never runs), the row's
+/// timestamp is bumped before storage. This distinguishes the pre-storage
+/// refresh from the `set_status` at success.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn delete_resume_refreshes_updated_at_before_storage() {
+    let (app, pool, storage_root, owner, org_slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+
+    let repo_name = tag("touch-del-repo");
+    let operation_id = Uuid::new_v4();
+    let repo_id = Uuid::new_v4();
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,'deleting','private',clock_timestamp() - interval '500 seconds')",
+    )
+    .bind(repo_id)
+    .bind(org_id)
+    .bind(&repo_name)
+    .bind(owner)
+    .bind(operation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Force the trash stage to fail (not NotFound, which the handler tolerates):
+    // put a regular file where the repository directory should be, so
+    // Storage::trash's verified_dir rejects it as "not a directory".
+    let sid = repo_id.simple().to_string();
+    let dir = storage_root.join("repositories").join(&sid[..2]);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{sid}.git")), b"").unwrap();
+
+    let key = tag("idem-touch-del");
+    let path = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}");
+    let hash = idempotency::request_hash("DELETE", &path, b"");
+    sqlx::query(
+        "INSERT INTO operations (actor_id, key, request_hash, status, operation_id, expires_at, created_at) \
+         VALUES ($1,$2,$3,'running',$4,clock_timestamp() + interval '24 hours',clock_timestamp() - interval '120 seconds')",
+    )
+    .bind(owner)
+    .bind(&key)
+    .bind(&hash)
+    .bind(operation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &path,
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let row: (String, bool) = sqlx::query_as(
+        "SELECT status, updated_at > clock_timestamp() - interval '5 seconds' FROM repositories WHERE id=$1",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "deleting");
+    assert!(row.1, "updated_at was not refreshed before storage");
+
+    cleanup(&storage_root);
+    pool.close().await;
+}

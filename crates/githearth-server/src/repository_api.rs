@@ -255,6 +255,12 @@ pub(crate) async fn create(
                     ) {
                         return Err(not_found());
                     }
+                    // Refresh updated_at before storage so the reconciler (which
+                    // visits only rows older than its grace) does not redo this
+                    // create against the same tmp/<operation> while we build it.
+                    if !repositories::touch(&mut tx, repo.id).await? {
+                        return Err(not_found());
+                    }
                     repo
                 }
                 None => {
@@ -662,11 +668,21 @@ pub(crate) async fn delete(
                 )
                 .await?;
                 tx.commit().await?;
-            } else if !matches!(
-                loaded.repo.status,
-                RepositoryStatus::Deleting | RepositoryStatus::Deleted
-            ) {
-                return Err(not_active());
+            } else {
+                if !matches!(
+                    loaded.repo.status,
+                    RepositoryStatus::Deleting | RepositoryStatus::Deleted
+                ) {
+                    return Err(not_active());
+                }
+                // Refresh updated_at before storage so the reconciler (which
+                // visits only rows older than its grace) does not move the same
+                // directory to trash while we trash it below.
+                let mut tx = state.pool.begin().await?;
+                if !repositories::touch(&mut tx, loaded.repo.id).await? {
+                    return Err(not_found());
+                }
+                tx.commit().await?;
             }
 
             // A failed create never produced a directory; a resumed delete may

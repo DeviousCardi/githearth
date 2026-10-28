@@ -80,6 +80,17 @@ pub async fn set_status(
     Ok(result.rows_affected() > 0)
 }
 
+/// Bump `updated_at` so the lifecycle reconciler (which only visits rows older
+/// than its grace) skips this row while a resumed create/delete is still doing
+/// its storage stage.
+pub async fn touch(conn: &mut PgConnection, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE repositories SET updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn find_by_operation(
     conn: &mut PgConnection,
     operation_id: Uuid,
