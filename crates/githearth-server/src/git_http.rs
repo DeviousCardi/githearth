@@ -7,8 +7,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{AppState, config::Config, git_admission};
@@ -128,8 +131,9 @@ async fn info_refs(
         buf
     };
 
+    let token = CancellationToken::new();
     let body = Body::from_stream(stream_git_output(
-        child, stdout, stderr, prefix, repo_id, deadline, permit, None,
+        child, stdout, stderr, prefix, repo_id, deadline, permit, None, None, token,
     ));
 
     let mut response = Response::new(body);
@@ -225,21 +229,35 @@ async fn upload_pack(
     // Kill channel: stdin feeder sends when the decoded body exceeds the limit.
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
 
-    // Spawn stdin feeder.
-    match content_encoding.as_deref() {
-        None | Some("identity") => {
-            tokio::spawn(stream_body_to_stdin(repo_id, body, stdin, limit, kill_tx));
-        }
-        Some("gzip") | Some("x-gzip") => {
-            tokio::spawn(stream_gzip_body_to_stdin(
-                repo_id, body, stdin, limit, kill_tx,
-            ));
-        }
+    // CancellationToken: one per request.  The supervisor cancels it after git
+    // exits so the feeder stops promptly.  The response body holds a drop-guard
+    // so client disconnect also cancels.
+    let token = CancellationToken::new();
+    let feeder_token = token.clone();
+
+    // Spawn stdin feeder, storing its JoinHandle.
+    let feeder_handle: tokio::task::JoinHandle<()> = match content_encoding.as_deref() {
+        None | Some("identity") => tokio::spawn(stream_body_to_stdin(
+            repo_id,
+            body,
+            stdin,
+            limit,
+            kill_tx,
+            feeder_token,
+        )),
+        Some("gzip") | Some("x-gzip") => tokio::spawn(stream_gzip_body_to_stdin(
+            repo_id,
+            body,
+            stdin,
+            limit,
+            kill_tx,
+            feeder_token,
+        )),
         Some(_) => {
             child.kill().await.ok();
             return Err(GitHttpError::UnsupportedContentEncoding);
         }
-    }
+    };
 
     let body = Body::from_stream(stream_git_output(
         child,
@@ -250,6 +268,8 @@ async fn upload_pack(
         deadline,
         permit,
         Some(kill_rx),
+        Some(feeder_handle),
+        token,
     ));
 
     let mut response = Response::new(body);
@@ -298,7 +318,7 @@ fn is_protocol_v2(protocol: Option<&str>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Stdin feeders
+// Stdin feeders — cancellable via CancellationToken
 // ---------------------------------------------------------------------------
 
 use futures_util::StreamExt;
@@ -310,27 +330,34 @@ async fn stream_body_to_stdin(
     mut stdin: tokio::process::ChildStdin,
     limit: usize,
     kill_tx: oneshot::Sender<()>,
+    token: CancellationToken,
 ) {
     let mut stream = body.into_data_stream();
     let mut total: usize = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        total += chunk.len();
-        if total > limit {
-            tracing::warn!(
-                repository_id = %repo_id,
-                total,
-                limit,
-                "git request body exceeds limit; signalling kill"
-            );
-            let _ = kill_tx.send(());
-            return;
-        }
-        if stdin.write_all(&chunk).await.is_err() {
-            break;
+    loop {
+        tokio::select! {
+            chunk = stream.next() => {
+                let Some(chunk) = chunk else { break };
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                total += chunk.len();
+                if total > limit {
+                    tracing::warn!(
+                        repository_id = %repo_id, total, limit,
+                        "git request body exceeds limit; signalling kill"
+                    );
+                    let _ = kill_tx.send(());
+                    return;
+                }
+                if stdin.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            _ = token.cancelled() => {
+                return;
+            }
         }
     }
     drop(stdin);
@@ -342,6 +369,7 @@ async fn stream_gzip_body_to_stdin(
     mut stdin: tokio::process::ChildStdin,
     limit: usize,
     kill_tx: oneshot::Sender<()>,
+    token: CancellationToken,
 ) {
     use async_compression::tokio::bufread::GzipDecoder;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -355,30 +383,32 @@ async fn stream_gzip_body_to_stdin(
     let mut total: usize = 0;
     let mut buf = [0u8; 8192];
     loop {
-        match decoder.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n;
-                if total > limit {
-                    tracing::warn!(
-                        repository_id = %repo_id,
-                        total,
-                        limit,
-                        "git decoded request body exceeds limit; signalling kill"
-                    );
-                    let _ = kill_tx.send(());
-                    return;
-                }
-                if stdin.write_all(&buf[..n]).await.is_err() {
-                    break;
+        tokio::select! {
+            result = decoder.read(&mut buf) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n;
+                        if total > limit {
+                            tracing::warn!(
+                                repository_id = %repo_id, total, limit,
+                                "git decoded request body exceeds limit; signalling kill"
+                            );
+                            let _ = kill_tx.send(());
+                            return;
+                        }
+                        if stdin.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(repository_id = %repo_id, "gzip decode failed: {e}; signalling kill");
+                        let _ = kill_tx.send(());
+                        return;
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    repository_id = %repo_id,
-                    "gzip decode failed: {e}; signalling kill"
-                );
-                let _ = kill_tx.send(());
+            _ = token.cancelled() => {
                 return;
             }
         }
@@ -387,7 +417,7 @@ async fn stream_gzip_body_to_stdin(
 }
 
 // ---------------------------------------------------------------------------
-// Git output stream
+// Git output stream — supervisor + deadline-aware response body
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -400,31 +430,29 @@ fn stream_git_output(
     deadline: tokio::time::Instant,
     permit: OwnedSemaphorePermit,
     kill_rx: Option<oneshot::Receiver<()>>,
+    feeder_handle: Option<tokio::task::JoinHandle<()>>,
+    token: CancellationToken,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::stream;
     use tokio_util::io::ReaderStream;
 
     // Supervisor task: drains stderr concurrently, waits for child exit /
-    // deadline / kill signal, logs non-zero exit, and drops the permit.
+    // deadline / kill signal / cancel, then stops the feeder and drops permit.
+    let supervisor_token = token.clone();
     tokio::spawn(async move {
         // Drain stderr concurrently (capped at 64 KiB).
         let stderr_task = tokio::spawn(drain_stderr(stderr));
 
         // A future that resolves only on an explicit kill request.
-        // When the stdin feeder drops kill_tx normally (Canceled), this
-        // future waits forever — no kill.
         let kill_requested = async {
             match kill_rx {
                 Some(rx) => {
                     if rx.await.is_ok() {
-                        // Explicit kill signal from stdin feeder.
                         return;
                     }
-                    // Sender dropped normally → wait forever, no kill.
                     std::future::pending::<()>().await;
                 }
                 None => {
-                    // No kill channel at all (info/refs).
                     std::future::pending::<()>().await;
                 }
             }
@@ -441,7 +469,22 @@ fn stream_git_output(
                 let _ = child.start_kill();
                 child.wait().await
             }
+            _ = supervisor_token.cancelled() => {
+                // Client disconnected (response body dropped its guard).
+                let _ = child.start_kill();
+                child.wait().await
+            }
         };
+
+        // After child exits (for any reason), cancel the token so the feeder
+        // stops promptly.
+        supervisor_token.cancel();
+
+        // Stop the feeder: abort its handle and await it.
+        if let Some(handle) = feeder_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         // Join stderr with a short bound.
         let stderr_bytes = tokio::time::timeout(Duration::from_secs(5), stderr_task)
@@ -465,13 +508,23 @@ fn stream_git_output(
         drop(permit);
     });
 
+    // Build the response body stream from stdout, wrapped with a deadline
+    // check and a drop-guard so client disconnect cancels the token.
     let stdout_stream = ReaderStream::new(stdout);
+    let guard = token.clone().drop_guard();
+    let deadline_stream = DeadlineStream {
+        inner: stdout_stream,
+        deadline,
+        token,
+        guard: Some(guard),
+        finished: false,
+    };
 
     if prefix.is_empty() {
-        stream::StreamExt::boxed(stdout_stream)
+        stream::StreamExt::boxed(deadline_stream)
     } else {
         let prefix_item = stream::once(async move { Ok(bytes::Bytes::from(prefix)) });
-        stream::StreamExt::boxed(prefix_item.chain(stdout_stream))
+        stream::StreamExt::boxed(prefix_item.chain(deadline_stream))
     }
 }
 
@@ -494,6 +547,60 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr) -> Vec<u8> {
     }
     buf
 }
+
+// ---------------------------------------------------------------------------
+// DeadlineStream — wraps a stdout stream, enforcing the deadline on every poll.
+// Holds a CancellationToken drop-guard so client disconnect cancels the token.
+// ---------------------------------------------------------------------------
+
+struct DeadlineStream<S> {
+    inner: S,
+    deadline: tokio::time::Instant,
+    token: CancellationToken,
+    /// Disarmed when the stream ends normally (EOF).  If the stream is dropped
+    /// before reaching EOF (client disconnect, deadline error), the guard
+    /// cancels the token so the supervisor kills git.
+    guard: Option<tokio_util::sync::DropGuard>,
+    /// Set after the deadline error so the stream ends instead of repeating it.
+    finished: bool,
+}
+
+impl<S, E> futures_util::Stream for DeadlineStream<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if tokio::time::Instant::now() >= self.deadline {
+            self.finished = true;
+            self.token.cancel();
+            self.guard.take();
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "git deadline exceeded",
+            ))));
+        }
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::other(e)))),
+            Poll::Ready(None) => {
+                // Normal EOF — disarm guard so token is NOT cancelled.
+                if let Some(g) = self.guard.take() {
+                    g.disarm();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: Unpin> Unpin for DeadlineStream<S> {}
 
 // ---------------------------------------------------------------------------
 // Error type

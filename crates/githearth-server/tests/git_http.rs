@@ -3,12 +3,13 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use futures_util::StreamExt;
 use githearth_server::{AppState, MIGRATOR, config::Config, connect, router};
 use http_body_util::BodyExt;
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -949,18 +950,317 @@ async fn git_timeout_kills_child() {
 
     let app = router(state.clone());
 
-    // Build a request body that sends one valid want pkt-line for the real
-    // commit, then hangs forever (never flush/done, never closes stdin).
-    // Git upload-pack will wait for more input; the deadline must kill it.
-    // pkt-line: 4-hex length (includes itself) + "want " + sha + "\n"
-    let want_pkt = format!("{:04x}want {}\n", real_sha.len() + 10, real_sha);
-    use futures_util::stream;
-    let hang_body = axum::body::Body::from_stream(
-        stream::once(
-            async move { Ok::<_, std::convert::Infallible>(bytes::Bytes::from(want_pkt)) },
-        )
-        .chain(stream::pending()),
+    // Complete valid upload-pack request — git finishes quickly and the
+    // pack sits in the pipe buffer.  The DeadlineStream enforces the deadline
+    // on the response body.
+    let body_bytes = format!(
+        "{:04x}want {}\n0000{:04x}done\n",
+        real_sha.len() + 10,
+        real_sha,
+        9
     );
+
+    // Drop probe for the feeder.
+    let feeder_dropped = Arc::new(AtomicBool::new(false));
+    struct DropProbe(Arc<AtomicBool>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let probe = DropProbe(feeder_dropped.clone());
+    let req_body = axum::body::Body::from_stream(futures_util::stream::unfold(
+        (Some(body_bytes), probe),
+        |(data, probe): (Option<String>, DropProbe)| async move {
+            match data {
+                Some(d) => Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(d)),
+                    (None, probe),
+                )),
+                None => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+        },
+    ));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/{org_slug}/{repo_name}.git/git-upload-pack"))
+        .header("authorization", basic_auth(&username, "testpass"))
+        .header("content-type", "application/x-git-upload-pack-request")
+        .body(req_body)
+        .unwrap();
+
+    let start = tokio::time::Instant::now();
+
+    // Get the response but do NOT read the body.
+    let response = app.clone().oneshot(req).await.expect("request failed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Sleep past the deadline.  The DeadlineStream will error on next poll.
+    tokio::time::sleep(Duration::from_secs(11)).await;
+
+    // Before touching the body (whose deadline would also cancel the transfer),
+    // the supervisor's own deadline must already have killed git, stopped the
+    // feeder and released the permit.
+    for _ in 0..20 {
+        if state.git_slots.available_permits() == 1 && feeder_dropped.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        state.git_slots.available_permits(),
+        1,
+        "supervisor deadline did not release the permit before the body was read"
+    );
+    assert!(
+        feeder_dropped.load(Ordering::SeqCst),
+        "supervisor deadline did not destroy the feeder before the body was read"
+    );
+
+    // Now try to read the body — must be empty or error (TimedOut).
+    let body_result = response.into_body().collect().await;
+    if let Ok(collected) = body_result {
+        assert!(
+            collected.to_bytes().is_empty(),
+            "body must be empty after deadline"
+        );
+    }
+
+    let elapsed = start.elapsed();
+
+    // Permit must be released.
+    assert_eq!(
+        state.git_slots.available_permits(),
+        1,
+        "permit not released (elapsed={:.1}s)",
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed >= Duration::from_secs(9),
+        "elapsed too short ({:.1}s)",
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed <= Duration::from_secs(20),
+        "elapsed too long ({:.1}s)",
+        elapsed.as_secs_f64()
+    );
+
+    // Feeder must be destroyed.
+    assert!(
+        feeder_dropped.load(Ordering::SeqCst),
+        "feeder not destroyed"
+    );
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn slow_reader_gets_timeout() {
+    let storage_root = std::env::temp_dir().join(format!("githearth-slow-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL").unwrap(),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        git_timeout_seconds: 10,
+        git_concurrency: 2,
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let owner = fixture_account(&pool, &tag("slow-owner")).await;
+    set_password(&pool, owner, "testpass").await;
+    let username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (_org_id, org_slug) = fixture_organization(&pool, owner).await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_name = tag("slow-repo");
+    let repo_id = create_active_repo(&pool, org_id, &repo_name, owner).await;
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    state
+        .storage
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha1,
+        )
+        .unwrap();
+
+    let repo_path = state_repo_path(&storage_root, repo_id);
+    let rps = repo_path.to_str().unwrap();
+    let tmp_work = std::env::temp_dir().join(format!("git-slow-work-{}", Uuid::new_v4()));
+    let tw = tmp_work.to_str().unwrap();
+    std::fs::create_dir_all(&tmp_work).unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+    std::fs::write(tmp_work.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    let _ = std::fs::remove_dir_all(&tmp_work);
+
+    let real_sha = git_output(git_cmd(&["-C", rps, "rev-parse", "main"])).await;
+    let app = router(state);
+
+    // Complete valid upload-pack request — git will finish quickly.
+    let body_bytes = format!(
+        "{:04x}want {}\n0000{:04x}done\n",
+        real_sha.len() + 10,
+        real_sha,
+        9
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/{org_slug}/{repo_name}.git/git-upload-pack"))
+        .header("authorization", basic_auth(&username, "testpass"))
+        .header("content-type", "application/x-git-upload-pack-request")
+        .body(Body::from(body_bytes))
+        .unwrap();
+
+    let response = app.clone().oneshot(req).await.expect("request failed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Do NOT read the body.  Sleep past the deadline.
+    tokio::time::sleep(Duration::from_secs(11)).await;
+
+    // Now try to read the body — it must be empty or error (TimedOut).
+    let body = response.into_body().collect().await;
+    match body {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            assert!(
+                bytes.is_empty(),
+                "body must be empty after deadline (got {} bytes)",
+                bytes.len()
+            );
+        }
+        Err(_) => {
+            // Error is also acceptable (connection closed).
+        }
+    }
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn client_disconnect_releases_permit() {
+    let storage_root = std::env::temp_dir().join(format!("githearth-drop-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL").unwrap(),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        git_timeout_seconds: 600,
+        git_concurrency: 1,
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let owner = fixture_account(&pool, &tag("drop-owner")).await;
+    set_password(&pool, owner, "testpass").await;
+    let username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (_org_id, org_slug) = fixture_organization(&pool, owner).await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_name = tag("drop-repo");
+    let repo_id = create_active_repo(&pool, org_id, &repo_name, owner).await;
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    state
+        .storage
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha1,
+        )
+        .unwrap();
+
+    let repo_path = state_repo_path(&storage_root, repo_id);
+    let rps = repo_path.to_str().unwrap();
+    let tmp_work = std::env::temp_dir().join(format!("git-drop-work-{}", Uuid::new_v4()));
+    let tw = tmp_work.to_str().unwrap();
+    std::fs::create_dir_all(&tmp_work).unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+    std::fs::write(tmp_work.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    let _ = std::fs::remove_dir_all(&tmp_work);
+
+    let real_sha = git_output(git_cmd(&["-C", rps, "rev-parse", "main"])).await;
+    let app = router(state.clone());
+
+    // Never-ending request body with drop probe.
+    let want_pkt = format!("{:04x}want {}\n", real_sha.len() + 10, real_sha);
+    let feeder_dropped = Arc::new(AtomicBool::new(false));
+    struct DropProbe2(Arc<AtomicBool>);
+    impl Drop for DropProbe2 {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let probe = DropProbe2(feeder_dropped.clone());
+    let hang_body = axum::body::Body::from_stream(futures_util::stream::unfold(
+        (Some(want_pkt), probe),
+        |(data, probe): (Option<String>, DropProbe2)| async move {
+            match data {
+                Some(d) => Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(d)),
+                    (None, probe),
+                )),
+                None => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+        },
+    ));
 
     let req = Request::builder()
         .method("POST")
@@ -970,52 +1270,37 @@ async fn git_timeout_kills_child() {
         .body(hang_body)
         .unwrap();
 
-    let start = tokio::time::Instant::now();
+    let response = app.clone().oneshot(req).await.expect("request failed");
+    assert_eq!(response.status(), StatusCode::OK);
 
-    // Drive the response to completion (body may end early when git closes
-    // stdout, but the child process may still be running waiting for stdin).
-    let test_future = app.clone().oneshot(req);
-    let _ = tokio::time::timeout(Duration::from_secs(30), test_future)
-        .await
-        .expect("request hung > 30 s");
+    // Drop the response immediately — must release permit and kill feeder.
+    drop(response);
 
-    // The real test: wait for the permit to be released.  The deadline fires
-    // at 10 s, which kills git, the supervisor drops the permit, and
-    // available_permits goes back to 1.
-    let permit_ok = tokio::time::timeout(Duration::from_secs(20), async {
+    // Permit must be released within 3 s.
+    let permit_ok = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if state.git_slots.available_permits() == 1 {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
     .unwrap_or(false);
-    let elapsed = start.elapsed();
-    eprintln!(
-        "timeout test: permit_released={} elapsed={:.1}s",
-        permit_ok,
-        elapsed.as_secs_f64()
-    );
+    assert!(permit_ok, "permit not released after client disconnect");
 
-    assert!(
-        permit_ok,
-        "permit was not released; deadline did not fire (elapsed={:.1}s)",
-        elapsed.as_secs_f64()
-    );
-    // Elapsed must be >= 9 s (deadline at 10 s minus scheduling jitter).
-    assert!(
-        elapsed >= Duration::from_secs(9),
-        "permit released too early ({:.1}s); git was not killed by deadline",
-        elapsed.as_secs_f64()
-    );
-    // Deadline must fire before 20 s.
-    assert!(
-        elapsed <= Duration::from_secs(20),
-        "deadline did not fire in time ({:.1}s)",
-        elapsed.as_secs_f64()
-    );
+    // Feeder must be destroyed within 3 s.
+    let feeder_ok = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if feeder_dropped.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(feeder_ok, "feeder not destroyed after client disconnect");
 
     cleanup(&storage_root);
     pool.close().await;
