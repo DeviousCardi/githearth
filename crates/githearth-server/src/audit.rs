@@ -108,17 +108,21 @@ pub async fn verify(
             .fetch_optional(&mut *conn)
             .await?;
     let head_seq = head.as_ref().map_or(0, |(s, _)| *s);
-    let mut rows = sqlx::query(
+    // Plain predicates keep the (organization_id, seq) index usable; the site chain is the NULL rows.
+    let chain_filter = if chain == SITE_CHAIN {
+        "organization_id IS NULL AND $1::uuid IS NOT NULL"
+    } else {
+        "organization_id = $1"
+    };
+    let sql = format!(
         "SELECT seq, id, organization_id, actor_id, kind, \
          (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS micros, prev_hash, hash \
-         FROM audit_events \
-         WHERE COALESCE(organization_id, $2) = $1 \
-         AND seq <= $3 ORDER BY seq",
-    )
-    .bind(chain)
-    .bind(SITE_CHAIN)
-    .bind(head_seq)
-    .fetch(&mut *conn);
+         FROM audit_events WHERE {chain_filter} AND seq IS NOT NULL AND seq <= $2 ORDER BY seq"
+    );
+    let mut rows = sqlx::query(&sql)
+        .bind(chain)
+        .bind(head_seq)
+        .fetch(&mut *conn);
 
     let mut count = 0u64;
     let mut ok = true;

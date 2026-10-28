@@ -1366,3 +1366,61 @@ async fn keyed_comment_replay_with_single_connection() {
     cleanup(&storage);
     pool.close().await;
 }
+
+/// A delete that commits while a mutation is in flight must win: the mutation
+/// re-checks the status under a row lock inside its own transaction.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn mutations_lose_to_a_delete_committed_mid_request() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    // `deleting` cannot go back to `active`, so every case gets its own repository.
+    let cases: [(&str, &str, Value); 6] = [
+        ("POST", "issues", json!({"title": "late"})),
+        ("PATCH", "issues/1", json!({"title": "late"})),
+        ("POST", "issues/1/comments", json!({"body": "late"})),
+        ("PATCH", "", json!({"description": "late"})),
+        ("POST", "archive", json!(null)),
+        (
+            "POST",
+            "access",
+            json!({"subject_kind": "account", "subject_id": owner, "role": "read"}),
+        ),
+    ];
+    for (i, (method, suffix, body)) in cases.into_iter().enumerate() {
+        let name = format!("racing-{i}");
+        let repo = fixture_repository(&pool, org_id, &name, owner, "private", false).await;
+        create_issue(&app, &token, &slug, &name, "x", "").await;
+        let base = format!("/api/v1/organizations/{slug}/repositories/{name}");
+        let path = if suffix.is_empty() {
+            base
+        } else {
+            format!("{base}/{suffix}")
+        };
+        // Hold an uncommitted delete: the handler's pre-check still sees `active`.
+        let mut deleter = pool.begin().await.unwrap();
+        sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+            .bind(repo)
+            .execute(&mut *deleter)
+            .await
+            .unwrap();
+        let call = tokio::spawn({
+            let app = app.clone();
+            let token = token.clone();
+            async move { request(&app, method, &path, Some(&token), None, body).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        deleter.commit().await.unwrap();
+        let (status, body) = call.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{method} {suffix}: {body}");
+        let issues: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM issues WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(issues, 1);
+    }
+    cleanup(&storage);
+    pool.close().await;
+}

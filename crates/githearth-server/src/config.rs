@@ -36,7 +36,7 @@ impl Default for Config {
             database_timeout_seconds: 3,
             request_timeout_seconds: 15,
             token_ttl_seconds: 3600,
-            body_limit_bytes: 16384,
+            body_limit_bytes: 524_288,
             auth_concurrency: 2,
             storage_root: PathBuf::from("data/repositories"),
             reconcile_interval_seconds: 60,

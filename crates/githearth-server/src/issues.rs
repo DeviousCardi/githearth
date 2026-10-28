@@ -198,6 +198,9 @@ async fn create(
             }
 
             let mut tx = state.pool.begin().await?;
+            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+                return Err(not_active());
+            }
             let number = allocate_number(&mut tx, loaded.repo.id).await?;
             let id = Uuid::new_v4();
             sqlx::query(
@@ -388,6 +391,9 @@ async fn update(
             }
 
             let mut tx = state.pool.begin().await?;
+            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+                return Err(not_active());
+            }
             // Lock the row so concurrent PATCHes cannot stomp fields we did not send.
             let locked: IssueJson = sqlx::query_as(&format!(
                 "SELECT {ISSUE_COLUMNS} FROM issues WHERE id = $1 FOR UPDATE"
@@ -481,6 +487,9 @@ async fn create_comment(
             }
 
             let mut tx = state.pool.begin().await?;
+            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+                return Err(not_active());
+            }
             let id = Uuid::new_v4();
             let seq = allocate_comment_seq(&mut tx, issue.id).await?;
             sqlx::query(

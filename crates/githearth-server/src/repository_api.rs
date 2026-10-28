@@ -484,6 +484,9 @@ pub(crate) async fn update(
             }
 
             let mut tx = state.pool.begin().await?;
+            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+                return Err(not_active());
+            }
             if let Some(ref new_name) = input.name {
                 match repositories::rename(&mut tx, loaded.repo.id, new_name).await {
                     Err(e)
@@ -568,6 +571,9 @@ macro_rules! archive_handler {
                     }
 
                     let mut tx = state.pool.begin().await?;
+                    if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+                        return Err(not_active());
+                    }
                     repositories::set_archived(&mut tx, loaded.repo.id, $archived).await?;
                     let event_kind = if $archived {
                         "repository.archived"
@@ -843,6 +849,9 @@ pub(crate) async fn grant_access(
             }
 
             let mut tx = state.pool.begin().await?;
+            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+                return Err(not_active());
+            }
 
             sqlx::query(
                 "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 \

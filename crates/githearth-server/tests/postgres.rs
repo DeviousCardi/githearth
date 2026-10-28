@@ -514,7 +514,7 @@ async fn postgres_foundation_contract() {
             "POST",
             "/api/v1/login",
             None,
-            json!({"username":"first-admin","password":"x".repeat(20000)})
+            json!({"username":"first-admin","password":"x".repeat(600_000)})
         )
         .await
         .0,
@@ -1048,7 +1048,7 @@ async fn postgres_read_organization_fact_contract() {
             .0,
         StatusCode::OK
     );
-    // A suspended account reads as not found, whatever its grants.
+    // A suspended account's sessions stop working, whatever its grants.
     sqlx::query("UPDATE accounts SET suspended=true WHERE id=$1")
         .bind(owner)
         .execute(&pool)
@@ -1058,7 +1058,7 @@ async fn postgres_read_organization_fact_contract() {
         request(&app, "GET", &path, Some(&token), Value::Null)
             .await
             .0,
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
     // A non-member reads as not found.
     let stranger = fixture_account(&pool, &tag("stranger")).await;
@@ -1177,5 +1177,45 @@ async fn postgres_authz_events_commit_order_contract() {
         .await
         .unwrap();
     assert_eq!(nulls, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn suspended_account_cannot_sign_in_or_create_organizations() {
+    let config = Config {
+        database_url: fresh_database("githearth_suspended_login").await,
+        database_timeout_seconds: 1,
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let app = router(AppState::new(pool.clone(), config).await.unwrap());
+    let password = "correct horse battery staple";
+    let admin = bootstrap_admin(&pool, "suspended-admin", password.into())
+        .await
+        .unwrap();
+    let (status, token) = login(&app, "suspended-admin", password).await;
+    assert_eq!(status, StatusCode::OK);
+    let token = token["token"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE accounts SET suspended=true WHERE id=$1")
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        login(&app, "suspended-admin", password).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/organizations",
+        Some(&token),
+        json!({"slug": "spam", "name": "Spam"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(count(&pool, "organizations").await, 0);
     pool.close().await;
 }

@@ -334,11 +334,15 @@ pub(crate) async fn verify_password(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "authentication busy"))?;
-    let row = sqlx::query("SELECT id, password_hash FROM accounts WHERE username = $1")
+    let row = sqlx::query("SELECT id, password_hash, suspended FROM accounts WHERE username = $1")
         .bind(username)
         .fetch_optional(&state.pool)
         .await?;
-    let id = row.as_ref().map(|r| r.get::<Uuid, _>("id"));
+    // A suspended account still pays for the hash, so timing does not reveal the suspension.
+    let id = row
+        .as_ref()
+        .filter(|r| !r.get::<bool, _>("suspended"))
+        .map(|r| r.get::<Uuid, _>("id"));
     let hash = row
         .as_ref()
         .map(|r| r.get::<String, _>("password_hash"))
@@ -392,7 +396,7 @@ pub(crate) async fn authenticate_token_hash(
     token_hash: Vec<u8>,
 ) -> ApiResult<(Account, u64)> {
     let row = sqlx::query_as::<_, (Uuid, String, bool, i64)>(
-        "SELECT a.id, a.username, a.is_admin, EXTRACT(EPOCH FROM clock_timestamp() - s.authenticated_at)::bigint AS auth_age FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp()",
+        "SELECT a.id, a.username, a.is_admin, EXTRACT(EPOCH FROM clock_timestamp() - s.authenticated_at)::bigint AS auth_age FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp() AND NOT a.suspended",
     )
     .bind(token_hash)
     .fetch_optional(pool)

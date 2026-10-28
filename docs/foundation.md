@@ -56,7 +56,7 @@ Skip bootstrap when the Compose installation already has its administrator. Use 
 | `database_timeout_seconds` | `GITHEARTH_DATABASE_TIMEOUT_SECONDS` | 3 / 1–30 seconds, pool acquisition and readiness |
 | `request_timeout_seconds` | `GITHEARTH_REQUEST_TIMEOUT_SECONDS` | 15 / 1–120 seconds |
 | `token_ttl_seconds` | `GITHEARTH_TOKEN_TTL_SECONDS` | 3600 / 1–86400 seconds |
-| `body_limit_bytes` | `GITHEARTH_BODY_LIMIT_BYTES` | 16384 / 1024–1048576 bytes |
+| `body_limit_bytes` | `GITHEARTH_BODY_LIMIT_BYTES` | 524288 / 1024–1048576 bytes |
 | `auth_concurrency` | `GITHEARTH_AUTH_CONCURRENCY` | 2 / 1–16 concurrent password verifications |
 
 Every connection sets a 5-second statement timeout, 3-second lock timeout, and 10-second idle-transaction timeout. Password verification uses blocking workers with a bounded permit held until hashing finishes, even when its HTTP caller times out. Busy authentication returns 429. The pool is bounded; HTTP bodies and total request duration are bounded. This is resource protection, not a distributed brute-force prevention service; per-account/IP throttling is a later production requirement.
