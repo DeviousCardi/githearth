@@ -652,11 +652,10 @@ pub(crate) async fn grant_access(
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let key = idempotency::extract_key(&headers).transpose()?;
-    let mut conn = state.pool.acquire().await?;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}/access");
 
     idempotency::run(
-        &mut conn,
+        &state.pool,
         actor.id,
         "POST",
         &path_str,
@@ -764,10 +763,9 @@ pub(crate) async fn revoke_access(
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{name}/access/{grant_id}");
     let key = idempotency::extract_key(&headers).transpose()?;
-    let mut conn = state.pool.acquire().await?;
 
     let (status, _) = idempotency::run(
-        &mut conn,
+        &state.pool,
         actor.id,
         "DELETE",
         &path_str,
@@ -777,6 +775,7 @@ pub(crate) async fn revoke_access(
             let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
             require(&state, &loaded, Action::RepositoryManageAccess)?;
 
+            // Unlike granting, revoking is allowed while the repository is `deleting`: removing access is always safe.
             let mut tx = state.pool.begin().await?;
             let result = sqlx::query(
                 "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 \
