@@ -6,20 +6,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("githearth-journal-{}-{nonce}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "githearth-journal-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(fs::canonicalize(path).unwrap())
     }
     fn repo(&self) -> PathBuf {
         let repo = self.0.join("repo");
