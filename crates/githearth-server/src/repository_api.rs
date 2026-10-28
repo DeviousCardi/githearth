@@ -239,7 +239,7 @@ pub(crate) async fn create(
                 Some(operation_id) => {
                     let repo = repositories::find_by_operation(&mut tx, operation_id)
                         .await?
-                        .ok_or_else(org_not_found)?;
+                        .ok_or_else(not_found)?;
                     // A previously deleted repository must never be resurrected.
                     if matches!(
                         repo.status,

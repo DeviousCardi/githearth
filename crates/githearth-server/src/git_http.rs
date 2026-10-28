@@ -192,6 +192,12 @@ async fn upload_pack(
         return Err(GitHttpError::PayloadTooLarge);
     }
 
+    // Refuse an unknown encoding before spawning git.
+    let is_gzip = matches!(content_encoding.as_deref(), Some("gzip" | "x-gzip"));
+    if !is_identity && !is_gzip {
+        return Err(GitHttpError::UnsupportedContentEncoding);
+    }
+
     let git_protocol = extract_git_protocol(&headers);
 
     let cmd = state
@@ -236,27 +242,24 @@ async fn upload_pack(
     let feeder_token = token.clone();
 
     // Spawn stdin feeder, storing its JoinHandle.
-    let feeder_handle: tokio::task::JoinHandle<()> = match content_encoding.as_deref() {
-        None | Some("identity") => tokio::spawn(stream_body_to_stdin(
+    let feeder_handle: tokio::task::JoinHandle<()> = if is_gzip {
+        tokio::spawn(stream_gzip_body_to_stdin(
             repo_id,
             body,
             stdin,
             limit,
             kill_tx,
             feeder_token,
-        )),
-        Some("gzip") | Some("x-gzip") => tokio::spawn(stream_gzip_body_to_stdin(
+        ))
+    } else {
+        tokio::spawn(stream_body_to_stdin(
             repo_id,
             body,
             stdin,
             limit,
             kill_tx,
             feeder_token,
-        )),
-        Some(_) => {
-            child.kill().await.ok();
-            return Err(GitHttpError::UnsupportedContentEncoding);
-        }
+        ))
     };
 
     let body = Body::from_stream(stream_git_output(

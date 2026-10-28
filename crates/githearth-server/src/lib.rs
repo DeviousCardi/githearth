@@ -321,6 +321,8 @@ struct Token {
     token_type: &'static str,
     expires_in: u64,
 }
+const AUTH_QUEUE_WAIT: Duration = Duration::from_secs(2);
+
 pub(crate) async fn verify_password(
     state: &AppState,
     username: &str,
@@ -329,11 +331,16 @@ pub(crate) async fn verify_password(
     if !valid_username(username) || password.len() > 1024 {
         return Ok(None);
     }
-    let permit = state
-        .auth_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "authentication busy"))?;
+    // A short queue absorbs bursts such as a clone's back-to-back Git requests; only a
+    // sustained overload is refused. Waiting holds no connection.
+    let permit = tokio::time::timeout(AUTH_QUEUE_WAIT, state.auth_slots.clone().acquire_owned())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "authentication busy",
+        ))?;
     let row = sqlx::query("SELECT id, password_hash, suspended FROM accounts WHERE username = $1")
         .bind(username)
         .fetch_optional(&state.pool)
@@ -456,6 +463,9 @@ async fn create_organization(
     let (account, _) = authenticate(&state.pool, &headers).await?;
     if input.slug.is_empty()
         || input.slug.len() > 64
+        || input.slug.starts_with('-')
+        || input.slug.ends_with('-')
+        || input.slug.contains("--")
         || !input
             .slug
             .bytes()
@@ -511,7 +521,7 @@ async fn list_organizations(
     if !(1..=100).contains(&limit) {
         return Err(invalid());
     }
-    Ok(Json(sqlx::query_as::<_, Organization>("SELECT o.id,o.slug,o.name,m.role FROM organizations o JOIN memberships m ON m.organization_id=o.id WHERE m.account_id=$1 AND ($2::uuid IS NULL OR o.id > $2) ORDER BY o.id LIMIT $3")
+    Ok(Json(sqlx::query_as::<_, Organization>("SELECT o.id,o.slug,o.name,m.role FROM organizations o JOIN memberships m ON m.organization_id=o.id WHERE m.account_id=$1 AND NOT o.suspended AND ($2::uuid IS NULL OR o.id > $2) ORDER BY o.id LIMIT $3")
         .bind(account.id).bind(page.after).bind(limit).fetch_all(&state.pool).await?))
 }
 async fn read_organization(
@@ -584,6 +594,39 @@ mod tests {
                 .verify_password(b"a sufficiently long password", &parsed)
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn auth_queues_briefly_instead_of_refusing_a_burst() {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://localhost:1/unused")
+            .unwrap();
+        let config = Config {
+            database_url: "postgres://localhost:1/unused".into(),
+            auth_concurrency: 1,
+            ..Config::default()
+        };
+        let state = AppState::new(pool, config).await.unwrap();
+        let permit = state.auth_slots.clone().acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(permit);
+        });
+        // The slot frees within the queue wait, so the request proceeds to the
+        // (unreachable) database instead of being refused as busy.
+        let response = router(state)
+            .oneshot(
+                Request::post("/api/v1/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"some-user","password":"some password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

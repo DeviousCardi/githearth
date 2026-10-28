@@ -372,6 +372,9 @@ async fn postgres_foundation_contract() {
         json!({"slug":"","name":"Invalid"}),
         json!({"slug":"UPPERCASE","name":"Invalid"}),
         json!({"slug":"bad/slash","name":"Invalid"}),
+        json!({"slug":"-leading","name":"Invalid"}),
+        json!({"slug":"trailing-","name":"Invalid"}),
+        json!({"slug":"double--hyphen","name":"Invalid"}),
         json!({"slug":"a".repeat(65),"name":"Invalid"}),
         json!({"slug":"valid-slug","name":"   "}),
         json!({"slug":"valid-slug","name":"x".repeat(201)}),
@@ -1025,12 +1028,28 @@ async fn postgres_read_organization_fact_contract() {
     let (status, body) = request(&app, "GET", &path, Some(&token), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["role"], "owner");
-    // A suspended organization reads as not found.
+    // A suspended organization reads as not found and drops out of the listing.
     sqlx::query("UPDATE organizations SET suspended=true WHERE slug=$1")
         .bind(&slug)
         .execute(&pool)
         .await
         .unwrap();
+    let (status, listed) = request(
+        &app,
+        "GET",
+        "/api/v1/organizations",
+        Some(&token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["slug"] == slug.as_str())
+    );
     assert_eq!(
         request(&app, "GET", &path, Some(&token), Value::Null)
             .await
