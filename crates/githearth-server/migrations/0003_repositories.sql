@@ -45,8 +45,8 @@ BEGIN
  IF OLD.status = 'deleting' AND NEW.status NOT IN ('deleted', 'deleting') THEN
   RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'deleting may only transition to deleted or itself';
  END IF;
- IF OLD.status = 'failed' AND NEW.status NOT IN ('creating', 'failed') THEN
-  RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'failed may only transition to creating or itself';
+ IF OLD.status = 'failed' AND NEW.status NOT IN ('creating', 'deleting', 'failed') THEN
+  RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'failed may only transition to creating, deleting, or itself';
  END IF;
  IF OLD.status = 'deleted' AND NEW.status <> 'deleted' THEN
   RAISE EXCEPTION USING ERRCODE = 'check_violation', MESSAGE = 'deleted may not transition';

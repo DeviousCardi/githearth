@@ -324,6 +324,45 @@ async fn creating_to_failed_then_retry() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn failed_repository_can_be_deleted_and_name_reused() {
+    use githearth_core::RepositoryStatus::{Creating, Deleted, Deleting, Failed};
+    let pool = pool().await;
+    let owner = fixture_account(&pool, &tag("owner")).await;
+    let org = fixture_organization(&pool, owner).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let row = repositories::insert_creating(&mut conn, org, "stuck", owner, Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(
+        repositories::set_status(&mut conn, row.id, Creating, Failed)
+            .await
+            .unwrap()
+    );
+    let pending = repositories::pending(&mut conn, 1000).await.unwrap();
+    assert!(
+        pending.iter().any(|r| r.id == row.id),
+        "failed rows are visible to the reconciler"
+    );
+
+    assert!(
+        repositories::set_status(&mut conn, row.id, Failed, Deleting)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repositories::set_status(&mut conn, row.id, Deleting, Deleted)
+            .await
+            .unwrap()
+    );
+    repositories::insert_creating(&mut conn, org, "stuck", owner, Uuid::new_v4())
+        .await
+        .expect("name is free once the failed row is deleted");
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn cas_returns_false_on_wrong_from() {
     let pool = pool().await;
     let owner = fixture_account(&pool, &tag("owner")).await;

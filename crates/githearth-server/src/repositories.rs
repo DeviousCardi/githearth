@@ -130,7 +130,7 @@ pub async fn pending(
     limit: i64,
 ) -> Result<Vec<RepositoryRow>, sqlx::Error> {
     Ok(sqlx::query(&format!(
-        "SELECT {REPO_COLS} FROM repositories WHERE status IN ('creating','deleting') ORDER BY created_at LIMIT $1"
+        "SELECT {REPO_COLS} FROM repositories WHERE status IN ('creating','deleting','failed') ORDER BY created_at LIMIT $1"
     ))
     .bind(limit)
     .fetch_all(&mut *conn)
@@ -140,6 +140,7 @@ pub async fn pending(
     .collect())
 }
 
+/// Starts its own transaction on `conn`, so inside a caller's transaction it acts as a savepoint.
 pub async fn rename(
     conn: &mut PgConnection,
     id: Uuid,

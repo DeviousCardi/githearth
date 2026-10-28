@@ -77,14 +77,14 @@ Repository rows in PostgreSQL hold identity, owner, name, visibility, archive st
 - **Create.** (1) Insert the row as `creating` with its operation ID and commit. (2) `git init --bare` into `tmp/<operation>`, write the config above, fsync the tree, `rename` into `repositories/`, fsync the parent directory. (3) Mark the row `active`. The API answers `201` only after step 3; a lost response is answered by replaying the operation ID.
 - **Rename / transfer.** Metadata only. The previous `owner/name` is stored as a redirect for Git and web URLs until the name is reused.
 - **Archive / unarchive.** Metadata only; ADR 0002's archive forbids stop writes, including pushes, at the next decision.
-- **Delete.** Mark `deleting`, then rename the directory into `trash/`, then mark `deleted`. Trash is purged after the retention window (default 7 days). Restore within the window reverses the rename while the name is still free.
+- **Delete.** Mark `deleting`, then rename the directory into `trash/`, then mark `deleted`. Trash is purged after the retention window (default 7 days). There is no automatic restore: a `deleted` row never transitions, so within the window an operator moves the directory back by hand and creates a new repository row.
 
 The lifecycle reconciler handles each intermediate state:
 
 | Row status | On disk | Action |
 | --- | --- | --- |
 | `creating` | final path valid | mark `active` |
-| `creating` | missing or only in `tmp/` | redo the create from step 2; after repeated failures mark `failed` |
+| `creating` | missing or only in `tmp/` | redo the create from step 2; after repeated failures mark `failed` (a `failed` row can be retried to `creating` or deleted, so its name is never stuck) |
 | `deleting` | still in `repositories/` | move to trash, mark `deleted` |
 | `deleting` | already in trash | mark `deleted` |
 | no row | directory in `repositories/` | move to `orphans/` and alert |
