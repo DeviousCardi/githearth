@@ -177,6 +177,7 @@ async fn create(
     }
 
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let state = &state;
     let key = idempotency::extract_key(&headers).transpose()?;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/issues");
 
@@ -187,11 +188,11 @@ async fn create(
         &path_str,
         &body,
         key,
-        || async {
+        |idem| async move {
             let loaded =
-                repository_api::load_current(&state, actor.id, auth_age, &org_slug, &repo_name)
+                repository_api::load_current(state, actor.id, auth_age, &org_slug, &repo_name)
                     .await?;
-            repository_api::require(&state, &loaded, Action::IssueCreate)?;
+            repository_api::require(state, &loaded, Action::IssueCreate)?;
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
             }
@@ -212,11 +213,13 @@ async fn create(
             .execute(&mut *tx)
             .await?;
             event(&mut tx, Some(loaded.org_id), actor.id, "issue.created").await?;
-            tx.commit().await?;
 
-            let mut conn = state.pool.acquire().await?;
-            let issue = fetch_issue(&mut conn, id).await?.unwrap();
-            Ok((StatusCode::CREATED, serde_json::to_value(&issue).unwrap()))
+            let issue = fetch_issue(&mut tx, id).await?.unwrap();
+            let status = StatusCode::CREATED;
+            let body = serde_json::to_value(&issue).unwrap();
+            idem.store(&mut tx, status, &body).await?;
+            tx.commit().await?;
+            Ok((status, body))
         },
     )
     .await?;
@@ -347,6 +350,7 @@ async fn update(
     }
 
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let state = &state;
     let key = idempotency::extract_key(&headers).transpose()?;
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/issues/{number}");
@@ -358,9 +362,9 @@ async fn update(
         &path_str,
         &body,
         key,
-        || async {
+        |idem| async move {
             let loaded = repository_api::load_current(
-                &state,
+                state,
                 actor.id,
                 auth_age,
                 &org_slug,
@@ -375,7 +379,7 @@ async fn update(
             drop(conn);
 
             // Closing, reopening and editing all gate on the same triage action.
-            require_issue(&state, &loaded, &issue, Action::IssueClose)?;
+            require_issue(state, &loaded, &issue, Action::IssueClose)?;
 
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
@@ -407,11 +411,13 @@ async fn update(
                 "issue.updated"
             };
             event(&mut tx, Some(loaded.org_id), actor.id, kind).await?;
-            tx.commit().await?;
 
-            let mut conn = state.pool.acquire().await?;
-            let updated = fetch_issue(&mut conn, issue.id).await?.unwrap();
-            Ok((StatusCode::OK, serde_json::to_value(&updated).unwrap()))
+            let updated = fetch_issue(&mut tx, issue.id).await?.unwrap();
+            let status = StatusCode::OK;
+            let body = serde_json::to_value(&updated).unwrap();
+            idem.store(&mut tx, status, &body).await?;
+            tx.commit().await?;
+            Ok((status, body))
         },
     )
     .await?;
@@ -436,6 +442,7 @@ async fn create_comment(
     }
 
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let state = &state;
     let key = idempotency::extract_key(&headers).transpose()?;
     let path_str = format!(
         "/api/v1/organizations/{org_slug}/repositories/{repo_name}/issues/{number}/comments"
@@ -448,9 +455,9 @@ async fn create_comment(
         &path_str,
         &body,
         key,
-        || async {
+        |idem| async move {
             let loaded = repository_api::load_current(
-                &state,
+                state,
                 actor.id,
                 auth_age,
                 &org_slug,
@@ -464,7 +471,7 @@ async fn create_comment(
                 .ok_or_else(not_found)?;
             drop(conn);
 
-            require_issue(&state, &loaded, &issue, Action::IssueComment)?;
+            require_issue(state, &loaded, &issue, Action::IssueComment)?;
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
             }
@@ -487,16 +494,18 @@ async fn create_comment(
                 .execute(&mut *tx)
                 .await?;
             event(&mut tx, Some(loaded.org_id), actor.id, "issue.commented").await?;
-            tx.commit().await?;
 
-            let mut conn = state.pool.acquire().await?;
             let comment: CommentJson = sqlx::query_as(&format!(
                 "SELECT {COMMENT_COLUMNS} FROM issue_comments WHERE id = $1"
             ))
             .bind(id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *tx)
             .await?;
-            Ok((StatusCode::CREATED, serde_json::to_value(&comment).unwrap()))
+            let status = StatusCode::CREATED;
+            let body = serde_json::to_value(&comment).unwrap();
+            idem.store(&mut tx, status, &body).await?;
+            tx.commit().await?;
+            Ok((status, body))
         },
     )
     .await?;

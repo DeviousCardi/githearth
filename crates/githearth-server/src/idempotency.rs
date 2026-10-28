@@ -3,9 +3,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use std::future::Future;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::ApiError;
+
+/// A `running` claim older than this is abandoned and may be re-claimed.
+const RUNNING_LEASE: Duration = Duration::from_secs(60);
 
 pub fn extract_key(headers: &HeaderMap) -> Option<Result<&str, ApiError>> {
     let key = headers.get("Idempotency-Key")?;
@@ -35,30 +39,58 @@ pub fn request_hash(method: &str, path: &str, body: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// Try to claim the key atomically. Returns the stored reply, 409/422, or
-/// lets the caller run the handler.
-enum Outcome {
-    Run,
-    Reply(StatusCode, Value),
-    Conflict,
-    Unprocessable,
+/// Handle to the current claim, passed to the handler so it writes the stored
+/// response in the SAME transaction as its mutation. `key` is `None` when the
+/// request carried no idempotency key, in which case every method is a no-op.
+pub struct Idem {
+    actor_id: Uuid,
+    key: Option<String>,
+    /// Set when an abandoned `running` claim was re-claimed: the operation id
+    /// the previous attempt stored, for the create handler to reuse its row.
+    pub prior_operation_id: Option<Uuid>,
 }
 
-async fn store(
-    conn: &mut PgConnection,
-    actor_id: Uuid,
-    key: &str,
-    status: StatusCode,
-    body: &Value,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE operations SET status = 'done', response_status = $1, response_body = $2 WHERE actor_id = $3 AND key = $4")
+impl Idem {
+    pub async fn store(
+        &self,
+        conn: &mut PgConnection,
+        status: StatusCode,
+        body: &Value,
+    ) -> Result<(), sqlx::Error> {
+        let Some(key) = &self.key else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE operations SET status = 'done', response_status = $1, response_body = $2 \
+             WHERE actor_id = $3 AND key = $4 AND status = 'running'",
+        )
         .bind(status.as_u16() as i32)
         .bind(body)
-        .bind(actor_id)
+        .bind(self.actor_id)
         .bind(key)
         .execute(conn)
         .await?;
-    Ok(())
+        Ok(())
+    }
+
+    /// Persist the created object's operation id on the claim, in the same
+    /// transaction that creates the object, so a retry can find it.
+    pub async fn record_operation(
+        &self,
+        conn: &mut PgConnection,
+        operation_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let Some(key) = &self.key else {
+            return Ok(());
+        };
+        sqlx::query("UPDATE operations SET operation_id = $1 WHERE actor_id = $2 AND key = $3")
+            .bind(operation_id)
+            .bind(self.actor_id)
+            .bind(key)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
 }
 
 async fn remove(conn: &mut PgConnection, actor_id: Uuid, key: &str) -> Result<(), sqlx::Error> {
@@ -68,6 +100,15 @@ async fn remove(conn: &mut PgConnection, actor_id: Uuid, key: &str) -> Result<()
         .execute(conn)
         .await?;
     Ok(())
+}
+
+/// Try to claim the key atomically. Returns the stored reply, 409/422, or runs
+/// the handler (optionally carrying the operation id of a re-claimed claim).
+enum Outcome {
+    Run { prior_operation_id: Option<Uuid> },
+    Reply(StatusCode, Value),
+    Conflict,
+    Unprocessable,
 }
 
 /// Holds no connection while `f` runs, so a request never needs two at once.
@@ -81,15 +122,27 @@ pub async fn run<F, Fut>(
     f: F,
 ) -> Result<(StatusCode, Value), ApiError>
 where
-    F: FnOnce() -> Fut,
+    F: FnOnce(Idem) -> Fut,
     Fut: Future<Output = Result<(StatusCode, Value), ApiError>>,
 {
     let Some(key) = key else {
-        return f().await;
+        return f(Idem {
+            actor_id,
+            key: None,
+            prior_operation_id: None,
+        })
+        .await;
     };
     let hash = request_hash(method, path, raw_body);
-    let claimed = check(&mut *pool.acquire().await?, actor_id, key, &hash).await?;
-    match claimed {
+    let claimed = check(
+        &mut *pool.acquire().await?,
+        actor_id,
+        key,
+        &hash,
+        RUNNING_LEASE.as_secs() as f64,
+    )
+    .await?;
+    let prior_operation_id = match claimed {
         Outcome::Reply(status, body) => return Ok((status, body)),
         Outcome::Conflict => {
             return Err(ApiError(StatusCode::CONFLICT, "idempotency key conflict"));
@@ -100,29 +153,31 @@ where
                 "idempotency key reused with different request",
             ));
         }
-        Outcome::Run => {}
-    }
-    let result = f().await;
-    let mut conn = pool.acquire().await?;
-    let stored = match &result {
-        Ok((status, body)) => store(&mut conn, actor_id, key, *status, body).await.is_ok(),
-        Err(_) => false,
+        Outcome::Run { prior_operation_id } => prior_operation_id,
     };
-    // Never leave the key `running`: the client could not retry for 24 hours.
-    if !stored {
+    let idem = Idem {
+        actor_id,
+        key: Some(key.to_string()),
+        prior_operation_id,
+    };
+    let result = f(idem).await;
+    if result.is_err() {
+        // Never leave the key `running`: the client could not retry for 24 hours.
+        let mut conn = pool.acquire().await?;
         let _ = remove(&mut conn, actor_id, key).await;
     }
     result
 }
 
-/// request_hash, status, response_status, response_body
-type StoredRow = (Vec<u8>, String, Option<i32>, Option<Value>);
+/// request_hash, status, response_status, response_body, operation_id
+type StoredRow = (Vec<u8>, String, Option<i32>, Option<Value>, Option<Uuid>);
 
 async fn check(
     conn: &mut PgConnection,
     actor_id: Uuid,
     key: &str,
     hash: &[u8],
+    lease_seconds: f64,
 ) -> Result<Outcome, ApiError> {
     sqlx::query(
         "DELETE FROM operations WHERE actor_id = $1 AND key = $2 AND expires_at < clock_timestamp()",
@@ -142,11 +197,24 @@ async fn check(
     .await?;
 
     if inserted.rows_affected() > 0 {
-        return Ok(Outcome::Run);
+        return Ok(Outcome::Run {
+            prior_operation_id: None,
+        });
     }
 
+    // An abandoned `running` claim (crash between commit and store) may be re-claimed.
+    let reclaimed = sqlx::query(
+        "UPDATE operations SET created_at = clock_timestamp() WHERE actor_id = $1 AND key = $2 AND status = 'running' AND created_at < clock_timestamp() - $3 * interval '1 second'",
+    )
+    .bind(actor_id)
+    .bind(key)
+    .bind(lease_seconds)
+    .execute(&mut *conn)
+    .await?;
+    let reclaimed = reclaimed.rows_affected() > 0;
+
     let row: Option<StoredRow> = sqlx::query_as(
-        "SELECT request_hash, status, response_status, response_body FROM operations WHERE actor_id = $1 AND key = $2",
+        "SELECT request_hash, status, response_status, response_body, operation_id FROM operations WHERE actor_id = $1 AND key = $2",
     )
     .bind(actor_id)
     .bind(key)
@@ -158,6 +226,15 @@ async fn check(
     };
 
     if row.1 == "running" {
+        if reclaimed {
+            // We took over an abandoned attempt; only the same request may continue it.
+            if row.0.as_slice() == hash {
+                return Ok(Outcome::Run {
+                    prior_operation_id: row.4,
+                });
+            }
+            return Ok(Outcome::Unprocessable);
+        }
         return Ok(Outcome::Conflict);
     }
     if row.0.as_slice() == hash {

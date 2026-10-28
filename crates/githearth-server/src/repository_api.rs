@@ -194,6 +194,7 @@ pub(crate) async fn create(
     }
 
     drop(conn);
+    let state = &state;
     let key = idempotency::extract_key(&headers).transpose()?;
     idempotency::run(
         &state.pool,
@@ -202,34 +203,44 @@ pub(crate) async fn create(
         &format!("/api/v1/organizations/{org_slug}/repositories"),
         &body,
         key,
-        || async {
-            let operation_id = Uuid::new_v4();
+        |idem| async move {
             let visibility = input.visibility.as_deref().unwrap_or("private");
             let description = &input.description;
 
             let mut tx = state.pool.begin().await?;
-            let repo = match repositories::insert_creating(
-                &mut tx,
-                org_id,
-                &input.name,
-                actor.id,
-                operation_id,
-                visibility,
-                description,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    if e.as_database_error()
-                        .is_some_and(|d| d.code().as_deref() == Some("23505"))
+            let repo = match idem.prior_operation_id {
+                // An abandoned attempt left a `creating` row; continue it instead of a second one.
+                Some(operation_id) => repositories::find_by_operation(&mut tx, operation_id)
+                    .await?
+                    .ok_or_else(org_not_found)?,
+                None => {
+                    let operation_id = Uuid::new_v4();
+                    idem.record_operation(&mut tx, operation_id).await?;
+                    match repositories::insert_creating(
+                        &mut tx,
+                        org_id,
+                        &input.name,
+                        actor.id,
+                        operation_id,
+                        visibility,
+                        description,
+                    )
+                    .await
                     {
-                        return Err(name_taken());
+                        Ok(r) => r,
+                        Err(e) => {
+                            if e.as_database_error()
+                                .is_some_and(|d| d.code().as_deref() == Some("23505"))
+                            {
+                                return Err(name_taken());
+                            }
+                            return Err(e.into());
+                        }
                     }
-                    return Err(e.into());
                 }
             };
             event(&mut tx, Some(org_id), actor.id, "repository.created").await?;
+            let operation_id = repo.operation_id;
             tx.commit().await?;
 
             let storage = state.storage.clone();
@@ -248,21 +259,26 @@ pub(crate) async fn create(
                 )
             })?;
 
-            let mut conn2 = state.pool.acquire().await?;
             match create_result {
                 Ok(_) => {
+                    // Store the response atomically with the mark-active step (ADR 0003).
+                    let mut tx = state.pool.begin().await?;
                     repositories::set_status(
-                        &mut conn2,
+                        &mut tx,
                         repo.id,
                         RepositoryStatus::Creating,
                         RepositoryStatus::Active,
                     )
                     .await?;
-                    let row = repositories::get(&mut conn2, repo.id)
+                    let row = repositories::get(&mut tx, repo.id)
                         .await?
                         .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
                     let result = RepositoryJson::from(&row);
-                    Ok((StatusCode::CREATED, serde_json::to_value(&result).unwrap()))
+                    let status = StatusCode::CREATED;
+                    let body = serde_json::to_value(&result).unwrap();
+                    idem.store(&mut tx, status, &body).await?;
+                    tx.commit().await?;
+                    Ok((status, body))
                 }
                 // ADR 0003: stay `creating` so the reconciler redoes the create; `failed` only after repeated failures.
                 Err(_) => Err(ApiError(
@@ -359,6 +375,8 @@ pub(crate) async fn update(
 ) -> Result<Json<RepositoryJson>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
+    let state = &state;
+    let body = &body;
     let key = idempotency::extract_key(&headers).transpose()?;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}");
 
@@ -367,10 +385,10 @@ pub(crate) async fn update(
         actor.id,
         "PATCH",
         &path_str,
-        &body,
+        body,
         key,
-        || async {
-            let input: UpdateRepository = serde_json::from_slice(&body).map_err(|_| invalid())?;
+        |idem| async move {
+            let input: UpdateRepository = serde_json::from_slice(body).map_err(|_| invalid())?;
 
             if let Some(ref new_name) = input.name
                 && !valid_repo_name(new_name)
@@ -383,8 +401,8 @@ pub(crate) async fn update(
                 return Err(invalid());
             }
 
-            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
-            require(&state, &loaded, Action::RepositoryUpdate)?;
+            let loaded = load_current(state, actor.id, auth_age, &org_slug, &name).await?;
+            require(state, &loaded, Action::RepositoryUpdate)?;
 
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
@@ -413,14 +431,13 @@ pub(crate) async fn update(
                 "repository.updated",
             )
             .await?;
-            tx.commit().await?;
-
-            let mut conn2 = state.pool.acquire().await?;
-            let updated = repositories::get(&mut conn2, loaded.repo.id)
-                .await?
-                .unwrap();
+            let updated = repositories::get(&mut tx, loaded.repo.id).await?.unwrap();
             let result_json = RepositoryJson::from(&updated);
-            Ok((StatusCode::OK, serde_json::to_value(&result_json).unwrap()))
+            let status = StatusCode::OK;
+            let body = serde_json::to_value(&result_json).unwrap();
+            idem.store(&mut tx, status, &body).await?;
+            tx.commit().await?;
+            Ok((status, body))
         },
     )
     .await
@@ -438,6 +455,7 @@ macro_rules! archive_handler {
 
             let suffix = if $archived { "archive" } else { "unarchive" };
             let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}/{suffix}");
+            let state = &state;
             let key = idempotency::extract_key(&headers).transpose()?;
 
             idempotency::run(
@@ -447,14 +465,14 @@ macro_rules! archive_handler {
                 &path_str,
                 b"",
                 key,
-                || async {
-                    let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
+                |idem| async move {
+                    let loaded = load_current(state, actor.id, auth_age, &org_slug, &name).await?;
                     let action = if $archived {
                         Action::RepositoryArchive
                     } else {
                         Action::RepositoryUnarchive
                     };
-                    require(&state, &loaded, action)?;
+                    require(state, &loaded, action)?;
 
                     if loaded.repo.status != RepositoryStatus::Active {
                         return Err(not_active());
@@ -462,7 +480,12 @@ macro_rules! archive_handler {
 
                     if loaded.repo.archived == $archived {
                         let result_json = RepositoryJson::from(&loaded.repo);
-                        return Ok((StatusCode::OK, serde_json::to_value(&result_json).unwrap()));
+                        let mut tx = state.pool.begin().await?;
+                        let status = StatusCode::OK;
+                        let body = serde_json::to_value(&result_json).unwrap();
+                        idem.store(&mut tx, status, &body).await?;
+                        tx.commit().await?;
+                        return Ok((status, body));
                     }
 
                     let mut tx = state.pool.begin().await?;
@@ -473,14 +496,13 @@ macro_rules! archive_handler {
                         "repository.unarchived"
                     };
                     event(&mut tx, Some(loaded.org_id), loaded.actor_id, event_kind).await?;
-                    tx.commit().await?;
-
-                    let mut conn2 = state.pool.acquire().await?;
-                    let updated = repositories::get(&mut conn2, loaded.repo.id)
-                        .await?
-                        .unwrap();
+                    let updated = repositories::get(&mut tx, loaded.repo.id).await?.unwrap();
                     let result_json = RepositoryJson::from(&updated);
-                    Ok((StatusCode::OK, serde_json::to_value(&result_json).unwrap()))
+                    let status = StatusCode::OK;
+                    let body = serde_json::to_value(&result_json).unwrap();
+                    idem.store(&mut tx, status, &body).await?;
+                    tx.commit().await?;
+                    Ok((status, body))
                 },
             )
             .await
@@ -499,6 +521,7 @@ pub(crate) async fn delete(
 ) -> Result<StatusCode, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
+    let state = &state;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}");
     let key = idempotency::extract_key(&headers).transpose()?;
 
@@ -509,9 +532,9 @@ pub(crate) async fn delete(
         &path_str,
         b"",
         key,
-        || async {
-            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
-            require(&state, &loaded, Action::RepositoryDelete)?;
+        |idem| async move {
+            let loaded = load_current(state, actor.id, auth_age, &org_slug, &name).await?;
+            require(state, &loaded, Action::RepositoryDelete)?;
 
             // A `failed` repository must be deletable, or its name stays reserved forever.
             if !matches!(
@@ -559,17 +582,22 @@ pub(crate) async fn delete(
                 )
             })?;
 
-            let mut conn2 = state.pool.acquire().await?;
             match trash_result {
                 Ok(_) => {
+                    // Store the response atomically with the mark-deleted step.
+                    let mut tx = state.pool.begin().await?;
                     repositories::set_status(
-                        &mut conn2,
+                        &mut tx,
                         loaded.repo.id,
                         RepositoryStatus::Deleting,
                         RepositoryStatus::Deleted,
                     )
                     .await?;
-                    Ok((StatusCode::NO_CONTENT, serde_json::Value::Null))
+                    let status = StatusCode::NO_CONTENT;
+                    let body = serde_json::Value::Null;
+                    idem.store(&mut tx, status, &body).await?;
+                    tx.commit().await?;
+                    Ok((status, body))
                 }
                 Err(_) => Err(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -651,6 +679,8 @@ pub(crate) async fn grant_access(
 ) -> Result<(StatusCode, Json<AccessGrant>), ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
+    let state = &state;
+    let body = &body;
     let key = idempotency::extract_key(&headers).transpose()?;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}/access");
 
@@ -659,11 +689,11 @@ pub(crate) async fn grant_access(
         actor.id,
         "POST",
         &path_str,
-        &body,
+        body,
         key,
-        || async {
+        |idem| async move {
             let input: GrantAccessBody =
-                serde_json::from_slice(&body).map_err(|_| invalid())?;
+                serde_json::from_slice(body).map_err(|_| invalid())?;
 
             if !matches!(input.subject_kind.as_str(), "account" | "team") {
                 return Err(invalid());
@@ -675,8 +705,8 @@ pub(crate) async fn grant_access(
                 return Err(invalid());
             }
 
-            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
-            require(&state, &loaded, Action::RepositoryManageAccess)?;
+            let loaded = load_current(state, actor.id, auth_age, &org_slug, &name).await?;
+            require(state, &loaded, Action::RepositoryManageAccess)?;
 
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
@@ -730,18 +760,16 @@ pub(crate) async fn grant_access(
                 "repository.access_granted",
             )
             .await?;
-            tx.commit().await?;
-
-            let mut conn2 = state.pool.acquire().await?;
             let row = sqlx::query(&format!("SELECT {GRANT_COLUMNS} FROM grants WHERE id = $1"))
-            .bind(grant_id)
-            .fetch_one(&mut *conn2)
-            .await?;
+                .bind(grant_id)
+                .fetch_one(&mut *tx)
+                .await?;
             let grant = AccessGrant::from_row(&row);
-            Ok((
-                StatusCode::CREATED,
-                serde_json::to_value(&grant).unwrap(),
-            ))
+            let status = StatusCode::CREATED;
+            let body = serde_json::to_value(&grant).unwrap();
+            idem.store(&mut tx, status, &body).await?;
+            tx.commit().await?;
+            Ok((status, body))
         },
     )
     .await
@@ -760,6 +788,7 @@ pub(crate) async fn revoke_access(
 ) -> Result<StatusCode, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
+    let state = &state;
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{name}/access/{grant_id}");
     let key = idempotency::extract_key(&headers).transpose()?;
@@ -771,9 +800,9 @@ pub(crate) async fn revoke_access(
         &path_str,
         b"",
         key,
-        || async {
-            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
-            require(&state, &loaded, Action::RepositoryManageAccess)?;
+        |idem| async move {
+            let loaded = load_current(state, actor.id, auth_age, &org_slug, &name).await?;
+            require(state, &loaded, Action::RepositoryManageAccess)?;
 
             // Unlike granting, revoking is allowed while the repository is `deleting`: removing access is always safe.
             let mut tx = state.pool.begin().await?;
@@ -798,8 +827,11 @@ pub(crate) async fn revoke_access(
                 "repository.access_revoked",
             )
             .await?;
+            let status = StatusCode::NO_CONTENT;
+            let body = serde_json::Value::Null;
+            idem.store(&mut tx, status, &body).await?;
             tx.commit().await?;
-            Ok((StatusCode::NO_CONTENT, serde_json::Value::Null))
+            Ok((status, body))
         },
     )
     .await?;
