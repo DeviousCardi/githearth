@@ -1,9 +1,10 @@
 use githearth_core::{ObjectId, RepositoryId, RepositoryReader};
-use githearth_git::NativeGitStorage;
+use githearth_git::layout::{ObjectFormat, Storage};
 use std::{
     error::Error,
     io::{self, Write},
 };
+use uuid::Uuid;
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,9 +18,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("incorrect number of arguments".into());
     }
     let id: RepositoryId = args[2].parse()?;
-    let storage = NativeGitStorage::open(&args[1])?;
+    let storage = Storage::open(&args[1])?;
     match args[0].as_str() {
-        "init" => println!("{}", storage.create(&id)?.display()),
+        "init" => {
+            let uuid = Uuid::parse_str(&id.to_string())
+                .map_err(|e| format!("invalid repository id: {e}"))?;
+            println!(
+                "{}",
+                storage
+                    .create(uuid, Uuid::new_v4(), ObjectFormat::Sha1)?
+                    .display()
+            );
+        }
         "refs" => {
             for reference in storage.list_refs(&id)? {
                 println!("{} {}", reference.target, reference.name);

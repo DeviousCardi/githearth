@@ -1,6 +1,7 @@
 //! Durable repository storage layout and lifecycle (ADR 0003 "Storage layout").
 
 use crate::{StorageError, checked, git};
+use githearth_core::{GitRef, ObjectId, RepositoryId, RepositoryReader};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -436,6 +437,75 @@ impl Storage {
 
 fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+}
+
+impl Storage {
+    fn run(&self, repository: &RepositoryId, args: &[&str]) -> Result<Vec<u8>, StorageError> {
+        let uuid = Uuid::parse_str(&repository.to_string())
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        let path = self.verified_dir(&self.repository_path(uuid))?;
+        checked(git().arg("--git-dir").arg(&path).args(args).output()?)
+    }
+}
+
+impl RepositoryReader for Storage {
+    type Error = StorageError;
+
+    fn list_refs(&self, repository: &RepositoryId) -> Result<Vec<GitRef>, StorageError> {
+        let bytes = self.run(
+            repository,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads/",
+                "refs/tags/",
+            ],
+        )?;
+        let text = String::from_utf8(bytes).map_err(|e| StorageError::Invalid(e.to_string()))?;
+        text.lines()
+            .map(|line| {
+                let (oid, name) = line
+                    .split_once(' ')
+                    .ok_or_else(|| StorageError::Invalid("unexpected ref record".into()))?;
+                Ok(GitRef {
+                    name: name.to_owned(),
+                    target: oid.parse().map_err(|e: githearth_core::InvalidId| {
+                        StorageError::Invalid(e.to_string())
+                    })?,
+                })
+            })
+            .collect()
+    }
+
+    fn read_blob(
+        &self,
+        repository: &RepositoryId,
+        object: &ObjectId,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, StorageError> {
+        let oid = object.to_string();
+        if self.run(repository, &["cat-file", "-t", &oid])? != b"blob\n" {
+            return Err(StorageError::Invalid(
+                "requested object is not a blob".into(),
+            ));
+        }
+        let size_bytes = self.run(repository, &["cat-file", "-s", &oid])?;
+        let size: u64 = String::from_utf8_lossy(&size_bytes)
+            .trim()
+            .parse()
+            .map_err(|_| StorageError::Invalid("invalid blob size".into()))?;
+        if size > max_bytes as u64 {
+            return Err(StorageError::TooLarge {
+                size,
+                limit: max_bytes,
+            });
+        }
+        let data = self.run(repository, &["cat-file", "blob", &oid])?;
+        if data.len() as u64 != size {
+            return Err(StorageError::Invalid("blob length mismatch".into()));
+        }
+        Ok(data)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

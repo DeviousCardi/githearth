@@ -165,30 +165,28 @@ fn unusable_storage_root_is_reported() {
 }
 
 #[test]
-fn init_creates_once_and_reports_duplicates() {
+fn init_creates_and_is_idempotent() {
     let temp = TempDir::new();
     let storage = temp.path().join("storage");
     let output = cli(&["init", storage.to_str().unwrap(), ID]);
     assert!(output.status.success(), "{}", stderr(&output));
     let created = PathBuf::from(stdout(&output).trim());
     assert!(created.is_dir());
+    // Sharded path: <root>/repositories/<id[0..2]>/<id>.git
     assert_eq!(
         created.file_name().unwrap().to_str().unwrap(),
         format!("{ID}.git")
     );
+    let canonical_storage = fs::canonicalize(&storage).unwrap();
     assert_eq!(
         created.parent().unwrap(),
-        fs::canonicalize(&storage).unwrap()
+        canonical_storage.join("repositories").join(&ID[..2])
     );
 
+    // Idempotent: second create with same id succeeds and returns the same path.
     let duplicate = cli(&["init", storage.to_str().unwrap(), ID]);
-    assert_eq!(duplicate.status.code(), Some(1));
-    let message = stderr(&duplicate);
-    assert!(
-        message.starts_with("githearth: filesystem or process error:"),
-        "{message}"
-    );
-    assert!(message.contains("File exists"), "{message}");
+    assert!(duplicate.status.success(), "{}", stderr(&duplicate));
+    assert_eq!(PathBuf::from(stdout(&duplicate).trim()), created);
 }
 
 #[test]
