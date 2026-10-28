@@ -375,3 +375,45 @@ fn purge_trash_keeps_recent_and_ignores_non_directories() {
     assert_eq!(storage.purge_trash(future).unwrap(), 1);
     assert!(root.join("trash").join("stray").exists());
 }
+
+#[test]
+fn trashing_one_repository_twice_in_a_second_keeps_both() {
+    let fixture = Fixture::new();
+    let storage = Storage::open(fixture.0.join("storage")).unwrap();
+    let id = Uuid::new_v4();
+    storage
+        .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+    let first = storage.trash(id).unwrap();
+    storage
+        .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+    let second = storage.trash(id).unwrap();
+    assert_ne!(first, second);
+    assert!(first.exists() && second.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_trash_removes_what_it_can_and_reports_the_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+    let (stuck, free) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut trashed = Vec::new();
+    for id in [stuck, free] {
+        storage
+            .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+            .unwrap();
+        trashed.push(storage.trash(id).unwrap());
+    }
+    // A read-only directory inside one entry makes its removal fail.
+    let locked = trashed[0].join("objects");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let result = storage.purge_trash(future);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert!(!trashed[1].exists(), "the removable entry was still purged");
+}

@@ -358,6 +358,41 @@ fn rotation_of_a_fully_applied_journal_keeps_sequences_after_reopen() {
 }
 
 #[test]
+fn rotation_rewrites_an_archive_left_by_a_crashed_rotation() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let mut journal = Journal::open(&repo).unwrap();
+    for i in 0..3u64 {
+        journal
+            .append_prepared(
+                Uuid::new_v4(),
+                None,
+                vec![update(
+                    &"0".repeat(40),
+                    &format!("{i:040x}"),
+                    "refs/heads/main",
+                )],
+            )
+            .unwrap();
+    }
+    // A crash after writing the archive but before replacing the journal leaves it behind.
+    let archive = repo.join("githearth").join("journal.1");
+    std::fs::write(&archive, b"left over from a crashed rotation").unwrap();
+    journal.rotate(0, 2).unwrap();
+    let bytes = std::fs::read(&archive).unwrap();
+    assert!(!bytes.starts_with(b"left over"));
+    // Exactly the two rotated records: 4-byte length + 4-byte CRC + payload each.
+    let mut offset = 0;
+    let mut records = 0;
+    while offset < bytes.len() {
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 8 + len;
+        records += 1;
+    }
+    assert_eq!((offset, records), (bytes.len(), 2));
+}
+
+#[test]
 fn classify_covers_every_outcome() {
     let prepared = |updates: Vec<Update>| Record {
         sequence: 0,

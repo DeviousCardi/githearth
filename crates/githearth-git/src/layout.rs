@@ -193,16 +193,25 @@ impl Storage {
         self.root.join("tmp").join(simple(operation))
     }
 
+    /// `<dir>/<id>.<secs>.git`, bumping `secs` past any existing entry so two moves of
+    /// the same repository within one second cannot collide.
+    fn timestamped_path(&self, dir: &str, repository: Uuid, now: u64) -> PathBuf {
+        (now..)
+            .map(|secs| {
+                self.root
+                    .join(dir)
+                    .join(format!("{}.{}.git", simple(repository), secs))
+            })
+            .find(|path| !path.exists())
+            .expect("an unused timestamp exists")
+    }
+
     fn trash_path(&self, repository: Uuid, now: u64) -> PathBuf {
-        self.root
-            .join("trash")
-            .join(format!("{}.{}.git", simple(repository), now))
+        self.timestamped_path("trash", repository, now)
     }
 
     fn orphan_path(&self, repository: Uuid, now: u64) -> PathBuf {
-        self.root
-            .join("orphans")
-            .join(format!("{}.{}.git", simple(repository), now))
+        self.timestamped_path("orphans", repository, now)
     }
 
     fn verified_dir(&self, path: &Path) -> Result<PathBuf, StorageError> {
@@ -360,6 +369,9 @@ impl Storage {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut removed = 0;
+        // One unremovable entry must not keep the rest of the trash forever: try them
+        // all, then report the first failure.
+        let mut first_error = None;
         for entry in fs::read_dir(self.root.join("trash"))? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -368,11 +380,18 @@ impl Storage {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if Self::timestamped(&name).is_some_and(|(_, secs)| secs < cutoff) {
-                fs::remove_dir_all(entry.path())?;
-                removed += 1;
+                match fs::remove_dir_all(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                }
             }
         }
-        Ok(removed)
+        match first_error {
+            Some(e) => Err(e.into()),
+            None => Ok(removed),
+        }
     }
 
     pub fn upload_pack(
