@@ -419,20 +419,80 @@ impl Storage {
         })
     }
 
-    pub fn clean_tmp(&self, live_operations: &HashSet<Uuid>) -> Result<usize, StorageError> {
-        let mut removed = 0;
+    /// List every entry under `tmp/`.  Each entry holds the file name and the
+    /// parsed operation id, or `None` when the name is not a UUID.
+    ///
+    /// This is the first phase of two-phase tmp cleanup.  The caller must list
+    /// candidates *before* reading the live operation set; see [`clean_tmp`].
+    pub fn list_tmp(&self) -> Result<Vec<TmpEntry>, StorageError> {
+        let mut entries = Vec::new();
         for entry in fs::read_dir(self.root.join("tmp"))? {
             let entry = entry?;
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let live = Uuid::parse_str(&name).is_ok_and(|id| live_operations.contains(&id));
-            if !live {
-                fs::remove_dir_all(entry.path())?;
-                removed += 1;
+            let name_str = name.to_string_lossy();
+
+            // Reject anything containing a path separator, or equal to `.`/`..`.
+            if name_str.contains(std::path::MAIN_SEPARATOR) || name_str == "." || name_str == ".." {
+                continue;
+            }
+
+            let operation = Uuid::parse_str(&name_str).ok();
+            entries.push(TmpEntry {
+                name: name_str.into_owned(),
+                operation,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Remove tmp entries whose operation is not in `live_operations`.
+    ///
+    /// **Call-order invariant:** `candidates` MUST have been obtained via
+    /// [`list_tmp`] *before* `live_operations` was read.  This guarantees that
+    /// any directory already on disk at listing time belongs to a `creating`
+    /// row that the live-set query will observe — because the API commits the
+    /// row *before* it creates `tmp/<operation>`.
+    ///
+    /// Entries whose file name is not a valid UUID are always removable (they
+    /// cannot correspond to an in-flight create).  An entry that no longer
+    /// exists (e.g. the create finished and renamed it) is silently skipped
+    /// (`NotFound` is not an error).  Returns the number of entries actually
+    /// removed.
+    pub fn clean_tmp(
+        &self,
+        candidates: &[TmpEntry],
+        live_operations: &HashSet<Uuid>,
+    ) -> Result<usize, StorageError> {
+        let mut removed = 0;
+        for candidate in candidates {
+            let live = candidate
+                .operation
+                .is_some_and(|id| live_operations.contains(&id));
+            if live {
+                continue;
+            }
+            let path = self.root.join("tmp").join(&candidate.name);
+            match fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // The entry disappeared between list_tmp and now — the
+                    // create completed and renamed it, or another reconciler
+                    // pass cleaned it.  Not an error.
+                }
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(removed)
     }
+}
+
+/// A single entry under `tmp/` returned by [`Storage::list_tmp`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TmpEntry {
+    /// Raw file name (a single path component, never `.` or `..`).
+    pub name: String,
+    /// Parsed operation id, or `None` when the name is not a valid UUID.
+    pub operation: Option<Uuid>,
 }
 
 fn is_lower_hex(b: u8) -> bool {

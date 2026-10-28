@@ -13,7 +13,7 @@
 use crate::AppState;
 use crate::repositories;
 use githearth_core::RepositoryStatus;
-use githearth_git::layout::ObjectFormat;
+use githearth_git::layout::{ObjectFormat, TmpEntry};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -64,6 +64,16 @@ pub async fn reconcile_once(
     let mut summary = Summary::default();
     let grace = Duration::from_secs(state.config.reconcile_grace_seconds);
 
+    // ---- list tmp candidates FIRST (blocking) ----------------------------
+    // Must happen before we read the live operation set: any tmp directory
+    // that exists now belongs to a `creating` row that was committed before
+    // the directory was created (API ordering: INSERT row, THEN mkdir tmp/).
+    // Directories created after this listing are not candidates and are safe.
+    let storage = state.storage.clone();
+    let candidates = tokio::task::spawn_blocking(move || storage.list_tmp())
+        .await
+        .map_err(|e| anyhow::anyhow!("list_tmp task panicked: {e}"))??;
+
     // ---- scan on-disk state (blocking) -----------------------------------
     let storage = state.storage.clone();
     let scan = tokio::task::spawn_blocking(move || storage.scan())
@@ -84,9 +94,6 @@ pub async fn reconcile_once(
 
     // Collect the set of creating ids from *this* pass (for attempts pruning).
     let mut pass_creating: HashSet<Uuid> = HashSet::new();
-
-    // Live operations for tmp cleanup: ALL creating rows, regardless of grace.
-    let live_operations = fetch_live_operations(&mut conn).await?;
 
     // ---- query DB status for every on-disk repository ----------------------
     let mut db_status: HashMap<Uuid, RepositoryStatus> = HashMap::new();
@@ -169,13 +176,14 @@ pub async fn reconcile_once(
         }
     }
 
-    // ---- tmp cleanup -------------------------------------------------------
-    let storage = state.storage.clone();
-    let live = live_operations.clone();
-    let cleaned = tokio::task::spawn_blocking(move || storage.clean_tmp(&live))
-        .await
-        .map_err(|e| anyhow::anyhow!("clean_tmp task panicked: {e}"))??;
-    summary.tmp_cleaned = cleaned;
+    // ---- tmp cleanup (two-phase) -------------------------------------------
+    // Phase 1 (list_tmp) ran at the top of this pass, before any DB queries.
+    // Phase 2 reads the live set NOW and cleans using the earlier candidates.
+    // Ordering: candidates listed → live set queried → clean with candidates.
+    // This is safe because the API commits the creating row BEFORE it creates
+    // tmp/<operation>; any directory seen in phase 1 belongs to a row that
+    // phase 2 will observe if it is still creating.
+    summary.tmp_cleaned = clean_tmp_step(state, candidates).await?;
 
     // ---- trash purge -------------------------------------------------------
     let retention = Duration::from_secs(state.config.trash_retention_seconds);
@@ -233,6 +241,28 @@ async fn fetch_live_operations(
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows.into_iter().collect())
+}
+
+/// Second phase of two-phase tmp cleanup.
+///
+/// `candidates` must have been obtained via [`Storage::list_tmp`] *before*
+/// this function is called.  This function reads the current live `creating`
+/// operation set from the database and then calls [`Storage::clean_tmp`] with
+/// the earlier candidates.  Because the API inserts the `creating` row before
+/// it creates `tmp/<operation>`, any directory that was present when
+/// `list_tmp` ran belongs to a row that this query will observe (if it is
+/// still `creating`).  Directories created *after* `list_tmp` are not in
+/// `candidates` and therefore safe from removal.
+pub async fn clean_tmp_step(state: &AppState, candidates: Vec<TmpEntry>) -> anyhow::Result<usize> {
+    let mut conn = state.pool.acquire().await?;
+    let live = fetch_live_operations(&mut conn).await?;
+    drop(conn);
+
+    let storage = state.storage.clone();
+    let cleaned = tokio::task::spawn_blocking(move || storage.clean_tmp(&candidates, &live))
+        .await
+        .map_err(|e| anyhow::anyhow!("clean_tmp task panicked: {e}"))??;
+    Ok(cleaned)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

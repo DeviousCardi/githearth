@@ -582,6 +582,63 @@ async fn stale_tmp_removed_live_tmp_kept() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn two_phase_tmp_cleanup_does_not_race_with_concurrent_create() {
+    // Deterministic regression test for the TOCTOU race in tmp cleanup.
+    // The fix uses two-phase cleanup: list candidates FIRST, THEN query the
+    // live set, THEN clean.  A directory created after listing must survive
+    // even if the live-set query misses its row.
+    let env = setup(30).await;
+
+    // Phase 1: list tmp candidates (before any creating row exists).
+    let storage = env.state.storage.clone();
+    let candidates = tokio::task::spawn_blocking(move || storage.list_tmp())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(candidates.is_empty());
+
+    // Now simulate the API create flow: insert a creating row, THEN create
+    // tmp/<operation>.  This ordering matches the real API.
+    let mut conn = env.pool.acquire().await.unwrap();
+    let op_id = Uuid::new_v4();
+    let _row = repositories::insert_creating(
+        &mut conn,
+        env.org,
+        "race-test",
+        env.owner,
+        op_id,
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    // Create tmp/<operation> AFTER the candidate listing.
+    let tmp_dir = env
+        .storage_root
+        .join("tmp")
+        .join(op_id.simple().to_string());
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    assert!(tmp_dir.is_dir());
+
+    // Phase 2: run the cleanup step with the *earlier* candidates (which did
+    // NOT include this tmp entry).  The live-set query will see the creating
+    // row, but the key invariant is that the directory is not a candidate.
+    let cleaned = reconcile::clean_tmp_step(&env.state, candidates)
+        .await
+        .unwrap();
+    assert_eq!(cleaned, 0);
+    assert!(
+        tmp_dir.is_dir(),
+        "tmp entry created after list_tmp must never be removed"
+    );
+
+    teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn repeated_create_failure_becomes_failed_after_max_attempts() {
     let env = setup(30).await; // minimum valid grace; rows are backdated past it
     let mut conn = env.pool.acquire().await.unwrap();
