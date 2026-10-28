@@ -1,6 +1,8 @@
 pub mod config;
 pub mod facts;
+pub mod git_admission;
 pub mod idempotency;
+pub mod pushes;
 pub mod repositories;
 pub mod repository_api;
 
@@ -240,7 +242,7 @@ async fn password_work<T: Send + 'static>(
     .await
 }
 
-fn hash_password(password: &str) -> anyhow::Result<String> {
+pub fn hash_password(password: &str) -> anyhow::Result<String> {
     Ok(password_hasher()
         .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))?
         .to_string())
@@ -299,9 +301,13 @@ struct Token {
     token_type: &'static str,
     expires_in: u64,
 }
-async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiResult<Json<Token>> {
-    if !valid_username(&input.username) || input.password.len() > 1024 {
-        return Err(unauthorized());
+pub(crate) async fn verify_password(
+    state: &AppState,
+    username: &str,
+    password: &str,
+) -> ApiResult<Option<Uuid>> {
+    if !valid_username(username) || password.len() > 1024 {
+        return Ok(None);
     }
     let permit = state
         .auth_slots
@@ -309,7 +315,7 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiRe
         .try_acquire_owned()
         .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "authentication busy"))?;
     let row = sqlx::query("SELECT id, password_hash FROM accounts WHERE username = $1")
-        .bind(&input.username)
+        .bind(username)
         .fetch_optional(&state.pool)
         .await?;
     let id = row.as_ref().map(|r| r.get::<Uuid, _>("id"));
@@ -317,16 +323,23 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiRe
         .as_ref()
         .map(|r| r.get::<String, _>("password_hash"))
         .unwrap_or_else(|| state.dummy_hash.to_string());
+    let password_owned = password.to_owned();
     let valid = password_work(permit, move || {
         PasswordHash::new(&hash).is_ok_and(|parsed| {
             password_hasher()
-                .verify_password(input.password.as_bytes(), &parsed)
+                .verify_password(password_owned.as_bytes(), &parsed)
                 .is_ok()
         })
     })
     .await
     .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"))?;
-    let id = id.filter(|_| valid).ok_or_else(unauthorized)?;
+    Ok(id.filter(|_| valid))
+}
+
+async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiResult<Json<Token>> {
+    let id = verify_password(&state, &input.username, &input.password)
+        .await?
+        .ok_or_else(unauthorized)?;
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
