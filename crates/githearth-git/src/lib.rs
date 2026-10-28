@@ -38,7 +38,8 @@ fn git() -> Command {
     let mut command = Command::new("git");
     command
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        // Fixed system locations only (the server environment is not trusted); covers Homebrew too.
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
