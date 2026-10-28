@@ -1424,3 +1424,49 @@ async fn mutations_lose_to_a_delete_committed_mid_request() {
     cleanup(&storage);
     pool.close().await;
 }
+
+/// Two writes to one repository row must serialize, not deadlock: an outside
+/// share lock lines both requests up on the row before either can proceed.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn concurrent_repository_writes_serialize_without_deadlock() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let repo = fixture_repository(&pool, org_id, "busy", owner, "private", false).await;
+    let base = format!("/api/v1/organizations/{slug}/repositories/busy");
+    for pair in [
+        [
+            ("PATCH", base.clone(), json!({"description": "one"})),
+            ("PATCH", base.clone(), json!({"description": "two"})),
+        ],
+        [
+            ("POST", format!("{base}/archive"), json!(null)),
+            ("POST", format!("{base}/unarchive"), json!(null)),
+        ],
+    ] {
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM repositories WHERE id = $1 FOR SHARE")
+            .bind(repo)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let calls: Vec<_> = pair
+            .into_iter()
+            .map(|(method, path, body)| {
+                let app = app.clone();
+                let token = token.clone();
+                tokio::spawn(
+                    async move { request(&app, method, &path, Some(&token), None, body).await },
+                )
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        holder.commit().await.unwrap();
+        for call in calls {
+            let (status, body) = call.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+    cleanup(&storage);
+    pool.close().await;
+}

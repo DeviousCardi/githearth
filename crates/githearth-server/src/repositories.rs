@@ -154,17 +154,29 @@ pub async fn pending(
     .collect())
 }
 
-/// Share-locks the row if it is `active`, so a concurrent delete (which updates
-/// the status) waits for the caller's transaction to commit. Call it inside the
+/// Locks the row if it is `active`, so a concurrent delete (which updates the
+/// status) waits for the caller's transaction to commit. Call it inside the
 /// mutation's transaction; false means the repository is no longer active.
-pub async fn lock_active(conn: &mut PgConnection, id: Uuid) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query("SELECT 1 FROM repositories WHERE id = $1 AND status = 'active' FOR SHARE")
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .is_some(),
-    )
+/// `writes_row` must be true when the transaction goes on to update this row:
+/// upgrading a share lock would deadlock two such requests, so they take
+/// `FOR NO KEY UPDATE` and serialize instead.
+pub async fn lock_active(
+    conn: &mut PgConnection,
+    id: Uuid,
+    writes_row: bool,
+) -> Result<bool, sqlx::Error> {
+    let mode = if writes_row {
+        "FOR NO KEY UPDATE"
+    } else {
+        "FOR SHARE"
+    };
+    Ok(sqlx::query(&format!(
+        "SELECT 1 FROM repositories WHERE id = $1 AND status = 'active' {mode}"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .is_some())
 }
 
 /// Starts its own transaction on `conn`, so inside a caller's transaction it acts as a savepoint.

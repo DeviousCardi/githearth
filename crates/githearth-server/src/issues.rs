@@ -198,7 +198,7 @@ async fn create(
             }
 
             let mut tx = state.pool.begin().await?;
-            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+            if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
                 return Err(not_active());
             }
             let number = allocate_number(&mut tx, loaded.repo.id).await?;
@@ -391,7 +391,7 @@ async fn update(
             }
 
             let mut tx = state.pool.begin().await?;
-            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+            if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
                 return Err(not_active());
             }
             // Lock the row so concurrent PATCHes cannot stomp fields we did not send.
@@ -487,7 +487,7 @@ async fn create_comment(
             }
 
             let mut tx = state.pool.begin().await?;
-            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+            if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
                 return Err(not_active());
             }
             let id = Uuid::new_v4();

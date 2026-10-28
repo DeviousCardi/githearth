@@ -484,7 +484,7 @@ pub(crate) async fn update(
             }
 
             let mut tx = state.pool.begin().await?;
-            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+            if !repositories::lock_active(&mut tx, loaded.repo.id, true).await? {
                 return Err(not_active());
             }
             if let Some(ref new_name) = input.name {
@@ -571,7 +571,7 @@ macro_rules! archive_handler {
                     }
 
                     let mut tx = state.pool.begin().await?;
-                    if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+                    if !repositories::lock_active(&mut tx, loaded.repo.id, true).await? {
                         return Err(not_active());
                     }
                     repositories::set_archived(&mut tx, loaded.repo.id, $archived).await?;
@@ -849,7 +849,7 @@ pub(crate) async fn grant_access(
             }
 
             let mut tx = state.pool.begin().await?;
-            if !repositories::lock_active(&mut tx, loaded.repo.id).await? {
+            if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
                 return Err(not_active());
             }
 
