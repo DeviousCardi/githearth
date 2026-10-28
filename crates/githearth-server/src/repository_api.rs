@@ -99,7 +99,7 @@ async fn load_repo(
     };
 
     let Some(repo) = repositories::find_by_name(&mut conn, org_id, name).await? else {
-        return Err(org_not_found());
+        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
     };
 
     Ok(Loaded {
@@ -109,6 +109,21 @@ async fn load_repo(
         facts,
         repo,
     })
+}
+
+/// Mutations must name the repository's current name; renamed-away names only redirect reads.
+async fn load_current(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    name: &str,
+) -> Result<Loaded, ApiError> {
+    let loaded = load_repo(state, actor_id, auth_age, org_slug, name).await?;
+    if !loaded.repo.name.eq_ignore_ascii_case(name) {
+        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+    }
+    Ok(loaded)
 }
 
 fn require(state: &AppState, loaded: &Loaded, action: Action) -> Result<(), ApiError> {
@@ -177,9 +192,10 @@ pub(crate) async fn create(
         return Err(org_not_found());
     }
 
+    drop(conn);
     let key = idempotency::extract_key(&headers).transpose()?;
     idempotency::run(
-        &mut conn,
+        &state.pool,
         actor.id,
         "POST",
         &format!("/api/v1/organizations/{org_slug}/repositories"),
@@ -247,19 +263,11 @@ pub(crate) async fn create(
                     let result = RepositoryJson::from(&row);
                     Ok((StatusCode::CREATED, serde_json::to_value(&result).unwrap()))
                 }
-                Err(_) => {
-                    repositories::set_status(
-                        &mut conn2,
-                        repo.id,
-                        RepositoryStatus::Creating,
-                        RepositoryStatus::Failed,
-                    )
-                    .await?;
-                    Err(ApiError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "repository storage unavailable",
-                    ))
-                }
+                // ADR 0003: stay `creating` so the reconciler redoes the create; `failed` only after repeated failures.
+                Err(_) => Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repository storage unavailable",
+                )),
             }
         },
     )
@@ -351,11 +359,10 @@ pub(crate) async fn update(
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let key = idempotency::extract_key(&headers).transpose()?;
-    let mut conn = state.pool.acquire().await?;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}");
 
     idempotency::run(
-        &mut conn,
+        &state.pool,
         actor.id,
         "PATCH",
         &path_str,
@@ -375,7 +382,7 @@ pub(crate) async fn update(
                 return Err(invalid());
             }
 
-            let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
             require(&state, &loaded, Action::RepositoryUpdate)?;
 
             if loaded.repo.status != RepositoryStatus::Active {
@@ -431,43 +438,50 @@ macro_rules! archive_handler {
             let suffix = if $archived { "archive" } else { "unarchive" };
             let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}/{suffix}");
             let key = idempotency::extract_key(&headers).transpose()?;
-            let mut conn = state.pool.acquire().await?;
 
-            idempotency::run(&mut conn, actor.id, "POST", &path_str, b"", key, || async {
-                let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
-                let action = if $archived {
-                    Action::RepositoryArchive
-                } else {
-                    Action::RepositoryUnarchive
-                };
-                require(&state, &loaded, action)?;
+            idempotency::run(
+                &state.pool,
+                actor.id,
+                "POST",
+                &path_str,
+                b"",
+                key,
+                || async {
+                    let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
+                    let action = if $archived {
+                        Action::RepositoryArchive
+                    } else {
+                        Action::RepositoryUnarchive
+                    };
+                    require(&state, &loaded, action)?;
 
-                if loaded.repo.status != RepositoryStatus::Active {
-                    return Err(not_active());
-                }
+                    if loaded.repo.status != RepositoryStatus::Active {
+                        return Err(not_active());
+                    }
 
-                if loaded.repo.archived == $archived && $archived {
-                    let result_json = RepositoryJson::from(&loaded.repo);
-                    return Ok((StatusCode::OK, serde_json::to_value(&result_json).unwrap()));
-                }
+                    if loaded.repo.archived == $archived {
+                        let result_json = RepositoryJson::from(&loaded.repo);
+                        return Ok((StatusCode::OK, serde_json::to_value(&result_json).unwrap()));
+                    }
 
-                let mut tx = state.pool.begin().await?;
-                repositories::set_archived(&mut tx, loaded.repo.id, $archived).await?;
-                let event_kind = if $archived {
-                    "repository.archived"
-                } else {
-                    "repository.unarchived"
-                };
-                event(&mut tx, Some(loaded.org_id), loaded.actor_id, event_kind).await?;
-                tx.commit().await?;
+                    let mut tx = state.pool.begin().await?;
+                    repositories::set_archived(&mut tx, loaded.repo.id, $archived).await?;
+                    let event_kind = if $archived {
+                        "repository.archived"
+                    } else {
+                        "repository.unarchived"
+                    };
+                    event(&mut tx, Some(loaded.org_id), loaded.actor_id, event_kind).await?;
+                    tx.commit().await?;
 
-                let mut conn2 = state.pool.acquire().await?;
-                let updated = repositories::get(&mut conn2, loaded.repo.id)
-                    .await?
-                    .unwrap();
-                let result_json = RepositoryJson::from(&updated);
-                Ok((StatusCode::OK, serde_json::to_value(&result_json).unwrap()))
-            })
+                    let mut conn2 = state.pool.acquire().await?;
+                    let updated = repositories::get(&mut conn2, loaded.repo.id)
+                        .await?
+                        .unwrap();
+                    let result_json = RepositoryJson::from(&updated);
+                    Ok((StatusCode::OK, serde_json::to_value(&result_json).unwrap()))
+                },
+            )
             .await
             .map(|(_, value)| (StatusCode::OK, Json(serde_json::from_value(value).unwrap())))
         }
@@ -486,20 +500,23 @@ pub(crate) async fn delete(
 
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}");
     let key = idempotency::extract_key(&headers).transpose()?;
-    let mut conn = state.pool.acquire().await?;
 
     let (status, _) = idempotency::run(
-        &mut conn,
+        &state.pool,
         actor.id,
         "DELETE",
         &path_str,
         b"",
         key,
         || async {
-            let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
             require(&state, &loaded, Action::RepositoryDelete)?;
 
-            if loaded.repo.status != RepositoryStatus::Active {
+            // A `failed` repository must be deletable, or its name stays reserved forever.
+            if !matches!(
+                loaded.repo.status,
+                RepositoryStatus::Active | RepositoryStatus::Failed
+            ) {
                 return Err(not_active());
             }
 
@@ -507,7 +524,7 @@ pub(crate) async fn delete(
             if !repositories::set_status(
                 &mut tx,
                 loaded.repo.id,
-                RepositoryStatus::Active,
+                loaded.repo.status,
                 RepositoryStatus::Deleting,
             )
             .await?
@@ -523,15 +540,23 @@ pub(crate) async fn delete(
             .await?;
             tx.commit().await?;
 
+            // A failed create never produced a directory, so there is nothing to trash.
+            let was_failed = loaded.repo.status == RepositoryStatus::Failed;
             let storage = state.storage.clone();
-            let trash_result = tokio::task::spawn_blocking(move || storage.trash(loaded.repo.id))
-                .await
-                .map_err(|_| {
-                    ApiError(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "storage operation failed",
-                    )
-                })?;
+            let trash_result = tokio::task::spawn_blocking(move || {
+                if was_failed {
+                    Ok(())
+                } else {
+                    storage.trash(loaded.repo.id).map(|_| ())
+                }
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage operation failed",
+                )
+            })?;
 
             let mut conn2 = state.pool.acquire().await?;
             match trash_result {

@@ -396,9 +396,17 @@ async fn failed_repository_can_be_deleted_and_name_reused() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "stuck", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "stuck",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
     assert!(
         repositories::set_status(&mut conn, row.id, Creating, Failed)
             .await
@@ -420,9 +428,17 @@ async fn failed_repository_can_be_deleted_and_name_reused() {
             .await
             .unwrap()
     );
-    repositories::insert_creating(&mut conn, org, "stuck", owner, Uuid::new_v4())
-        .await
-        .expect("name is free once the failed row is deleted");
+    repositories::insert_creating(
+        &mut conn,
+        org,
+        "stuck",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .expect("name is free once the failed row is deleted");
     pool.close().await;
 }
 

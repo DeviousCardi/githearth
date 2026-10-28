@@ -590,7 +590,7 @@ async fn delete_204_dir_gone_name_reusable() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn storage_failure_503_and_row_failed() {
+async fn storage_failure_503() {
     let (app, pool, storage_root, _, org_slug) = setup().await;
     let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
         .bind(&org_slug)
@@ -1154,7 +1154,7 @@ async fn concurrent_same_key_one_201_one_409() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn failed_repository_is_visible_and_not_mutable() {
+async fn storage_failure_leaves_creating_for_the_reconciler() {
     use std::os::unix::fs::PermissionsExt;
     let (app, pool, storage_root, _, org_slug) = setup().await;
     let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
@@ -1176,7 +1176,7 @@ async fn failed_repository_is_visible_and_not_mutable() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     std::fs::set_permissions(&repos_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    // Clients can tell a failed create from a missing repository.
+    // The row stays `creating` (ADR 0003): clients can tell it from a missing repository.
     let (status, body) = request(
         &app,
         "GET",
@@ -1188,7 +1188,7 @@ async fn failed_repository_is_visible_and_not_mutable() {
     .await;
     assert_eq!(
         (status, body["status"].as_str()),
-        (StatusCode::OK, Some("failed"))
+        (StatusCode::OK, Some("creating"))
     );
     for (method, suffix) in [
         ("DELETE", ""),
@@ -1212,6 +1212,181 @@ async fn failed_repository_is_visible_and_not_mutable() {
         !repos_dir.read_dir().unwrap().any(|_| true),
         "nothing reached disk"
     );
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn failed_repository_can_be_deleted_and_name_reused() {
+    let (app, pool, storage_root, owner, org_slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let base = format!("/api/v1/organizations/{org_slug}/repositories");
+    use std::os::unix::fs::PermissionsExt;
+    let repos_dir = storage_root.join("repositories");
+    std::fs::create_dir_all(&repos_dir).unwrap();
+    std::fs::set_permissions(&repos_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (status, _) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"name": "dead"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    std::fs::set_permissions(&repos_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    sqlx::query("UPDATE repositories SET status='failed' WHERE name='dead' AND organization_id=(SELECT id FROM organizations WHERE slug=$1)")
+        .bind(&org_slug)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{base}/dead"),
+        Some(&token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"name": "dead"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn mutations_through_a_renamed_away_name_are_404() {
+    let (app, pool, storage_root, owner, org_slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let base = format!("/api/v1/organizations/{org_slug}/repositories");
+    request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"name": "before"}),
+    )
+    .await;
+    request(
+        &app,
+        "PATCH",
+        &format!("{base}/before"),
+        Some(&token),
+        None,
+        json!({"name": "after"}),
+    )
+    .await;
+    for (method, suffix) in [
+        ("DELETE", ""),
+        ("PATCH", ""),
+        ("POST", "/archive"),
+        ("POST", "/unarchive"),
+    ] {
+        let (status, body) = request(
+            &app,
+            method,
+            &format!("{base}/before{suffix}"),
+            Some(&token),
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {suffix}");
+        assert_eq!(body["error"], "repository not found");
+    }
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{base}/after"),
+        Some(&token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn unarchive_of_an_unarchived_repository_is_a_noop() {
+    let (app, pool, storage_root, owner, org_slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let base = format!("/api/v1/organizations/{org_slug}/repositories");
+    request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"name": "plain"}),
+    )
+    .await;
+    let events = || {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events WHERE kind='repository.unarchived' AND organization_id=(SELECT id FROM organizations WHERE slug=$1)").bind(&org_slug).fetch_one(&pool)
+    };
+    let before = events().await.unwrap();
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{base}/plain/unarchive"),
+        Some(&token),
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        (status, body["archived"].as_bool()),
+        (StatusCode::OK, Some(false))
+    );
+    assert_eq!(events().await.unwrap(), before);
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn concurrent_keyed_mutations_do_not_exhaust_the_pool() {
+    // setup() allows 4 connections; 12 parallel keyed requests must all finish.
+    let (app, pool, storage_root, owner, org_slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let base = format!("/api/v1/organizations/{org_slug}/repositories");
+    let calls: Vec<_> = (0..12)
+        .map(|i| {
+            let (app, token, base) = (app.clone(), token.clone(), base.clone());
+            tokio::spawn(async move {
+                let key = format!("pool-{i}");
+                request(
+                    &app,
+                    "POST",
+                    &base,
+                    Some(&token),
+                    Some(("Idempotency-Key", &key)),
+                    json!({"name": format!("p{i}")}),
+                )
+                .await
+                .0
+            })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.await.unwrap(), StatusCode::CREATED);
+    }
     cleanup(&storage_root);
     pool.close().await;
 }

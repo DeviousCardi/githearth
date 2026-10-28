@@ -1,7 +1,7 @@
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 use std::future::Future;
 use uuid::Uuid;
 
@@ -70,8 +70,9 @@ async fn remove(conn: &mut PgConnection, actor_id: Uuid, key: &str) -> Result<()
     Ok(())
 }
 
+/// Holds no connection while `f` runs, so a request never needs two at once.
 pub async fn run<F, Fut>(
-    conn: &mut PgConnection,
+    pool: &PgPool,
     actor_id: Uuid,
     method: &str,
     path: &str,
@@ -87,7 +88,8 @@ where
         return f().await;
     };
     let hash = request_hash(method, path, raw_body);
-    match check(conn, actor_id, key, &hash).await? {
+    let claimed = check(&mut *pool.acquire().await?, actor_id, key, &hash).await?;
+    match claimed {
         Outcome::Reply(status, body) => return Ok((status, body)),
         Outcome::Conflict => {
             return Err(ApiError(StatusCode::CONFLICT, "idempotency key conflict"));
@@ -101,13 +103,14 @@ where
         Outcome::Run => {}
     }
     let result = f().await;
+    let mut conn = pool.acquire().await?;
     let stored = match &result {
-        Ok((status, body)) => store(conn, actor_id, key, *status, body).await.is_ok(),
+        Ok((status, body)) => store(&mut conn, actor_id, key, *status, body).await.is_ok(),
         Err(_) => false,
     };
     // Never leave the key `running`: the client could not retry for 24 hours.
     if !stored {
-        let _ = remove(conn, actor_id, key).await;
+        let _ = remove(&mut conn, actor_id, key).await;
     }
     result
 }
