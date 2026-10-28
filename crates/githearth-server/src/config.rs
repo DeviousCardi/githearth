@@ -18,6 +18,9 @@ pub struct Config {
     pub body_limit_bytes: usize,
     pub auth_concurrency: usize,
     pub storage_root: PathBuf,
+    pub reconcile_interval_seconds: u64,
+    pub reconcile_grace_seconds: u64,
+    pub trash_retention_seconds: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -31,6 +34,9 @@ impl Default for Config {
             body_limit_bytes: 16384,
             auth_concurrency: 2,
             storage_root: PathBuf::from("data/repositories"),
+            reconcile_interval_seconds: 60,
+            reconcile_grace_seconds: 300,
+            trash_retention_seconds: 604_800,
         }
     }
 }
@@ -75,6 +81,12 @@ impl Config {
         {
             env!(storage_root, "GITHEARTH_STORAGE_ROOT");
         }
+        env!(
+            reconcile_interval_seconds,
+            "GITHEARTH_RECONCILE_INTERVAL_SECONDS"
+        );
+        env!(trash_retention_seconds, "GITHEARTH_TRASH_RETENTION_SECONDS");
+        env!(reconcile_grace_seconds, "GITHEARTH_RECONCILE_GRACE_SECONDS");
         c.validate()?;
         Ok(c)
     }
@@ -90,9 +102,12 @@ impl Config {
             || !(1..=86400).contains(&self.token_ttl_seconds)
             || !(1024..=1048576).contains(&self.body_limit_bytes)
             || !(1..=16).contains(&self.auth_concurrency)
+            || !(5..=3600).contains(&self.reconcile_interval_seconds)
+            || !(30..=86400).contains(&self.reconcile_grace_seconds)
+            || !(3600..=31536000).contains(&self.trash_retention_seconds)
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, trash retention 3600..31536000s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {

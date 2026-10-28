@@ -5,6 +5,7 @@ pub mod git_admission;
 pub mod idempotency;
 pub mod issues;
 pub mod pushes;
+pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
 

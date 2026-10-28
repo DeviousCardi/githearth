@@ -214,16 +214,72 @@ fn trash_restore_orphan_purge_scan_clean_tmp() {
     let past = SystemTime::now() - Duration::from_secs(60);
     assert_eq!(storage.purge_trash(past).unwrap(), 0);
 
-    // clean_tmp removes only entries with no live operation.
+    // clean_tmp (two-phase) removes only entries with no live operation.
     let op_live = Uuid::new_v4();
     let op_dead = Uuid::new_v4();
     fs::create_dir_all(tmp_dir(&root, op_live)).unwrap();
     fs::create_dir_all(tmp_dir(&root, op_dead)).unwrap();
+    // Phase 1: list candidates BEFORE reading the live set.
+    let candidates = storage.list_tmp().unwrap();
     let mut live_ops = HashSet::new();
     live_ops.insert(op_live);
-    assert_eq!(storage.clean_tmp(&live_ops).unwrap(), 1);
+    // Phase 2: clean using the earlier candidates.
+    assert_eq!(storage.clean_tmp(&candidates, &live_ops).unwrap(), 1);
     assert!(tmp_dir(&root, op_live).is_dir());
     assert!(!tmp_dir(&root, op_dead).exists());
+}
+
+#[test]
+fn clean_tmp_entry_created_after_list_is_never_removed() {
+    // Regression test for the TOCTOU race described in the reconciler fix.
+    // An entry created after list_tmp must not be in the candidate set, so
+    // clean_tmp must not remove it — even if the live-set query misses it.
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+
+    // Phase 1: list candidates.
+    let candidates = storage.list_tmp().unwrap();
+    assert!(candidates.is_empty());
+
+    // Now create a tmp entry *after* listing — simulating a concurrent create.
+    let op = Uuid::new_v4();
+    fs::create_dir_all(tmp_dir(&root, op)).unwrap();
+
+    // Phase 2: clean with an empty live set (simulating that the create's row
+    // hasn't been committed yet, or the live-set query missed it).
+    let live_ops = HashSet::new();
+    let removed = storage.clean_tmp(&candidates, &live_ops).unwrap();
+    assert_eq!(removed, 0);
+    assert!(
+        tmp_dir(&root, op).is_dir(),
+        "entry created after list_tmp must never be removed"
+    );
+}
+
+#[test]
+fn clean_tmp_candidate_vanished_is_skipped_without_error() {
+    // A candidate that disappeared between list_tmp and clean_tmp (e.g. the
+    // create completed and renamed the directory) must be silently skipped.
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+
+    let op = Uuid::new_v4();
+    fs::create_dir_all(tmp_dir(&root, op)).unwrap();
+
+    // Phase 1: list candidates.
+    let candidates = storage.list_tmp().unwrap();
+    assert_eq!(candidates.len(), 1);
+
+    // Simulate the create completing: remove the tmp dir.
+    fs::remove_dir_all(tmp_dir(&root, op)).unwrap();
+
+    // Phase 2: clean with an empty live set.  The vanished entry must be
+    // silently skipped (no error), and nothing removed.
+    let live_ops = HashSet::new();
+    let removed = storage.clean_tmp(&candidates, &live_ops).unwrap();
+    assert_eq!(removed, 0);
 }
 
 #[test]
