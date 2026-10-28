@@ -613,6 +613,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_browser_login_is_busy_not_bad_credentials() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let config = Config {
+            database_url: "postgres://localhost/unused".into(),
+            auth_concurrency: 1,
+            ..Config::default()
+        };
+        let state = AppState::new(pool, config).await.unwrap();
+        let _permit = state.auth_slots.clone().acquire_owned().await.unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        let response = router(state)
+            .oneshot(
+                Request::post("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("cookie", format!("githearth_csrf={token}"))
+                    .body(Body::from(format!(
+                        "username=some-user&password=some+password&csrf_token={token}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
     async fn cancelled_password_caller_retains_slot_until_worker_finishes() {
         let slots = Arc::new(Semaphore::new(1));
         let permit = slots.clone().acquire_owned().await.unwrap();

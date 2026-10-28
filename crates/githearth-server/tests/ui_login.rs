@@ -545,3 +545,68 @@ async fn logout_success_clears_cookie() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn login_during_outage_is_unavailable_not_bad_credentials() {
+    let (app, pool, _db) = setup().await;
+    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
+    pool.close().await;
+    let (status, _, set_cookie) = post_form(
+        &app,
+        "/login",
+        Some(&csrf_cookie),
+        &format!("username=alice&password=password123456&csrf_token={csrf_token}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(set_cookie.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn login_page_reuses_csrf_cookie_and_sets_page_headers() {
+    let (app, pool, _db) = setup().await;
+    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/login")
+                .header("cookie", &csrf_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains(&format!("value=\"{csrf_token}\"")));
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn logout_with_expired_session_clears_cookie() {
+    let (app, pool, _db) = setup().await;
+    let cookie = login(&app, "alice", "password123456").await;
+    let (_, body) = get_page(&app, "/", Some(&cookie)).await;
+    let marker = "name=\"csrf_token\" value=\"";
+    let rest = &body[body.find(marker).unwrap() + marker.len()..];
+    let csrf = &rest[..rest.find('"').unwrap()];
+    sqlx::query("DELETE FROM sessions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, set_cookie) = post_form(
+        &app,
+        "/logout",
+        Some(&cookie),
+        &format!("csrf_token={csrf}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(set_cookie.unwrap().contains("githearth_session=; "));
+    pool.close().await;
+}

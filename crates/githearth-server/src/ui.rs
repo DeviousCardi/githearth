@@ -1,7 +1,10 @@
 use axum::{
     Form, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::SET_COOKIE},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, SET_COOKIE, X_FRAME_OPTIONS},
+    },
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -101,6 +104,12 @@ async fn browser_auth(
     authenticate_token_hash(&state.pool, hash).await
 }
 
+/// Compares digests so the time taken does not reveal how much of the secret matched.
+fn csrf_matches(supplied: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    !expected.is_empty() && Sha256::digest(supplied) == Sha256::digest(expected)
+}
+
 fn csrf_expected(token_hash: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(token_hash);
@@ -172,6 +181,24 @@ li{{padding:.4rem 0;border-bottom:1px solid #eee}}\
     )
 }
 
+fn clear_csrf_cookie(state: &AppState) -> String {
+    let secure = if state.config.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!("githearth_csrf=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
+}
+
+/// Redirect to sign-in and drop the browser's session cookie, which the server no longer honours.
+fn signed_out(state: &AppState) -> UiError {
+    let mut response = Redirect::to("/login").into_response();
+    if let Ok(value) = clear_session_cookie(state).parse() {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    UiError(Box::new(response))
+}
+
 fn auth_required() -> UiError {
     UiError(Box::new(Redirect::to("/login").into_response()))
 }
@@ -200,6 +227,21 @@ fn unavailable_page(username: Option<&str>) -> UiError {
                 username,
                 None,
                 "<h1>Unavailable</h1>",
+            )),
+        )
+            .into_response(),
+    ))
+}
+
+fn busy_page() -> UiError {
+    UiError(Box::new(
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(render_page(
+                "Busy",
+                None,
+                None,
+                "<h1>Busy</h1><p>Too many sign-ins in progress. Try again in a moment.</p>",
             )),
         )
             .into_response(),
@@ -240,9 +282,14 @@ async fn login_page(
     } else {
         ""
     };
-    let mut bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
-    let token = hex::encode(bytes);
+    // Reuse a well-formed token so a second sign-in tab does not invalidate the first.
+    let token = csrf_cookie(&headers)
+        .filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| {
+            let mut bytes = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+            hex::encode(bytes)
+        });
     let body = format!(
         "<h1>Sign in</h1><div class=\"card\">{error}<form method=\"post\" action=\"/login\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
@@ -273,16 +320,16 @@ async fn login_submit(
     headers: HeaderMap,
     Form(input): Form<LoginForm>,
 ) -> Result<Response, UiError> {
-    let cookie_token = csrf_cookie(&headers);
-    if cookie_token.is_none()
-        || cookie_token.as_deref() != Some(input.csrf_token.as_str())
-        || input.csrf_token.is_empty()
-    {
+    let cookie_token = csrf_cookie(&headers).unwrap_or_default();
+    if !csrf_matches(&input.csrf_token, &cookie_token) {
         return Err(forbidden_page());
     }
+    // Only a definite mismatch is reported as bad credentials; an outage must not look like one.
     let id = match verify_password(&state, &input.username, &input.password).await {
         Ok(Some(id)) => id,
-        _ => return Ok(Redirect::to("/login?error=1").into_response()),
+        Ok(None) => return Ok(Redirect::to("/login?error=1").into_response()),
+        Err(e) if e.status_code() == StatusCode::TOO_MANY_REQUESTS => return Err(busy_page()),
+        Err(_) => return Err(unavailable_page(None)),
     };
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
@@ -293,7 +340,7 @@ async fn login_submit(
         .pool
         .begin()
         .await
-        .map_err(|_| UiError(Box::new(Redirect::to("/login?error=1").into_response())))?;
+        .map_err(|_| unavailable_page(None))?;
     if sqlx::query(
         "INSERT INTO sessions (token_hash, account_id, expires_at) VALUES ($1,$2,clock_timestamp() + $3 * interval '1 second')",
     )
@@ -304,21 +351,25 @@ async fn login_submit(
     .await
     .is_err()
     {
-        return Ok(Redirect::to("/login?error=1").into_response());
+        return Err(unavailable_page(None));
     }
     if crate::event(&mut tx, None, id, "session.created")
         .await
         .is_err()
     {
-        return Ok(Redirect::to("/login?error=1").into_response());
+        return Err(unavailable_page(None));
     }
     if tx.commit().await.is_err() {
-        return Ok(Redirect::to("/login?error=1").into_response());
+        return Err(unavailable_page(None));
     }
     let mut response = Redirect::to("/").into_response();
-    let cookie = set_session_cookie(&state, &token);
-    if let Ok(value) = cookie.parse() {
-        response.headers_mut().insert(SET_COOKIE, value);
+    for cookie in [
+        set_session_cookie(&state, &token),
+        clear_csrf_cookie(&state),
+    ] {
+        if let Ok(value) = cookie.parse() {
+            response.headers_mut().append(SET_COOKIE, value);
+        }
     }
     Ok(response)
 }
@@ -338,13 +389,12 @@ async fn logout_submit(
     } else {
         form.csrf_token.clone()
     };
-    let expected = csrf_expected(&token_hash);
-    if supplied != expected {
+    if !csrf_matches(&supplied, &csrf_expected(&token_hash)) {
         return Err(forbidden_page());
     }
     let (account, _) = match browser_auth(&state, &headers).await {
         Ok(v) => v,
-        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(signed_out(&state)),
         Err(_) => return Err(unavailable_page(None)),
     };
     let mut tx = state
@@ -369,12 +419,7 @@ async fn logout_submit(
     if tx.commit().await.is_err() {
         return Err(unavailable_page(Some(&account.username)));
     }
-    let mut response = Redirect::to("/login").into_response();
-    let cookie = clear_session_cookie(&state);
-    if let Ok(value) = cookie.parse() {
-        response.headers_mut().insert(SET_COOKIE, value);
-    }
-    Ok(response)
+    Ok(signed_out(&state).into_response())
 }
 
 async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, UiError> {
@@ -463,7 +508,8 @@ async fn organization(
         .fetch_one(&mut *conn)
         .await
         .map_err(|_| unavailable_page(Some(&account.username)))?;
-    // shortcut: navigation loads only the first 100 repositories; cursor pagination is deferred to a later increment.
+    // shortcut: reads the first 100 repositories *before* authorization filtering, so a member
+    // with access only to later ones sees an empty list; add cursor pagination before large orgs.
     let rows = repositories::list(&mut conn, org_id, None, 100)
         .await
         .map_err(|_| unavailable_page(Some(&account.username)))?;
@@ -555,6 +601,14 @@ async fn repository(
     .into_response())
 }
 
+/// Pages carry account data and a sign-out form: keep them out of shared caches and frames.
+async fn page_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/login", get(login_page).post(login_submit))
@@ -563,4 +617,5 @@ pub fn router() -> Router<AppState> {
         .route("/organizations/{slug}", get(organization))
         .route("/organizations/{slug}/repositories", get(organization))
         .route("/organizations/{slug}/repositories/{name}", get(repository))
+        .layer(axum::middleware::map_response(page_headers))
 }
