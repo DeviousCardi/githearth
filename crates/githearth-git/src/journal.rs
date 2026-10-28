@@ -266,10 +266,9 @@ impl Journal {
             .to_path_buf();
         let moved_path = dir.join(format!("journal.{first}"));
         {
-            let mut moved = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&moved_path)?;
+            // Truncate: a rotation that crashed after writing this archive is redone in full,
+            // not appended a second time.
+            let mut moved = fs::File::create(&moved_path)?;
             for record in &self.records[..split] {
                 write_record(&mut moved, record)?;
             }
