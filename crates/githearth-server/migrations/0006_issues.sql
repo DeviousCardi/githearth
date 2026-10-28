@@ -22,10 +22,17 @@ CREATE TABLE issue_comments (
  issue_id uuid NOT NULL REFERENCES issues(id),
  author_id uuid NOT NULL REFERENCES accounts(id),
  body text NOT NULL CHECK (length(body) BETWEEN 1 AND 65536),
+ seq integer NOT NULL,
  created_at timestamptz NOT NULL DEFAULT now(),
- updated_at timestamptz NOT NULL DEFAULT now()
+ updated_at timestamptz NOT NULL DEFAULT now(),
+ UNIQUE (issue_id, seq)
 );
-CREATE INDEX issue_comments_issue ON issue_comments (issue_id, created_at, id);
+CREATE INDEX issue_comments_issue ON issue_comments (issue_id, seq);
+
+CREATE TABLE issue_comment_counters (
+ issue_id uuid PRIMARY KEY REFERENCES issues(id),
+ last integer NOT NULL
+);
 
 CREATE FUNCTION check_issue_state() RETURNS trigger AS $$
 BEGIN

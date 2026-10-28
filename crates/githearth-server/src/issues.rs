@@ -38,13 +38,21 @@ fn not_found() -> ApiError {
 fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
 }
+// Reads treat a non-active repository like a missing one; only an `active`
+// repository (archived included) is readable.
+fn require_readable_repo(loaded: &Loaded) -> Result<(), ApiError> {
+    if loaded.repo.status != RepositoryStatus::Active {
+        return Err(not_found());
+    }
+    Ok(())
+}
 
 const ISSUE_COLUMNS: &str = "id, number, title, body, state, author_id, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at, \
  to_char(closed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS closed_at";
 
-const COMMENT_COLUMNS: &str = "id, author_id, body, \
+const COMMENT_COLUMNS: &str = "id, author_id, body, seq, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
 
@@ -66,6 +74,7 @@ struct CommentJson {
     id: Uuid,
     author_id: Uuid,
     body: String,
+    seq: i32,
     created_at: String,
     updated_at: String,
 }
@@ -133,6 +142,17 @@ async fn allocate_number(conn: &mut PgConnection, repository_id: Uuid) -> Result
          RETURNING last",
     )
     .bind(repository_id)
+    .fetch_one(&mut *conn)
+    .await
+}
+
+async fn allocate_comment_seq(conn: &mut PgConnection, issue_id: Uuid) -> Result<i32, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO issue_comment_counters (issue_id, last) VALUES ($1, 1) \
+         ON CONFLICT (issue_id) DO UPDATE SET last = issue_comment_counters.last + 1 \
+         RETURNING last",
+    )
+    .bind(issue_id)
     .fetch_one(&mut *conn)
     .await
 }
@@ -239,6 +259,7 @@ async fn list(
     let loaded =
         repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
     repository_api::require(&state, &loaded, Action::RepositoryRead)?;
+    require_readable_repo(&loaded)?;
 
     let mut conn = state.pool.acquire().await?;
     let sql = format!(
@@ -279,6 +300,7 @@ async fn read(
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let loaded =
         repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    require_readable_repo(&loaded)?;
     let mut conn = state.pool.acquire().await?;
     let issue = find_issue(&mut conn, loaded.repo.id, number)
         .await?
@@ -360,18 +382,26 @@ async fn update(
             }
 
             let mut tx = state.pool.begin().await?;
-            let new_state = input.state.as_deref().unwrap_or(issue.state.as_str());
+            // Lock the row so concurrent PATCHes cannot stomp fields we did not send.
+            let locked: IssueJson = sqlx::query_as(&format!(
+                "SELECT {ISSUE_COLUMNS} FROM issues WHERE id = $1 FOR UPDATE"
+            ))
+            .bind(issue.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(not_found)?;
+            let new_state = input.state.as_deref().unwrap_or(locked.state.as_str());
             sqlx::query(
                 "UPDATE issues SET title = $1, body = $2, state = $3, updated_at = now() WHERE id = $4",
             )
-            .bind(input.title.as_deref().unwrap_or(&issue.title))
-            .bind(input.body.as_deref().unwrap_or(&issue.body))
+            .bind(input.title.as_deref().unwrap_or(&locked.title))
+            .bind(input.body.as_deref().unwrap_or(&locked.body))
             .bind(new_state)
-            .bind(issue.id)
+            .bind(locked.id)
             .execute(&mut *tx)
             .await?;
 
-            let kind = if new_state != issue.state {
+            let kind = if new_state != locked.state {
                 if new_state == "closed" { "issue.closed" } else { "issue.reopened" }
             } else {
                 "issue.updated"
@@ -441,15 +471,21 @@ async fn create_comment(
 
             let mut tx = state.pool.begin().await?;
             let id = Uuid::new_v4();
+            let seq = allocate_comment_seq(&mut tx, issue.id).await?;
             sqlx::query(
-                "INSERT INTO issue_comments (id, issue_id, author_id, body) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO issue_comments (id, issue_id, author_id, body, seq) VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(id)
             .bind(issue.id)
             .bind(actor.id)
             .bind(&input.body)
+            .bind(seq)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("UPDATE issues SET updated_at = now() WHERE id = $1")
+                .bind(issue.id)
+                .execute(&mut *tx)
+                .await?;
             event(&mut tx, Some(loaded.org_id), actor.id, "issue.commented").await?;
             tx.commit().await?;
 
@@ -473,13 +509,13 @@ struct CommentListQuery {
     #[serde(default)]
     limit: Option<i64>,
     #[serde(default)]
-    after: Option<Uuid>,
+    after: Option<i32>,
 }
 
 #[derive(Serialize)]
 struct CommentPage {
     items: Vec<CommentJson>,
-    next: Option<Uuid>,
+    next: Option<i32>,
 }
 
 async fn list_comments(
@@ -493,32 +529,27 @@ async fn list_comments(
     if !(1..=100).contains(&limit) {
         return Err(invalid());
     }
+    // The cursor is a per-issue comment sequence; anything else is not a valid cursor.
+    if let Some(after) = query.after
+        && after < 1
+    {
+        return Err(invalid());
+    }
 
     let loaded =
         repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    require_readable_repo(&loaded)?;
+
     let mut conn = state.pool.acquire().await?;
     let issue = find_issue(&mut conn, loaded.repo.id, number)
         .await?
         .ok_or_else(not_found)?;
     require_issue(&state, &loaded, &issue, Action::IssueRead)?;
-    // A cursor must be a comment of this issue; otherwise the keyset comparison would silently return nothing.
-    if let Some(after) = query.after {
-        let known: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM issue_comments WHERE id = $1 AND issue_id = $2)",
-        )
-        .bind(after)
-        .bind(issue.id)
-        .fetch_one(&mut *conn)
-        .await?;
-        if !known {
-            return Err(invalid());
-        }
-    }
 
     let rows = sqlx::query_as::<_, CommentJson>(&format!(
         "SELECT {COMMENT_COLUMNS} FROM issue_comments WHERE issue_id = $1 \
-         AND ($2::uuid IS NULL OR (created_at, id) > (SELECT created_at, id FROM issue_comments WHERE id = $2)) \
-         ORDER BY issue_comments.created_at, issue_comments.id LIMIT $3"
+         AND ($2::integer IS NULL OR seq > $2) \
+         ORDER BY seq LIMIT $3"
     ))
     .bind(issue.id)
     .bind(query.after)
@@ -530,7 +561,7 @@ async fn list_comments(
     let mut items = rows;
     items.truncate(limit as usize);
     let next = if has_more {
-        items.last().map(|c| c.id)
+        items.last().map(|c| c.seq)
     } else {
         None
     };

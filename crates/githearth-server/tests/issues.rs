@@ -6,8 +6,9 @@ use axum::{
 use githearth_server::{AppState, MIGRATOR, config::Config, connect, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use std::path::PathBuf;
+use std::time::Duration;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -432,7 +433,6 @@ async fn comment_pagination_oldest_first() {
     create_issue(&app, &token, &slug, "m", "x", "").await;
 
     let base = format!("{}/1/comments", issues_path(&slug, "m"));
-    let mut ids = Vec::new();
     for i in 0..5 {
         let (status, body) = request(
             &app,
@@ -444,7 +444,7 @@ async fn comment_pagination_oldest_first() {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        ids.push(body["id"].as_str().unwrap().to_owned());
+        assert_eq!(body["seq"], i + 1);
     }
 
     let (status, body) = request(
@@ -461,7 +461,7 @@ async fn comment_pagination_oldest_first() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["body"], "comment 0");
     assert_eq!(items[1]["body"], "comment 1");
-    let next = body["next"].as_str().unwrap().to_owned();
+    let next = body["next"].as_i64().unwrap().to_string();
 
     let (_, body) = request(
         &app,
@@ -476,7 +476,7 @@ async fn comment_pagination_oldest_first() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["body"], "comment 2");
     assert_eq!(items[1]["body"], "comment 3");
-    let next = body["next"].as_str().unwrap().to_owned();
+    let next = body["next"].as_i64().unwrap().to_string();
     let (_, body) = request(
         &app,
         "GET",
@@ -489,29 +489,19 @@ async fn comment_pagination_oldest_first() {
     assert_eq!(body["items"][0]["body"], "comment 4");
     assert_eq!(body["next"], Value::Null);
 
-    // A cursor that is not a comment of this issue is rejected, not answered with an empty page.
-    create_issue(&app, &token, &slug, "m", "other", "").await;
-    let other = format!("{}/2/comments", issues_path(&slug, "m"));
-    let (status, _) = request(
-        &app,
-        "GET",
-        &format!("{other}?after={}", ids[0]),
-        Some(&token),
-        None,
-        Value::Null,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _) = request(
-        &app,
-        "GET",
-        &format!("{base}?after={}", Uuid::new_v4()),
-        Some(&token),
-        None,
-        Value::Null,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A cursor that is not a positive integer is rejected, not answered with an empty page.
+    for bad in ["0", "-1", "abc", "1.5"] {
+        let (status, _) = request(
+            &app,
+            "GET",
+            &format!("{base}?after={bad}"),
+            Some(&token),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "after={bad}");
+    }
 
     cleanup(&storage);
     pool.close().await;
@@ -918,6 +908,287 @@ async fn edits_need_an_active_repository() {
         let (status, body) = request(&app, "PATCH", &path, Some(&token), None, patch).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
     }
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn concurrent_patches_do_not_lose_updates() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    fixture_repository(&pool, org_id, "cc", owner, "private", false).await;
+    create_issue(&app, &token, &slug, "cc", "original", "body").await;
+
+    // Concurrent PATCHes: one renames, one closes. Both must survive; exactly one issue.closed.
+    // Hold the issue row lock first so both PATCH transactions block on their
+    // own FOR UPDATE, forcing them to genuinely overlap and serialize on the
+    // row, rather than racing to see which happens to run first.
+    let mut gate = pool.acquire().await.unwrap();
+    let issue_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM issues WHERE repository_id = (SELECT id FROM repositories WHERE organization_id = $1 AND name = 'cc') AND number = 1",
+    )
+    .bind(org_id)
+    .fetch_one(&mut *gate)
+    .await
+    .unwrap();
+    let mut gate_tx = gate.begin().await.unwrap();
+    sqlx::query("SELECT id FROM issues WHERE id = $1 FOR UPDATE")
+        .bind(issue_id)
+        .execute(&mut *gate_tx)
+        .await
+        .unwrap();
+
+    let app1 = app.clone();
+    let app2 = app.clone();
+    let token1 = token.clone();
+    let token2 = token.clone();
+    let path = format!("{}/1", issues_path(&slug, "cc"));
+    let (path1, path2) = (path.clone(), path);
+    let mut f1 = tokio::spawn(async move {
+        request(
+            &app1,
+            "PATCH",
+            &path1,
+            Some(&token1),
+            None,
+            json!({"title": "renamed"}),
+        )
+        .await
+    });
+    let mut f2 = tokio::spawn(async move {
+        request(
+            &app2,
+            "PATCH",
+            &path2,
+            Some(&token2),
+            None,
+            json!({"state": "closed"}),
+        )
+        .await
+    });
+
+    // Give both tasks a chance to reach their FOR UPDATE and block on it.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    // Both PATCHes are blocked on the held row lock: neither completes within a short window.
+    let f1_blocked = tokio::time::timeout(Duration::from_millis(300), &mut f1)
+        .await
+        .is_err();
+    let f2_blocked = tokio::time::timeout(Duration::from_millis(300), &mut f2)
+        .await
+        .is_err();
+    // Release the lock and let both proceed.
+    gate_tx.commit().await.unwrap();
+    drop(gate);
+
+    let (s1, _) = f1.await.unwrap();
+    let (s2, _) = f2.await.unwrap();
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK);
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("{}/1", issues_path(&slug, "cc")),
+        Some(&token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(body["title"], "renamed");
+    assert_eq!(body["state"], "closed");
+
+    // Exactly one issue.closed event, not a follow-up issue.updated overwriting the state.
+    let closed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND kind = 'issue.closed'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(closed, 1);
+
+    // The lock was actually contended: both PATCHes blocked on the row lock.
+    assert!(
+        f1_blocked && f2_blocked,
+        "expected both PATCHes to block on the held row lock"
+    );
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn concurrent_comments_page_without_skips_or_duplicates() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    fixture_repository(&pool, org_id, "mp", owner, "private", false).await;
+    create_issue(&app, &token, &slug, "mp", "x", "").await;
+
+    let base = format!("{}/1/comments", issues_path(&slug, "mp"));
+    // Concurrent comment POSTs: the per-issue sequence must be allocated
+    // gap-free so the commits are ordered 1..N with no skips or duplicates.
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let app = app.clone();
+        let token = token.clone();
+        let base = base.clone();
+        handles.push(tokio::spawn(async move {
+            let (status, _) = request(
+                &app,
+                "POST",
+                &base,
+                Some(&token),
+                None,
+                json!({"body": format!("c{i}")}),
+            )
+            .await;
+            status
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), StatusCode::CREATED);
+    }
+
+    // Page through all comments; the sequence column must be exactly 1..=20.
+    let seqs: Vec<i32> = sqlx::query_scalar(
+        "SELECT seq FROM issue_comments WHERE issue_id = (SELECT id FROM issues WHERE repository_id = (SELECT id FROM repositories WHERE organization_id = $1 AND name = 'mp') AND number = 1) ORDER BY seq",
+    )
+    .bind(org_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(seqs, (1..=20).collect::<Vec<_>>());
+    assert_eq!(sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM issue_comments WHERE issue_id = (SELECT id FROM issues WHERE repository_id = (SELECT id FROM repositories WHERE organization_id = $1 AND name = 'mp') AND number = 1)",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap(), 20);
+
+    // The API pages them back in exact sequence order with a numeric cursor.
+    let mut after: Option<i32> = None;
+    let mut seen = Vec::new();
+    loop {
+        let mut url = format!("{base}?limit=3");
+        if let Some(a) = after {
+            url.push_str(&format!("&after={a}"));
+        }
+        let (status, body) = request(&app, "GET", &url, Some(&token), None, Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body["items"].as_array().unwrap().clone();
+        for it in &items {
+            seen.push(it["seq"].as_i64().unwrap() as i32);
+        }
+        match body["next"].as_i64() {
+            Some(n) => after = Some(n as i32),
+            None => break,
+        }
+    }
+    assert_eq!(seen, (1..=20).collect::<Vec<_>>());
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn new_comment_bumps_issue_updated_at() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let repo_id = fixture_repository(&pool, org_id, "up", owner, "private", false).await;
+    create_issue(&app, &token, &slug, "up", "x", "").await;
+
+    // Backdate the issue so any forward movement is attributable to the comment.
+    sqlx::query("UPDATE issues SET updated_at = now() - interval '1 hour' WHERE repository_id = $1 AND number = 1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before: String = sqlx::query_scalar(
+        "SELECT to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM issues WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let base = format!("{}/1/comments", issues_path(&slug, "up"));
+    let (status, _) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"body": "bump"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let after: String = sqlx::query_scalar(
+        "SELECT to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM issues WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(
+        after, before,
+        "a new comment must bump the issue's updated_at"
+    );
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reads_of_non_active_repository_404() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let repo = fixture_repository(&pool, org_id, "nonact", owner, "private", false).await;
+    create_issue(&app, &token, &slug, "nonact", "x", "").await;
+
+    // A non-active repository reads like a missing one: 404.
+    sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for path in [
+        format!("{}/1", issues_path(&slug, "nonact")),
+        issues_path(&slug, "nonact"),
+        format!("{}/1/comments", issues_path(&slug, "nonact")),
+    ] {
+        let (status, _) = request(&app, "GET", &path, Some(&token), None, Value::Null).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+
+    // An archived active repository stays readable.
+    let arc = fixture_repository(&pool, org_id, "arcact", owner, "private", true).await;
+    sqlx::query("INSERT INTO issues (id, repository_id, number, title, body, author_id) VALUES ($1, $2, 1, 'seed', '', $3)")
+        .bind(Uuid::new_v4())
+        .bind(arc)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{}/1", issues_path(&slug, "arcact")),
+        Some(&token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
     cleanup(&storage);
     pool.close().await;
 }
