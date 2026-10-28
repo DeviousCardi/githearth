@@ -21,6 +21,7 @@ services:
     environment: &app-environment
       GITHEARTH_DATABASE_URL: postgres://githearth:${POSTGRES_PASSWORD}@postgres:5432/githearth
       GITHEARTH_BIND: 0.0.0.0:8080
+      GITHEARTH_SECURE_COOKIES: 'false'
     depends_on:
       postgres:
         condition: service_healthy

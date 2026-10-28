@@ -9,6 +9,7 @@ pub mod pushes;
 pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
+pub mod ui;
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
@@ -117,6 +118,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/organizations/{id}", get(read_organization))
         .merge(issues::router())
         .merge(audit::router())
+        .merge(ui::router())
         .route(
             "/api/v1/organizations/{org}/repositories",
             post(repository_api::create).get(repository_api::list),
@@ -178,6 +180,11 @@ pub struct ApiError(StatusCode, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+    }
+}
+impl ApiError {
+    pub fn status_code(&self) -> StatusCode {
+        self.0
     }
 }
 impl From<sqlx::Error> for ApiError {
@@ -368,7 +375,7 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiRe
         expires_in: state.config.token_ttl_seconds,
     }))
 }
-fn bearer(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
+pub(crate) fn bearer(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -379,17 +386,15 @@ fn bearer(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
     }
     Ok(Sha256::digest(token.as_bytes()).to_vec())
 }
-#[derive(Serialize, sqlx::FromRow)]
-struct Account {
-    id: Uuid,
-    username: String,
-    is_admin: bool,
-}
-pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResult<(Account, u64)> {
+
+pub(crate) async fn authenticate_token_hash(
+    pool: &PgPool,
+    token_hash: Vec<u8>,
+) -> ApiResult<(Account, u64)> {
     let row = sqlx::query_as::<_, (Uuid, String, bool, i64)>(
         "SELECT a.id, a.username, a.is_admin, EXTRACT(EPOCH FROM clock_timestamp() - s.authenticated_at)::bigint AS auth_age FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp()",
     )
-    .bind(bearer(headers)?)
+    .bind(token_hash)
     .fetch_optional(pool)
     .await?
     .ok_or_else(unauthorized)?;
@@ -401,6 +406,15 @@ pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResul
         },
         row.3.max(0) as u64,
     ))
+}
+#[derive(Serialize, sqlx::FromRow)]
+pub(crate) struct Account {
+    id: Uuid,
+    username: String,
+    is_admin: bool,
+}
+pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResult<(Account, u64)> {
+    authenticate_token_hash(pool, bearer(headers)?).await
 }
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Account>> {
     Ok(Json(authenticate(&state.pool, &headers).await?.0))
