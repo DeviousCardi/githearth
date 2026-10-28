@@ -7,3 +7,4 @@ request_timeout_seconds = 15
 token_ttl_seconds = 3600
 body_limit_bytes = 16384
 auth_concurrency = 2
+# storage_root = "data/repositories"

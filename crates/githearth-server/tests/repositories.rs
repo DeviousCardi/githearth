@@ -56,7 +56,7 @@ async fn insert_creating_and_find() {
     let org = fixture_organization(&pool, owner).await;
     let op_id = Uuid::new_v4();
     let mut conn = pool.acquire().await.unwrap();
-    let row = repositories::insert_creating(&mut conn, org, "my-repo", owner, op_id)
+    let row = repositories::insert_creating(&mut conn, org, "my-repo", owner, op_id, "private", "")
         .await
         .unwrap();
     assert_eq!(row.name, "my-repo");
@@ -103,9 +103,17 @@ async fn name_check_rejections() {
 
     let long_name = "a".repeat(101);
     for name in ["", ".", "..", "a.git", "a/b", &long_name[..]] {
-        let err = repositories::insert_creating(&mut conn, org, name, owner, Uuid::new_v4())
-            .await
-            .unwrap_err();
+        let err = repositories::insert_creating(
+            &mut conn,
+            org,
+            name,
+            owner,
+            Uuid::new_v4(),
+            "private",
+            "",
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.as_database_error()
                 .is_some_and(|e| e.code().as_deref() == Some("23514")),
@@ -115,9 +123,17 @@ async fn name_check_rejections() {
 
     // valid names
     for name in ["valid-repo", "valid_repo", "Valid123", "x.y.z", "x"] {
-        let row = repositories::insert_creating(&mut conn, org, name, owner, Uuid::new_v4())
-            .await
-            .unwrap();
+        let row = repositories::insert_creating(
+            &mut conn,
+            org,
+            name,
+            owner,
+            Uuid::new_v4(),
+            "private",
+            "",
+        )
+        .await
+        .unwrap();
         assert_eq!(row.name, name);
     }
 
@@ -132,13 +148,29 @@ async fn name_uniqueness_case_insensitive() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    repositories::insert_creating(&mut conn, org, "My-Repo", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    repositories::insert_creating(
+        &mut conn,
+        org,
+        "My-Repo",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
 
-    let err = repositories::insert_creating(&mut conn, org, "my-repo", owner, Uuid::new_v4())
-        .await
-        .unwrap_err();
+    let err = repositories::insert_creating(
+        &mut conn,
+        org,
+        "my-repo",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap_err();
     assert!(
         err.as_database_error()
             .is_some_and(|e| e.is_unique_violation())
@@ -155,9 +187,17 @@ async fn deleted_name_reusable() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "reuse-me", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "reuse-me",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
 
     repositories::set_status(
         &mut conn,
@@ -186,9 +226,17 @@ async fn deleted_name_reusable() {
     .await
     .unwrap();
 
-    let row2 = repositories::insert_creating(&mut conn, org, "reuse-me", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row2 = repositories::insert_creating(
+        &mut conn,
+        org,
+        "reuse-me",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
     assert_ne!(row2.id, row.id);
     assert_eq!(row2.name, "reuse-me");
 
@@ -203,9 +251,17 @@ async fn status_transitions_allowed() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "transitions", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "transitions",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
 
     // creating -> active
     assert!(
@@ -253,9 +309,10 @@ async fn status_transition_disallowed() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "nope", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row =
+        repositories::insert_creating(&mut conn, org, "nope", owner, Uuid::new_v4(), "private", "")
+            .await
+            .unwrap();
 
     // active -> creating is not allowed
     repositories::set_status(
@@ -291,9 +348,17 @@ async fn creating_to_failed_then_retry() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "retry-me", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "retry-me",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
 
     // creating -> failed
     assert!(
@@ -369,9 +434,17 @@ async fn cas_returns_false_on_wrong_from() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "cas-test", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "cas-test",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
 
     // CAS from wrong state
     let matched = repositories::set_status(
@@ -399,9 +472,17 @@ async fn rename_with_redirect() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "old-name", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "old-name",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
 
     // Must be active to rename
     repositories::set_status(
@@ -443,9 +524,17 @@ async fn rename_removes_redirect_on_name_reuse() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "first", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "first",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
     repositories::set_status(
         &mut conn,
         row.id,
@@ -461,9 +550,17 @@ async fn rename_removes_redirect_on_name_reuse() {
         .unwrap();
 
     // Create new repo with "first" name
-    let row2 = repositories::insert_creating(&mut conn, org, "first", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row2 = repositories::insert_creating(
+        &mut conn,
+        org,
+        "first",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
     repositories::set_status(
         &mut conn,
         row2.id,
@@ -503,12 +600,14 @@ async fn pending_lists_creating_and_deleting() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let r1 = repositories::insert_creating(&mut conn, org, "p1", owner, Uuid::new_v4())
-        .await
-        .unwrap();
-    let r2 = repositories::insert_creating(&mut conn, org, "p2", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let r1 =
+        repositories::insert_creating(&mut conn, org, "p1", owner, Uuid::new_v4(), "private", "")
+            .await
+            .unwrap();
+    let r2 =
+        repositories::insert_creating(&mut conn, org, "p2", owner, Uuid::new_v4(), "private", "")
+            .await
+            .unwrap();
 
     repositories::set_status(
         &mut conn,
@@ -588,9 +687,17 @@ async fn authz_repository_mapping() {
     let org = fixture_organization(&pool, owner).await;
     let mut conn = pool.acquire().await.unwrap();
 
-    let row = repositories::insert_creating(&mut conn, org, "authz-repo", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        org,
+        "authz-repo",
+        owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
     let repo = repositories::authz_repository(&row);
     assert_eq!(repo.id, row.id);
     assert_eq!(repo.organization, org);
@@ -617,17 +724,19 @@ async fn redirects_never_outlive_their_name() {
     };
 
     // Taking a redirected name retires the redirect, so deleting the new owner does not revive it.
-    let old = repositories::insert_creating(&mut conn, org, "old", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let old =
+        repositories::insert_creating(&mut conn, org, "old", owner, Uuid::new_v4(), "private", "")
+            .await
+            .unwrap();
     assert!(
         repositories::rename(&mut conn, old.id, "moved")
             .await
             .unwrap()
     );
-    let reuse = repositories::insert_creating(&mut conn, org, "old", owner, Uuid::new_v4())
-        .await
-        .unwrap();
+    let reuse =
+        repositories::insert_creating(&mut conn, org, "old", owner, Uuid::new_v4(), "private", "")
+            .await
+            .unwrap();
     assert_eq!(redirects("old").fetch_one(&mut *conn).await.unwrap(), 0);
     for (from, to) in [(Creating, Active), (Active, Deleting), (Deleting, Deleted)] {
         assert!(

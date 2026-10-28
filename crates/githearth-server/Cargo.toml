@@ -12,6 +12,7 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 githearth-authz = { path = "../githearth-authz" }
 githearth-core = { path = "../githearth-core" }
+githearth-git = { path = "../githearth-git" }
 hex = "0.4"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

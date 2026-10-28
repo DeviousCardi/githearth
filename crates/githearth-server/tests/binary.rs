@@ -114,6 +114,29 @@ impl Drop for Schema {
     }
 }
 
+struct StorageGuard {
+    path: PathBuf,
+}
+impl StorageGuard {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "githearth-bin-storage-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let _ = fs::create_dir_all(&path);
+        Self { path }
+    }
+    fn env(&self) -> (&'static str, &str) {
+        ("GITHEARTH_STORAGE_ROOT", self.path.to_str().unwrap())
+    }
+}
+impl Drop for StorageGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 struct ChildGuard {
     child: Child,
 }
@@ -230,6 +253,7 @@ fn bootstrap(schema: &Schema, username: &str, password: &[u8]) -> Output {
 
 fn graceful_signal(signal: &str) {
     let schema = Schema::new();
+    let storage = StorageGuard::new();
     let migrated = migrate(&schema);
     assert!(migrated.status.success(), "{}", stderr(&migrated));
 
@@ -237,6 +261,7 @@ fn graceful_signal(signal: &str) {
     let mut command = server();
     command.env("GITHEARTH_DATABASE_URL", schema.url());
     command.env("GITHEARTH_BIND", format!("127.0.0.1:{port}"));
+    command.env(storage.env().0, storage.env().1);
     command.arg("serve");
     let mut server = ChildGuard::new(command);
 
@@ -249,6 +274,7 @@ fn graceful_signal(signal: &str) {
     let logs = server.stdout();
     assert!(status.success(), "server exited with {status}: {logs}");
     assert!(logs.contains("HTTP server listening"), "{logs}");
+    drop(storage);
 }
 
 #[test]
@@ -460,6 +486,7 @@ fn serve_stops_gracefully_on_sigint() {
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 fn serve_reports_bind_failure() {
     let schema = Schema::new();
+    let storage = StorageGuard::new();
     let migrated = migrate(&schema);
     assert!(migrated.status.success(), "{}", stderr(&migrated));
 
@@ -468,10 +495,12 @@ fn serve_reports_bind_failure() {
     let mut command = server();
     command.env("GITHEARTH_DATABASE_URL", schema.url());
     command.env("GITHEARTH_BIND", format!("127.0.0.1:{port}"));
+    command.env(storage.env().0, storage.env().1);
     command.arg("serve");
     let output = run(command);
     assert_eq!(output.status.code(), Some(1));
     let message = stderr(&output);
     assert!(message.contains("cannot bind HTTP listener"), "{message}");
     drop(listener);
+    drop(storage);
 }

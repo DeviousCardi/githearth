@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::{net::SocketAddr, path::Path};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 // Deliberately no Debug: database_url contains credentials.
 #[derive(Clone, Deserialize)]
@@ -14,6 +17,7 @@ pub struct Config {
     pub token_ttl_seconds: u64,
     pub body_limit_bytes: usize,
     pub auth_concurrency: usize,
+    pub storage_root: PathBuf,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -26,6 +30,7 @@ impl Default for Config {
             token_ttl_seconds: 3600,
             body_limit_bytes: 16384,
             auth_concurrency: 2,
+            storage_root: PathBuf::from("data/repositories"),
         }
     }
 }
@@ -63,6 +68,13 @@ impl Config {
         env!(token_ttl_seconds, "GITHEARTH_TOKEN_TTL_SECONDS");
         env!(body_limit_bytes, "GITHEARTH_BODY_LIMIT_BYTES");
         env!(auth_concurrency, "GITHEARTH_AUTH_CONCURRENCY");
+        if std::env::var("GITHEARTH_STORAGE_ROOT")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            env!(storage_root, "GITHEARTH_STORAGE_ROOT");
+        }
         c.validate()?;
         Ok(c)
     }
@@ -82,6 +94,9 @@ impl Config {
             bail!(
                 "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16"
             );
+        }
+        if self.storage_root.as_os_str().is_empty() {
+            bail!("storage_root must not be empty");
         }
         Ok(())
     }

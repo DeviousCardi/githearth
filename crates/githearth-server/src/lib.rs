@@ -1,6 +1,8 @@
 pub mod config;
 pub mod facts;
+pub mod idempotency;
 pub mod repositories;
+pub mod repository_api;
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
@@ -35,7 +37,8 @@ pub struct AppState {
     config: Config,
     auth_slots: Arc<Semaphore>,
     dummy_hash: Arc<String>,
-    authz: Arc<Engine>,
+    pub authz: Arc<Engine>,
+    pub storage: Arc<githearth_git::layout::Storage>,
 }
 impl AppState {
     pub async fn new(pool: PgPool, config: Config) -> anyhow::Result<Self> {
@@ -43,12 +46,18 @@ impl AppState {
         let dummy_hash =
             tokio::task::spawn_blocking(|| hash_password("dummy-password-not-an-account"))
                 .await??;
+        let storage = tokio::task::spawn_blocking({
+            let root = config.storage_root.clone();
+            move || githearth_git::layout::Storage::open(&root)
+        })
+        .await??;
         Ok(Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
             config,
             dummy_hash: Arc::new(dummy_hash),
             authz: Arc::new(Engine::new()?),
+            storage: Arc::new(storage),
         })
     }
 }
@@ -97,6 +106,24 @@ pub fn router(state: AppState) -> Router {
             post(create_organization).get(list_organizations),
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
+        .route(
+            "/api/v1/organizations/{org}/repositories",
+            post(repository_api::create).get(repository_api::list),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{name}",
+            get(repository_api::read)
+                .patch(repository_api::update)
+                .delete(repository_api::delete),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{name}/archive",
+            post(repository_api::archive),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{name}/unarchive",
+            post(repository_api::unarchive),
+        )
         .layer(RequestBodyLimitLayer::new(state.config.body_limit_bytes))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -123,7 +150,7 @@ async fn observe(request: axum::extract::Request, next: axum::middleware::Next) 
     response
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError(StatusCode, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -148,7 +175,7 @@ type ApiResult<T> = Result<T, ApiError>;
 fn unauthorized() -> ApiError {
     ApiError(StatusCode::UNAUTHORIZED, "invalid or expired credentials")
 }
-fn invalid() -> ApiError {
+pub(crate) fn invalid() -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "invalid input")
 }
 
@@ -324,7 +351,7 @@ struct Account {
     username: String,
     is_admin: bool,
 }
-async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResult<(Account, u64)> {
+pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResult<(Account, u64)> {
     let row = sqlx::query_as::<_, (Uuid, String, bool, i64)>(
         "SELECT a.id, a.username, a.is_admin, EXTRACT(EPOCH FROM clock_timestamp() - s.authenticated_at)::bigint AS auth_age FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp()",
     )
@@ -418,9 +445,9 @@ async fn create_organization(
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Page {
-    after: Option<Uuid>,
-    limit: Option<i64>,
+pub struct Page {
+    pub after: Option<Uuid>,
+    pub limit: Option<i64>,
 }
 async fn list_organizations(
     State(state): State<AppState>,
@@ -459,7 +486,7 @@ async fn read_organization(
         .bind(account.id).bind(id).fetch_optional(&mut *conn).await?.ok_or_else(not_found)?;
     Ok(Json(row))
 }
-async fn event(
+pub(crate) async fn event(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     organization: Option<Uuid>,
     actor: Uuid,

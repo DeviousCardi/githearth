@@ -39,18 +39,21 @@ pub async fn insert_creating(
     name: &str,
     created_by: Uuid,
     operation_id: Uuid,
+    visibility: &str,
+    description: &str,
 ) -> Result<RepositoryRow, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query(
-        // Reusing a name retires its redirect, so the redirect cannot revive if this repository is deleted.
         "WITH retired AS (DELETE FROM repository_redirects WHERE organization_id=$2 AND lower(name)=lower($3)) \
-         INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status) VALUES ($1,$2,$3,$4,$5,'creating')",
+         INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, description) VALUES ($1,$2,$3,$4,$5,'creating',$6,$7)",
     )
     .bind(id)
     .bind(organization_id)
     .bind(name)
     .bind(created_by)
     .bind(operation_id)
+    .bind(visibility)
+    .bind(description)
     .execute(&mut *conn)
     .await?;
     find_by_operation(conn, operation_id)
@@ -201,5 +204,272 @@ pub fn authz_repository(row: &RepositoryRow) -> Repository {
             _ => Visibility::Private,
         },
         archived: row.archived,
+    }
+}
+
+pub async fn list(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    after: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<RepositoryRow>, sqlx::Error> {
+    sqlx::query(&format!(
+        "SELECT {REPO_COLS} FROM repositories WHERE organization_id=$1 AND status <> 'deleted' AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3"
+    ))
+    .bind(organization_id)
+    .bind(after)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await
+    .map(|rows| rows.iter().map(row_to_repository).collect())
+}
+
+pub async fn set_description(
+    conn: &mut PgConnection,
+    id: Uuid,
+    description: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE repositories SET description=$1, updated_at=now() WHERE id=$2 AND status <> 'deleted'",
+    )
+    .bind(description)
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn set_archived(
+    conn: &mut PgConnection,
+    id: Uuid,
+    archived: bool,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE repositories SET archived=$1, updated_at=now() WHERE id=$2 AND status <> 'deleted'",
+    )
+    .bind(archived)
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use githearth_core::RepositoryStatus;
+    use sqlx::{ConnectOptions, PgPool};
+    use std::str::FromStr;
+
+    async fn repo_test_pool() -> PgPool {
+        let cfg = sqlx::postgres::PgConnectOptions::from_str(
+            &std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL"),
+        )
+        .unwrap()
+        .disable_statement_logging();
+        let pool = PgPool::connect_with(cfg).await.unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn insert_and_find_by_name() {
+        let pool = repo_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let tag = format!("t-{}", Uuid::new_v4().simple());
+        let owner = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'hash')")
+            .bind(owner)
+            .bind(&tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Test Org')")
+            .bind(org_id)
+            .bind(tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let repo = insert_creating(
+            &mut conn,
+            org_id,
+            "my-repo",
+            owner,
+            Uuid::new_v4(),
+            "private",
+            "",
+        )
+        .await
+        .unwrap();
+        let found = find_by_name(&mut conn, org_id, "my-repo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, repo.id);
+        assert_eq!(found.status, RepositoryStatus::Creating);
+
+        let found2 = find_by_name(&mut conn, org_id, "MY-REPO")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found2.id, repo.id);
+
+        assert!(
+            find_by_name(&mut conn, org_id, "nonexistent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn rename_and_redirect() {
+        let pool = repo_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let tag = format!("t-{}", Uuid::new_v4().simple());
+        let owner = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'hash')")
+            .bind(owner)
+            .bind(&tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Test Org')")
+            .bind(org_id)
+            .bind(tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let repo = insert_creating(
+            &mut conn,
+            org_id,
+            "old-name",
+            owner,
+            Uuid::new_v4(),
+            "private",
+            "",
+        )
+        .await
+        .unwrap();
+        set_status(
+            &mut conn,
+            repo.id,
+            RepositoryStatus::Creating,
+            RepositoryStatus::Active,
+        )
+        .await
+        .unwrap();
+        assert!(rename(&mut conn, repo.id, "new-name").await.unwrap());
+        let found = find_by_name(&mut conn, org_id, "new-name")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, repo.id);
+        assert_eq!(found.name, "new-name");
+        let redirect = find_by_name(&mut conn, org_id, "old-name")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(redirect.id, repo.id);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn set_description_and_archived() {
+        let pool = repo_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let tag = format!("t-{}", Uuid::new_v4().simple());
+        let owner = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'hash')")
+            .bind(owner)
+            .bind(&tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Test Org')")
+            .bind(org_id)
+            .bind(tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let repo = insert_creating(
+            &mut conn,
+            org_id,
+            "repo",
+            owner,
+            Uuid::new_v4(),
+            "private",
+            "",
+        )
+        .await
+        .unwrap();
+        set_status(
+            &mut conn,
+            repo.id,
+            RepositoryStatus::Creating,
+            RepositoryStatus::Active,
+        )
+        .await
+        .unwrap();
+        assert!(
+            set_description(&mut conn, repo.id, "a description")
+                .await
+                .unwrap()
+        );
+        assert!(set_archived(&mut conn, repo.id, true).await.unwrap());
+        let found = get(&mut conn, repo.id).await.unwrap().unwrap();
+        assert_eq!(found.description, "a description");
+        assert!(found.archived);
+        assert!(set_archived(&mut conn, repo.id, false).await.unwrap());
+        let found = get(&mut conn, repo.id).await.unwrap().unwrap();
+        assert!(!found.archived);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn list_pagination() {
+        let pool = repo_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let tag = format!("t-{}", Uuid::new_v4().simple());
+        let owner = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'hash')")
+            .bind(owner)
+            .bind(&tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Test Org')")
+            .bind(org_id)
+            .bind(tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let repo = insert_creating(
+                &mut conn,
+                org_id,
+                &format!("repo-{i}"),
+                owner,
+                Uuid::new_v4(),
+                "private",
+                "",
+            )
+            .await
+            .unwrap();
+            ids.push(repo.id);
+        }
+        let all = list(&mut conn, org_id, None, 10).await.unwrap();
+        assert_eq!(all.len(), 3);
+        let mut sorted = ids;
+        sorted.sort();
+        let page = list(&mut conn, org_id, Some(sorted[0]), 10).await.unwrap();
+        assert_eq!(page.len(), 2);
     }
 }
