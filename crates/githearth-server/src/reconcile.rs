@@ -9,6 +9,13 @@
 //! Rows are ordered by `updated_at`; each pass fetches up to 1000 rows.  If
 //! more than 1000 repositories are pending the remainder is handled in
 //! subsequent passes.
+//!
+//! # Lock ordering
+//!
+//! The per-repository filesystem lock MUST be acquired **before** any pool
+//! connection.  Never await the repository lock while holding a connection:
+//! the API also takes the lock first and then a connection, so a pass holding
+//! the only connection while waiting for the lock would deadlock with it.
 
 use crate::AppState;
 use crate::repositories;
@@ -112,6 +119,13 @@ pub async fn reconcile_once(
         }
     }
 
+    // ---- drop the pass connection before the per-row loop ------------------
+    // Each per-row step acquires the repository lock *first*, then its own
+    // pool connection.  Holding the pass connection across the lock wait
+    // would deadlock with an API request that holds the lock while awaiting
+    // a connection.
+    drop(conn);
+
     // ---- process each pending row ------------------------------------------
     for row in &pending {
         if row.status == RepositoryStatus::Creating {
@@ -120,11 +134,9 @@ pub async fn reconcile_once(
 
         let result = match row.status {
             RepositoryStatus::Creating => {
-                reconcile_creating(state, &mut conn, row.id, row.operation_id, attempts).await
+                reconcile_creating(state, row.id, row.operation_id, attempts).await
             }
-            RepositoryStatus::Deleting => {
-                reconcile_deleting(state, &mut conn, row.id, &scanned).await
-            }
+            RepositoryStatus::Deleting => reconcile_deleting(state, row.id, &scanned).await,
             _ => continue,
         };
 
@@ -153,7 +165,7 @@ pub async fn reconcile_once(
     // their directory may legitimately exist.
     for id in &scan.repositories {
         match db_status.get(id) {
-            None => match orphan_repo(state, &mut conn, *id).await {
+            None => match orphan_repo(state, *id).await {
                 Ok(true) => summary.orphaned += 1,
                 Ok(false) => { /* status changed under lock, skip */ }
                 Err(e) => {
@@ -162,7 +174,7 @@ pub async fn reconcile_once(
                 }
             },
             Some(RepositoryStatus::Deleted) => {
-                match orphan_repo(state, &mut conn, *id).await {
+                match orphan_repo(state, *id).await {
                     Ok(true) => summary.orphaned += 1,
                     Ok(false) => { /* status changed under lock, skip */ }
                     Err(e) => {
@@ -185,9 +197,11 @@ pub async fn reconcile_once(
     // This is safe because the API commits the creating row BEFORE it creates
     // tmp/<operation>; any directory seen in phase 1 belongs to a row that
     // phase 2 will observe if it is still creating.
-    // Uses the caller's connection (no second pool acquire) so the pass works
-    // even with database_max_connections = 1.
+    // Re-acquire a connection: clean_tmp_step takes no repository lock so
+    // the lock ordering rule does not apply here.
+    let mut conn = state.pool.acquire().await?;
     summary.tmp_cleaned = clean_tmp_step(&mut conn, &state.storage, candidates).await?;
+    drop(conn);
 
     // ---- trash purge -------------------------------------------------------
     let retention = Duration::from_secs(state.config.trash_retention_seconds);
@@ -280,19 +294,20 @@ enum Change {
 
 async fn reconcile_creating(
     state: &AppState,
-    conn: &mut sqlx::PgConnection,
     repo_id: Uuid,
     op_id: Uuid,
     attempts: &mut HashMap<Uuid, u32>,
 ) -> anyhow::Result<Option<Change>> {
     let storage = state.storage.clone();
 
-    // Acquire the per-repository filesystem lock before touching disk.
+    // Acquire the per-repository filesystem lock *before* any DB connection
+    // (see module-level lock-ordering docs).
     let guard = storage.repository_lock(repo_id).lock_owned().await;
 
     // Re-read the row under the lock: a concurrent API delete may have already
     // removed it, and the reconciler must not recreate the directory.
-    let still_creating = repositories::get(conn, repo_id)
+    let mut conn = state.pool.acquire().await?;
+    let still_creating = repositories::get(&mut conn, repo_id)
         .await?
         .is_some_and(|r| r.status == RepositoryStatus::Creating);
     if !still_creating {
@@ -311,7 +326,7 @@ async fn reconcile_creating(
         Ok(_) => {
             attempts.remove(&repo_id);
             let ok = repositories::set_status(
-                conn,
+                &mut conn,
                 repo_id,
                 RepositoryStatus::Creating,
                 RepositoryStatus::Active,
@@ -336,7 +351,7 @@ async fn reconcile_creating(
             if current >= MAX_CREATE_ATTEMPTS {
                 attempts.remove(&repo_id);
                 let ok = repositories::set_status(
-                    conn,
+                    &mut conn,
                     repo_id,
                     RepositoryStatus::Creating,
                     RepositoryStatus::Failed,
@@ -361,19 +376,21 @@ async fn reconcile_creating(
 
 async fn reconcile_deleting(
     state: &AppState,
-    conn: &mut sqlx::PgConnection,
     repo_id: Uuid,
     scanned: &HashSet<Uuid>,
 ) -> anyhow::Result<Option<Change>> {
     let storage = state.storage.clone();
 
-    // Acquire the per-repository filesystem lock before touching disk.
+    // Acquire the per-repository filesystem lock *before* any DB connection
+    // (see module-level lock-ordering docs).
     let guard = storage.repository_lock(repo_id).lock_owned().await;
+
+    let mut conn = state.pool.acquire().await?;
 
     // Re-read the row under the lock: a concurrent request may have already
     // changed the status, and the reconciler must not trash a directory that
     // is no longer deleting.
-    let still_deleting = repositories::get(conn, repo_id)
+    let still_deleting = repositories::get(&mut conn, repo_id)
         .await?
         .is_some_and(|r| r.status == RepositoryStatus::Deleting);
     if !still_deleting {
@@ -391,7 +408,7 @@ async fn reconcile_deleting(
         drop(guard);
     }
     let ok = repositories::set_status(
-        conn,
+        &mut conn,
         repo_id,
         RepositoryStatus::Deleting,
         RepositoryStatus::Deleted,
@@ -405,19 +422,17 @@ async fn reconcile_deleting(
     }
 }
 
-async fn orphan_repo(
-    state: &AppState,
-    conn: &mut sqlx::PgConnection,
-    id: Uuid,
-) -> anyhow::Result<bool> {
+async fn orphan_repo(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
     let storage = state.storage.clone();
     let guard = storage.repository_lock(id).lock_owned().await;
+
+    let mut conn = state.pool.acquire().await?;
 
     // Re-read the row under the lock: the orphan decision was made from a
     // status snapshot taken before the lock was acquired.  Only orphan if
     // the row is still missing or `Deleted`; otherwise a concurrent request
     // may have changed the status.
-    let should_orphan = match repositories::get(conn, id).await? {
+    let should_orphan = match repositories::get(&mut conn, id).await? {
         None => true,
         Some(r) if r.status == RepositoryStatus::Deleted => true,
         _ => false,

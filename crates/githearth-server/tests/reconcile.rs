@@ -178,6 +178,38 @@ async fn setup_with_pool(grace_seconds: u64, max_connections: u32) -> TestEnv {
     }
 }
 
+/// Build a [`TestEnv`] with a single-connection pool and a long DB timeout
+/// so a lock-ordering deadlock shows as the test timeout (not a pool error).
+async fn setup_single_conn(grace_seconds: u64, db_timeout_seconds: u64) -> TestEnv {
+    let db = TestDb::with_max_connections(1).await;
+    let db_url = db.url.clone();
+    let storage_root = std::env::temp_dir().join(format!("githearth-reconcile-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let canonical = std::fs::canonicalize(&storage_root).unwrap();
+    let config = Config {
+        database_url: db_url.clone(),
+        database_max_connections: 1,
+        database_timeout_seconds: db_timeout_seconds,
+        storage_root: canonical.clone(),
+        reconcile_interval_seconds: 60,
+        reconcile_grace_seconds: grace_seconds,
+        trash_retention_seconds: 604_800,
+        ..Config::default()
+    };
+    let pool = db.pool.clone();
+    let owner = fixture_account(&pool, &tag("owner")).await;
+    let org = fixture_organization(&pool, owner).await;
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    TestEnv {
+        state,
+        pool,
+        storage_root: canonical,
+        owner,
+        org,
+        db,
+    }
+}
+
 async fn teardown(env: TestEnv) {
     let _ = std::fs::remove_dir_all(&env.storage_root);
     env.db.drop_db().await;
@@ -961,6 +993,72 @@ async fn reconciler_skips_creating_when_row_flipped_under_lock() {
         summary.activated, 0,
         "reconciler must not activate a row that was flipped to deleting"
     );
+
+    teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn single_connection_pool_no_lock_order_deadlock() {
+    // With one pool connection, an API request that holds a repository lock
+    // and then needs a connection must not wait on a reconciler pass that
+    // holds the connection while waiting for that same lock.
+    // The DB timeout (30 s) exceeds the test bound (10 s), so a deadlock
+    // shows as a timeout rather than a pool error.
+    let env = setup_single_conn(30, 30).await;
+    let mut conn = env.pool.acquire().await.unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        env.org,
+        "lock-order",
+        env.owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
+    let repo_id = row.id;
+    drop(conn);
+    backdate(&env.pool, repo_id).await;
+
+    // Play the API: hold the repository lock first.
+    let api_guard = env
+        .state
+        .storage
+        .repository_lock(repo_id)
+        .lock_owned()
+        .await;
+
+    let state = env.state.clone();
+    let reconciler = tokio::spawn(async move {
+        let mut attempts = HashMap::new();
+        reconcile::reconcile_once(&state, &mut attempts).await
+    });
+
+    // Wait until the pass has fetched its rows and is parked on the lock.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !reconciler.is_finished(),
+        "pass must be waiting on the lock"
+    );
+
+    // Still holding the lock, the API now needs a connection.
+    // A deadlock surfaces as this timeout or as the pool's own acquire timeout.
+    let api_conn = tokio::time::timeout(Duration::from_secs(10), env.pool.acquire()).await;
+    assert!(
+        matches!(api_conn, Ok(Ok(_))),
+        "lock-order deadlock: the pass holds the only connection while waiting for the lock"
+    );
+    drop(api_conn);
+    drop(api_guard);
+
+    let summary = tokio::time::timeout(Duration::from_secs(10), reconciler)
+        .await
+        .expect("reconciler did not finish after the lock was released")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.activated, 1);
 
     teardown(env).await;
 }

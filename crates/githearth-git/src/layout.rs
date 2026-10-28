@@ -225,6 +225,13 @@ impl Storage {
     /// must acquire it with `.lock_owned().await` (async) or
     /// `.blocking_lock_owned()` (sync) and move the resulting
     /// [`RepositoryGuard`] into the `spawn_blocking` closure.
+    ///
+    /// # Lock ordering
+    ///
+    /// The repository lock MUST be acquired **before** any database pool
+    /// connection.  Never await this lock while holding a pool connection.
+    /// The API follows this order (lock then connection); the reconciler
+    /// must do the same to avoid deadlock on a single-connection pool.
     pub fn repository_lock(&self, repository: Uuid) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self
             .locks
