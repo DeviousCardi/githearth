@@ -2,10 +2,11 @@
 
 use crate::{StorageError, checked, git};
 use githearth_core::{GitRef, ObjectId, RepositoryId, RepositoryReader};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -91,9 +92,35 @@ impl Default for StorageOptions {
     }
 }
 
+/// A guard that holds the per-repository filesystem lock.
+///
+/// Callers acquire it with
+/// [`tokio::sync::Mutex::lock_owned`](tokio::sync::Mutex::lock_owned)`.await`
+/// (async) or
+/// [`tokio::sync::Mutex::blocking_lock_owned`](tokio::sync::Mutex::blocking_lock_owned)
+/// (sync) and **must** move the guard into the `spawn_blocking` closure that
+/// performs the directory operation.  Moving the guard into the blocking
+/// worker prevents a cancelled request from dropping the lock while the
+/// directory operator is still running.
+///
+/// **Shortcut:** this lock is single-process only.  If the server ever runs
+/// as multiple processes on one node it must be replaced with an
+/// inter-process lock.
+pub type RepositoryGuard = tokio::sync::OwnedMutexGuard<()>;
+
+/// Durable repository storage.
+///
+/// All public methods on this type are lock-free — they do **not** acquire
+/// the per-repository filesystem lock internally.  Callers are responsible
+/// for acquiring the lock via [`Storage::repository_lock`] before calling
+/// [`create`](Storage::create), [`trash`](Storage::trash), or
+/// [`orphan`](Storage::orphan), and for moving the resulting
+/// [`RepositoryGuard`] into the `spawn_blocking` closure that performs the
+/// directory operation.
 pub struct Storage {
     root: PathBuf,
     options: StorageOptions,
+    locks: Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 fn simple(id: Uuid) -> String {
@@ -178,7 +205,51 @@ impl Storage {
         for sub in ["repositories", "tmp", "trash", "orphans"] {
             mkdir0700(&root.join(sub))?;
         }
-        Ok(Self { root, options })
+        Ok(Self {
+            root,
+            options,
+            locks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Return the per-repository lock for `repository`, creating it if the
+    /// [`Weak`] is dead or missing.
+    ///
+    /// Two calls for the same id while any [`Arc`] is alive return the same
+    /// mutex ([`Arc::ptr_eq`]); different ids never block each other.
+    ///
+    /// Dead [`Weak`] entries are pruned while the map lock is held, so the
+    /// map never grows without bound.
+    ///
+    /// The returned lock is **not** acquired by this function — the caller
+    /// must acquire it with `.lock_owned().await` (async) or
+    /// `.blocking_lock_owned()` (sync) and move the resulting
+    /// [`RepositoryGuard`] into the `spawn_blocking` closure.
+    pub fn repository_lock(&self, repository: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Prune dead entries while we hold the lock.
+        map.retain(|_, w| w.strong_count() > 0);
+        // If a live entry exists, upgrade and return the same Arc.
+        if let Some(arc) = map.get(&repository).and_then(|w| w.upgrade()) {
+            return arc;
+        }
+        // Create a new mutex, store a Weak to it, and return the Arc.
+        let arc = Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(repository, Arc::downgrade(&arc));
+        arc
+    }
+
+    /// Number of entries currently in the lock map (including dead [`Weak`]
+    /// entries that have not yet been pruned).
+    #[doc(hidden)]
+    pub fn lock_entries(&self) -> usize {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     fn repository_path(&self, repository: Uuid) -> PathBuf {

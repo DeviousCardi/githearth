@@ -417,3 +417,93 @@ fn purge_trash_removes_what_it_can_and_reports_the_failure() {
     assert!(result.is_err());
     assert!(!trashed[1].exists(), "the removable entry was still purged");
 }
+
+// ---------------------------------------------------------------------------
+// Per-repository lock tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repository_lock_same_id_returns_same_arc_while_held() {
+    let fixture = Fixture::new();
+    let storage = Storage::open(fixture.0.join("storage")).unwrap();
+    let id = Uuid::new_v4();
+
+    let a = storage.repository_lock(id);
+    let b = storage.repository_lock(id);
+    assert!(std::sync::Arc::ptr_eq(&a, &b));
+    drop(a);
+    drop(b);
+}
+
+#[test]
+fn repository_lock_different_ids_are_independent() {
+    let fixture = Fixture::new();
+    let storage = Storage::open(fixture.0.join("storage")).unwrap();
+    let x = Uuid::new_v4();
+    let y = Uuid::new_v4();
+
+    let lock_x = storage.repository_lock(x);
+    let lock_y = storage.repository_lock(y);
+
+    // Hold x's lock, then try_lock on y must succeed.
+    let _guard_x = lock_x.clone().blocking_lock_owned();
+    assert!(lock_y.clone().try_lock_owned().is_ok());
+}
+
+#[test]
+fn repository_lock_entry_pruned_when_no_strong_references() {
+    let fixture = Fixture::new();
+    let storage = Storage::open(fixture.0.join("storage")).unwrap();
+    let id = Uuid::new_v4();
+
+    assert_eq!(storage.lock_entries(), 0);
+    let lock = storage.repository_lock(id);
+    assert_eq!(storage.lock_entries(), 1);
+    drop(lock);
+    // The Weak still occupies an entry; calling repository_lock again will
+    // prune it and the count will drop to 0 after the prune + insert (or
+    // the prune itself may remove it).  Call repository_lock once more to
+    // trigger the prune, then drop — the prune on the *next* call should
+    // see it dead.
+    let lock2 = storage.repository_lock(id);
+    // After this call, the dead Weak from the first drop was pruned; we now
+    // have one live entry again.
+    assert_eq!(storage.lock_entries(), 1);
+    drop(lock2);
+    // Now trigger a prune by calling with a different id.
+    let _other = storage.repository_lock(Uuid::new_v4());
+    // The dead entry for `id` should have been pruned, leaving only `_other`.
+    assert_eq!(storage.lock_entries(), 1);
+    drop(_other);
+}
+
+#[test]
+fn repository_lock_held_in_thread_blocks_blocking_lock_owned() {
+    let fixture = Fixture::new();
+    let storage = Storage::open(fixture.0.join("storage")).unwrap();
+    let id = Uuid::new_v4();
+
+    let lock = storage.repository_lock(id);
+    let lock_clone = lock.clone();
+    // Acquire the lock on this thread.
+    let guard = lock.blocking_lock_owned();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_w = done.clone();
+
+    let handle = std::thread::spawn(move || {
+        // This should block until the guard is dropped.
+        let _g = lock_clone.blocking_lock_owned();
+        done_w.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    // Give the spawned thread time to try to acquire.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !done.load(std::sync::atomic::Ordering::SeqCst),
+        "spawned thread acquired the lock while the guard was still held"
+    );
+
+    drop(guard);
+    handle.join().unwrap();
+    assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+}

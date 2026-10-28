@@ -9,6 +9,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -860,6 +861,106 @@ async fn creating_row_inside_grace_period_not_touched() {
 
     // tmp directory for the in-flight operation survives clean_tmp.
     assert!(tmp_dir.is_dir(), "in-flight tmp directory must be kept");
+
+    teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reconciler_skips_creating_when_row_flipped_under_lock() {
+    // While the reconciler is blocked on the per-repository lock for a
+    // `creating` row, another request flips the row to `deleting`.  When the
+    // lock is released the reconciler must re-read the row under the lock and
+    // skip the create — the directory must not exist afterwards.
+    let env = setup(30).await;
+    let mut conn = env.pool.acquire().await.unwrap();
+
+    let op_id = Uuid::new_v4();
+    let row = repositories::insert_creating(
+        &mut conn,
+        env.org,
+        "flip-under-lock",
+        env.owner,
+        op_id,
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
+    let repo_id = row.id;
+    backdate(&env.pool, repo_id).await;
+    drop(conn);
+
+    let lock = env.state.storage.repository_lock(repo_id);
+
+    // Hold the per-repo lock in a std::thread so the reconciler blocks.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+
+    let lock_clone = lock.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = lock_clone.blocking_lock_owned();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+
+    // Wait until the lock is held.
+    held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("lock holder did not acquire the lock");
+
+    // Spawn the reconciler — it will block on `repository_lock(id).lock_owned().await`.
+    let state = env.state.clone();
+    let reconciler = tokio::spawn(async move {
+        let mut attempts = HashMap::new();
+        reconcile::reconcile_once(&state, &mut attempts).await
+    });
+
+    // Give the reconciler time to reach the lock acquisition point.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Flip the row to `deleting` while the reconciler is blocked.
+    // The status trigger requires Creating → Active → Deleting.
+    let mut conn = env.pool.acquire().await.unwrap();
+    repositories::set_status(
+        &mut conn,
+        repo_id,
+        RepositoryStatus::Creating,
+        RepositoryStatus::Active,
+    )
+    .await
+    .unwrap();
+    repositories::set_status(
+        &mut conn,
+        repo_id,
+        RepositoryStatus::Active,
+        RepositoryStatus::Deleting,
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    // Release the lock so the reconciler can proceed.
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+
+    // Wait for the reconciler to finish (with a bounded timeout — it must not
+    // deadlock).
+    let summary = tokio::time::timeout(Duration::from_secs(10), reconciler)
+        .await
+        .expect("reconciler timed out — likely deadlocked on the repository lock")
+        .unwrap()
+        .unwrap();
+
+    // The reconciler must NOT have created the directory.
+    assert!(
+        !repo_path(&env.storage_root, repo_id).exists(),
+        "reconciler must not create the directory when the row was flipped to deleting under the lock"
+    );
+    assert_eq!(
+        summary.activated, 0,
+        "reconciler must not activate a row that was flipped to deleting"
+    );
 
     teardown(env).await;
 }

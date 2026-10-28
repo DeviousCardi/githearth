@@ -153,20 +153,22 @@ pub async fn reconcile_once(
     // their directory may legitimately exist.
     for id in &scan.repositories {
         match db_status.get(id) {
-            None => {
-                if let Err(e) = orphan_repo(state, *id).await {
+            None => match orphan_repo(state, &mut conn, *id).await {
+                Ok(true) => summary.orphaned += 1,
+                Ok(false) => { /* status changed under lock, skip */ }
+                Err(e) => {
                     summary.errors += 1;
                     tracing::warn!(repository_id = %id, error = %e, "orphan move failed");
-                } else {
-                    summary.orphaned += 1;
                 }
-            }
+            },
             Some(RepositoryStatus::Deleted) => {
-                if let Err(e) = orphan_repo(state, *id).await {
-                    summary.errors += 1;
-                    tracing::warn!(repository_id = %id, error = %e, "orphan move failed");
-                } else {
-                    summary.orphaned += 1;
+                match orphan_repo(state, &mut conn, *id).await {
+                    Ok(true) => summary.orphaned += 1,
+                    Ok(false) => { /* status changed under lock, skip */ }
+                    Err(e) => {
+                        summary.errors += 1;
+                        tracing::warn!(repository_id = %id, error = %e, "orphan move failed");
+                    }
                 }
             }
             Some(RepositoryStatus::Creating | RepositoryStatus::Deleting) => {
@@ -285,10 +287,25 @@ async fn reconcile_creating(
 ) -> anyhow::Result<Option<Change>> {
     let storage = state.storage.clone();
 
-    let create_result =
-        tokio::task::spawn_blocking(move || storage.create(repo_id, op_id, ObjectFormat::Sha1))
-            .await
-            .map_err(|e| anyhow::anyhow!("create task panicked: {e}"))?;
+    // Acquire the per-repository filesystem lock before touching disk.
+    let guard = storage.repository_lock(repo_id).lock_owned().await;
+
+    // Re-read the row under the lock: a concurrent API delete may have already
+    // removed it, and the reconciler must not recreate the directory.
+    let still_creating = repositories::get(conn, repo_id)
+        .await?
+        .is_some_and(|r| r.status == RepositoryStatus::Creating);
+    if !still_creating {
+        attempts.remove(&repo_id);
+        return Ok(None);
+    }
+
+    let create_result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        storage.create(repo_id, op_id, ObjectFormat::Sha1)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("create task panicked: {e}"))?;
 
     match create_result {
         Ok(_) => {
@@ -348,11 +365,30 @@ async fn reconcile_deleting(
     repo_id: Uuid,
     scanned: &HashSet<Uuid>,
 ) -> anyhow::Result<Option<Change>> {
+    let storage = state.storage.clone();
+
+    // Acquire the per-repository filesystem lock before touching disk.
+    let guard = storage.repository_lock(repo_id).lock_owned().await;
+
+    // Re-read the row under the lock: a concurrent request may have already
+    // changed the status, and the reconciler must not trash a directory that
+    // is no longer deleting.
+    let still_deleting = repositories::get(conn, repo_id)
+        .await?
+        .is_some_and(|r| r.status == RepositoryStatus::Deleting);
+    if !still_deleting {
+        return Ok(None);
+    }
+
     if scanned.contains(&repo_id) {
-        let storage = state.storage.clone();
-        tokio::task::spawn_blocking(move || storage.trash(repo_id))
-            .await
-            .map_err(|e| anyhow::anyhow!("trash task panicked: {e}"))??;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            storage.trash(repo_id)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("trash task panicked: {e}"))??;
+    } else {
+        drop(guard);
     }
     let ok = repositories::set_status(
         conn,
@@ -369,13 +405,35 @@ async fn reconcile_deleting(
     }
 }
 
-async fn orphan_repo(state: &AppState, id: Uuid) -> anyhow::Result<()> {
+async fn orphan_repo(
+    state: &AppState,
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+) -> anyhow::Result<bool> {
     let storage = state.storage.clone();
-    tokio::task::spawn_blocking(move || storage.orphan(id))
-        .await
-        .map_err(|e| anyhow::anyhow!("orphan task panicked: {e}"))??;
+    let guard = storage.repository_lock(id).lock_owned().await;
+
+    // Re-read the row under the lock: the orphan decision was made from a
+    // status snapshot taken before the lock was acquired.  Only orphan if
+    // the row is still missing or `Deleted`; otherwise a concurrent request
+    // may have changed the status.
+    let should_orphan = match repositories::get(conn, id).await? {
+        None => true,
+        Some(r) if r.status == RepositoryStatus::Deleted => true,
+        _ => false,
+    };
+    if !should_orphan {
+        return Ok(false);
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        storage.orphan(id)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("orphan task panicked: {e}"))??;
     tracing::warn!(repository_id = %id, "orphaned on-disk repository with no corresponding metadata row");
-    Ok(())
+    Ok(true)
 }
 
 /// Spawn the reconciler background task.  Runs one pass at startup, then
