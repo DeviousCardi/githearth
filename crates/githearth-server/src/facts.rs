@@ -122,8 +122,8 @@ pub async fn load(
     .collect();
     let mut grants = Vec::new();
     for row in sqlx::query(&format!(
-        "{TEAMS_CTE} SELECT role, subject_kind, subject_id FROM grants \
- WHERE scope_kind = 'organization' AND scope_id = $2 AND revoked_at IS NULL \
+        "{TEAMS_CTE} SELECT role, subject_kind, subject_id, repository_id FROM grants \
+ WHERE scope_id = $2 AND revoked_at IS NULL \
  AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
  AND ((subject_kind = 'account' AND subject_id = $1) \
  OR (subject_kind = 'team' AND subject_id IN (SELECT id FROM tree))) \
@@ -156,10 +156,15 @@ pub async fn load(
                 continue;
             }
         };
+        let scope = if let Some(repo_id) = row.get::<Option<Uuid>, _>("repository_id") {
+            Scope::Repository(repo_id)
+        } else {
+            Scope::Organization(organization_id)
+        };
         grants.push(Grant {
             role: Role::Builtin(role),
             subject,
-            scope: Scope::Organization(organization_id),
+            scope,
         });
     }
     tx.commit().await?;

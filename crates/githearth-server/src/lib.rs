@@ -13,7 +13,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use config::Config;
 use githearth_authz::{Engine, Resource};
@@ -123,6 +123,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/organizations/{org}/repositories/{name}/unarchive",
             post(repository_api::unarchive),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{name}/access",
+            get(repository_api::list_access).post(repository_api::grant_access),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{name}/access/{grant_id}",
+            delete(repository_api::revoke_access),
         )
         .layer(RequestBodyLimitLayer::new(state.config.body_limit_bytes))
         .layer(TimeoutLayer::with_status_code(

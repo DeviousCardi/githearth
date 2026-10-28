@@ -7,6 +7,7 @@ use axum::{
 use githearth_authz::{Action, Resource};
 use githearth_core::RepositoryStatus;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -575,6 +576,231 @@ pub(crate) async fn delete(
                     "repository storage unavailable",
                 )),
             }
+        },
+    )
+    .await?;
+    Ok(status)
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct AccessGrant {
+    id: Uuid,
+    subject_kind: String,
+    subject_id: Uuid,
+    role: String,
+    expires_at: Option<String>,
+    granted_by: Uuid,
+    created_at: Option<String>,
+}
+
+// Timestamps are rendered in UTC whatever the session time zone is.
+const GRANT_COLUMNS: &str = "id, subject_kind, subject_id, role, granted_by, \
+ to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS expires_at, \
+ to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at";
+
+impl AccessGrant {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Self {
+        AccessGrant {
+            id: row.get("id"),
+            subject_kind: row.get("subject_kind"),
+            subject_id: row.get("subject_id"),
+            role: row.get("role"),
+            expires_at: row.get("expires_at"),
+            granted_by: row.get("granted_by"),
+            created_at: row.get("created_at"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantAccessBody {
+    subject_kind: String,
+    subject_id: Uuid,
+    role: String,
+    expires_at: Option<String>,
+}
+
+pub(crate) async fn list_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, name)): Path<(String, String)>,
+) -> Result<Json<Vec<AccessGrant>>, ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+    require(&state, &loaded, Action::RepositoryManageAccess)?;
+
+    let rows = sqlx::query::<sqlx::Postgres>(&format!(
+        "SELECT {GRANT_COLUMNS} FROM grants \
+         WHERE repository_id = $1 AND revoked_at IS NULL \
+         AND (expires_at IS NULL OR expires_at > clock_timestamp())"
+    ))
+    .bind(loaded.repo.id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let grants = rows.iter().map(AccessGrant::from_row).collect();
+    Ok(Json(grants))
+}
+
+pub(crate) async fn grant_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<AccessGrant>), ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+
+    let key = idempotency::extract_key(&headers).transpose()?;
+    let mut conn = state.pool.acquire().await?;
+    let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}/access");
+
+    idempotency::run(
+        &mut conn,
+        actor.id,
+        "POST",
+        &path_str,
+        &body,
+        key,
+        || async {
+            let input: GrantAccessBody =
+                serde_json::from_slice(&body).map_err(|_| invalid())?;
+
+            if !matches!(input.subject_kind.as_str(), "account" | "team") {
+                return Err(invalid());
+            }
+            if !matches!(
+                input.role.as_str(),
+                "read" | "triage" | "write" | "maintain" | "admin"
+            ) {
+                return Err(invalid());
+            }
+
+            let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+            require(&state, &loaded, Action::RepositoryManageAccess)?;
+
+            if loaded.repo.status != RepositoryStatus::Active {
+                return Err(not_active());
+            }
+
+            let mut tx = state.pool.begin().await?;
+
+            sqlx::query(
+                "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 \
+                 WHERE repository_id = $2 AND subject_kind = $3 AND subject_id = $4 \
+                 AND revoked_at IS NULL",
+            )
+            .bind(actor.id)
+            .bind(loaded.repo.id)
+            .bind(&input.subject_kind)
+            .bind(input.subject_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let grant_id = Uuid::new_v4();
+            // The trigger rejects bad subjects/roles (23514); PostgreSQL rejects a bad expires_at (22007/22008).
+            sqlx::query(
+                "INSERT INTO grants (id, role, subject_kind, subject_id, scope_kind, scope_id, repository_id, expires_at, granted_by) \
+                 VALUES ($1, $2, $3, $4, 'repository', $5, $6, $7::timestamptz, $8)",
+            )
+            .bind(grant_id)
+            .bind(&input.role)
+            .bind(&input.subject_kind)
+            .bind(input.subject_id)
+            .bind(loaded.org_id)
+            .bind(loaded.repo.id)
+            .bind(input.expires_at.as_deref())
+            .bind(actor.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                if e.as_database_error().is_some_and(|d| {
+                    matches!(d.code().as_deref(), Some("23514" | "22007" | "22008"))
+                })
+                {
+                    ApiError(StatusCode::BAD_REQUEST, "invalid grant")
+                } else {
+                    e.into()
+                }
+            })?;
+
+            event(
+                &mut tx,
+                Some(loaded.org_id),
+                loaded.actor_id,
+                "repository.access_granted",
+            )
+            .await?;
+            tx.commit().await?;
+
+            let mut conn2 = state.pool.acquire().await?;
+            let row = sqlx::query(&format!("SELECT {GRANT_COLUMNS} FROM grants WHERE id = $1"))
+            .bind(grant_id)
+            .fetch_one(&mut *conn2)
+            .await?;
+            let grant = AccessGrant::from_row(&row);
+            Ok((
+                StatusCode::CREATED,
+                serde_json::to_value(&grant).unwrap(),
+            ))
+        },
+    )
+    .await
+    .map(|(_, value)| {
+        (
+            StatusCode::CREATED,
+            Json(serde_json::from_value(value).unwrap()),
+        )
+    })
+}
+
+pub(crate) async fn revoke_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, name, grant_id)): Path<(String, String, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+
+    let path_str =
+        format!("/api/v1/organizations/{org_slug}/repositories/{name}/access/{grant_id}");
+    let key = idempotency::extract_key(&headers).transpose()?;
+    let mut conn = state.pool.acquire().await?;
+
+    let (status, _) = idempotency::run(
+        &mut conn,
+        actor.id,
+        "DELETE",
+        &path_str,
+        b"",
+        key,
+        || async {
+            let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+            require(&state, &loaded, Action::RepositoryManageAccess)?;
+
+            let mut tx = state.pool.begin().await?;
+            let result = sqlx::query(
+                "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 \
+                 WHERE id = $2 AND repository_id = $3 AND revoked_at IS NULL",
+            )
+            .bind(actor.id)
+            .bind(grant_id)
+            .bind(loaded.repo.id)
+            .execute(&mut *tx)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                return Err(ApiError(StatusCode::NOT_FOUND, "grant not found"));
+            }
+
+            event(
+                &mut tx,
+                Some(loaded.org_id),
+                loaded.actor_id,
+                "repository.access_revoked",
+            )
+            .await?;
+            tx.commit().await?;
+            Ok((StatusCode::NO_CONTENT, serde_json::Value::Null))
         },
     )
     .await?;
