@@ -1171,6 +1171,115 @@ async fn slow_reader_gets_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn v0_info_refs_prefix_governed_by_deadline() {
+    let storage_root = std::env::temp_dir().join(format!("githearth-v0dead-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL").unwrap(),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        git_timeout_seconds: 10,
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let owner = fixture_account(&pool, &tag("v0dead-owner")).await;
+    set_password(&pool, owner, "testpass").await;
+    let username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (_org_id, org_slug) = fixture_organization(&pool, owner).await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_name = tag("v0dead-repo");
+    let repo_id = create_active_repo(&pool, org_id, &repo_name, owner).await;
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    state
+        .storage
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha1,
+        )
+        .unwrap();
+
+    let repo_path = state_repo_path(&storage_root, repo_id);
+    let rps = repo_path.to_str().unwrap();
+    let tmp_work = std::env::temp_dir().join(format!("git-v0dead-work-{}", Uuid::new_v4()));
+    let tw = tmp_work.to_str().unwrap();
+    std::fs::create_dir_all(&tmp_work).unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+    std::fs::write(tmp_work.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    let _ = std::fs::remove_dir_all(&tmp_work);
+
+    let app = router(state);
+
+    // v0 info/refs: do NOT set Git-Protocol header so we get the prefix.
+    let (status, _headers, body) = raw_request(
+        &app,
+        "GET",
+        &format!("/{org_slug}/{repo_name}.git/info/refs?service=git-upload-pack"),
+        &[("authorization", &basic_auth(&username, "testpass"))],
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Body should contain the service prefix immediately.
+    assert!(String::from_utf8_lossy(&body).contains("# service=git-upload-pack"));
+
+    // Now get a fresh response, don't read the body, sleep past the deadline,
+    // then collect — the prefix must NOT appear.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{org_slug}/{repo_name}.git/info/refs?service=git-upload-pack"
+        ))
+        .header("authorization", basic_auth(&username, "testpass"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.expect("request failed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Sleep past the deadline.
+    tokio::time::sleep(Duration::from_secs(11)).await;
+
+    let body_result = response.into_body().collect().await;
+    if let Ok(collected) = body_result {
+        let bytes = collected.to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("# service=git-upload-pack"),
+            "prefix must not appear after deadline, got: {text}"
+        );
+    }
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn client_disconnect_releases_permit() {
     let storage_root = std::env::temp_dir().join(format!("githearth-drop-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();

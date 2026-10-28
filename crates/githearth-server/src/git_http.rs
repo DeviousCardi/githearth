@@ -508,24 +508,30 @@ fn stream_git_output(
         drop(permit);
     });
 
-    // Build the response body stream from stdout, wrapped with a deadline
-    // check and a drop-guard so client disconnect cancels the token.
+    // Build the full output stream first (prefix + stdout if needed), then
+    // wrap it in DeadlineStream so the prefix is also governed by the deadline.
     let stdout_stream = ReaderStream::new(stdout);
+    let full_stream: Box<
+        dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin + Send,
+    > = if prefix.is_empty() {
+        Box::new(stdout_stream)
+    } else {
+        use futures_util::{future, stream};
+        let prefix_item = stream::once(future::ready(Ok(bytes::Bytes::from(prefix))));
+        Box::new(prefix_item.chain(stdout_stream))
+    };
+
     let guard = token.clone().drop_guard();
+    let sleep = Box::pin(tokio::time::sleep_until(deadline));
     let deadline_stream = DeadlineStream {
-        inner: stdout_stream,
-        deadline,
+        inner: full_stream,
+        sleep,
         token,
         guard: Some(guard),
         finished: false,
     };
 
-    if prefix.is_empty() {
-        stream::StreamExt::boxed(deadline_stream)
-    } else {
-        let prefix_item = stream::once(async move { Ok(bytes::Bytes::from(prefix)) });
-        stream::StreamExt::boxed(prefix_item.chain(deadline_stream))
-    }
+    stream::StreamExt::boxed(deadline_stream)
 }
 
 async fn drain_stderr(stderr: tokio::process::ChildStderr) -> Vec<u8> {
@@ -555,7 +561,9 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr) -> Vec<u8> {
 
 struct DeadlineStream<S> {
     inner: S,
-    deadline: tokio::time::Instant,
+    /// A sleep that fires at the deadline.  Polled first on every poll so the
+    /// deadline wakes a pending inner read.
+    sleep: Pin<Box<tokio::time::Sleep>>,
     token: CancellationToken,
     /// Disarmed when the stream ends normally (EOF).  If the stream is dropped
     /// before reaching EOF (client disconnect, deadline error), the guard
@@ -576,15 +584,21 @@ where
         if self.finished {
             return Poll::Ready(None);
         }
-        if tokio::time::Instant::now() >= self.deadline {
-            self.finished = true;
-            self.token.cancel();
-            self.guard.take();
-            return Poll::Ready(Some(Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "git deadline exceeded",
-            ))));
+        // Poll the deadline sleep first.  If it fires, end the stream with
+        // TimedOut — even if the inner stream still has data pending.
+        match self.sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.finished = true;
+                self.token.cancel();
+                self.guard.take();
+                return Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "git deadline exceeded",
+                ))));
+            }
+            Poll::Pending => {}
         }
+        // Deadline hasn't fired yet — poll the inner stream.
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::other(e)))),
@@ -656,6 +670,7 @@ impl IntoResponse for GitHttpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     #[test]
     fn protocol_v2_detection_by_component() {
@@ -674,5 +689,77 @@ mod tests {
         assert!(sem.clone().try_acquire_owned().is_err());
         drop(_held);
         assert!(sem.clone().try_acquire_owned().is_ok());
+    }
+
+    /// DeadlineStream over a never-yielding inner stream: the sleep must fire
+    /// and produce a TimedOut error, then None on the next poll.
+    #[tokio::test]
+    async fn deadline_stream_timed_out() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+        let inner: Box<
+            dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin + Send,
+        > = Box::new(futures_util::stream::pending());
+        let sleep = Box::pin(tokio::time::sleep_until(deadline));
+        let mut stream = DeadlineStream {
+            inner,
+            sleep,
+            token,
+            guard: Some(guard),
+            finished: false,
+        };
+
+        let start = tokio::time::Instant::now();
+
+        // First poll must yield TimedOut around 200 ms.
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream hung")
+            .expect("stream ended without item");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed <= Duration::from_secs(1),
+            "TimedOut arrived at {:.0} ms, expected ~200 ms",
+            elapsed.as_millis()
+        );
+        assert_eq!(item.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+
+        // Next poll must return None.
+        let next = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .unwrap_or(None);
+        assert!(next.is_none(), "second poll must return None, got {next:?}");
+    }
+
+    /// When the deadline is already in the past, the sleep fires immediately and
+    /// the inner stream's ready item is never yielded.
+    #[tokio::test]
+    async fn deadline_stream_past_deadline_skips_inner() {
+        let deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+        let inner: Box<
+            dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin + Send,
+        > = Box::new(futures_util::stream::once(futures_util::future::ready(Ok(
+            bytes::Bytes::from("should not appear"),
+        ))));
+        let sleep = Box::pin(tokio::time::sleep_until(deadline));
+        let mut stream = DeadlineStream {
+            inner,
+            sleep,
+            token,
+            guard: Some(guard),
+            finished: false,
+        };
+
+        let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream hung")
+            .expect("stream ended without item");
+        assert_eq!(item.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+
+        let next = stream.next().await;
+        assert!(next.is_none(), "second poll must return None, got {next:?}");
     }
 }
