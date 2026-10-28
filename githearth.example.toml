@@ -6,6 +6,7 @@ database_timeout_seconds = 3
 request_timeout_seconds = 15
 token_ttl_seconds = 3600
 body_limit_bytes = 16384
+# secure_cookies = true  # set false only for local HTTP development
 auth_concurrency = 2
 # storage_root = "data/repositories"
 # reconcile_interval_seconds = 60

@@ -24,6 +24,8 @@ pub struct Config {
     pub git_concurrency: usize,
     pub git_timeout_seconds: u64,
     pub git_request_limit_bytes: usize,
+    #[serde(default = "default_secure_cookies")]
+    pub secure_cookies: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -43,9 +45,14 @@ impl Default for Config {
             git_concurrency: 8,
             git_timeout_seconds: 600,
             git_request_limit_bytes: 10_485_760,
+            secure_cookies: true,
         }
     }
 }
+fn default_secure_cookies() -> bool {
+    true
+}
+
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let mut c: Self = match path {
@@ -80,6 +87,7 @@ impl Config {
         env!(token_ttl_seconds, "GITHEARTH_TOKEN_TTL_SECONDS");
         env!(body_limit_bytes, "GITHEARTH_BODY_LIMIT_BYTES");
         env!(auth_concurrency, "GITHEARTH_AUTH_CONCURRENCY");
+        env!(secure_cookies, "GITHEARTH_SECURE_COOKIES");
         env!(git_concurrency, "GITHEARTH_GIT_CONCURRENCY");
         env!(git_timeout_seconds, "GITHEARTH_GIT_TIMEOUT_SECONDS");
         env!(git_request_limit_bytes, "GITHEARTH_GIT_REQUEST_LIMIT_BYTES");
