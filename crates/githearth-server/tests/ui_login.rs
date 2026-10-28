@@ -28,10 +28,6 @@ async fn fresh_db(name: &str) -> String {
     format!("{origin}/{name}")
 }
 
-async fn setup() -> (Router, PgPool, String) {
-    setup_with_secure(true).await
-}
-
 async fn setup_with_secure(secure: bool) -> (Router, PgPool, String) {
     let db_name = format!("githearth_ui_{}", Uuid::new_v4().simple());
     let url = fresh_db(&db_name).await;
@@ -44,7 +40,6 @@ async fn setup_with_secure(secure: bool) -> (Router, PgPool, String) {
     };
     let pool = connect(&config).await.unwrap();
     MIGRATOR.run(&pool).await.unwrap();
-    // create admin
     let hash = hash_password("password123456").unwrap();
     let account_id = Uuid::new_v4();
     sqlx::query(
@@ -56,12 +51,10 @@ async fn setup_with_secure(secure: bool) -> (Router, PgPool, String) {
     .execute(&pool)
     .await
     .unwrap();
-    // organization + membership + grant
     let org_id = Uuid::new_v4();
-    let org_slug = "acme";
     sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Acme Org')")
         .bind(org_id)
-        .bind(org_slug)
+        .bind("acme")
         .execute(&pool)
         .await
         .unwrap();
@@ -72,14 +65,29 @@ async fn setup_with_secure(secure: bool) -> (Router, PgPool, String) {
         .await
         .unwrap();
     sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'owner','account',$2,'organization',$3,$2)")
-        .bind(Uuid::new_v4()).bind(account_id).bind(org_id).execute(&pool).await.unwrap();
-    // repository
+        .bind(Uuid::new_v4())
+        .bind(account_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO repositories (id,organization_id,name,description,visibility,archived,status,operation_id,created_by) VALUES ($1,$2,$3,$4,'private',false,'active',$5,$6)")
-        .bind(Uuid::new_v4()).bind(org_id).bind("repo1").bind("<script>alert(1)</script>").bind(Uuid::new_v4()).bind(account_id).execute(&pool).await.unwrap();
-
+        .bind(Uuid::new_v4())
+        .bind(org_id)
+        .bind("repo1")
+        .bind("<script>alert(1)</script>")
+        .bind(Uuid::new_v4())
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     let state = AppState::new(pool.clone(), config).await.unwrap();
     let app = router(state);
     (app, pool, db_name)
+}
+
+async fn setup() -> (Router, PgPool, String) {
+    setup_with_secure(true).await
 }
 
 async fn fetch_csrf(app: &Router) -> (String, String) {
@@ -110,18 +118,14 @@ async fn fetch_csrf(app: &Router) -> (String, String) {
     let pos = html.find(marker).unwrap() + marker.len();
     let rest = &html[pos..];
     let end = rest.find('"').unwrap();
-    let token = rest[..end].to_string();
-    (cookie, token)
+    (cookie, rest[..end].to_string())
 }
 
-#[tokio::test]
-#[ignore = "requires PostgreSQL"]
-async fn login_sets_cookie_and_redirects() {
-    let (app, pool, _db) = setup().await;
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
+async fn login(app: &Router, username: &str, password: &str) -> String {
+    let (csrf_cookie, csrf_token) = fetch_csrf(app).await;
     let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
+        "username={}&password={}&csrf_token={}",
+        username, password, csrf_token
     );
     let resp = app
         .clone()
@@ -136,17 +140,78 @@ async fn login_sets_cookie_and_redirects() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let cookie = resp
-        .headers()
+    resp.headers()
         .get(header::SET_COOKIE)
         .unwrap()
         .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+async fn get_page(app: &Router, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+    let mut builder = Request::builder().method("GET").uri(path);
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
         .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn post_form(
+    app: &Router,
+    path: &str,
+    cookie: Option<&str>,
+    body: &str,
+) -> (StatusCode, String, Option<String>) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .map(|v| v.to_str().unwrap().to_string());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        String::from_utf8_lossy(&bytes).into_owned(),
+        set_cookie,
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn login_sets_cookie_and_redirects() {
+    let (app, pool, _db) = setup().await;
+    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
+    let body = format!(
+        "username=alice&password=password123456&csrf_token={}",
+        csrf_token
+    );
+    let (status, _, set_cookie) = post_form(&app, "/login", Some(&csrf_cookie), &body).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = set_cookie.unwrap();
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Lax"));
     assert!(cookie.contains("githearth_session="));
-    // safe default: Secure present
     assert!(cookie.contains("Secure"));
     pool.close().await;
 }
@@ -155,19 +220,15 @@ async fn login_sets_cookie_and_redirects() {
 #[ignore = "requires PostgreSQL"]
 async fn login_csrf_missing_rejected() {
     let (app, pool, _db) = setup().await;
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("username=alice&password=password123456"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let (status, body, _) = post_form(
+        &app,
+        "/login",
+        None,
+        "username=alice&password=password123456",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("Invalid CSRF token."));
     pool.close().await;
 }
 
@@ -180,26 +241,8 @@ async fn login_cookie_opt_out_not_secure() {
         "username=alice&password=password123456&csrf_token={}",
         csrf_token
     );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert!(!cookie.contains("Secure"));
+    let (_, _, set_cookie) = post_form(&app, "/login", Some(&csrf_cookie), &body).await;
+    assert!(!set_cookie.unwrap().contains("Secure"));
     pool.close().await;
 }
 
@@ -212,97 +255,31 @@ async fn login_failure_does_not_leak() {
         "username=alice&password=wrongpassword&csrf_token={}",
         csrf_token
     );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let loc = resp
-        .headers()
-        .get(header::LOCATION)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert!(loc.contains("error=1"));
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(loc)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("Invalid username or password."));
-    assert!(!html.contains("alice"));
-    // rejected CSRF attempt renders its own error
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from(
-                    "username=alice&password=password123456&csrf_token=bad",
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("Invalid CSRF token."));
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/login?error=csrf")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("Invalid CSRF token."));
-    // unknown user
+    let (status, _, _) = post_form(&app, "/login", Some(&csrf_cookie), &body).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, body) = get_page(&app, "/login?error=1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Invalid username or password."));
+    assert!(!body.contains("alice"));
+    let (status, body, _) = post_form(
+        &app,
+        "/login",
+        None,
+        "username=alice&password=password123456&csrf_token=bad",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("Invalid CSRF token."));
+    let (status, body) = get_page(&app, "/login?error=csrf", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Invalid CSRF token."));
     let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
     let body = format!(
         "username=nobody&password=password123456&csrf_token={}",
         csrf_token
     );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let (status, _, _) = post_form(&app, "/login", Some(&csrf_cookie), &body).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
     pool.close().await;
 }
 
@@ -310,51 +287,10 @@ async fn login_failure_does_not_leak() {
 #[ignore = "requires PostgreSQL"]
 async fn home_lists_orgs_with_cookie() {
     let (app, pool, _db) = setup().await;
-    // login
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("acme"));
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, body) = get_page(&app, "/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("acme"));
     pool.close().await;
 }
 
@@ -362,70 +298,20 @@ async fn home_lists_orgs_with_cookie() {
 #[ignore = "requires PostgreSQL"]
 async fn org_page_lists_readable_repo_and_escapes() {
     let (app, pool, _db) = setup().await;
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/organizations/acme")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("repo1"));
-    // description is not rendered on the organization page.
-    assert!(!html.contains("script"));
-    // Repository page renders the escaped description.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/organizations/acme/repositories/repo1")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-    assert!(!html.contains("<script>alert(1)</script>"));
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, body) = get_page(&app, "/organizations/acme", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("repo1"));
+    assert!(!body.contains("script"));
+    let (status, body) = get_page(
+        &app,
+        "/organizations/acme/repositories/repo1",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!body.contains("<script>alert(1)</script>"));
     pool.close().await;
 }
 
@@ -433,50 +319,15 @@ async fn org_page_lists_readable_repo_and_escapes() {
 #[ignore = "requires PostgreSQL"]
 async fn authenticated_repository_page_renders() {
     let (app, pool, _db) = setup().await;
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/organizations/acme/repositories/repo1")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("repo1"));
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, body) = get_page(
+        &app,
+        "/organizations/acme/repositories/repo1",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("repo1"));
     pool.close().await;
 }
 
@@ -492,47 +343,14 @@ async fn unauthorized_repository_access_returns_not_found() {
         .execute(&pool)
         .await
         .unwrap();
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=bob&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/organizations/acme/repositories/repo1")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let cookie = login(&app, "bob", "password123456").await;
+    let (status, _) = get_page(
+        &app,
+        "/organizations/acme/repositories/repo1",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     pool.close().await;
 }
 
@@ -540,74 +358,15 @@ async fn unauthorized_repository_access_returns_not_found() {
 #[ignore = "requires PostgreSQL"]
 async fn database_failure_returns_unavailable() {
     let (app, pool, _db) = setup().await;
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/login")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, _) = get_page(&app, "/login", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
     pool.close().await;
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/login")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let (status, _) = get_page(&app, "/login", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, _) = get_page(&app, "/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // pool already closed
 }
 
 #[tokio::test]
@@ -640,64 +399,13 @@ async fn suspended_organization_hidden_from_navigation() {
         .execute(&pool)
         .await
         .unwrap();
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(!html.contains("Hidden Org"));
-    assert!(!html.contains("/organizations/hiddenorg"));
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/organizations/hiddenorg")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, body) = get_page(&app, "/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Hidden Org"));
+    assert!(!body.contains("/organizations/hiddenorg"));
+    let (status, _) = get_page(&app, "/organizations/hiddenorg", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     pool.close().await;
 }
 
@@ -706,18 +414,8 @@ async fn suspended_organization_hidden_from_navigation() {
 async fn login_page_displays_error_states() {
     let (app, pool, _db) = setup().await;
     for q in ["/login?error=1", "/login?error=csrf"] {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(q)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let (status, _) = get_page(&app, q, None).await;
+        assert_eq!(status, StatusCode::OK);
     }
     pool.close().await;
 }
@@ -726,7 +424,6 @@ async fn login_page_displays_error_states() {
 #[ignore = "requires PostgreSQL"]
 async fn empty_navigation_states_render() {
     let (app, pool, _db) = setup().await;
-    // empty organization list for a user without memberships
     let hash = hash_password("password123456").unwrap();
     sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,$3)")
         .bind(Uuid::new_v4())
@@ -735,52 +432,10 @@ async fn empty_navigation_states_render() {
         .execute(&pool)
         .await
         .unwrap();
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=bob&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("No organizations yet."));
-
-    // empty repository list for an organization without readable repos
+    let cookie = login(&app, "bob", "password123456").await;
+    let (status, body) = get_page(&app, "/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("No organizations yet."));
     let org_id = Uuid::new_v4();
     sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Empty Org')")
         .bind(org_id)
@@ -805,51 +460,10 @@ async fn empty_navigation_states_render() {
         .execute(&pool)
         .await
         .unwrap();
-    // login as alice again (new session)
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/organizations/emptyorg")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("No repositories you can read."));
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, body) = get_page(&app, "/organizations/emptyorg", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("No repositories you can read."));
     pool.close().await;
 }
 
@@ -857,7 +471,6 @@ async fn empty_navigation_states_render() {
 #[ignore = "requires PostgreSQL"]
 async fn access_isolation() {
     let (app, pool, _db) = setup().await;
-    // create second user bob without org access
     let hash = hash_password("password123456").unwrap();
     sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,$3)")
         .bind(Uuid::new_v4())
@@ -866,52 +479,10 @@ async fn access_isolation() {
         .execute(&pool)
         .await
         .unwrap();
-    // bob login
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=bob&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    // bob cannot see acme org
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/organizations/acme")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(!html.contains("repo1"));
+    let cookie = login(&app, "bob", "password123456").await;
+    let (status, body) = get_page(&app, "/organizations/acme", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!body.contains("repo1"));
     pool.close().await;
 }
 
@@ -919,50 +490,9 @@ async fn access_isolation() {
 #[ignore = "requires PostgreSQL"]
 async fn logout_requires_csrf() {
     let (app, pool, _db) = setup().await;
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    // logout without csrf
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/logout")
-                .header("cookie", &cookie)
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from(""))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    // with csrf from derived token? Need compute. We'll fetch home? Instead test logout success via form with token extracted? Skip exact; test invalid enough.
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, _, _) = post_form(&app, "/logout", Some(&cookie), "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     pool.close().await;
 }
 
@@ -970,35 +500,7 @@ async fn logout_requires_csrf() {
 #[ignore = "requires PostgreSQL"]
 async fn cookie_cannot_authenticate_json_mutation() {
     let (app, pool, _db) = setup().await;
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    // attempt to create org via JSON API using only cookie (no Bearer)
+    let cookie = login(&app, "alice", "password123456").await;
     let resp = app
         .clone()
         .oneshot(
@@ -1020,93 +522,26 @@ async fn cookie_cannot_authenticate_json_mutation() {
 #[ignore = "requires PostgreSQL"]
 async fn logout_success_clears_cookie() {
     let (app, pool, _db) = setup().await;
-    let (csrf_cookie, csrf_token) = fetch_csrf(&app).await;
-    let body = format!(
-        "username=alice&password=password123456&csrf_token={}",
-        csrf_token
-    );
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("cookie", &csrf_cookie)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    // Extract CSRF token from rendered home page.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, body) = get_page(&app, "/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
     let marker = "name=\"csrf_token\" value=\"";
-    let pos = html
-        .find(marker)
-        .expect("csrf field present")
-        .saturating_add(marker.len());
-    let rest = &html[pos..];
+    let pos = body.find(marker).unwrap() + marker.len();
+    let rest = &body[pos..];
     let end = rest.find('"').unwrap();
     let csrf = &rest[..end];
-    let body = format!("csrf_token={}", csrf);
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/logout")
-                .header("cookie", &cookie)
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let cleared = resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let (status, _, set_cookie) = post_form(
+        &app,
+        "/logout",
+        Some(&cookie),
+        &format!("csrf_token={}", csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cleared = set_cookie.unwrap();
     assert!(cleared.contains("Max-Age=0"));
     assert!(cleared.contains("Secure"));
-    // after logout, home redirects
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let (status, _) = get_page(&app, "/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
     pool.close().await;
 }
