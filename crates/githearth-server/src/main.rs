@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use githearth_server::{AppState, MIGRATOR, bootstrap_admin, config::Config, connect, router};
+use githearth_server::{
+    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, reconcile, router,
+};
 use std::{
     io::{self, Read},
     path::PathBuf,
@@ -78,6 +80,7 @@ async fn run() -> Result<()> {
             let state = AppState::new(pool, config.clone())
                 .await
                 .context("cannot initialize authentication")?;
+            let _reconciler = reconcile::spawn(state.clone());
             let listener = tokio::net::TcpListener::bind(config.bind)
                 .await
                 .context("cannot bind HTTP listener")?;
