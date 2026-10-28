@@ -73,15 +73,15 @@ impl From<&repositories::RepositoryRow> for RepositoryJson {
     }
 }
 
-struct Loaded {
-    actor_id: Uuid,
-    auth_age: u64,
-    org_id: Uuid,
-    facts: crate::facts::Facts,
-    repo: repositories::RepositoryRow,
+pub(crate) struct Loaded {
+    pub(crate) actor_id: Uuid,
+    pub(crate) auth_age: u64,
+    pub(crate) org_id: Uuid,
+    pub(crate) facts: crate::facts::Facts,
+    pub(crate) repo: repositories::RepositoryRow,
 }
 
-async fn load_repo(
+pub(crate) async fn load_repo(
     state: &AppState,
     actor_id: Uuid,
     auth_age: u64,
@@ -113,7 +113,7 @@ async fn load_repo(
 }
 
 /// Mutations must name the repository's current name; renamed-away names only redirect reads.
-async fn load_current(
+pub(crate) async fn load_current(
     state: &AppState,
     actor_id: Uuid,
     auth_age: u64,
@@ -127,7 +127,7 @@ async fn load_current(
     Ok(loaded)
 }
 
-fn require(state: &AppState, loaded: &Loaded, action: Action) -> Result<(), ApiError> {
+pub(crate) fn require(state: &AppState, loaded: &Loaded, action: Action) -> Result<(), ApiError> {
     let authz_repo = repositories::authz_repository(&loaded.repo);
     let decision = state.authz.authorize(&loaded.facts.request(
         action,

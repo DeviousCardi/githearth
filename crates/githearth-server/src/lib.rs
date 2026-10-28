@@ -2,6 +2,7 @@ pub mod config;
 pub mod facts;
 pub mod git_admission;
 pub mod idempotency;
+pub mod issues;
 pub mod pushes;
 pub mod repositories;
 pub mod repository_api;
@@ -108,6 +109,7 @@ pub fn router(state: AppState) -> Router {
             post(create_organization).get(list_organizations),
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
+        .merge(issues::router())
         .route(
             "/api/v1/organizations/{org}/repositories",
             post(repository_api::create).get(repository_api::list),
