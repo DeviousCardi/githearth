@@ -4,20 +4,19 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("githearth-test-{}-{nonce}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "githearth-test-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(fs::canonicalize(path).unwrap())
     }
 }
 impl Drop for Fixture {
