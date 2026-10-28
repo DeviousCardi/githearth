@@ -217,7 +217,9 @@ async fn create(
             let issue = fetch_issue(&mut tx, id).await?.unwrap();
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&issue).unwrap();
-            idem.store(&mut tx, status, &body).await?;
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
             tx.commit().await?;
             Ok((status, body))
         },
@@ -415,7 +417,9 @@ async fn update(
             let updated = fetch_issue(&mut tx, issue.id).await?.unwrap();
             let status = StatusCode::OK;
             let body = serde_json::to_value(&updated).unwrap();
-            idem.store(&mut tx, status, &body).await?;
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
             tx.commit().await?;
             Ok((status, body))
         },
@@ -503,7 +507,9 @@ async fn create_comment(
             .await?;
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&comment).unwrap();
-            idem.store(&mut tx, status, &body).await?;
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
             tx.commit().await?;
             Ok((status, body))
         },

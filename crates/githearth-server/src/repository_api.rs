@@ -28,6 +28,14 @@ fn name_taken() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository name already taken")
 }
 
+/// Serializes the filesystem create/trash stage so a stalled handler and its
+/// re-claimer cannot both build the same temporary directory. It also lets a
+/// create re-check the row's status before touching disk, so a stale handler
+/// cannot recreate the directory of an already-deleted repository.
+/// shortcut: single-process only — if the server ever forked/ran as multiple
+/// processes on one node, this must be replaced with an inter-process lock.
+static STORAGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NewRepository {
@@ -127,6 +135,32 @@ pub(crate) async fn load_current(
     Ok(loaded)
 }
 
+/// Resolve a repository by its immutable creation operation id, for resuming a
+/// crashed mutation against the exact row it started on (never a newer repository
+/// that has since reused the name).
+async fn load_by_operation(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    operation_id: Uuid,
+) -> Result<Loaded, ApiError> {
+    let mut conn = state.pool.acquire().await?;
+    let Some(repo) = repositories::find_by_operation(&mut conn, operation_id).await? else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+    };
+    let org_id = repo.organization_id;
+    let Some(facts) = facts::load(&mut conn, actor_id, org_id).await? else {
+        return Err(org_not_found());
+    };
+    Ok(Loaded {
+        actor_id,
+        auth_age,
+        org_id,
+        facts,
+        repo,
+    })
+}
+
 pub(crate) fn require(state: &AppState, loaded: &Loaded, action: Action) -> Result<(), ApiError> {
     let authz_repo = repositories::authz_repository(&loaded.repo);
     let decision = state.authz.authorize(&loaded.facts.request(
@@ -210,12 +244,24 @@ pub(crate) async fn create(
             let mut tx = state.pool.begin().await?;
             let repo = match idem.prior_operation_id {
                 // An abandoned attempt left a `creating` row; continue it instead of a second one.
-                Some(operation_id) => repositories::find_by_operation(&mut tx, operation_id)
-                    .await?
-                    .ok_or_else(org_not_found)?,
+                Some(operation_id) => {
+                    let repo = repositories::find_by_operation(&mut tx, operation_id)
+                        .await?
+                        .ok_or_else(org_not_found)?;
+                    // A previously deleted repository must never be resurrected.
+                    if matches!(
+                        repo.status,
+                        RepositoryStatus::Deleted | RepositoryStatus::Deleting
+                    ) {
+                        return Err(not_found());
+                    }
+                    repo
+                }
                 None => {
                     let operation_id = Uuid::new_v4();
-                    idem.record_operation(&mut tx, operation_id).await?;
+                    if !idem.record_operation(&mut tx, operation_id).await? {
+                        return Err(idempotency::claim_lost());
+                    }
                     match repositories::insert_creating(
                         &mut tx,
                         org_id,
@@ -239,53 +285,82 @@ pub(crate) async fn create(
                     }
                 }
             };
-            event(&mut tx, Some(org_id), actor.id, "repository.created").await?;
+            // Only the first attempt emits repository.created; a resume reuses
+            // the already-committed row and must not replay the event.
+            if idem.prior_operation_id.is_none() {
+                event(&mut tx, Some(org_id), actor.id, "repository.created").await?;
+            }
             let operation_id = repo.operation_id;
             tx.commit().await?;
 
+            // Re-check the row's status under the filesystem lock: a later delete
+            // may have already removed it, and a stale handler must never recreate
+            // the directory of a deleted repository. The guard is then moved into
+            // the blocking worker, so a cancelled request cannot drop the lock
+            // while the directory operator is still running.
+            let guard = STORAGE_LOCK.lock().await;
+            let current_status = {
+                let mut conn = state.pool.acquire().await?;
+                let row = repositories::get(&mut conn, repo.id)
+                    .await?
+                    .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
+                drop(conn);
+                row.status
+            };
             let storage = state.storage.clone();
-            let create_result = tokio::task::spawn_blocking(move || {
-                storage.create(
-                    repo.id,
-                    operation_id,
-                    githearth_git::layout::ObjectFormat::Sha1,
-                )
-            })
-            .await
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage operation failed",
-                )
-            })?;
-
-            match create_result {
-                Ok(_) => {
-                    // Store the response atomically with the mark-active step (ADR 0003).
-                    let mut tx = state.pool.begin().await?;
-                    repositories::set_status(
-                        &mut tx,
-                        repo.id,
-                        RepositoryStatus::Creating,
-                        RepositoryStatus::Active,
-                    )
-                    .await?;
-                    let row = repositories::get(&mut tx, repo.id)
-                        .await?
-                        .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
-                    let result = RepositoryJson::from(&row);
-                    let status = StatusCode::CREATED;
-                    let body = serde_json::to_value(&result).unwrap();
-                    idem.store(&mut tx, status, &body).await?;
-                    tx.commit().await?;
-                    Ok((status, body))
+            match current_status {
+                RepositoryStatus::Creating => {
+                    tokio::task::spawn_blocking(move || {
+                        let _guard = guard;
+                        storage.create(
+                            repo.id,
+                            operation_id,
+                            githearth_git::layout::ObjectFormat::Sha1,
+                        )
+                    })
+                    .await
+                    .map_err(|_| {
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "storage operation failed",
+                        )
+                    })?
+                    // ADR 0003: stay `creating` so the reconciler redoes the create; `failed` only after repeated failures.
+                    .map_err(|_| {
+                        ApiError(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "repository storage unavailable",
+                        )
+                    })?;
                 }
-                // ADR 0003: stay `creating` so the reconciler redoes the create; `failed` only after repeated failures.
-                Err(_) => Err(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "repository storage unavailable",
-                )),
+                // Finished elsewhere (a concurrent retry): nothing to create.
+                RepositoryStatus::Active => drop(guard),
+                _ => {
+                    drop(guard);
+                    return Err(not_active());
+                }
             }
+
+            // Store the response atomically with the mark-active step (ADR 0003).
+            let mut tx = state.pool.begin().await?;
+            repositories::set_status(
+                &mut tx,
+                repo.id,
+                RepositoryStatus::Creating,
+                RepositoryStatus::Active,
+            )
+            .await?;
+            let row = repositories::get(&mut tx, repo.id)
+                .await?
+                .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
+            let result = RepositoryJson::from(&row);
+            let status = StatusCode::CREATED;
+            let body = serde_json::to_value(&result).unwrap();
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
+            tx.commit().await?;
+            Ok((status, body))
         },
     )
     .await
@@ -435,7 +510,9 @@ pub(crate) async fn update(
             let result_json = RepositoryJson::from(&updated);
             let status = StatusCode::OK;
             let body = serde_json::to_value(&result_json).unwrap();
-            idem.store(&mut tx, status, &body).await?;
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
             tx.commit().await?;
             Ok((status, body))
         },
@@ -483,7 +560,9 @@ macro_rules! archive_handler {
                         let mut tx = state.pool.begin().await?;
                         let status = StatusCode::OK;
                         let body = serde_json::to_value(&result_json).unwrap();
-                        idem.store(&mut tx, status, &body).await?;
+                        if !idem.store(&mut tx, status, &body).await? {
+                            return Err(idempotency::claim_lost());
+                        }
                         tx.commit().await?;
                         return Ok((status, body));
                     }
@@ -500,7 +579,9 @@ macro_rules! archive_handler {
                     let result_json = RepositoryJson::from(&updated);
                     let status = StatusCode::OK;
                     let body = serde_json::to_value(&result_json).unwrap();
-                    idem.store(&mut tx, status, &body).await?;
+                    if !idem.store(&mut tx, status, &body).await? {
+                        return Err(idempotency::claim_lost());
+                    }
                     tx.commit().await?;
                     Ok((status, body))
                 },
@@ -533,45 +614,81 @@ pub(crate) async fn delete(
         b"",
         key,
         |idem| async move {
-            let loaded = load_current(state, actor.id, auth_age, &org_slug, &name).await?;
+            // A crashed delete records the target's operation id, so the retry
+            // resolves the exact repository (never a newer one reusing its name)
+            // and resumes instead of starting over.
+            let resuming = idem.prior_operation_id.is_some();
+            let loaded = match idem.prior_operation_id {
+                Some(operation_id) => {
+                    load_by_operation(state, actor.id, auth_age, operation_id).await?
+                }
+                None => load_current(state, actor.id, auth_age, &org_slug, &name).await?,
+            };
             require(state, &loaded, Action::RepositoryDelete)?;
 
-            // A `failed` repository must be deletable, or its name stays reserved forever.
-            if !matches!(
+            let mut was_failed = false;
+            if !resuming {
+                // A `failed` repository must be deletable, or its name stays reserved forever.
+                if !matches!(
+                    loaded.repo.status,
+                    RepositoryStatus::Active | RepositoryStatus::Failed
+                ) {
+                    return Err(not_active());
+                }
+                was_failed = loaded.repo.status == RepositoryStatus::Failed;
+
+                let mut tx = state.pool.begin().await?;
+                if !repositories::set_status(
+                    &mut tx,
+                    loaded.repo.id,
+                    loaded.repo.status,
+                    RepositoryStatus::Deleting,
+                )
+                .await?
+                {
+                    return Err(not_active());
+                }
+                if !idem
+                    .record_operation(&mut tx, loaded.repo.operation_id)
+                    .await?
+                {
+                    return Err(idempotency::claim_lost());
+                }
+                event(
+                    &mut tx,
+                    Some(loaded.org_id),
+                    loaded.actor_id,
+                    "repository.deleted",
+                )
+                .await?;
+                tx.commit().await?;
+            } else if !matches!(
                 loaded.repo.status,
-                RepositoryStatus::Active | RepositoryStatus::Failed
+                RepositoryStatus::Deleting | RepositoryStatus::Deleted
             ) {
                 return Err(not_active());
             }
 
-            let mut tx = state.pool.begin().await?;
-            if !repositories::set_status(
-                &mut tx,
-                loaded.repo.id,
-                loaded.repo.status,
-                RepositoryStatus::Deleting,
-            )
-            .await?
-            {
-                return Err(not_active());
-            }
-            event(
-                &mut tx,
-                Some(loaded.org_id),
-                loaded.actor_id,
-                "repository.deleted",
-            )
-            .await?;
-            tx.commit().await?;
-
-            // A failed create never produced a directory, so there is nothing to trash.
-            let was_failed = loaded.repo.status == RepositoryStatus::Failed;
+            // A failed create never produced a directory; a resumed delete may
+            // already have moved it to trash, so a missing source is not an error.
+            // The lock is held by the blocking worker so a cancelled request
+            // cannot drop it while the directory operator is still running.
+            let repo_id = loaded.repo.id;
             let storage = state.storage.clone();
+            let guard = STORAGE_LOCK.lock().await;
             let trash_result = tokio::task::spawn_blocking(move || {
+                let _guard = guard;
                 if was_failed {
-                    Ok(())
-                } else {
-                    storage.trash(loaded.repo.id).map(|_| ())
+                    return Ok(());
+                }
+                match storage.trash(repo_id) {
+                    Ok(_) => Ok(()),
+                    Err(githearth_git::StorageError::Io(e))
+                        if e.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
             })
             .await
@@ -588,14 +705,16 @@ pub(crate) async fn delete(
                     let mut tx = state.pool.begin().await?;
                     repositories::set_status(
                         &mut tx,
-                        loaded.repo.id,
+                        repo_id,
                         RepositoryStatus::Deleting,
                         RepositoryStatus::Deleted,
                     )
                     .await?;
                     let status = StatusCode::NO_CONTENT;
                     let body = serde_json::Value::Null;
-                    idem.store(&mut tx, status, &body).await?;
+                    if !idem.store(&mut tx, status, &body).await? {
+                        return Err(idempotency::claim_lost());
+                    }
                     tx.commit().await?;
                     Ok((status, body))
                 }
@@ -767,7 +886,9 @@ pub(crate) async fn grant_access(
             let grant = AccessGrant::from_row(&row);
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&grant).unwrap();
-            idem.store(&mut tx, status, &body).await?;
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
             tx.commit().await?;
             Ok((status, body))
         },
@@ -829,11 +950,67 @@ pub(crate) async fn revoke_access(
             .await?;
             let status = StatusCode::NO_CONTENT;
             let body = serde_json::Value::Null;
-            idem.store(&mut tx, status, &body).await?;
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
             tx.commit().await?;
             Ok((status, body))
         },
     )
     .await?;
     Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::STORAGE_LOCK;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// The storage lock must live inside the blocking worker, not the awaiting
+    /// task: if the awaiting task is cancelled the worker must keep the lock
+    /// until it exits, so a re-claimed handler cannot start the same directory
+    /// operation concurrently.
+    #[tokio::test]
+    async fn storage_lock_lives_in_the_blocking_worker_until_it_exits() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+
+        let entered_w = entered.clone();
+        let release_w = release.clone();
+        let guard = STORAGE_LOCK.lock().await;
+        let worker = tokio::task::spawn_blocking(move || {
+            let _held = guard;
+            entered_w.store(true, Ordering::SeqCst);
+            while !release_w.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+
+        // Detach the handle ("cancel" the awaiting task): the worker keeps the lock.
+        drop(worker);
+
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_w = acquired.clone();
+        let waiter = tokio::spawn(async move {
+            let _g = STORAGE_LOCK.lock().await;
+            acquired_w.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "second acquisition won the lock while the worker still held it"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        waiter.await.unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+    }
 }

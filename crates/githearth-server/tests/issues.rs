@@ -121,12 +121,18 @@ async fn fixture_repository(
 }
 
 async fn setup() -> (Router, PgPool, PathBuf, Uuid, Uuid, String) {
+    setup_with_connections(4).await
+}
+
+async fn setup_with_connections(
+    max_connections: u32,
+) -> (Router, PgPool, PathBuf, Uuid, Uuid, String) {
     let storage_root = std::env::temp_dir().join(format!("githearth-issues-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
     let config = Config {
         database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
             .expect("set GITHEARTH_TEST_DATABASE_URL"),
-        database_max_connections: 4,
+        database_max_connections: max_connections,
         database_timeout_seconds: 1,
         body_limit_bytes: 200_000,
         storage_root: storage_root.clone(),
@@ -1188,6 +1194,174 @@ async fn reads_of_non_active_repository_404() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+/// A mutation whose response store fails must roll back the whole transaction
+/// (business data, audit event and outbox), not commit a response-less write.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn store_failure_rolls_back_mutation_audit_and_outbox() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    let repo = fixture_repository(&pool, org_id, "boom", owner, "private", false).await;
+
+    // Narrowly-targeted trigger: force only this key's response store to fail.
+    let key = tag("idem-boom");
+    let fn_name = format!("fn_{}", Uuid::new_v4().simple());
+    let trg_name = format!("trg_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE FUNCTION {fn_name}() RETURNS trigger AS $$ \
+         BEGIN \
+           IF NEW.status = 'done' AND NEW.key = $1 THEN \
+             RAISE EXCEPTION 'forced' USING ERRCODE = 'check_violation'; \
+           END IF; \
+           RETURN NEW; \
+         END $$ LANGUAGE plpgsql"
+    ))
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER {trg_name} BEFORE UPDATE ON operations FOR EACH ROW EXECUTE FUNCTION {fn_name}()"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let before_audit: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND kind = 'issue.created'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        &issues_path(&slug, "boom"),
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        json!({"title": "forced", "body": ""}),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "store failure should 5xx, got {status}"
+    );
+
+    let issues: i64 = sqlx::query_scalar("SELECT count(*) FROM issues WHERE repository_id = $1")
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        issues, 0,
+        "mutation committed despite failed response store"
+    );
+    let after_audit: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND kind = 'issue.created'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_audit, before_audit, "audit event not rolled back");
+    let outbox: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_events WHERE organization_id = $1 AND kind = 'issue.created'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outbox, 0, "outbox event not rolled back");
+
+    sqlx::query(&format!("DROP TRIGGER {trg_name} ON operations"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP FUNCTION {fn_name}()"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+/// A keyed create replay works even when the pool allows a single connection.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn keyed_create_replay_with_single_connection() {
+    let (app, pool, storage, owner, org_id, slug) = setup_with_connections(1).await;
+    let token = fixture_session(&pool, owner).await;
+    fixture_repository(&pool, org_id, "one", owner, "private", false).await;
+
+    let key = tag("idem-1conn");
+    let (status, body) = request(
+        &app,
+        "POST",
+        &issues_path(&slug, "one"),
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        json!({"title": "a", "body": "b"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status2, body2) = request(
+        &app,
+        "POST",
+        &issues_path(&slug, "one"),
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        json!({"title": "a", "body": "b"}),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CREATED);
+    assert_eq!(body, body2);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+/// A keyed comment replay works even when the pool allows a single connection.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn keyed_comment_replay_with_single_connection() {
+    let (app, pool, storage, owner, org_id, slug) = setup_with_connections(1).await;
+    let token = fixture_session(&pool, owner).await;
+    fixture_repository(&pool, org_id, "onec", owner, "private", false).await;
+    create_issue(&app, &token, &slug, "onec", "x", "").await;
+
+    let base = format!("{}/1/comments", issues_path(&slug, "onec"));
+    let key = tag("idem-c1");
+    let (status, body) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        json!({"body": "hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status2, body2) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        json!({"body": "hello"}),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CREATED);
+    assert_eq!(body, body2);
 
     cleanup(&storage);
     pool.close().await;
