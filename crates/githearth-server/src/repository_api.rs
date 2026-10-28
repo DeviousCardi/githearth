@@ -675,7 +675,7 @@ pub(crate) async fn grant_access(
                 return Err(invalid());
             }
 
-            let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
             require(&state, &loaded, Action::RepositoryManageAccess)?;
 
             if loaded.repo.status != RepositoryStatus::Active {
@@ -772,7 +772,7 @@ pub(crate) async fn revoke_access(
         b"",
         key,
         || async {
-            let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+            let loaded = load_current(&state, actor.id, auth_age, &org_slug, &name).await?;
             require(&state, &loaded, Action::RepositoryManageAccess)?;
 
             // Unlike granting, revoking is allowed while the repository is `deleting`: removing access is always safe.

@@ -604,3 +604,63 @@ async fn busy_or_unavailable_authentication_is_not_a_bad_password() {
     .unwrap_err();
     assert_eq!(error.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reload_sees_changes_made_after_admission() {
+    let (pool, owner, org_slug, tmp) = setup().await;
+    set_password(&pool, owner, "correctpass").await;
+    let username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo = create_active_repo(&pool, org_id, "live", owner).await;
+    let state = app_state_for_test(pool.clone(), &tmp).await;
+    let admitted = admit_basic(
+        &state,
+        &org_slug,
+        "live",
+        &username,
+        "correctpass",
+        git_admission::Want::Push,
+    )
+    .await
+    .unwrap();
+    let update = githearth_git::journal::Update {
+        old: "0".repeat(40),
+        new: "a".repeat(40),
+        reference: "refs/heads/main".into(),
+    };
+    assert_eq!(
+        git_admission::decide_ref(&state, &admitted, &update, true),
+        Ok(())
+    );
+
+    // Archived while the pack was uploading.
+    sqlx::query("UPDATE repositories SET archived = true WHERE id = $1")
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let fresh = git_admission::reload(&state, &admitted).await.unwrap();
+    assert_eq!(
+        git_admission::decide_ref(&state, &fresh, &update, true),
+        Err("permission denied: ref.push")
+    );
+
+    // Deleted meanwhile: no longer admitted at all.
+    sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = git_admission::reload(&state, &admitted).await.unwrap_err();
+    assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    pool.close().await;
+}

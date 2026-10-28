@@ -66,10 +66,15 @@ fn parse_basic(headers: &HeaderMap) -> Result<(String, String), AuthError> {
             StatusCode::UNAUTHORIZED,
             "invalid or expired credentials",
         ))?;
-    let credentials = header.strip_prefix("Basic ").ok_or(AuthError(
-        StatusCode::UNAUTHORIZED,
-        "invalid or expired credentials",
-    ))?;
+    // RFC 7235: the scheme name is case-insensitive.
+    let credentials = header
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Basic"))
+        .map(|(_, rest)| rest)
+        .ok_or(AuthError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired credentials",
+        ))?;
     let decoded = base64_decode(credentials.trim())
         .map_err(|_| AuthError(StatusCode::UNAUTHORIZED, "invalid or expired credentials"))?;
     let text = std::str::from_utf8(&decoded)
@@ -164,13 +169,35 @@ pub async fn admit(
     })
 }
 
+/// Re-reads the repository row and facts. The pre-receive hook runs after the whole pack has
+/// uploaded, so call this before `decide_ref` to honour an archive or revoke made meanwhile.
+pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, AuthError> {
+    let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    let mut conn = state.pool.acquire().await.map_err(unavailable)?;
+    let facts = crate::facts::load(&mut conn, admitted.account, admitted.organization)
+        .await
+        .map_err(unavailable)?
+        .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    let repository = repositories::get(&mut conn, admitted.repository.id)
+        .await
+        .map_err(unavailable)?
+        .filter(|r| r.status == githearth_core::RepositoryStatus::Active)
+        .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    Ok(Admitted {
+        account: admitted.account,
+        organization: admitted.organization,
+        repository,
+        facts,
+    })
+}
+
 pub fn decide_ref(
     state: &AppState,
     admitted: &Admitted,
     update: &Update,
     fast_forward: bool,
 ) -> Result<(), &'static str> {
-    if !update.reference.starts_with("refs/heads/") && !update.reference.starts_with("refs/tags/") {
+    if !crate::pushes::valid_ref_name(&update.reference) {
         return Err("ref namespace is read-only");
     }
 
@@ -217,6 +244,9 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use std::sync::Arc;
 
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn test_state() -> AppState {
         let engine = Engine::new().unwrap();
         let root = std::env::temp_dir().join(format!("githearth-gad-{}", uuid::Uuid::new_v4()));
@@ -239,33 +269,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn decide_ref_push_ok() {
-        let state = test_state();
+    /// An admitted account; `owner` gives an organization Owner grant, otherwise no grants.
+    fn admitted(owner: bool, archived: bool) -> Admitted {
         let org_id = uuid::Uuid::new_v4();
         let account_id = uuid::Uuid::new_v4();
-        let org = Organization {
+        let organization = Organization {
             id: org_id,
             suspended: false,
         };
         let account = githearth_authz::Account {
             id: account_id,
             suspended: false,
-            site_admin: true,
+            site_admin: owner,
             organizations: vec![org_id],
             teams: vec![],
         };
-        let facts = crate::facts::Facts {
-            account,
-            teams: vec![],
-            grants: vec![Grant {
+        let grants = if owner {
+            vec![Grant {
                 role: Role::Builtin(BuiltinRole::Owner),
                 subject: Subject::Account(account_id),
                 scope: Scope::Organization(org_id),
-            }],
-            organization: org,
+            }]
+        } else {
+            vec![]
         };
-        let admitted = Admitted {
+        Admitted {
             account: account_id,
             organization: org_id,
             repository: RepositoryRow {
@@ -274,270 +302,84 @@ mod tests {
                 name: "test".into(),
                 description: "".into(),
                 visibility: "private".into(),
-                archived: false,
+                archived,
                 status: RepositoryStatus::Active,
                 operation_id: uuid::Uuid::new_v4(),
                 created_by: uuid::Uuid::new_v4(),
             },
-            facts,
-        };
+            facts: crate::facts::Facts {
+                account,
+                teams: vec![],
+                grants,
+                organization,
+            },
+        }
+    }
 
-        let update = Update {
-            old: "0000000000000000000000000000000000000000".into(),
-            new: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            reference: "refs/heads/main".into(),
-        };
-        assert!(decide_ref(&state, &admitted, &update, true).is_ok());
+    fn update(old: &str, new: &str, reference: &str) -> Update {
+        Update {
+            old: old.into(),
+            new: new.into(),
+            reference: reference.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_ref_push_ok() {
+        let u = update(ZERO, A, "refs/heads/main");
+        assert!(decide_ref(&test_state(), &admitted(true, false), &u, true).is_ok());
     }
 
     #[tokio::test]
     async fn decide_ref_delete() {
-        let state = test_state();
-        let org_id = uuid::Uuid::new_v4();
-        let account_id = uuid::Uuid::new_v4();
-        let org = Organization {
-            id: org_id,
-            suspended: false,
-        };
-        let account = githearth_authz::Account {
-            id: account_id,
-            suspended: false,
-            site_admin: true,
-            organizations: vec![org_id],
-            teams: vec![],
-        };
-        let facts = crate::facts::Facts {
-            account,
-            teams: vec![],
-            grants: vec![Grant {
-                role: Role::Builtin(BuiltinRole::Owner),
-                subject: Subject::Account(account_id),
-                scope: Scope::Organization(org_id),
-            }],
-            organization: org,
-        };
-        let admitted = Admitted {
-            account: account_id,
-            organization: org_id,
-            repository: RepositoryRow {
-                id: uuid::Uuid::new_v4(),
-                organization_id: org_id,
-                name: "test".into(),
-                description: "".into(),
-                visibility: "private".into(),
-                archived: false,
-                status: RepositoryStatus::Active,
-                operation_id: uuid::Uuid::new_v4(),
-                created_by: uuid::Uuid::new_v4(),
-            },
-            facts,
-        };
-
-        let update = Update {
-            old: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            new: "0000000000000000000000000000000000000000".into(),
-            reference: "refs/heads/main".into(),
-        };
-        // Site admin with Owner grant — RefDelete should be allowed
-        assert!(decide_ref(&state, &admitted, &update, false).is_ok());
+        let u = update(A, ZERO, "refs/heads/main");
+        assert!(decide_ref(&test_state(), &admitted(true, false), &u, false).is_ok());
     }
 
     #[tokio::test]
     async fn decide_ref_non_ff() {
-        let state = test_state();
-        let org_id = uuid::Uuid::new_v4();
-        let account_id = uuid::Uuid::new_v4();
-        let org = Organization {
-            id: org_id,
-            suspended: false,
-        };
-        let account = githearth_authz::Account {
-            id: account_id,
-            suspended: false,
-            site_admin: true,
-            organizations: vec![org_id],
-            teams: vec![],
-        };
-        let facts = crate::facts::Facts {
-            account,
-            teams: vec![],
-            grants: vec![Grant {
-                role: Role::Builtin(BuiltinRole::Owner),
-                subject: Subject::Account(account_id),
-                scope: Scope::Organization(org_id),
-            }],
-            organization: org,
-        };
-        let admitted = Admitted {
-            account: account_id,
-            organization: org_id,
-            repository: RepositoryRow {
-                id: uuid::Uuid::new_v4(),
-                organization_id: org_id,
-                name: "test".into(),
-                description: "".into(),
-                visibility: "private".into(),
-                archived: false,
-                status: RepositoryStatus::Active,
-                operation_id: uuid::Uuid::new_v4(),
-                created_by: uuid::Uuid::new_v4(),
-            },
-            facts,
-        };
-
-        let update = Update {
-            old: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-            new: "cccccccccccccccccccccccccccccccccccccccc".into(),
-            reference: "refs/heads/main".into(),
-        };
-        // Non-ff with Owner grant should be allowed
-        assert!(decide_ref(&state, &admitted, &update, false).is_ok());
+        let u = update(
+            A,
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "refs/heads/main",
+        );
+        assert!(decide_ref(&test_state(), &admitted(true, false), &u, false).is_ok());
     }
 
     #[tokio::test]
-    async fn decide_ref_rejects_refs_notes() {
-        let state = test_state();
-        let org_id = uuid::Uuid::new_v4();
-        let account_id = uuid::Uuid::new_v4();
-        let org = Organization {
-            id: org_id,
-            suspended: false,
-        };
-        let account = githearth_authz::Account {
-            id: account_id,
-            suspended: false,
-            site_admin: false,
-            organizations: vec![org_id],
-            teams: vec![],
-        };
-        let facts = crate::facts::Facts {
-            account,
-            teams: vec![],
-            grants: vec![],
-            organization: org,
-        };
-        let admitted = Admitted {
-            account: account_id,
-            organization: org_id,
-            repository: RepositoryRow {
-                id: uuid::Uuid::new_v4(),
-                organization_id: org_id,
-                name: "test".into(),
-                description: "".into(),
-                visibility: "private".into(),
-                archived: false,
-                status: RepositoryStatus::Active,
-                operation_id: uuid::Uuid::new_v4(),
-                created_by: uuid::Uuid::new_v4(),
-            },
-            facts,
-        };
-
-        let update = Update {
-            old: "0000000000000000000000000000000000000000".into(),
-            new: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            reference: "refs/notes/review".into(),
-        };
-        assert_eq!(
-            decide_ref(&state, &admitted, &update, true).unwrap_err(),
-            "ref namespace is read-only"
-        );
+    async fn decide_ref_rejects_foreign_and_empty_refs() {
+        for reference in ["refs/notes/review", "refs/heads/", "refs/tags/"] {
+            let u = update(ZERO, A, reference);
+            assert_eq!(
+                decide_ref(&test_state(), &admitted(true, false), &u, true).unwrap_err(),
+                "ref namespace is read-only",
+                "{reference}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn decide_ref_archived_denied() {
-        let state = test_state();
-        let org_id = uuid::Uuid::new_v4();
-        let account_id = uuid::Uuid::new_v4();
-        let org = Organization {
-            id: org_id,
-            suspended: false,
-        };
-        let account = githearth_authz::Account {
-            id: account_id,
-            suspended: false,
-            site_admin: false,
-            organizations: vec![org_id],
-            teams: vec![],
-        };
-        let facts = crate::facts::Facts {
-            account,
-            teams: vec![],
-            grants: vec![],
-            organization: org,
-        };
-        let admitted = Admitted {
-            account: account_id,
-            organization: org_id,
-            repository: RepositoryRow {
-                id: uuid::Uuid::new_v4(),
-                organization_id: org_id,
-                name: "test".into(),
-                description: "".into(),
-                visibility: "private".into(),
-                archived: true,
-                status: RepositoryStatus::Active,
-                operation_id: uuid::Uuid::new_v4(),
-                created_by: uuid::Uuid::new_v4(),
-            },
-            facts,
-        };
-
-        let update = Update {
-            old: "0000000000000000000000000000000000000000".into(),
-            new: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            reference: "refs/heads/main".into(),
-        };
-        let result = decide_ref(&state, &admitted, &update, true);
-        assert!(result.is_err());
+        let u = update(ZERO, A, "refs/heads/main");
+        assert!(decide_ref(&test_state(), &admitted(true, true), &u, true).is_err());
     }
 
     #[tokio::test]
-    async fn decide_ref_read_only_role_denied() {
-        let state = test_state();
-        let org_id = uuid::Uuid::new_v4();
-        let account_id = uuid::Uuid::new_v4();
-        let org = Organization {
-            id: org_id,
-            suspended: false,
-        };
-        let account = githearth_authz::Account {
-            id: account_id,
-            suspended: false,
-            site_admin: false,
-            organizations: vec![org_id],
-            teams: vec![],
-        };
-        let facts = crate::facts::Facts {
-            account,
-            teams: vec![],
-            grants: vec![],
-            organization: org,
-        };
-        let admitted = Admitted {
-            account: account_id,
-            organization: org_id,
-            repository: RepositoryRow {
-                id: uuid::Uuid::new_v4(),
-                organization_id: org_id,
-                name: "test".into(),
-                description: "".into(),
-                visibility: "private".into(),
-                archived: false,
-                status: RepositoryStatus::Active,
-                operation_id: uuid::Uuid::new_v4(),
-                created_by: uuid::Uuid::new_v4(),
-            },
-            facts,
-        };
+    async fn decide_ref_without_grant_denied() {
+        let u = update(ZERO, A, "refs/heads/main");
+        assert_eq!(
+            decide_ref(&test_state(), &admitted(false, false), &u, true).unwrap_err(),
+            "permission denied: ref.push"
+        );
+    }
 
-        let update = Update {
-            old: "0000000000000000000000000000000000000000".into(),
-            new: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            reference: "refs/heads/main".into(),
-        };
-        let result = decide_ref(&state, &admitted, &update, true);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "permission denied: ref.push");
+    #[test]
+    fn basic_scheme_is_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        // "u:p" in base64
+        headers.insert("authorization", "bAsIc dTpw".parse().unwrap());
+        assert_eq!(parse_basic(&headers).unwrap(), ("u".into(), "p".into()));
+        headers.insert("authorization", "Bearer dTpw".parse().unwrap());
+        assert!(parse_basic(&headers).is_err());
     }
 }

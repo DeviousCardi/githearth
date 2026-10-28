@@ -39,7 +39,7 @@ fn valid_oid(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn valid_ref_name(s: &str) -> bool {
+pub(crate) fn valid_ref_name(s: &str) -> bool {
     if let Some(tail) = s.strip_prefix("refs/heads/") {
         !tail.is_empty()
     } else if let Some(tail) = s.strip_prefix("refs/tags/") {
@@ -49,6 +49,9 @@ fn valid_ref_name(s: &str) -> bool {
     }
 }
 
+/// Records a committed push. Idempotent, and it never moves `journal_applied`: sequences are
+/// not one-per-push (markers, interleaved pushes), so only the reconciler's in-order pass may
+/// call [`advance`].
 pub async fn apply_committed(
     conn: &mut PgConnection,
     repository_id: Uuid,
@@ -69,6 +72,9 @@ pub async fn apply_committed(
         }
         if !valid_oid(&u.new) {
             return Err(PushError::Invalid("invalid new OID"));
+        }
+        if u.old.len() != u.new.len() {
+            return Err(PushError::Invalid("old and new OIDs differ in length"));
         }
         if !valid_ref_name(&u.reference) {
             return Err(PushError::Invalid(
@@ -137,20 +143,14 @@ pub async fn apply_committed(
         .bind(repository_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE repositories SET journal_applied = GREATEST(journal_applied, $1) WHERE id = $2",
-        )
-        .bind(prepared.sequence as i64)
-        .bind(repository_id)
-        .execute(&mut *tx)
-        .await?;
     }
 
     tx.commit().await?;
     Ok(inserted)
 }
 
-pub async fn skip(
+/// Declares every journal record up to `sequence` resolved. Reconciler only, in journal order.
+pub async fn advance(
     conn: &mut PgConnection,
     repository_id: Uuid,
     sequence: u64,

@@ -125,7 +125,7 @@ async fn apply_once_true_and_rows_created() {
         .fetch_one(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(ja, 1);
+    assert_eq!(ja, 0, "apply_committed must not move the resume mark");
 
     pool.close().await;
 }
@@ -210,7 +210,7 @@ async fn out_of_order_keeps_highest_watermark() {
         .fetch_one(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(ja, 5);
+    assert_eq!(ja, 0, "out-of-order applies must not move the resume mark");
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
             .bind(repo_id)
@@ -297,6 +297,20 @@ async fn all_invalid_cases_table_driven() {
             },
         ),
         (
+            "mixed OID lengths",
+            Record {
+                sequence: 1,
+                operation: Uuid::new_v4(),
+                kind: Kind::Prepared,
+                actor: Some(actor),
+                updates: vec![Update {
+                    old: good_oid.clone(),
+                    new: "b".repeat(64),
+                    reference: "refs/heads/main".into(),
+                }],
+            },
+        ),
+        (
             "bad ref namespace",
             Record {
                 sequence: 1,
@@ -325,18 +339,18 @@ async fn all_invalid_cases_table_driven() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn skip() {
+async fn advance() {
     let pool = pool().await;
     let (_org, _actor, repo_id) = fixture(&pool).await;
     let mut conn = pool.acquire().await.unwrap();
-    pushes::skip(&mut conn, repo_id, 7).await.unwrap();
+    pushes::advance(&mut conn, repo_id, 7).await.unwrap();
     let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
         .bind(repo_id)
         .fetch_one(&mut *conn)
         .await
         .unwrap();
     assert_eq!(ja, 7);
-    pushes::skip(&mut conn, repo_id, 3).await.unwrap();
+    pushes::advance(&mut conn, repo_id, 3).await.unwrap();
     let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
         .bind(repo_id)
         .fetch_one(&mut *conn)
@@ -356,7 +370,7 @@ async fn applied_through() {
         pushes::applied_through(&mut conn, repo_id).await.unwrap(),
         0
     );
-    pushes::skip(&mut conn, repo_id, 42).await.unwrap();
+    pushes::advance(&mut conn, repo_id, 42).await.unwrap();
     assert_eq!(
         pushes::applied_through(&mut conn, repo_id).await.unwrap(),
         42
