@@ -375,6 +375,28 @@ impl Storage {
         Ok(removed)
     }
 
+    pub fn upload_pack(
+        &self,
+        repository: Uuid,
+        advertise: bool,
+        protocol: Option<&str>,
+    ) -> Result<std::process::Command, StorageError> {
+        let path = self.verified_dir(&self.repository_path(repository))?;
+        let mut cmd = crate::git();
+        cmd.arg("upload-pack")
+            .arg("--stateless-rpc")
+            .arg("--strict");
+        if advertise {
+            cmd.arg("--advertise-refs");
+        }
+        cmd.arg(&path);
+        if let Some(proto) = protocol {
+            validate_git_protocol(proto)?;
+            cmd.env("GIT_PROTOCOL", proto);
+        }
+        Ok(cmd)
+    }
+
     pub fn scan(&self) -> Result<Scan, StorageError> {
         let mut repositories = Vec::new();
         let mut malformed = Vec::new();
@@ -497,6 +519,25 @@ pub struct TmpEntry {
 
 fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+}
+
+pub fn validate_git_protocol(value: &str) -> Result<(), StorageError> {
+    if value.is_empty() || value.len() > 256 {
+        return Err(StorageError::Invalid(
+            "GIT_PROTOCOL must be 1..256 bytes".into(),
+        ));
+    }
+    for part in value.split(':') {
+        match part {
+            "version=0" | "version=1" | "version=2" => {}
+            other => {
+                return Err(StorageError::Invalid(format!(
+                    "unsupported GIT_PROTOCOL component: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Storage {

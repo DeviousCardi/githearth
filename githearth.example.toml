@@ -11,3 +11,6 @@ auth_concurrency = 2
 # reconcile_interval_seconds = 60
 # reconcile_grace_seconds = 300
 # trash_retention_seconds = 604800
+# git_concurrency = 8
+# git_timeout_seconds = 600
+# git_request_limit_bytes = 10485760
