@@ -263,6 +263,7 @@ mod tests {
                 ..crate::config::Config::default()
             },
             auth_slots: Arc::new(tokio::sync::Semaphore::new(10)),
+            git_slots: Arc::new(tokio::sync::Semaphore::new(10)),
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(engine),
             storage: Arc::new(storage),

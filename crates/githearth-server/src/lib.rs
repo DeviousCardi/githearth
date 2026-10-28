@@ -2,6 +2,7 @@ pub mod audit;
 pub mod config;
 pub mod facts;
 pub mod git_admission;
+pub mod git_http;
 pub mod idempotency;
 pub mod issues;
 pub mod pushes;
@@ -39,8 +40,10 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
-    config: Config,
-    auth_slots: Arc<Semaphore>,
+    pub(crate) config: Config,
+    pub(crate) auth_slots: Arc<Semaphore>,
+    // pub so the concurrency-exhaustion integration test can hold a permit.
+    pub git_slots: Arc<Semaphore>,
     dummy_hash: Arc<String>,
     pub authz: Arc<Engine>,
     pub storage: Arc<githearth_git::layout::Storage>,
@@ -59,6 +62,7 @@ impl AppState {
         Ok(Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
+            git_slots: Arc::new(Semaphore::new(config.git_concurrency)),
             config,
             dummy_hash: Arc::new(dummy_hash),
             authz: Arc::new(Engine::new()?),
@@ -100,7 +104,7 @@ pub async fn connect(config: &Config) -> anyhow::Result<PgPool> {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let json = Router::new()
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(ready))
         .route("/api/v1/login", post(login))
@@ -143,7 +147,11 @@ pub fn router(state: AppState) -> Router {
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(state.config.request_timeout_seconds),
-        ))
+        ));
+
+    let git = git_http::router(&state.config);
+
+    json.merge(git)
         .layer(axum::middleware::from_fn(observe))
         .with_state(state)
 }
