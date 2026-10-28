@@ -10,6 +10,7 @@ anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false }
 githearth-authz = { path = "../githearth-authz" }
 githearth-core = { path = "../githearth-core" }
 githearth-git = { path = "../githearth-git" }

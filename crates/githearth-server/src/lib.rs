@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod config;
 pub mod facts;
 pub mod git_admission;
@@ -110,6 +111,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
         .merge(issues::router())
+        .merge(audit::router())
         .route(
             "/api/v1/organizations/{org}/repositories",
             post(repository_api::create).get(repository_api::list),
