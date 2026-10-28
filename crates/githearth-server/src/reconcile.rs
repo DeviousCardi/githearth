@@ -183,7 +183,9 @@ pub async fn reconcile_once(
     // This is safe because the API commits the creating row BEFORE it creates
     // tmp/<operation>; any directory seen in phase 1 belongs to a row that
     // phase 2 will observe if it is still creating.
-    summary.tmp_cleaned = clean_tmp_step(state, candidates).await?;
+    // Uses the caller's connection (no second pool acquire) so the pass works
+    // even with database_max_connections = 1.
+    summary.tmp_cleaned = clean_tmp_step(&mut conn, &state.storage, candidates).await?;
 
     // ---- trash purge -------------------------------------------------------
     let retention = Duration::from_secs(state.config.trash_retention_seconds);
@@ -247,18 +249,20 @@ async fn fetch_live_operations(
 ///
 /// `candidates` must have been obtained via [`Storage::list_tmp`] *before*
 /// this function is called.  This function reads the current live `creating`
-/// operation set from the database and then calls [`Storage::clean_tmp`] with
-/// the earlier candidates.  Because the API inserts the `creating` row before
-/// it creates `tmp/<operation>`, any directory that was present when
-/// `list_tmp` ran belongs to a row that this query will observe (if it is
-/// still `creating`).  Directories created *after* `list_tmp` are not in
+/// operation set from the database (using the caller's connection — it does
+/// NOT acquire from the pool) and then calls [`Storage::clean_tmp`] with the
+/// earlier candidates.  Because the API inserts the `creating` row before it
+/// creates `tmp/<operation>`, any directory that was present when `list_tmp`
+/// ran belongs to a row that this query will observe (if it is still
+/// `creating`).  Directories created *after* `list_tmp` are not in
 /// `candidates` and therefore safe from removal.
-pub async fn clean_tmp_step(state: &AppState, candidates: Vec<TmpEntry>) -> anyhow::Result<usize> {
-    let mut conn = state.pool.acquire().await?;
-    let live = fetch_live_operations(&mut conn).await?;
-    drop(conn);
-
-    let storage = state.storage.clone();
+pub async fn clean_tmp_step(
+    conn: &mut sqlx::PgConnection,
+    storage: &std::sync::Arc<githearth_git::layout::Storage>,
+    candidates: Vec<TmpEntry>,
+) -> anyhow::Result<usize> {
+    let live = fetch_live_operations(conn).await?;
+    let storage = storage.clone();
     let cleaned = tokio::task::spawn_blocking(move || storage.clean_tmp(&candidates, &live))
         .await
         .map_err(|e| anyhow::anyhow!("clean_tmp task panicked: {e}"))??;

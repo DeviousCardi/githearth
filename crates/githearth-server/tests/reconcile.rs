@@ -9,6 +9,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn tag(prefix: &str) -> String {
@@ -28,7 +29,7 @@ struct TestDb {
 }
 
 impl TestDb {
-    async fn new() -> Self {
+    async fn with_max_connections(max_connections: u32) -> Self {
         let base_url =
             std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
         let db_name = format!("githearth_test_{}", Uuid::new_v4().simple());
@@ -52,7 +53,7 @@ impl TestDb {
             .unwrap()
             .disable_statement_logging();
         let pool = PgPoolOptions::new()
-            .max_connections(4)
+            .max_connections(max_connections)
             .acquire_timeout(std::time::Duration::from_secs(1))
             .connect_with(test_opts)
             .await
@@ -96,10 +97,15 @@ struct TestEnv {
 }
 
 /// Build a Config with the given grace and a unique storage root.
-fn test_config(db_url: &str, storage_root: &Path, grace_seconds: u64) -> Config {
+fn test_config_with_pool(
+    db_url: &str,
+    storage_root: &Path,
+    grace_seconds: u64,
+    max_connections: u32,
+) -> Config {
     Config {
         database_url: db_url.to_owned(),
-        database_max_connections: 4,
+        database_max_connections: max_connections,
         database_timeout_seconds: 1,
         storage_root: storage_root.to_path_buf(),
         reconcile_interval_seconds: 60,
@@ -147,12 +153,16 @@ async fn backdate(pool: &PgPool, repo_id: Uuid) {
 }
 
 async fn setup(grace_seconds: u64) -> TestEnv {
-    let db = TestDb::new().await;
+    setup_with_pool(grace_seconds, 4).await
+}
+
+async fn setup_with_pool(grace_seconds: u64, max_connections: u32) -> TestEnv {
+    let db = TestDb::with_max_connections(max_connections).await;
     let db_url = db.url.clone();
     let storage_root = std::env::temp_dir().join(format!("githearth-reconcile-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
     let canonical = std::fs::canonicalize(&storage_root).unwrap();
-    let config = test_config(&db_url, &canonical, grace_seconds);
+    let config = test_config_with_pool(&db_url, &canonical, grace_seconds, max_connections);
     let pool = db.pool.clone();
     let owner = fixture_account(&pool, &tag("owner")).await;
     let org = fixture_organization(&pool, owner).await;
@@ -625,7 +635,8 @@ async fn two_phase_tmp_cleanup_does_not_race_with_concurrent_create() {
     // Phase 2: run the cleanup step with the *earlier* candidates (which did
     // NOT include this tmp entry).  The live-set query will see the creating
     // row, but the key invariant is that the directory is not a candidate.
-    let cleaned = reconcile::clean_tmp_step(&env.state, candidates)
+    let mut conn = env.pool.acquire().await.unwrap();
+    let cleaned = reconcile::clean_tmp_step(&mut conn, &env.state.storage, candidates)
         .await
         .unwrap();
     assert_eq!(cleaned, 0);
@@ -633,6 +644,51 @@ async fn two_phase_tmp_cleanup_does_not_race_with_concurrent_create() {
         tmp_dir.is_dir(),
         "tmp entry created after list_tmp must never be removed"
     );
+
+    teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reconcile_pass_completes_with_single_connection_pool() {
+    // Regression test: clean_tmp_step must not acquire a second pool
+    // connection while reconcile_once already holds one.  With a pool of
+    // size 1 any second acquire would time out.  We bound the whole pass
+    // with tokio::time::timeout so a regression fails fast.
+    let env = setup_with_pool(30, 1).await;
+
+    // Create a stale tmp entry (no corresponding creating row → not live).
+    let stale_op = Uuid::new_v4();
+    let stale_tmp = env
+        .storage_root
+        .join("tmp")
+        .join(stale_op.simple().to_string());
+    std::fs::create_dir_all(&stale_tmp).unwrap();
+
+    // Create a trash entry with timestamp 0 (epoch) so it is always expired.
+    let trash_id = Uuid::new_v4();
+    let stale_trash = env
+        .storage_root
+        .join("trash")
+        .join(format!("{}.0.git", trash_id.simple()));
+    std::fs::create_dir_all(&stale_trash).unwrap();
+
+    let mut attempts = HashMap::new();
+    let summary = tokio::time::timeout(
+        Duration::from_secs(30),
+        reconcile::reconcile_once(&env.state, &mut attempts),
+    )
+    .await
+    .expect("reconcile_once timed out — likely a second pool acquire on a pool of size 1")
+    .unwrap();
+
+    assert_eq!(summary.tmp_cleaned, 1, "stale tmp entry must be cleaned");
+    assert_eq!(
+        summary.trash_purged, 1,
+        "expired trash entry must be purged"
+    );
+    assert!(!stale_tmp.exists(), "stale tmp entry must be removed");
+    assert!(!stale_trash.exists(), "expired trash entry must be removed");
 
     teardown(env).await;
 }
