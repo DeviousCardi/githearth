@@ -1264,14 +1264,21 @@ async fn v0_info_refs_prefix_governed_by_deadline() {
     // Sleep past the deadline.
     tokio::time::sleep(Duration::from_secs(11)).await;
 
-    let body_result = response.into_body().collect().await;
-    if let Ok(collected) = body_result {
-        let bytes = collected.to_bytes();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(
-            !text.contains("# service=git-upload-pack"),
-            "prefix must not appear after deadline, got: {text}"
-        );
+    // Inspect the FIRST frame: `collect()` would discard a data frame that is
+    // followed by an error, hiding a prefix sent outside the deadline.
+    let mut body = response.into_body();
+    match tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("first poll after the deadline hung")
+    {
+        None | Some(Err(_)) => {}
+        Some(Ok(frame)) => {
+            let data = frame.into_data().unwrap_or_default();
+            panic!(
+                "first frame after the deadline must be a timeout or end, got data: {}",
+                String::from_utf8_lossy(&data)
+            );
+        }
     }
 
     cleanup(&storage_root);
