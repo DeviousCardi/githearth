@@ -324,6 +324,40 @@ fn rotation_keeps_unapplied_and_sequences() {
 }
 
 #[test]
+fn rotation_of_a_fully_applied_journal_keeps_sequences_after_reopen() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let mut journal = Journal::open(&repo).unwrap();
+    for i in 0..3u64 {
+        journal
+            .append_prepared(
+                Uuid::new_v4(),
+                None,
+                vec![update(
+                    &"0".repeat(40),
+                    &format!("{i:040x}"),
+                    "refs/heads/main",
+                )],
+            )
+            .unwrap();
+    }
+    journal.rotate(0, 3).unwrap();
+    let live: Vec<u64> = journal.records_after(0).map(|r| r.sequence).collect();
+    assert_eq!(live, vec![3]);
+    drop(journal);
+
+    let mut reopened = Journal::open(&repo).unwrap();
+    let next = reopened
+        .append_prepared(
+            Uuid::new_v4(),
+            None,
+            vec![update(&"0".repeat(40), &"d".repeat(40), "refs/heads/main")],
+        )
+        .unwrap();
+    assert_eq!(next, 4);
+}
+
+#[test]
 fn classify_covers_every_outcome() {
     let prepared = |updates: Vec<Update>| Record {
         sequence: 0,

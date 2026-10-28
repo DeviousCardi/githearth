@@ -251,7 +251,10 @@ impl Journal {
             .records
             .iter()
             .take_while(|r| r.sequence <= applied_through)
-            .count();
+            .count()
+            // Keep the newest record live: `open` derives the next sequence from it, and an
+            // empty journal would restart at 1 and collide with already-recorded pushes.
+            .min(self.records.len().saturating_sub(1));
         if split == 0 {
             return Ok(());
         }
