@@ -144,7 +144,7 @@ async fn info_refs(
 
     let token = CancellationToken::new();
     let body = Body::from_stream(stream_git_output(
-        child, stdout, stderr, prefix, repo_id, deadline, permit, None, None, token, None,
+        child, stdout, stderr, prefix, repo_id, deadline, permit, None, None, token, None, true,
     ));
 
     let mut response = Response::new(body);
@@ -282,6 +282,7 @@ async fn upload_pack(
         Some(feeder_handle),
         token,
         None,
+        true,
     ));
 
     let mut response = Response::new(body);
@@ -323,11 +324,20 @@ async fn receive_pack(
         .await;
     let repo_id = admitted.repository.id;
 
+    // Remove lock files left by a receive-pack killed mid-update (we hold the
+    // per-repository lock, so nothing else can be writing refs).
+    if let Err(e) = state.storage.remove_stale_locks(repo_id) {
+        tracing::warn!(repository_id = %repo_id, error = %e, "cannot remove stale ref locks");
+    }
+
     // Stage 6 pre-flight: apply any journaled-but-unapplied pushes first.
     if let Err(e) = pushes::replay(&state, repo_id).await {
         return Err(match e {
-            pushes::ReplayError::Database(_) => GitHttpError::ServerError,
-            _ => GitHttpError::Diverged,
+            pushes::ReplayError::Diverged { .. } => GitHttpError::Diverged,
+            other => {
+                tracing::error!(repository_id = %repo_id, error = %other, "pre-push journal replay failed");
+                GitHttpError::ServerError
+            }
         });
     }
 
@@ -378,6 +388,9 @@ async fn receive_pack(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(hook_token.clone(), admitted.clone());
+    // RAII: a cancelled request or an aborted supervisor still releases the
+    // one-use token.
+    let token_guard = HookTokenGuard::new(state.hook_tokens.clone(), hook_token.clone());
 
     let mut hook_cmd = tokio::process::Command::from(cmd);
     hook_cmd
@@ -390,8 +403,11 @@ async fn receive_pack(
     if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
         hook_cmd.env("LLVM_PROFILE_FILE", profile);
     }
+    // Once the pack is fully fed, a client that went away must not kill
+    // receive-pack mid-ref-update (that would leave stale lock files); the
+    // deadline still bounds it.  So: no kill on drop, no kill on disconnect.
     let mut child = match hook_cmd
-        .kill_on_drop(true)
+        .kill_on_drop(false)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -399,11 +415,7 @@ async fn receive_pack(
     {
         Ok(child) => child,
         Err(e) => {
-            state
-                .hook_tokens
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&hook_token);
+            drop(token_guard);
             tracing::error!(
                 category = "git",
                 repository_id = %repo_id,
@@ -443,12 +455,16 @@ async fn receive_pack(
     };
 
     // Stage 7: after git exits, apply the committed push to metadata.  The
-    // repository lock and the one-use hook token are released afterwards.
+    // repository lock and the one-use hook token are released by their guards
+    // when this future drops (RAII), so a client that went away cannot skip
+    // the replay or leak the token.
     let after_exit: futures_util::future::BoxFuture<'static, ()> = {
         let state = state.clone();
-        let _guard = repo_guard;
-        let hook_token = hook_token.clone();
         Box::pin(async move {
+            // Guards live inside the future: they drop when it completes or is
+            // itself dropped, never before the hook has had a chance to run.
+            let _guard = repo_guard;
+            let _token_guard = token_guard;
             if let Err(e) = pushes::replay(&state, repo_id).await {
                 // A metadata failure after git succeeded never changes the
                 // client's result; the reconciler applies it later.
@@ -458,12 +474,6 @@ async fn receive_pack(
                     "post-push journal replay failed; reconciler will retry"
                 );
             }
-            state
-                .hook_tokens
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&hook_token);
-            drop(_guard);
         })
     };
 
@@ -479,6 +489,7 @@ async fn receive_pack(
         Some(feeder_handle),
         token,
         Some(after_exit),
+        false,
     ));
 
     let mut response = Response::new(body);
@@ -503,6 +514,35 @@ fn new_hook_token() -> String {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex::encode(bytes)
+}
+
+/// Removes a one-use hook token when dropped, so a cancelled request or an
+/// aborted supervisor cannot leak the admitted principal.
+struct HookTokenGuard {
+    tokens: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, git_admission::Admitted>>,
+    >,
+    token: String,
+}
+
+impl HookTokenGuard {
+    fn new(
+        tokens: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, git_admission::Admitted>>,
+        >,
+        token: String,
+    ) -> Self {
+        Self { tokens, token }
+    }
+}
+
+impl Drop for HookTokenGuard {
+    fn drop(&mut self) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.token);
+    }
 }
 
 pub(crate) async fn hook_accept_loop(listener: tokio::net::UnixListener, state: AppState) {
@@ -747,6 +787,7 @@ fn stream_git_output(
     feeder_handle: Option<tokio::task::JoinHandle<()>>,
     token: CancellationToken,
     after_exit: Option<futures_util::future::BoxFuture<'static, ()>>,
+    kill_on_disconnect: bool,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::stream;
     use tokio_util::io::ReaderStream;
@@ -784,7 +825,7 @@ fn stream_git_output(
                 let _ = child.start_kill();
                 child.wait().await
             }
-            _ = supervisor_token.cancelled() => {
+            _ = supervisor_token.cancelled(), if kill_on_disconnect => {
                 // Client disconnected (response body dropped its guard).
                 let _ = child.start_kill();
                 child.wait().await
@@ -842,13 +883,13 @@ fn stream_git_output(
         Box::new(prefix_item.chain(stdout_stream))
     };
 
-    let guard = token.clone().drop_guard();
+    let guard = kill_on_disconnect.then(|| token.clone().drop_guard());
     let sleep = Box::pin(tokio::time::sleep_until(deadline));
     let deadline_stream = DeadlineStream {
         inner: full_stream,
         sleep,
         token,
-        guard: Some(guard),
+        guard,
         finished: false,
     };
 

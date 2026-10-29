@@ -77,6 +77,45 @@ async fn seed_bare(repo_path: &str, work_dir: &str, refspec: &str) {
     .await;
 }
 
+/// Generate a complete `git-receive-pack` stateless-rpc request body: one
+/// `report-status` command pkt-line, a flush, then the pack for the commit at
+/// `work_dir`'s HEAD.
+async fn receive_pack_request_body(fx: &Fixture, work_dir: &str, refspec: &str) -> Vec<u8> {
+    use std::io::Write;
+
+    let old = git_output(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "rev-parse",
+        "refs/heads/main",
+    ]))
+    .await;
+    let new = git_output(git_cmd(&["-C", work_dir, "rev-parse", "HEAD"])).await;
+
+    let mut pack_cmd = git_cmd(&["-C", work_dir, "pack-objects", "--stdout", "--revs"]);
+    pack_cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = pack_cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{new}\n").as_bytes())
+        .unwrap();
+    let pack = child.wait_with_output().unwrap().stdout;
+    assert!(pack.starts_with(b"PACK"), "pack-objects produced a pack");
+
+    let payload = format!("{old} {new} {refspec}\0report-status\n");
+    let mut body = Vec::with_capacity(payload.len() + 8 + pack.len());
+    body.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+    body.extend_from_slice(payload.as_bytes());
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&pack);
+    body
+}
+
 fn tag(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
@@ -1476,6 +1515,169 @@ async fn oversized_push_rejected() {
     assert!(!out.status.success(), "oversized push must fail");
     assert!(journal_records(&fx.repo_path).is_empty());
 
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn stale_ref_locks_cleaned_before_push() {
+    let fx = setup(1 << 30).await;
+
+    // A receive-pack killed mid-update leaves these behind.
+    let nested_lock = fx.repo_path.join("refs").join("heads").join("main.lock");
+    std::fs::write(&nested_lock, b"").unwrap();
+    let packed_lock = fx.repo_path.join("packed-refs.lock");
+    std::fs::write(&packed_lock, b"").unwrap();
+
+    let clone = std::env::temp_dir().join(format!("git-push-lock-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    std::fs::write(clone.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let new_sha = git_output(git_cmd(&["-C", cd, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+
+    assert!(!nested_lock.exists(), "stale ref lock removed before push");
+    assert!(
+        !packed_lock.exists(),
+        "stale packed-refs lock removed before push"
+    );
+    assert_eq!(
+        git_output(git_cmd(&[
+            "--git-dir",
+            fx.repo_path_str(),
+            "rev-parse",
+            "main"
+        ]))
+        .await,
+        new_sha,
+        "push landed"
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn disconnect_after_full_pack_applies_and_cleans_token() {
+    use axum::{body::Body, http::Request};
+
+    let fx = setup(1 << 30).await;
+
+    // Build a child commit in a work tree.
+    let work = std::env::temp_dir().join(format!("git-push-disc-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let new_sha = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+
+    let request = receive_pack_request_body(&fx, tw, "refs/heads/main").await;
+    assert!(!request.is_empty());
+
+    // Send the complete pack, then drop the response without reading it —
+    // the client has gone away mid-push.
+    let response = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/{}/{}.git/git-receive-pack",
+                fx.org_slug, fx.repo_name
+            ))
+            .header("authorization", basic_auth(&fx.username, "testpass"))
+            .header("content-type", "application/x-git-receive-pack-request")
+            .body(Body::from(request))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(response);
+
+    // Git ran to completion and the push was applied, without the reconciler.
+    wait_for_journal_applied(&fx.pool, fx.repo_id, 1).await;
+    assert_eq!(
+        git_output(git_cmd(&[
+            "--git-dir",
+            fx.repo_path_str(),
+            "rev-parse",
+            "main"
+        ]))
+        .await,
+        new_sha,
+        "push committed even though the client disconnected"
+    );
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 1, "post-push replay applied without the reconciler");
+
+    // The one-use hook token is gone.
+    let tokens_empty = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fx.state.hook_tokens.lock().unwrap().is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(tokens_empty, "hook token leaked after disconnect");
+
+    // A later push to the same ref still succeeds (no stale locks).
+    let clone = std::env::temp_dir().join(format!("git-push-disc2-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    std::fs::write(clone.join("g"), "y").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "g"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m2",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+
+    let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&clone);
     cleanup(&fx.storage_root);
     fx.pool.close().await;

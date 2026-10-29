@@ -614,8 +614,9 @@ async fn active_row_without_directory_storage_error() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    // Receive-pack replays the (missing) journal first and returns 409.
-    let (status, _headers, body) = raw_request(
+    // Receive-pack replays the (missing) journal first: a Journal error is a
+    // 500, not a divergence.
+    let (status, _headers, _body) = raw_request(
         &app,
         "POST",
         &format!("/{org_slug}/ghost-repo.git/git-receive-pack"),
@@ -626,8 +627,7 @@ async fn active_row_without_directory_storage_error() {
         b"0000".to_vec(),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(String::from_utf8_lossy(&body).contains("repository needs repair"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
     cleanup(&storage_root);
     pool.close().await;

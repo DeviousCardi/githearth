@@ -52,7 +52,8 @@ pub struct AppState {
     dummy_hash: Arc<String>,
     pub authz: Arc<Engine>,
     pub storage: Arc<githearth_git::layout::Storage>,
-    pub(crate) hook_tokens: Arc<std::sync::Mutex<HashMap<String, git_admission::Admitted>>>,
+    // pub so the disconnect integration test can assert the token is released.
+    pub hook_tokens: Arc<std::sync::Mutex<HashMap<String, git_admission::Admitted>>>,
     pub(crate) hook_socket_path: std::path::PathBuf,
 }
 impl AppState {

@@ -527,6 +527,18 @@ impl Storage {
         Ok(cmd)
     }
 
+    /// Removes stale `*.lock` files under the repository's `refs/` and its
+    /// `packed-refs.lock`, left behind by a receive-pack killed mid-update.
+    ///
+    /// Safe because the caller holds the per-repository lock: pushes and
+    /// replay are serialized by it and nothing else writes refs.  Never
+    /// follows symlinks; a lock that happens to be a symlink is unlinked.
+    pub fn remove_stale_locks(&self, repository: Uuid) -> Result<(), StorageError> {
+        let path = self.verified_dir(&self.repository_path(repository))?;
+        remove_lock_file(&path.join("packed-refs.lock"))?;
+        remove_lock_files_recursively(&path.join("refs"))
+    }
+
     pub fn scan(&self) -> Result<Scan, StorageError> {
         let mut repositories = Vec::new();
         let mut malformed = Vec::new();
@@ -649,6 +661,35 @@ pub struct TmpEntry {
 
 fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+}
+
+/// Unlink one lock file, tolerating its absence.
+fn remove_lock_file(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Recursively unlink `*.lock` files.  Symlinked directories are not followed
+/// (their metadata is read without following); a `.lock` symlink is unlinked.
+fn remove_lock_files_recursively(dir: &Path) -> Result<(), StorageError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() {
+            remove_lock_files_recursively(&entry.path())?;
+        } else if entry.file_name().to_string_lossy().ends_with(".lock") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_git_protocol(value: &str) -> Result<(), StorageError> {

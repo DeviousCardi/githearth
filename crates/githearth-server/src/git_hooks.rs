@@ -97,10 +97,12 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
         let mut parts = line.split(' ');
         let (Some(old), Some(new), Some(reference)) = (parts.next(), parts.next(), parts.next())
         else {
-            continue;
+            let _ = writeln!(stderr, "malformed ref update");
+            return 1;
         };
         if parts.next().is_some() {
-            continue;
+            let _ = writeln!(stderr, "malformed ref update");
+            return 1;
         }
         // Fast-forward is only meaningful when both sides exist.
         let ff = !is_zero(old) && !is_zero(new) && fast_forward(old, new);
@@ -478,15 +480,17 @@ mod tests {
     }
 
     #[test]
-    fn pre_receive_malformed_lines_are_skipped() {
-        let (path, server) = mock_server("OK\n");
-        let env = env_with(&[("GITHEARTH_HOOK_SOCKET", path.as_str())]);
-        let stdin = format!(
-            "{ZERO} {SHA}\n{ZERO} {SHA} refs/heads/main extra\n{ZERO} {SHA} refs/heads/main\n"
-        );
-        let (code, _err) = run_with("pre-receive", &[], &env, &stdin);
-        server.join().unwrap();
-        assert_eq!(code, 0);
+    fn pre_receive_malformed_lines_are_rejected() {
+        // Malformed lines reject the whole push before the socket is touched,
+        // so no mock server is needed.
+        for malformed in [
+            format!("{ZERO} {SHA}\n"),                       // two fields
+            format!("{ZERO} {SHA} refs/heads/main extra\n"), // five fields
+        ] {
+            let (code, err) = run_with("pre-receive", &[], &env_with(&[]), &malformed);
+            assert_eq!(code, 1, "{malformed:?}");
+            assert!(err.contains("malformed ref update"), "{err}");
+        }
     }
 
     #[test]
