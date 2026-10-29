@@ -1,5 +1,6 @@
 //! Durable repository storage (ADR 0003 layout), push journal, and local reads.
 //! No network or push service is exposed.
+pub mod browse;
 pub mod journal;
 pub mod layout;
 
@@ -15,6 +16,7 @@ pub enum StorageError {
     Invalid(String),
     Git(String),
     TooLarge { size: u64, limit: usize },
+    Timeout,
 }
 
 impl fmt::Display for StorageError {
@@ -24,6 +26,7 @@ impl fmt::Display for StorageError {
             Self::Invalid(e) => write!(f, "invalid repository data: {e}"),
             Self::Git(e) => write!(f, "Git failed: {e}"),
             Self::TooLarge { size, limit } => write!(f, "blob is {size} bytes; limit is {limit}"),
+            Self::Timeout => write!(f, "git process timed out"),
         }
     }
 }

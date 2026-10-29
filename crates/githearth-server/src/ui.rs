@@ -38,14 +38,14 @@ struct LoginQuery {
     error: Option<String>,
 }
 
-struct UiError(Box<Response>);
+pub(crate) struct UiError(Box<Response>);
 impl axum::response::IntoResponse for UiError {
     fn into_response(self) -> Response {
         *self.0
     }
 }
 
-fn esc(value: &str) -> String {
+pub(crate) fn esc(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -54,7 +54,7 @@ fn esc(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn url_encode(value: &str) -> String {
+pub(crate) fn url_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
         match byte {
@@ -78,7 +78,7 @@ fn csrf_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn browser_token_hash(headers: &HeaderMap) -> Option<Vec<u8>> {
+pub(crate) fn browser_token_hash(headers: &HeaderMap) -> Option<Vec<u8>> {
     let cookie = headers.get("cookie")?.to_str().ok()?;
     let mut found = None;
     for part in cookie.split(';') {
@@ -96,7 +96,7 @@ fn browser_token_hash(headers: &HeaderMap) -> Option<Vec<u8>> {
     Some(Sha256::digest(token.as_bytes()).to_vec())
 }
 
-async fn browser_auth(
+pub(crate) async fn browser_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(crate::Account, u64), crate::ApiError> {
@@ -110,7 +110,7 @@ fn csrf_matches(supplied: &str, expected: &str) -> bool {
     !expected.is_empty() && Sha256::digest(supplied) == Sha256::digest(expected)
 }
 
-fn csrf_expected(token_hash: &[u8]) -> String {
+pub(crate) fn csrf_expected(token_hash: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(token_hash);
     hex::encode(&digest[..16])
@@ -137,7 +137,12 @@ fn clear_session_cookie(state: &AppState) -> String {
     format!("githearth_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
 }
 
-fn render_page(title: &str, username: Option<&str>, csrf: Option<&str>, body: &str) -> String {
+pub(crate) fn render_page(
+    title: &str,
+    username: Option<&str>,
+    csrf: Option<&str>,
+    body: &str,
+) -> String {
     let nav = if let Some(name) = username {
         if let Some(token) = csrf {
             format!(
@@ -199,11 +204,11 @@ fn signed_out(state: &AppState) -> UiError {
     UiError(Box::new(response))
 }
 
-fn auth_required() -> UiError {
+pub(crate) fn auth_required() -> UiError {
     UiError(Box::new(Redirect::to("/login").into_response()))
 }
 
-fn not_found_page(username: Option<&str>) -> UiError {
+pub(crate) fn not_found_page(username: Option<&str>) -> UiError {
     UiError(Box::new(
         (
             StatusCode::NOT_FOUND,
@@ -218,7 +223,7 @@ fn not_found_page(username: Option<&str>) -> UiError {
     ))
 }
 
-fn unavailable_page(username: Option<&str>) -> UiError {
+pub(crate) fn unavailable_page(username: Option<&str>) -> UiError {
     UiError(Box::new(
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -582,13 +587,54 @@ async fn repository(
         return Err(not_found_page(Some(&account.username)));
     }
     let repo = &loaded.repo;
+    let mut browse_section = String::new();
+    if repo.status == githearth_core::RepositoryStatus::Active {
+        let storage = state.storage.clone();
+        let repo_id = repo.id;
+        let timeout = Duration::from_secs(state.config.git_timeout_seconds);
+        let refs = match state.git_slots.clone().try_acquire_owned() {
+            Ok(permit) => tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let path = storage.read_path(repo_id)?;
+                githearth_git::browse::refs(&path, timeout)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok),
+            Err(_) => None,
+        };
+        match refs {
+            Some(refs) if !refs.branches.is_empty() => {
+                let branch = refs
+                    .default_branch
+                    .clone()
+                    .or_else(|| refs.branches.first().map(|b| b.name.clone()))
+                    .unwrap_or_else(|| "main".to_owned());
+                browse_section = format!(
+                    "<p><a href=\"/organizations/{}/repositories/{}/tree/{}\">Browse files</a></p>",
+                    url_encode(&slug),
+                    url_encode(&repo.name),
+                    url_encode(&branch)
+                );
+            }
+            Some(_) => {
+                browse_section = format!(
+                    "<p>This repository is empty. Clone it with:</p><pre>git clone /{}/{}.git</pre>",
+                    url_encode(&slug),
+                    url_encode(&repo.name)
+                );
+            }
+            None => {}
+        }
+    }
     let body = format!(
-        "<h1>{}</h1><div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p></div>",
+        "<h1>{}</h1><div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>",
         esc(&repo.name),
         esc(&slug),
         esc(&repo.visibility),
         esc(repo.status.as_str()),
-        esc(&repo.description)
+        esc(&repo.description),
+        browse_section
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
     let csrf = Some(csrf_expected(&hash));

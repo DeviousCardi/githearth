@@ -267,6 +267,13 @@ impl Storage {
             .join(format!("{id}.git"))
     }
 
+    /// Verified canonical path of a repository's Git directory, for read-only
+    /// browsing. Errors (including a missing directory) are the caller's to
+    /// map; no detail about the filesystem layout is exposed here.
+    pub fn read_path(&self, repository: Uuid) -> Result<PathBuf, StorageError> {
+        self.verified_dir(&self.repository_path(repository))
+    }
+
     fn tmp_path(&self, operation: Uuid) -> PathBuf {
         self.root.join("tmp").join(simple(operation))
     }
