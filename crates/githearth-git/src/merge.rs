@@ -6,7 +6,8 @@
 
 use crate::StorageError;
 use crate::browse::{
-    MAX_OUTPUT_BYTES, cmd, nul_fields, run_bounded, run_bounded_input, stderr_error, utf8,
+    MAX_OUTPUT_BYTES, MergeTree, cmd, nul_fields, parse_merge_tree, run_bounded, run_bounded_input,
+    stderr_error, utf8,
 };
 use std::path::Path;
 use std::process::Command;
@@ -117,8 +118,8 @@ pub fn build_candidate(
                 return Ok(Candidate::Unrelated);
             }
             let tree = match run_merge_tree(repo, None, request.target, request.source, timeout)? {
-                TreeResult::Clean(tree) => tree,
-                TreeResult::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
+                MergeTree::Clean(tree) => tree,
+                MergeTree::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
             };
             let parents: &[&str] = match request.method {
                 Method::Merge => &[request.target, request.source],
@@ -164,7 +165,11 @@ fn is_ancestor(
     let mut command = cmd(repo);
     command.args(["merge-base", "--is-ancestor", ancestor, descendant]);
     let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
-    Ok(result.success)
+    match result.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(stderr_error(&result.stderr)),
+    }
 }
 
 fn merge_base(
@@ -176,18 +181,14 @@ fn merge_base(
     let mut command = cmd(repo);
     command.args(["merge-base", a, b]);
     let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
-    if result.success {
-        Ok(Some(
+    match result.code {
+        Some(0) => Ok(Some(
             String::from_utf8_lossy(&result.stdout).trim().to_owned(),
-        ))
-    } else {
-        Ok(None)
+        )),
+        // Exit 1 with no output: the histories share no commit.
+        Some(1) => Ok(None),
+        _ => Err(stderr_error(&result.stderr)),
     }
-}
-
-enum TreeResult {
-    Clean(String),
-    Conflicts(Vec<String>),
 }
 
 fn run_merge_tree(
@@ -196,7 +197,7 @@ fn run_merge_tree(
     a: &str,
     b: &str,
     timeout: Duration,
-) -> Result<TreeResult, StorageError> {
+) -> Result<MergeTree, StorageError> {
     let mut command = cmd(repo);
     command.args([
         "merge-tree",
@@ -210,25 +211,12 @@ fn run_merge_tree(
     }
     command.arg(a).arg(b);
     let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
-    let fields = nul_fields(&result.stdout);
-    match result.code {
-        Some(0) => Ok(TreeResult::Clean(
-            fields
-                .first()
-                .map(|f| utf8(f))
-                .transpose()?
-                .unwrap_or_default(),
-        )),
-        Some(1) => {
-            let paths = fields
-                .iter()
-                .skip(1)
-                .map(|f| utf8(f))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(TreeResult::Conflicts(paths))
-        }
-        _ => Err(stderr_error(&result.stderr)),
-    }
+    parse_merge_tree(
+        result.code,
+        &result.stdout,
+        &result.stderr,
+        result.truncated,
+    )
 }
 
 fn commit_tree(
@@ -329,6 +317,10 @@ fn check_commit_count(count: usize) -> Result<(), StorageError> {
     }
 }
 
+/// Replay each source commit onto the target, keeping its author and message.
+/// A commit whose result tree equals its new parent's is dropped, like
+/// `git rebase` does for already-applied changes; this also drops commits that
+/// were intentionally empty.
 fn rebase(repo: &Path, request: &Request, timeout: Duration) -> Result<Candidate, StorageError> {
     let commits = list_rebase_commits(repo, request, timeout)?;
     check_commit_count(commits.len())?;
@@ -341,8 +333,8 @@ fn rebase(repo: &Path, request: &Request, timeout: Duration) -> Result<Candidate
         }
         let base = format!("{}^", commit.oid);
         let tree = match run_merge_tree(repo, Some(&base), &previous, &commit.oid, timeout)? {
-            TreeResult::Clean(tree) => tree,
-            TreeResult::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
+            MergeTree::Clean(tree) => tree,
+            MergeTree::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
         };
         if tree == tree_of(repo, &previous, timeout)? {
             continue;
@@ -417,6 +409,27 @@ mod tests {
         assert!(matches!(
             parse_rebase_commits(b"a\0\0n\0e\0not-a-date\0m\0"),
             Err(StorageError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn git_errors_are_not_read_as_answers() {
+        // Exit 128 (not a repository) must surface, not become "unrelated" or
+        // "not an ancestor".
+        let missing = std::env::temp_dir().join("githearth-merge-no-such-repo");
+        let oid = "0".repeat(40);
+        let timeout = Duration::from_secs(10);
+        assert!(matches!(
+            merge_base(&missing, &oid, &oid, timeout),
+            Err(StorageError::Git(_))
+        ));
+        assert!(matches!(
+            is_ancestor(&missing, &oid, &oid, timeout),
+            Err(StorageError::Git(_))
+        ));
+        assert!(matches!(
+            run_merge_tree(&missing, None, &oid, &oid, timeout),
+            Err(StorageError::Git(_))
         ));
     }
 

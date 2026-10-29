@@ -120,12 +120,18 @@ fn run_bounded_impl(
     let stdout_thread = std::thread::spawn(move || read_capped(stdout, max_output));
     let stderr_thread = std::thread::spawn(move || read_capped(stderr, 64 * 1024));
 
-    if let Some(data) = input
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        // The child's exit status reports a short stdin write; ignore EPIPE here.
-        let _ = stdin.write_all(data);
-    }
+    // Write stdin from a thread so a child that stops reading cannot block us
+    // past the deadline; killing the child breaks the pipe and ends the write.
+    // The child's exit status reports a short write, so EPIPE is ignored.
+    let stdin_thread = match (input, child.stdin.take()) {
+        (Some(data), Some(mut stdin)) => {
+            let data = data.to_vec();
+            Some(std::thread::spawn(move || {
+                let _ = stdin.write_all(&data);
+            }))
+        }
+        _ => None,
+    };
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -139,6 +145,11 @@ fn run_bounded_impl(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    if let Some(writer) = stdin_thread {
+        writer
+            .join()
+            .map_err(|_| StorageError::Invalid("git writer panicked".into()))?;
+    }
     let stdout = stdout_thread
         .join()
         .map_err(|_| StorageError::Invalid("git reader panicked".into()))?;
@@ -857,25 +868,44 @@ fn run_merge_tree(
         .env("GIT_OBJECT_DIRECTORY", scratch)
         .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", repo.join("objects"));
     let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
-    parse_merge_tree(
-        result.code,
-        &result.stdout,
-        &result.stderr,
-        result.truncated,
+    Ok(
+        match parse_merge_tree(
+            result.code,
+            &result.stdout,
+            &result.stderr,
+            result.truncated,
+        )? {
+            MergeTree::Clean(_) => Mergeability::Clean,
+            MergeTree::Conflicts(paths) => Mergeability::Conflicts(paths),
+        },
     )
+}
+
+/// Outcome of `git merge-tree --write-tree`: the written tree id, or the
+/// conflicted paths.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MergeTree {
+    Clean(String),
+    Conflicts(Vec<String>),
 }
 
 /// Interpret `git merge-tree --write-tree --name-only --no-messages -z`
 /// output: exit 0 is clean, exit 1 lists conflicted paths after the tree id
 /// line (NUL-separated); anything else is an error.
-fn parse_merge_tree(
+pub(crate) fn parse_merge_tree(
     code: Option<i32>,
     stdout: &[u8],
     stderr: &[u8],
     truncated: bool,
-) -> Result<Mergeability, StorageError> {
+) -> Result<MergeTree, StorageError> {
     match code {
-        Some(0) => Ok(Mergeability::Clean),
+        Some(0) => Ok(MergeTree::Clean(
+            nul_fields(stdout)
+                .first()
+                .map(|f| utf8(f))
+                .transpose()?
+                .unwrap_or_default(),
+        )),
         Some(1) => {
             if truncated {
                 return Err(StorageError::TooLarge {
@@ -890,7 +920,7 @@ fn parse_merge_tree(
                 .skip(1)
                 .map(utf8)
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Mergeability::Conflicts(paths))
+            Ok(MergeTree::Conflicts(paths))
         }
         _ => Err(stderr_error(stderr)),
     }
@@ -1370,16 +1400,16 @@ mod tests {
     fn merge_tree_parser_distinguishes_outcomes() {
         assert_eq!(
             parse_merge_tree(Some(0), b"abc\0", b"", false).unwrap(),
-            Mergeability::Clean
+            MergeTree::Clean("abc".into())
         );
         assert_eq!(
             parse_merge_tree(Some(1), b"abc\0a.txt\0b/c.txt\0", b"", false).unwrap(),
-            Mergeability::Conflicts(vec!["a.txt".into(), "b/c.txt".into()])
+            MergeTree::Conflicts(vec!["a.txt".into(), "b/c.txt".into()])
         );
         // A tree id with no paths is an empty conflict list, not an error.
         assert_eq!(
             parse_merge_tree(Some(1), b"abc\0", b"", false).unwrap(),
-            Mergeability::Conflicts(vec![])
+            MergeTree::Conflicts(vec![])
         );
         // Truncated conflict listing is an error, never a partial answer.
         assert!(matches!(
@@ -1545,5 +1575,20 @@ mod tests {
         let big = vec![b'x'; 256 * 1024];
         let result = run_bounded_input(command, &big, 1024, Duration::from_secs(5)).unwrap();
         assert!(!result.success);
+    }
+
+    #[test]
+    fn run_bounded_input_times_out_when_child_never_reads_stdin() {
+        // More than a pipe buffer, to a child that neither reads nor exits:
+        // the deadline must still fire.
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let big = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        assert!(matches!(
+            run_bounded_input(command, &big, 1024, Duration::from_millis(300)),
+            Err(StorageError::Timeout)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }
