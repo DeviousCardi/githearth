@@ -8,7 +8,8 @@ export RUSTFLAGS="-D warnings"
 min_lines="${GITHEARTH_MIN_LINE_COVERAGE:-95}"
 
 container=""
-cleanup() { [ -n "$container" ] && docker rm -f "$container" >/dev/null; }
+# Not `[ -n ] &&`: with no container that test fails and becomes the exit status.
+cleanup() { [ -z "$container" ] || docker rm -f "$container" >/dev/null; }
 trap cleanup EXIT
 
 if [ -z "${GITHEARTH_TEST_DATABASE_URL:-}" ]; then
