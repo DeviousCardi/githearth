@@ -183,7 +183,11 @@ async fn create(
 
 fn new_issue(body: &[u8]) -> Result<NewIssue, ApiError> {
     let input: NewIssue = serde_json::from_slice(body).map_err(|_| invalid())?;
-    if !(1..=256).contains(&input.title.chars().count()) || input.body.chars().count() > 65536 {
+    // Blank titles and comments are refused by the API and the pages alike.
+    if input.title.trim().is_empty()
+        || input.title.chars().count() > 256
+        || input.body.chars().count() > 65536
+    {
         return Err(invalid());
     }
     Ok(input)
@@ -502,7 +506,7 @@ async fn create_comment(
 
 fn new_comment(body: &[u8]) -> Result<NewComment, ApiError> {
     let input: NewComment = serde_json::from_slice(body).map_err(|_| invalid())?;
-    if !(1..=65536).contains(&input.body.chars().count()) {
+    if input.body.trim().is_empty() || input.body.chars().count() > 65536 {
         return Err(invalid());
     }
     Ok(input)

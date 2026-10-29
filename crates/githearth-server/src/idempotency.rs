@@ -25,13 +25,18 @@ pub fn extract_key(headers: &HeaderMap) -> Option<Result<&str, ApiError>> {
             )));
         }
     };
-    if key.is_empty() || key.len() > 128 || !key.bytes().all(|b| (33..=126).contains(&b)) {
+    if !valid_key(key) {
         return Some(Err(ApiError(
             StatusCode::BAD_REQUEST,
             "invalid idempotency key",
         )));
     }
     Some(Ok(key))
+}
+
+/// 1 to 128 visible ASCII characters, the same rule for headers and form fields.
+pub fn valid_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 128 && key.bytes().all(|b| (33..=126).contains(&b))
 }
 
 pub fn request_hash(method: &str, path: &str, body: &[u8]) -> Vec<u8> {

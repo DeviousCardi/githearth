@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::{AppState, issues, ui};
+use crate::{AppState, idempotency, issues, ui};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -127,11 +127,40 @@ fn repo_href(slug: &str, name: &str) -> String {
     )
 }
 
-fn csrf_field(s: &Session) -> String {
+/// The CSRF token plus a per-form idempotency key, so a double submit or a
+/// resent POST replays the first result instead of creating a duplicate.
+fn form_fields(s: &Session, key: &str) -> String {
     format!(
-        "<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">",
-        ui::esc(&s.csrf)
+        "<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<input type=\"hidden\" name=\"idempotency_key\" value=\"{}\">",
+        ui::esc(&s.csrf),
+        ui::esc(key)
     )
+}
+
+fn new_key() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+fn checked_key<'a>(s: &Session, key: &'a str) -> Result<&'a str, ui::UiError> {
+    if idempotency::valid_key(key) {
+        Ok(key)
+    } else {
+        Err(message_page(
+            s,
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "Reload the page and submit the form again.",
+        ))
+    }
+}
+
+fn title_ok(title: &str) -> bool {
+    !title.trim().is_empty() && title.chars().count() <= 256
+}
+
+fn comment_ok(body: &str) -> bool {
+    !body.trim().is_empty() && body.chars().count() <= 65536
 }
 
 /// Usernames for the given account ids; unknown ids are simply absent.
@@ -242,6 +271,7 @@ fn new_issue_body(
     name: &str,
     title: &str,
     text: &str,
+    key: &str,
     error: Option<&str>,
 ) -> String {
     let error = error
@@ -254,7 +284,7 @@ fn new_issue_body(
 <label for=\"body\">Description</label><textarea id=\"body\" name=\"body\" rows=\"8\" style=\"width:100%;box-sizing:border-box\">{}</textarea>\
 <p><button type=\"submit\">Create issue</button></p></form>",
         ui::esc(name),
-        csrf_field(s),
+        form_fields(s, key),
         ui::esc(title),
         ui::esc(text)
     )
@@ -266,7 +296,7 @@ async fn new_page(
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, ui::UiError> {
     let s = session(&state, &headers).await?;
-    // Same visibility as the list: a repository the viewer cannot read is 404.
+    // Access probe only: the form is shown to exactly those who can list issues.
     issues::list_issues(
         &state,
         s.account.id,
@@ -285,7 +315,7 @@ async fn new_page(
         &s,
         StatusCode::OK,
         "New issue",
-        &new_issue_body(&s, &base, &name, "", "", None),
+        &new_issue_body(&s, &base, &name, "", "", &new_key(), None),
     ))
 }
 
@@ -293,6 +323,8 @@ async fn new_page(
 struct IssueForm {
     #[serde(default)]
     csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -306,9 +338,9 @@ async fn create_submit(
     Form(form): Form<IssueForm>,
 ) -> Result<Response, ui::UiError> {
     let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let key = checked_key(&s, &form.idempotency_key)?;
     let base = repo_href(&slug, &name);
-    let title = form.title.trim();
-    if !(1..=256).contains(&title.chars().count()) || form.body.chars().count() > 65536 {
+    if !title_ok(&form.title) || form.body.chars().count() > 65536 {
         return Ok(page(
             &s,
             StatusCode::BAD_REQUEST,
@@ -319,13 +351,14 @@ async fn create_submit(
                 &name,
                 &form.title,
                 &form.body,
+                key,
                 Some(
                     "A title of 1 to 256 characters is required; the description is limited to 65536 characters.",
                 ),
             ),
         ));
     }
-    let payload = serde_json::json!({ "title": title, "body": form.body }).to_string();
+    let payload = serde_json::json!({ "title": form.title, "body": form.body }).to_string();
     let (_, value) = issues::create_issue(
         &state,
         s.account.id,
@@ -333,7 +366,7 @@ async fn create_submit(
         &slug,
         &name,
         payload.as_bytes(),
-        None,
+        Some(key),
     )
     .await
     .map_err(|e| api_error(&s, e))?;
@@ -356,29 +389,62 @@ async fn issue_page(
     let Ok(number) = number.parse::<i32>() else {
         return Err(ui::not_found_page(Some(&s.account.username)));
     };
-    let issue = issues::read_issue(&state, s.account.id, s.auth_age, &slug, &name, number)
-        .await
-        .map_err(|e| api_error(&s, e))?;
-    let comments = issues::list_issue_comments(
+    let draft = Draft {
+        text: "",
+        key: &new_key(),
+        error: None,
+    };
+    render_issue(
         &state,
-        s.account.id,
-        s.auth_age,
+        &s,
         &slug,
         &name,
         number,
-        issues::CommentListQuery {
-            limit: None,
-            after: params.after,
-        },
+        params.after,
+        draft,
+        StatusCode::OK,
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+}
+
+/// A comment form's contents when the page is shown again after a rejected submit.
+struct Draft<'a> {
+    text: &'a str,
+    key: &'a str,
+    error: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_issue(
+    state: &AppState,
+    s: &Session,
+    slug: &str,
+    name: &str,
+    number: i32,
+    after: Option<i32>,
+    draft: Draft<'_>,
+    status: StatusCode,
+) -> Result<Response, ui::UiError> {
+    let issue = issues::read_issue(state, s.account.id, s.auth_age, slug, name, number)
+        .await
+        .map_err(|e| api_error(s, e))?;
+    let comments = issues::list_issue_comments(
+        state,
+        s.account.id,
+        s.auth_age,
+        slug,
+        name,
+        number,
+        issues::CommentListQuery { limit: None, after },
+    )
+    .await
+    .map_err(|e| api_error(s, e))?;
     let mut ids: Vec<Uuid> = comments.items.iter().map(|c| c.author_id).collect();
     ids.push(issue.author_id);
-    let names = usernames(&state, ids)
+    let names = usernames(state, ids)
         .await
         .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
-    let base = repo_href(&slug, &name);
+    let base = repo_href(slug, name);
 
     let mut list = String::new();
     for c in &comments.items {
@@ -395,8 +461,12 @@ async fn issue_page(
     } else {
         format!("<ul>{list}</ul>")
     };
+    let error = draft
+        .error
+        .map(|e| format!("<p class=\"error\" role=\"alert\">{}</p>", ui::esc(e)))
+        .unwrap_or_default();
     let mut pager = String::new();
-    if params.after.is_some() {
+    if after.is_some() {
         pager.push_str(&format!(
             "<a href=\"{base}/issues/{number}\">First comments</a> "
         ));
@@ -411,25 +481,28 @@ async fn issue_page(
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
 <p class=\"muted\">{} · opened by {} at {}</p>\
 <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
-<h2>Comments</h2>{list}<p>{pager}</p>\
+<h2>Comments</h2>{list}<p>{pager}</p>{error}\
 <form class=\"card\" method=\"post\" action=\"{base}/issues/{number}/comments\">{}\
-<label for=\"comment\">Add a comment</label><textarea id=\"comment\" name=\"body\" rows=\"5\" required style=\"width:100%;box-sizing:border-box\"></textarea>\
+<label for=\"comment\">Add a comment</label><textarea id=\"comment\" name=\"body\" rows=\"5\" required style=\"width:100%;box-sizing:border-box\">{}</textarea>\
 <p><button type=\"submit\">Comment</button></p></form>",
-        ui::esc(&name),
+        ui::esc(name),
         ui::esc(&issue.title),
         ui::esc(&issue.state),
         who(&names, &issue.author_id),
         ui::esc(&issue.created_at),
         ui::esc(&issue.body),
-        csrf_field(&s),
+        form_fields(s, draft.key),
+        ui::esc(draft.text),
     );
-    Ok(page(&s, StatusCode::OK, "Issue", &body))
+    Ok(page(s, status, "Issue", &body))
 }
 
 #[derive(Deserialize)]
 struct CommentForm {
     #[serde(default)]
     csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
     #[serde(default)]
     body: String,
 }
@@ -444,13 +517,24 @@ async fn comment_submit(
     let Ok(number) = number.parse::<i32>() else {
         return Err(ui::not_found_page(Some(&s.account.username)));
     };
-    if !(1..=65536).contains(&form.body.trim().chars().count()) {
-        return Err(message_page(
+    let key = checked_key(&s, &form.idempotency_key)?;
+    if !comment_ok(&form.body) {
+        let draft = Draft {
+            text: &form.body,
+            key,
+            error: Some("A comment must be 1 to 65536 characters and not only spaces."),
+        };
+        return render_issue(
+            &state,
             &s,
+            &slug,
+            &name,
+            number,
+            None,
+            draft,
             StatusCode::BAD_REQUEST,
-            "Invalid comment",
-            "A comment must be 1 to 65536 characters.",
-        ));
+        )
+        .await;
     }
     let payload = serde_json::json!({ "body": form.body }).to_string();
     issues::create_issue_comment(
@@ -461,7 +545,7 @@ async fn comment_submit(
         &name,
         number,
         payload.as_bytes(),
-        None,
+        Some(key),
     )
     .await
     .map_err(|e| api_error(&s, e))?;

@@ -750,11 +750,14 @@ class Harness:
             if status != 200:
                 raise HarnessError(f"issue page {path} status {status}")
             match = re.search(rb'name="csrf_token" value="([0-9a-f]{32})"', body)
-            if not match:
-                raise HarnessError(f"no CSRF token on {path}")
-            return body, match.group(1).decode()
+            key = re.search(rb'name="idempotency_key" value="([0-9a-f]{32})"', body)
+            if not match or not key:
+                raise HarnessError(f"no CSRF token or idempotency key on {path}")
+            return body, match.group(1).decode(), key.group(1).decode()
 
-        body, _ = page(ui)
+        status, _, body = self.api("GET", ui, headers=cookie)
+        if status != 200:
+            raise HarnessError(f"issue list page status {status}")
         for title in self.issue_titles:
             if html.escape(title).encode() not in body:
                 raise HarnessError(f"issue list page missing {title!r}")
@@ -762,7 +765,7 @@ class Harness:
         if status != 303:
             raise HarnessError(f"issue list without a session status {status}")
 
-        _, csrf = page(ui + "/new")
+        _, csrf, key = page(ui + "/new")
         status, _, _ = self.api(
             "POST", ui, headers=form_headers,
             body=urllib.parse.urlencode({"csrf_token": "0" * 32, "title": "forged"}).encode(),
@@ -770,29 +773,35 @@ class Harness:
         if status != 403:
             raise HarnessError(f"issue form with a bad CSRF token status {status}")
         title = "UI issue <b>escaped</b>"
-        status, headers, _ = self.api(
-            "POST", ui, headers=form_headers,
-            body=urllib.parse.urlencode(
-                {"csrf_token": csrf, "title": title, "body": "made in the browser"}
-            ).encode(),
-        )
-        location = dict((k.lower(), v) for k, v in headers).get("location", "")
-        if status != 303 or not location.startswith(ui + "/"):
-            raise HarnessError(f"issue form status {status} location {location!r}")
+        issue_form = urllib.parse.urlencode(
+            {"csrf_token": csrf, "idempotency_key": key, "title": title, "body": "made in the browser"}
+        ).encode()
+        locations = []
+        for _ in range(2):  # a double submit must replay, not duplicate
+            status, headers, _ = self.api("POST", ui, headers=form_headers, body=issue_form)
+            location = dict((k.lower(), v) for k, v in headers).get("location", "")
+            if status != 303 or not location.startswith(ui + "/"):
+                raise HarnessError(f"issue form status {status} location {location!r}")
+            locations.append(location)
+        if locations[0] != locations[1]:
+            raise HarnessError(f"resubmitted issue form went to {locations}")
         number = int(location.rsplit("/", 1)[1])
         self.issue_numbers.append(number)
         self.issue_titles.append(title)
 
-        body, csrf = page(location)
+        body, csrf, key = page(location)
         if html.escape(title).encode() not in body or b"<b>escaped</b>" in body:
             raise HarnessError("issue page does not show the escaped title")
-        status, _, _ = self.api(
-            "POST", location + "/comments", headers=form_headers,
-            body=urllib.parse.urlencode({"csrf_token": csrf, "body": "browser comment"}).encode(),
-        )
-        if status != 303:
-            raise HarnessError(f"comment form status {status}")
-        body, _ = page(location)
+        comment_form = urllib.parse.urlencode(
+            {"csrf_token": csrf, "idempotency_key": key, "body": "browser comment"}
+        ).encode()
+        for _ in range(2):
+            status, _, _ = self.api(
+                "POST", location + "/comments", headers=form_headers, body=comment_form
+            )
+            if status != 303:
+                raise HarnessError(f"comment form status {status}")
+        body, _, _ = page(location)
         if b"browser comment" not in body:
             raise HarnessError("issue page missing the new comment")
         status, comments = self.api_json(
@@ -801,7 +810,12 @@ class Harness:
             token=self.admin_token,
         )
         if status != 200 or [c["body"] for c in comments["items"]] != ["browser comment"]:
-            raise HarnessError("API does not see the browser comment")
+            raise HarnessError("API does not see exactly one browser comment")
+        created = int(self.sql(
+            MAIN_DB, "SELECT count(*) FROM issues WHERE title='" + title.replace("'", "''") + "'"
+        ))
+        if created != 1:
+            raise HarnessError(f"resubmitted issue form created {created} issues")
 
     def s4_isolation_archive(self):
         repo_path = "/api/v1/organizations/m2-org/repositories/m2-repo"

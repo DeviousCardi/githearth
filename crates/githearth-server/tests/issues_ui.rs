@@ -109,10 +109,18 @@ async fn api(
     (status, serde_json::from_str(&text).unwrap_or_default())
 }
 
-fn csrf(html: &str) -> String {
-    let marker = "name=\"csrf_token\" value=\"";
-    let rest = &html[html.find(marker).unwrap() + marker.len()..];
+fn hidden(html: &str, name: &str) -> String {
+    let marker = format!("name=\"{name}\" value=\"");
+    let rest = &html[html.find(&marker).unwrap() + marker.len()..];
     rest[..rest.find('"').unwrap()].to_owned()
+}
+
+fn csrf(html: &str) -> String {
+    hidden(html, "csrf_token")
+}
+
+fn key(html: &str) -> String {
+    hidden(html, "idempotency_key")
 }
 
 /// An account with a browser session; returns (id, username, session token).
@@ -217,6 +225,7 @@ async fn create_view_and_comment_through_forms() {
         &f.cookie,
         &[
             ("csrf_token", &token),
+            ("idempotency_key", &key(&form)),
             ("title", "<script>x</script> broken"),
             ("body", "Steps & details"),
         ],
@@ -239,6 +248,7 @@ async fn create_view_and_comment_through_forms() {
         &f.cookie,
         &[
             ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
             ("body", "first <b>comment</b>"),
         ],
     )
@@ -363,12 +373,22 @@ async fn forms_require_session_csrf_and_valid_input() {
 
     let (_, form) = get(&f.app, &format!("{}/issues/new", f.base), Some(&f.cookie)).await;
     let token = csrf(&form);
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues", f.base),
+        &f.cookie,
+        &[("csrf_token", &token), ("title", "no key")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let k = key(&form);
     let (status, _, page) = post_form(
         &f.app,
         &format!("{}/issues", f.base),
         &f.cookie,
         &[
             ("csrf_token", &token),
+            ("idempotency_key", &k),
             ("title", "   "),
             ("body", "kept text"),
         ],
@@ -377,12 +397,34 @@ async fn forms_require_session_csrf_and_valid_input() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(page.contains("role=\"alert\""));
     assert!(page.contains("kept text"));
+    assert_eq!(
+        key(&page),
+        k,
+        "the re-rendered form keeps its idempotency key"
+    );
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "   "}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the API refuses blank titles too"
+    );
 
     let (status, _, _) = post_form(
         &f.app,
         &format!("{}/issues/1/comments", f.base),
         &f.cookie,
-        &[("csrf_token", &token), ("body", "hi")],
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", "c1"),
+            ("body", "hi"),
+        ],
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -392,18 +434,62 @@ async fn forms_require_session_csrf_and_valid_input() {
         &f.app,
         &format!("{}/issues", f.base),
         &f.cookie,
-        &[("csrf_token", &token), ("title", "ok")],
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", "i2"),
+            ("title", "ok"),
+        ],
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (status, _, _) = post_form(
+    let (status, _, page) = post_form(
         &f.app,
         &format!("{}/issues/1/comments", f.base),
         &f.cookie,
-        &[("csrf_token", &token), ("body", "  ")],
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", "c3"),
+            ("body", " draft? \n "),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "text with non-space content is kept as is"
+    );
+    let _ = page;
+    let (status, _, page) = post_form(
+        &f.app,
+        &format!("{}/issues/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", "c4"),
+            ("body", " \n "),
+        ],
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(page.contains("role=\"alert\""));
+    assert_eq!(
+        key(&page),
+        "c4",
+        "the re-rendered comment form keeps its key"
+    );
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues/1/comments", f.api_base),
+        &f.token,
+        json!({"body": "  "}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the API refuses blank comments too"
+    );
     finish(f).await;
 }
 
@@ -432,7 +518,11 @@ async fn unrelated_users_get_404_and_readers_can_open_issues() {
         &f.app,
         &format!("{}/issues", f.base),
         &cookie,
-        &[("csrf_token", &csrf(&home)), ("title", "x")],
+        &[
+            ("csrf_token", &csrf(&home)),
+            ("idempotency_key", "s1"),
+            ("title", "x"),
+        ],
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -461,9 +551,65 @@ async fn unrelated_users_get_404_and_readers_can_open_issues() {
         &f.app,
         &format!("{}/issues", f.base),
         &cookie,
-        &[("csrf_token", &csrf(&page)), ("title", "x")],
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("title", "x"),
+        ],
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resubmitted_forms_do_not_duplicate() {
+    let f = fixture().await;
+    let (_, form) = get(&f.app, &format!("{}/issues/new", f.base), Some(&f.cookie)).await;
+    let (token, k) = (csrf(&form), key(&form));
+    let fields = [
+        ("csrf_token", token.as_str()),
+        ("idempotency_key", k.as_str()),
+        ("title", "double click"),
+    ];
+    let (first, first_location, _) =
+        post_form(&f.app, &format!("{}/issues", f.base), &f.cookie, &fields).await;
+    let (second, second_location, _) =
+        post_form(&f.app, &format!("{}/issues", f.base), &f.cookie, &fields).await;
+    assert_eq!(
+        (first, second),
+        (StatusCode::SEE_OTHER, StatusCode::SEE_OTHER)
+    );
+    assert_eq!(first_location, second_location);
+
+    let (_, page) = get(&f.app, &first_location.unwrap(), Some(&f.cookie)).await;
+    let (token, k) = (csrf(&page), key(&page));
+    let fields = [
+        ("csrf_token", token.as_str()),
+        ("idempotency_key", k.as_str()),
+        ("body", "once"),
+    ];
+    for _ in 0..2 {
+        let (status, _, _) = post_form(
+            &f.app,
+            &format!("{}/issues/1/comments", f.base),
+            &f.cookie,
+            &fields,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM issues i JOIN repositories r ON r.id = i.repository_id WHERE r.organization_id = $1), \
+                (SELECT count(*) FROM issue_comments c JOIN issues i ON i.id = c.issue_id JOIN repositories r ON r.id = i.repository_id WHERE r.organization_id = $1), \
+                (SELECT count(*) FROM audit_events WHERE organization_id = $1 AND kind IN ('issue.created','issue.commented'))",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1, 2));
     finish(f).await;
 }
