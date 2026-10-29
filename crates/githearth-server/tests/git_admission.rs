@@ -569,7 +569,10 @@ async fn busy_or_unavailable_authentication_is_not_a_bad_password() {
     )
     .await
     .unwrap();
-    // One password check at a time: concurrent attempts beyond it are told to back off.
+    // One password check at a time: concurrent attempts queue briefly and are then
+    // either checked or told to back off, never reported as a bad password. Whether a
+    // burst outlasts the queue wait depends on hashing speed; the deterministic 429 case
+    // is `saturated_auth_returns_429_before_database_access` in the library tests.
     let mut attempts = tokio::task::JoinSet::new();
     for _ in 0..8 {
         let (state, org_slug, username) = (state.clone(), org_slug.clone(), username.clone());
@@ -582,10 +585,6 @@ async fn busy_or_unavailable_authentication_is_not_a_bad_password() {
         });
     }
     let statuses = attempts.join_all().await;
-    assert!(
-        statuses.contains(&axum::http::StatusCode::TOO_MANY_REQUESTS),
-        "{statuses:?}"
-    );
     assert!(
         statuses.iter().all(|s| matches!(s.as_u16(), 404 | 429)),
         "{statuses:?}"
