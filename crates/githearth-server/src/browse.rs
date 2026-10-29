@@ -82,7 +82,7 @@ async fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphoreP
 
 /// Run one Git invocation set on the blocking pool, holding the permit for the
 /// whole call so a cancelled request cannot release it while Git still runs.
-async fn git_read<T>(
+pub(crate) async fn git_read<T>(
     state: &AppState,
     repo_id: Uuid,
     work: impl FnOnce(&FsPath, Duration) -> Result<T, StorageError> + Send + 'static,

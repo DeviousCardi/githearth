@@ -35,12 +35,12 @@ pub fn router() -> Router<AppState> {
 fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "issue not found")
 }
-fn not_active() -> ApiError {
+pub(crate) fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
 }
 // Reads treat a non-active repository like a missing one; only an `active`
 // repository (archived included) is readable.
-fn require_readable_repo(loaded: &Loaded) -> Result<(), ApiError> {
+pub(crate) fn require_readable_repo(loaded: &Loaded) -> Result<(), ApiError> {
     if loaded.repo.status != RepositoryStatus::Active {
         return Err(not_found());
     }
@@ -135,7 +135,10 @@ fn require_issue(
     }
 }
 
-async fn allocate_number(conn: &mut PgConnection, repository_id: Uuid) -> Result<i32, sqlx::Error> {
+pub(crate) async fn allocate_number(
+    conn: &mut PgConnection,
+    repository_id: Uuid,
+) -> Result<i32, sqlx::Error> {
     sqlx::query_scalar(
         "INSERT INTO issue_counters (repository_id, last) VALUES ($1, 1) \
          ON CONFLICT (repository_id) DO UPDATE SET last = issue_counters.last + 1 \
