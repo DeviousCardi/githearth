@@ -1682,3 +1682,224 @@ async fn disconnect_after_full_pack_applies_and_cleans_token() {
     cleanup(&fx.storage_root);
     fx.pool.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Branch protection (M3): protected refs refuse force-push, delete and direct
+// pushes unless the rule allows them.
+// ---------------------------------------------------------------------------
+
+async fn add_protection_rule(
+    pool: &PgPool,
+    repo_id: Uuid,
+    created_by: Uuid,
+    pattern: &str,
+    allow_force_push: bool,
+    allow_deletion: bool,
+    require_pull_request: bool,
+) {
+    sqlx::query(
+        "INSERT INTO branch_protection_rules \
+         (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, require_checks, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, 0, false, $7)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(pattern)
+    .bind(allow_force_push)
+    .bind(allow_deletion)
+    .bind(require_pull_request)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO protection_generations (repository_id, generation) VALUES ($1, 1) \
+         ON CONFLICT (repository_id) DO UPDATE SET generation = protection_generations.generation + 1",
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn owner_id(fx: &Fixture) -> Uuid {
+    sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn protected_main_refuses_force_push_and_delete() {
+    let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
+    add_protection_rule(&fx.pool, fx.repo_id, owner, "main", false, false, false).await;
+
+    let clone = std::env::temp_dir().join(format!("git-prot-main-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // Fast-forward push to main is still allowed (no require_pull_request).
+    std::fs::write(clone.join("a"), "a").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "a"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "a",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+
+    // Rewind and force-push: refused.
+    git_ok(git_cmd(&["-C", cd, "reset", "--hard", "HEAD~1"])).await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "--force", "origin", "main"])).await;
+    assert!(
+        !out.status.success(),
+        "force push to protected main must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protected branch: ref.force_push"),
+        "force push reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Delete main: refused.
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "--delete", "main"])).await;
+    assert!(!out.status.success(), "delete of protected main must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protected branch: ref.delete"),
+        "delete reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn release_glob_applies_and_unprotected_branches_unchanged() {
+    let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
+    add_protection_rule(
+        &fx.pool,
+        fx.repo_id,
+        owner,
+        "release/*",
+        false,
+        false,
+        false,
+    )
+    .await;
+
+    let clone = std::env::temp_dir().join(format!("git-prot-glob-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // A release/* branch refuses a force push.
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "release/v1"])).await;
+    std::fs::write(clone.join("r"), "r").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "r"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "r",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "release/v1"])).await;
+    git_ok(git_cmd(&["-C", cd, "reset", "--hard", "HEAD~1"])).await;
+    let out = git_run(git_cmd(&[
+        "-C",
+        cd,
+        "push",
+        "--force",
+        "origin",
+        "release/v1",
+    ]))
+    .await;
+    assert!(!out.status.success(), "force push to release/* must fail");
+
+    // An ordinary branch is unaffected: force push and delete both work.
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "feature"])).await;
+    std::fs::write(clone.join("f"), "f").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "f",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
+    git_ok(git_cmd(&["-C", cd, "reset", "--hard", "HEAD~1"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "--force", "origin", "feature"])).await;
+    git_ok(git_cmd(&[
+        "-C", cd, "push", "origin", "--delete", "feature",
+    ]))
+    .await;
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn require_pull_request_refuses_direct_push() {
+    let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
+    add_protection_rule(&fx.pool, fx.repo_id, owner, "main", false, false, true).await;
+
+    let clone = std::env::temp_dir().join(format!("git-prot-pr-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    std::fs::write(clone.join("a"), "a").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "a"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "a",
+    ]))
+    .await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+    assert!(
+        !out.status.success(),
+        "direct push to require_pull_request main must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protected branch: ref.push"),
+        "push reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
