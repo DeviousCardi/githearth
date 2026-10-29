@@ -753,6 +753,217 @@ async fn close_reopen_and_edit_issues_from_the_ui() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn edited_resubmit_with_the_same_key_shows_the_422_notice_and_keeps_the_text() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "first", "body": "before"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, form) = get(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        Some(&f.cookie),
+    )
+    .await;
+    let (token, k) = (csrf(&form), key(&form));
+
+    // The first submit succeeds.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("title", "edited once"),
+            ("body", "kept text"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Resubmitting the same key with an edited body re-renders the form with
+    // the friendly notice and the user's text, not a generic error page.
+    let (status, _, page) = post_form(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("title", "edited again"),
+            ("body", "kept text"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        page.contains("This form was already submitted. Reload the page to start a new one."),
+        "{page}"
+    );
+    assert!(page.contains("kept text"), "{page}");
+    assert_eq!(key(&page), k, "the re-rendered form keeps its key");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn submit_while_the_same_key_is_in_flight_shows_the_409_notice() {
+    let f = fixture().await;
+    let (_, form) = get(&f.app, &format!("{}/issues/new", f.base), Some(&f.cookie)).await;
+    let (token, k) = (csrf(&form), key(&form));
+
+    // A first submit with this key is still running: its claim is fresh.
+    sqlx::query(
+        "INSERT INTO operations (actor_id, key, request_hash, status, expires_at) \
+         SELECT account_id, $2, sha256('in flight'::bytea), 'running', clock_timestamp() + interval '1 hour' \
+         FROM sessions WHERE token_hash = sha256($1::bytea)",
+    )
+    .bind(&f.token)
+    .bind(&k)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let (status, _, page) = post_form(
+        &f.app,
+        &format!("{}/issues", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("title", "double click"),
+            ("body", "kept body"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        page.contains("This form is already being submitted. Reload the page to see the result."),
+        "{page}"
+    );
+    assert!(page.contains("double click"), "{page}");
+    assert!(page.contains("kept body"), "{page}");
+    let issues: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issues WHERE title = 'double click'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(issues, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn comment_resubmit_with_the_same_key_shows_the_422_notice() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "t"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    let (token, k) = (csrf(&page), key(&page));
+
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("body", "first comment"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, _, page) = post_form(
+        &f.app,
+        &format!("{}/issues/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("body", "edited comment"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        page.contains("This form was already submitted. Reload the page to start a new one."),
+        "{page}"
+    );
+    assert!(page.contains("edited comment"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn state_resubmit_with_the_same_key_shows_the_422_notice() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "t"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    let (token, k) = (csrf(&page), state_key(&page));
+
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/state", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("state", "closed"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, _, page) = post_form(
+        &f.app,
+        &format!("{}/issues/1/state", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("state", "open"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        page.contains("This form was already submitted. Reload the page to start a new one."),
+        "{page}"
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn issue_edits_and_state_require_csrf_and_escape_titles() {
     let f = fixture().await;
     let (status, _) = api(

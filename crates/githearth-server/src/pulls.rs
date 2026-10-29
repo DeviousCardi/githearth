@@ -56,8 +56,33 @@ fn branch_missing() -> ApiError {
 fn head_moved() -> ApiError {
     ApiError(StatusCode::CONFLICT, "commit is not the pull request head")
 }
+fn path_not_found() -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, "path not found at commit")
+}
+fn not_text() -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, "path is not a text file")
+}
+fn line_out_of_range() -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, "line out of range")
+}
 fn not_open() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is not open")
+}
+
+/// Re-checks inside the transaction, on the same row lock the PATCH
+/// close/reopen path takes, that the pull request is still open. A close that
+/// commits between the earlier head check and the review insert must not leave
+/// a review on a closed pull request.
+async fn require_open(conn: &mut PgConnection, id: Uuid) -> Result<(), ApiError> {
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM pull_requests WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(conn)
+            .await?;
+    match state.as_deref() {
+        Some("open") => Ok(()),
+        _ => Err(not_open()),
+    }
 }
 fn already_open() -> ApiError {
     ApiError(
@@ -88,6 +113,20 @@ pub(crate) fn valid_branch(name: &str) -> bool {
 /// Full lowercase commit ids only, as stored and compared.
 fn valid_commit_id(id: &str) -> bool {
     browse::is_commit_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// Number of text lines in a blob's content: newline-terminated segments plus
+/// a trailing segment with no newline. An empty blob has no lines.
+fn line_count(content: &[u8]) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+    let newlines = content.iter().filter(|&&b| b == b'\n').count();
+    if content.last() == Some(&b'\n') {
+        newlines
+    } else {
+        newlines + 1
+    }
 }
 
 const PULL_COLUMNS: &str = "id, number, title, body, state, author_id, source_branch, target_branch, \
@@ -209,6 +248,7 @@ fn require_pull(
             repository: loaded.repo.id,
             name: format!("refs/heads/{}", pull.target_branch),
             protection: None,
+            exists: true,
         },
     };
     let decision = state.authz.authorize(&loaded.facts.request(
@@ -701,13 +741,40 @@ pub(crate) async fn create_pull_comment(
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
             }
-            if let Some(commit) = &input.commit_id
-                && branch_tip(state, loaded.repo.id, &pull.source_branch)
+            if let Some(commit) = input.commit_id.clone() {
+                if branch_tip(state, loaded.repo.id, &pull.source_branch)
                     .await?
                     .as_ref()
-                    != Some(commit)
-            {
-                return Err(head_moved());
+                    != Some(&commit)
+                {
+                    return Err(head_moved());
+                }
+                // An anchored comment must point at a real line of a real
+                // blob at that commit. `browse::blob` reads through the
+                // blocking Git pool with the configured timeout and reports a
+                // missing path, a directory or a submodule as `None`.
+                let path = input.path.clone().unwrap();
+                let line = input.line.unwrap();
+                let commit_for_git = commit.clone();
+                let blob = browse::git_read(state, loaded.repo.id, move |fs_path, timeout| {
+                    git_browse::blob(
+                        fs_path,
+                        &commit_for_git,
+                        &path,
+                        git_browse::MAX_BLOB_BYTES,
+                        timeout,
+                    )
+                })
+                .await?
+                .ok_or_else(path_not_found)?;
+                if blob.binary {
+                    return Err(not_text());
+                }
+                // A truncated blob undercounts its lines; only a complete one
+                // can prove the line is past the end.
+                if !blob.truncated && line as usize > line_count(&blob.content) {
+                    return Err(line_out_of_range());
+                }
             }
 
             let mut tx = state.pool.begin().await?;
@@ -959,6 +1026,9 @@ pub(crate) async fn create_pull_review(
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
                 return Err(not_active());
             }
+            // The early `pull.state != "open"` check above races a concurrent
+            // close; re-check under the row lock the close/reopen path takes.
+            require_open(&mut tx, pull.id).await?;
             let id = Uuid::new_v4();
             let review: ReviewJson = sqlx::query_as(&format!(
                 "INSERT INTO pull_request_reviews \
@@ -1076,6 +1146,15 @@ mod tests {
     }
 
     #[test]
+    fn blob_line_counts_match_text_lines() {
+        assert_eq!(line_count(b""), 0);
+        assert_eq!(line_count(b"feature\n"), 1);
+        assert_eq!(line_count(b"a\nb"), 2);
+        assert_eq!(line_count(b"a\nb\n"), 2);
+        assert_eq!(line_count(b"a\nb\nc\n"), 3);
+    }
+
+    #[test]
     fn comment_anchors_are_all_or_nothing() {
         let id = "a".repeat(40);
         let ok = |v: serde_json::Value| new_comment(v.to_string().as_bytes()).is_ok();
@@ -1128,5 +1207,78 @@ mod tests {
         assert!(!ok(
             serde_json::json!({"verdict": "approved", "commit_id": "main"})
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn require_open_locks_and_rejects_a_closed_pull_request() {
+        use sqlx::{ConnectOptions, postgres::PgPoolOptions};
+        use std::str::FromStr;
+
+        let url =
+            std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .disable_statement_logging();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused')")
+            .bind(account)
+            .bind(format!("rq-{}", Uuid::new_v4().simple()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let org = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')",
+        )
+        .bind(org)
+        .bind(format!("o-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'r',$3,$4,'active','private')",
+        )
+        .bind(repo)
+        .bind(org)
+        .bind(account)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pull = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+        )
+        .bind(pull)
+        .bind(repo)
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        require_open(&mut conn, pull).await.unwrap();
+
+        sqlx::query("UPDATE pull_requests SET state = 'closed', closed_at = now() WHERE id = $1")
+            .bind(pull)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = require_open(&mut conn, pull).await.unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.message(), "pull request is not open");
+
+        pool.close().await;
     }
 }

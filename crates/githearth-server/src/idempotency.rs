@@ -14,6 +14,11 @@ const RUNNING_LEASE: Duration = Duration::from_secs(60);
 /// Internal marker distinguishing a lost claim from other handler errors.
 const LOST_CLAIM: &str = "idempotency claim lost";
 
+/// A key whose first submit is still running.
+pub const KEY_CONFLICT: &str = "idempotency key conflict";
+/// A key reused with a different request body.
+pub const KEY_REUSED: &str = "idempotency key reused with different request";
+
 pub fn extract_key(headers: &HeaderMap) -> Option<Result<&str, ApiError>> {
     let key = headers.get("Idempotency-Key")?;
     let key = match key.to_str() {
@@ -185,11 +190,8 @@ where
     .await?;
     match claimed {
         Outcome::Reply(status, body) => Ok((status, body)),
-        Outcome::Conflict => Err(ApiError(StatusCode::CONFLICT, "idempotency key conflict")),
-        Outcome::Unprocessable => Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "idempotency key reused with different request",
-        )),
+        Outcome::Conflict => Err(ApiError(StatusCode::CONFLICT, KEY_CONFLICT)),
+        Outcome::Unprocessable => Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, KEY_REUSED)),
         Outcome::Run {
             claim_id,
             prior_operation_id,
@@ -240,13 +242,10 @@ async fn resolve_lost(
                 let code = StatusCode::from_u16(code as u16).unwrap_or(StatusCode::OK);
                 Ok((code, body))
             } else {
-                Err(ApiError(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "idempotency key reused with different request",
-                ))
+                Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, KEY_REUSED))
             }
         }
-        _ => Err(ApiError(StatusCode::CONFLICT, "idempotency key conflict")),
+        _ => Err(ApiError(StatusCode::CONFLICT, KEY_CONFLICT)),
     }
 }
 

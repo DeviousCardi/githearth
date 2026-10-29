@@ -107,7 +107,7 @@ forbid (
   action in [GitHearth::Action::"ref.push", GitHearth::Action::"ref.force_push"],
   resource
 )
-when { resource.protected && resource.require_pull_request };
+when { resource.protected && resource.require_pull_request && resource.exists };
 
 @id("merge-requires-approvals")
 forbid (principal, action == GitHearth::Action::"pull_request.merge", resource)

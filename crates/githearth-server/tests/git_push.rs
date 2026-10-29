@@ -1865,6 +1865,67 @@ async fn release_glob_applies_and_unprotected_branches_unchanged() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn creating_a_require_pull_request_branch_succeeds_but_the_next_push_is_refused() {
+    let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
+    add_protection_rule(&fx.pool, fx.repo_id, owner, "release/*", false, false, true).await;
+
+    let clone = std::env::temp_dir().join(format!("git-prot-create-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // Creating release/2.0 is allowed even though release/* requires a PR:
+    // the branch does not exist yet, so the rule only applies from then on.
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "release/2.0"])).await;
+    std::fs::write(clone.join("r"), "r").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "r"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "r",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "release/2.0"])).await;
+
+    // A second fast-forward push to the now-existing branch is refused.
+    std::fs::write(clone.join("r2"), "r2").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "r2"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "r2",
+    ]))
+    .await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "release/2.0"])).await;
+    assert!(
+        !out.status.success(),
+        "fast-forward push to protected branch must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protected branch: ref.push"),
+        "push reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn require_pull_request_refuses_direct_push() {
     let fx = setup(1 << 30).await;
     let owner = owner_id(&fx).await;

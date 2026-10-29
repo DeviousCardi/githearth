@@ -38,7 +38,8 @@ namespace GitHearth {
     archived: Bool,
   };
   // A branch or tag. Unprotected refs have protected == false and the
-  // remaining protection fields at their permissive values.
+  // remaining protection fields at their permissive values. `exists` is false
+  // only while the ref is being created (old oid all zeros).
   entity Ref in [Repository] = {
     organization: Organization,
     repository: Repository,
@@ -48,6 +49,7 @@ namespace GitHearth {
     require_pull_request: Bool,
     required_approvals: Long,
     require_checks: Bool,
+    exists: Bool,
   };
   entity Issue in [Repository] = {
     organization: Organization,
