@@ -25,21 +25,30 @@ enum Command {
         #[arg(long)]
         username: String,
     },
+    /// Internal: dispatched by the Git hooks before any configuration is loaded.
+    #[command(hide = true, name = "git-hook")]
+    GitHook {
+        name: String,
+        args: Vec<String>,
+    },
 }
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+    if let Command::GitHook { name, args } = &args.command {
+        std::process::exit(githearth_server::git_hooks::run_process(name, args));
+    }
     tracing_subscriber::fmt()
         .json()
         .with_env_filter("githearth_server=info")
         .init();
-    if let Err(error) = run().await {
+    if let Err(error) = run(args).await {
         // Only configuration and explicitly sanitized application errors are printed here.
         eprintln!("{error}");
         std::process::exit(1);
     }
 }
-async fn run() -> Result<()> {
-    let args = Args::parse();
+async fn run(args: Args) -> Result<()> {
     let config = Config::load(args.config.as_deref())?;
     let pool = connect(&config).await?;
     match args.command {
@@ -90,6 +99,8 @@ async fn run() -> Result<()> {
                 .await
                 .context("HTTP server failed")?;
         }
+        // Handled in `main` before any configuration is loaded.
+        Command::GitHook { .. } => unreachable!("git-hook is dispatched in main"),
     }
     Ok(())
 }

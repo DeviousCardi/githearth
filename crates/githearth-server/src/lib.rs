@@ -4,6 +4,7 @@ mod browse_ui;
 pub mod config;
 pub mod facts;
 pub mod git_admission;
+pub mod git_hooks;
 pub mod git_http;
 pub mod idempotency;
 pub mod issues;
@@ -13,6 +14,7 @@ pub mod repositories;
 pub mod repository_api;
 pub mod ui;
 
+use anyhow::Context;
 use argon2::{
     Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
     password_hash::{SaltString, rand_core::OsRng},
@@ -33,7 +35,7 @@ use sqlx::{
     ConnectOptions, PgPool, Row,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 use uuid::Uuid;
@@ -50,6 +52,9 @@ pub struct AppState {
     dummy_hash: Arc<String>,
     pub authz: Arc<Engine>,
     pub storage: Arc<githearth_git::layout::Storage>,
+    // pub so the disconnect integration test can assert the token is released.
+    pub hook_tokens: Arc<std::sync::Mutex<HashMap<String, git_admission::Admitted>>>,
+    pub(crate) hook_socket_path: std::path::PathBuf,
 }
 impl AppState {
     pub async fn new(pool: PgPool, config: Config) -> anyhow::Result<Self> {
@@ -59,10 +64,49 @@ impl AppState {
                 .await??;
         let storage = tokio::task::spawn_blocking({
             let root = config.storage_root.clone();
-            move || githearth_git::layout::Storage::open(&root)
+            let hooks_path = root.join("hooks");
+            let max_input_size = config.git_push_limit_bytes;
+            move || {
+                githearth_git::layout::Storage::open_with(
+                    &root,
+                    githearth_git::layout::StorageOptions {
+                        hooks_path,
+                        max_input_size,
+                    },
+                )
+            }
         })
         .await??;
-        Ok(Self {
+
+        // The hook scripts exec the server binary so the hooks talk to this
+        // process's admission socket; tests point this at the real binary.
+        let hook_program = if config.hook_program.as_os_str().is_empty() {
+            std::env::current_exe().context("cannot resolve the server executable for hooks")?
+        } else {
+            config.hook_program.clone()
+        };
+        let hooks_path = config.storage_root.join("hooks");
+        tokio::task::spawn_blocking(move || write_hooks(&hooks_path, &hook_program)).await??;
+
+        // One admission socket per AppState.  A unique, short name lets tests
+        // create several states on one storage root without bind conflicts or
+        // exceeding the Unix socket path limit.
+        let run_dir = config.storage_root.join("run");
+        tokio::task::spawn_blocking(move || {
+            create_run_dir(&run_dir)?;
+            clean_stale_sockets(&run_dir)
+        })
+        .await??;
+        let mut bytes = [0u8; 4];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        let socket_path = config
+            .storage_root
+            .join("run")
+            .join(format!("hook-{}.sock", hex::encode(bytes)));
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .with_context(|| format!("cannot bind hook socket {}", socket_path.display()))?;
+
+        let state = Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
             git_slots: Arc::new(Semaphore::new(config.git_concurrency)),
@@ -70,8 +114,62 @@ impl AppState {
             dummy_hash: Arc::new(dummy_hash),
             authz: Arc::new(Engine::new()?),
             storage: Arc::new(storage),
-        })
+            hook_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            hook_socket_path: socket_path,
+        };
+        tokio::spawn(crate::git_http::hook_accept_loop(listener, state.clone()));
+        Ok(state)
     }
+}
+
+fn write_hooks(hooks_dir: &std::path::Path, program: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(hooks_dir)?;
+    let program = program.display().to_string().replace('\'', "'\\''");
+    for name in ["pre-receive", "reference-transaction"] {
+        let path = hooks_dir.join(name);
+        let script = format!("#!/bin/sh\nexec '{program}' git-hook {name} \"$@\"\n");
+        std::fs::write(&path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
+
+fn create_run_dir(run_dir: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::create_dir(run_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Remove hook sockets left by a previous process.  A socket that still
+/// accepts a connection belongs to a live AppState and is kept.
+fn clean_stale_sockets(run_dir: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        for entry in std::fs::read_dir(run_dir)?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("hook-")
+                && name.ends_with(".sock")
+                && UnixStream::connect(entry.path()).is_err()
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn connect(config: &Config) -> anyhow::Result<PgPool> {
@@ -582,6 +680,18 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    /// A unique storage root in the system temp dir so AppState setup never
+    /// writes under the source tree.
+    fn temp_storage_root() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "githearth-lib-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn hashes_pin_argon2_resource_parameters() {
         let hash = hash_password("a sufficiently long password").unwrap();
@@ -599,6 +709,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hook_script_escapes_single_quotes_in_the_program_path() {
+        let root = temp_storage_root();
+        write_hooks(&root.join("hooks"), &root.join("it's")).unwrap();
+        let script = std::fs::read_to_string(root.join("hooks").join("pre-receive")).unwrap();
+        assert!(script.contains("it'\\''s"), "{script}");
+        assert!(script.contains("git-hook pre-receive \"$@\""), "{script}");
+    }
+
     #[tokio::test]
     async fn auth_queues_briefly_instead_of_refusing_a_burst() {
         let pool = PgPoolOptions::new()
@@ -608,6 +727,7 @@ mod tests {
         let config = Config {
             database_url: "postgres://localhost:1/unused".into(),
             auth_concurrency: 1,
+            storage_root: temp_storage_root(),
             ..Config::default()
         };
         let state = AppState::new(pool, config).await.unwrap();
@@ -641,6 +761,7 @@ mod tests {
         let config = Config {
             database_url: "postgres://localhost/unused".into(),
             auth_concurrency: 1,
+            storage_root: temp_storage_root(),
             ..Config::default()
         };
         let state = AppState::new(pool, config).await.unwrap();
@@ -670,6 +791,7 @@ mod tests {
         let config = Config {
             database_url: "postgres://localhost/unused".into(),
             auth_concurrency: 1,
+            storage_root: temp_storage_root(),
             ..Config::default()
         };
         let state = AppState::new(pool, config).await.unwrap();

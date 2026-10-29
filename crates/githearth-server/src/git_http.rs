@@ -1,5 +1,6 @@
-//! Git Smart HTTP transport: clone/fetch via git-upload-pack.
-//! Push (receive-pack) is explicitly refused until a later task.
+//! Git Smart HTTP transport: clone/fetch via git-upload-pack and push via
+//! git-receive-pack (ADR 0003 push transaction: admission, per-repository
+//! serialization, journal replay, hooks, bounded streaming).
 use axum::{
     Router,
     body::Body,
@@ -14,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{AppState, config::Config, git_admission};
+use crate::{AppState, config::Config, git_admission, pushes};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -29,7 +30,7 @@ pub fn router(_config: &Config) -> Router<AppState> {
         )
         .route(
             "/{org}/{repo}/git-receive-pack",
-            axum::routing::post(receive_pack_denied),
+            axum::routing::post(receive_pack),
         )
 }
 
@@ -59,27 +60,27 @@ async fn info_refs(
     let repo_name = strip_dot_git(&repo).ok_or(GitHttpError::NotFound)?;
 
     let service = query.service.as_deref().unwrap_or("");
-    match service {
-        "git-upload-pack" => {}
-        "git-receive-pack" => {
-            return Err(GitHttpError::PushNotEnabled);
-        }
+    let (want, svc, content_type) = match service {
+        "git-upload-pack" => (
+            git_admission::Want::Fetch,
+            "git-upload-pack",
+            "application/x-git-upload-pack-advertisement",
+        ),
+        "git-receive-pack" => (
+            git_admission::Want::Push,
+            "git-receive-pack",
+            "application/x-git-receive-pack-advertisement",
+        ),
         _ => {
             return Err(GitHttpError::BadRequest(
                 "dumb HTTP protocol is not supported",
             ));
         }
-    }
+    };
 
-    let admitted = git_admission::admit(
-        &state,
-        &headers,
-        &org,
-        repo_name,
-        git_admission::Want::Fetch,
-    )
-    .await
-    .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
+    let admitted = git_admission::admit(&state, &headers, &org, repo_name, want)
+        .await
+        .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
 
     let permit = acquire_git_permit(&state).await?;
     let deadline =
@@ -87,17 +88,27 @@ async fn info_refs(
 
     let git_protocol = extract_git_protocol(&headers);
 
-    let cmd = state
-        .storage
-        .upload_pack(admitted.repository.id, true, git_protocol.as_deref())
-        .map_err(|e| {
-            tracing::error!(
-                category = "git",
-                repository_id = %admitted.repository.id,
-                "storage error: {e}"
-            );
-            GitHttpError::ServerError
-        })?;
+    let cmd = if want == git_admission::Want::Fetch {
+        state
+            .storage
+            .upload_pack(admitted.repository.id, true, git_protocol.as_deref())
+    } else {
+        let hooks_dir = state.config.storage_root.join("hooks");
+        state.storage.receive_pack(
+            admitted.repository.id,
+            true,
+            git_protocol.as_deref(),
+            &hooks_dir,
+        )
+    }
+    .map_err(|e| {
+        tracing::error!(
+            category = "git",
+            repository_id = %admitted.repository.id,
+            "storage error: {e}"
+        );
+        GitHttpError::ServerError
+    })?;
 
     let mut child = tokio::process::Command::from(cmd)
         .kill_on_drop(true)
@@ -122,27 +133,24 @@ async fn info_refs(
     let prefix: Vec<u8> = if use_v2 {
         Vec::new()
     } else {
-        let svc = "# service=git-upload-pack\n";
-        let len = svc.len() + 4;
+        let svc_line = format!("# service={svc}\n");
+        let len = svc_line.len() + 4;
         let mut buf = Vec::with_capacity(len + 4);
         buf.extend_from_slice(format!("{len:04x}").as_bytes());
-        buf.extend_from_slice(svc.as_bytes());
+        buf.extend_from_slice(svc_line.as_bytes());
         buf.extend_from_slice(b"0000");
         buf
     };
 
     let token = CancellationToken::new();
     let body = Body::from_stream(stream_git_output(
-        child, stdout, stderr, prefix, repo_id, deadline, permit, None, None, token,
+        child, stdout, stderr, prefix, repo_id, deadline, permit, None, None, token, None, true,
     ));
 
     let mut response = Response::new(body);
-    response.headers_mut().insert(
-        "Content-Type",
-        "application/x-git-upload-pack-advertisement"
-            .parse()
-            .unwrap(),
-    );
+    response
+        .headers_mut()
+        .insert("Content-Type", content_type.parse().unwrap());
     response
         .headers_mut()
         .insert("Cache-Control", "no-cache".parse().unwrap());
@@ -273,6 +281,8 @@ async fn upload_pack(
         Some(kill_rx),
         Some(feeder_handle),
         token,
+        None,
+        true,
     ));
 
     let mut response = Response::new(body);
@@ -287,11 +297,352 @@ async fn upload_pack(
 }
 
 // ---------------------------------------------------------------------------
-// POST /{org}/{repo}/git-receive-pack  (explicitly denied)
+// POST /{org}/{repo}/git-receive-pack
 // ---------------------------------------------------------------------------
 
-async fn receive_pack_denied() -> Result<Response, GitHttpError> {
-    Err(GitHttpError::PushNotEnabled)
+async fn receive_pack(
+    State(state): State<AppState>,
+    Path((org, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, GitHttpError> {
+    let repo_name = strip_dot_git(&repo).ok_or(GitHttpError::NotFound)?;
+
+    let admitted =
+        git_admission::admit(&state, &headers, &org, repo_name, git_admission::Want::Push)
+            .await
+            .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
+
+    let permit = acquire_git_permit(&state).await?;
+    // Per-repository lock BEFORE any pool connection (see reconcile.rs lock
+    // ordering).  Held until the response stream finishes so the journal
+    // records of one ref transaction stay adjacent.
+    let repo_guard = state
+        .storage
+        .repository_lock(admitted.repository.id)
+        .lock_owned()
+        .await;
+    let repo_id = admitted.repository.id;
+
+    // Remove lock files left by a receive-pack killed mid-update (we hold the
+    // per-repository lock, so nothing else can be writing refs).
+    if let Err(e) = state.storage.remove_stale_locks(repo_id) {
+        tracing::warn!(repository_id = %repo_id, error = %e, "cannot remove stale ref locks");
+    }
+
+    // Stage 6 pre-flight: apply any journaled-but-unapplied pushes first.
+    if let Err(e) = pushes::replay(&state, repo_id).await {
+        return Err(match e {
+            pushes::ReplayError::Diverged { .. } => GitHttpError::Diverged,
+            other => {
+                tracing::error!(repository_id = %repo_id, error = %other, "pre-push journal replay failed");
+                GitHttpError::ServerError
+            }
+        });
+    }
+
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(state.config.git_timeout_seconds);
+    let limit = state.config.git_push_limit_bytes;
+
+    // Content-Length check — reject before spawning git.
+    let content_encoding = headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase());
+    let is_identity = matches!(content_encoding.as_deref(), None | Some("identity"));
+    if is_identity
+        && let Some(cl) = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+        && cl > limit
+    {
+        return Err(GitHttpError::PayloadTooLarge);
+    }
+
+    let is_gzip = matches!(content_encoding.as_deref(), Some("gzip" | "x-gzip"));
+    if !is_identity && !is_gzip {
+        return Err(GitHttpError::UnsupportedContentEncoding);
+    }
+
+    let git_protocol = extract_git_protocol(&headers);
+    let hooks_dir = state.config.storage_root.join("hooks");
+
+    let cmd = state
+        .storage
+        .receive_pack(repo_id, false, git_protocol.as_deref(), &hooks_dir)
+        .map_err(|e| {
+            tracing::error!(
+                category = "git",
+                repository_id = %repo_id,
+                "storage error: {e}"
+            );
+            GitHttpError::ServerError
+        })?;
+
+    let hook_token = new_hook_token();
+    let operation = Uuid::new_v4();
+    state
+        .hook_tokens
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(hook_token.clone(), admitted.clone());
+    // RAII: a cancelled request or an aborted supervisor still releases the
+    // one-use token.
+    let token_guard = HookTokenGuard::new(state.hook_tokens.clone(), hook_token.clone());
+
+    let mut hook_cmd = tokio::process::Command::from(cmd);
+    hook_cmd
+        .env("GITHEARTH_HOOK_SOCKET", &state.hook_socket_path)
+        .env("GITHEARTH_HOOK_TOKEN", &hook_token)
+        .env("GITHEARTH_OPERATION", operation.to_string())
+        .env("GITHEARTH_ACTOR", admitted.account.to_string());
+    // coverage: let the hook subprocess (the same instrumented binary) record
+    // its own profile under the test harness.
+    if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+        hook_cmd.env("LLVM_PROFILE_FILE", profile);
+    }
+    // Once the pack is fully fed, a client that went away must not kill
+    // receive-pack mid-ref-update (that would leave stale lock files); the
+    // deadline still bounds it.  So: no kill on drop, no kill on disconnect.
+    let mut child = match hook_cmd
+        .kill_on_drop(false)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            drop(token_guard);
+            tracing::error!(
+                category = "git",
+                repository_id = %repo_id,
+                "cannot spawn git: {e}"
+            );
+            return Err(GitHttpError::ServerError);
+        }
+    };
+
+    let stdin = child.stdin.take().expect("stdin piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    // Kill channel: stdin feeder sends when the decoded body exceeds the limit.
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let token = CancellationToken::new();
+    let feeder_token = token.clone();
+
+    let feeder_handle: tokio::task::JoinHandle<()> = if is_gzip {
+        tokio::spawn(stream_gzip_body_to_stdin(
+            repo_id,
+            body,
+            stdin,
+            limit,
+            kill_tx,
+            feeder_token,
+        ))
+    } else {
+        tokio::spawn(stream_body_to_stdin(
+            repo_id,
+            body,
+            stdin,
+            limit,
+            kill_tx,
+            feeder_token,
+        ))
+    };
+
+    // Stage 7: after git exits, apply the committed push to metadata.  The
+    // repository lock and the one-use hook token are released by their guards
+    // when this future drops (RAII), so a client that went away cannot skip
+    // the replay or leak the token.
+    let after_exit: futures_util::future::BoxFuture<'static, ()> = {
+        let state = state.clone();
+        Box::pin(async move {
+            // Guards live inside the future: they drop when it completes or is
+            // itself dropped, never before the hook has had a chance to run.
+            let _guard = repo_guard;
+            let _token_guard = token_guard;
+            if let Err(e) = pushes::replay(&state, repo_id).await {
+                // A metadata failure after git succeeded never changes the
+                // client's result; the reconciler applies it later.
+                tracing::warn!(
+                    repository_id = %repo_id,
+                    error = %e,
+                    "post-push journal replay failed; reconciler will retry"
+                );
+            }
+        })
+    };
+
+    let body = Body::from_stream(stream_git_output(
+        child,
+        stdout,
+        stderr,
+        Vec::new(),
+        repo_id,
+        deadline,
+        permit,
+        Some(kill_rx),
+        Some(feeder_handle),
+        token,
+        Some(after_exit),
+        false,
+    ));
+
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        "Content-Type",
+        "application/x-git-receive-pack-result".parse().unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert("Cache-Control", "no-cache".parse().unwrap());
+    Ok(response)
+}
+
+// ---------------------------------------------------------------------------
+// Hook admission socket (one per AppState)
+// ---------------------------------------------------------------------------
+
+const HOOK_REQUEST_LIMIT: usize = 1024 * 1024;
+const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn new_hook_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    hex::encode(bytes)
+}
+
+/// Removes a one-use hook token when dropped, so a cancelled request or an
+/// aborted supervisor cannot leak the admitted principal.
+struct HookTokenGuard {
+    tokens: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, git_admission::Admitted>>,
+    >,
+    token: String,
+}
+
+impl HookTokenGuard {
+    fn new(
+        tokens: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, git_admission::Admitted>>,
+        >,
+        token: String,
+    ) -> Self {
+        Self { tokens, token }
+    }
+}
+
+impl Drop for HookTokenGuard {
+    fn drop(&mut self) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.token);
+    }
+}
+
+pub(crate) async fn hook_accept_loop(listener: tokio::net::UnixListener, state: AppState) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let state = state.clone();
+                tokio::spawn(handle_hook_connection(stream, state));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "hook admission socket accept failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn handle_hook_connection(mut stream: tokio::net::UnixStream, state: AppState) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let decision = tokio::time::timeout(HOOK_TIMEOUT, async {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > HOOK_REQUEST_LIMIT {
+                        return Err("request too large".to_owned());
+                    }
+                }
+                Err(_) => return Err("cannot read the hook request".to_owned()),
+            }
+        }
+
+        let text = String::from_utf8_lossy(&buf);
+        let (token, rest) = text.split_once('\n').unwrap_or((text.as_ref(), ""));
+        // One use: removed here even if the hook never runs again.
+        let admitted = state
+            .hook_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(token.trim_end())
+            .ok_or_else(|| "invalid or expired hook token".to_owned())?;
+
+        let updates = parse_hook_updates(rest)?;
+
+        let fresh = git_admission::reload(&state, &admitted)
+            .await
+            .map_err(|e| match e.0 {
+                StatusCode::NOT_FOUND => "repository is no longer available".to_owned(),
+                _ => "authentication unavailable".to_owned(),
+            })?;
+        for (update, fast_forward) in &updates {
+            if let Err(reason) = git_admission::decide_ref(&state, &fresh, update, *fast_forward) {
+                return Err(reason.to_owned());
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    let response = match decision {
+        Ok(Ok(())) => "OK\n".to_owned(),
+        Ok(Err(reason)) => format!("DENIED {reason}\n"),
+        Err(_) => "ERROR hook service timed out\n".to_owned(),
+    };
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// Parse the ref-update lines after the leading token line.
+fn parse_hook_updates(
+    rest: &str,
+) -> Result<Vec<(githearth_git::journal::Update, bool)>, &'static str> {
+    let mut updates = Vec::new();
+    for line in rest.lines() {
+        let mut parts = line.split(' ');
+        let (Some(old), Some(new), Some(reference), Some(ff)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err("malformed ref update");
+        };
+        if parts.next().is_some() {
+            return Err("malformed ref update");
+        }
+        updates.push((
+            githearth_git::journal::Update {
+                old: old.to_owned(),
+                new: new.to_owned(),
+                reference: reference.to_owned(),
+            },
+            ff == "1",
+        ));
+    }
+    if updates.is_empty() {
+        return Err("no ref updates in the hook request");
+    }
+    Ok(updates)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +786,8 @@ fn stream_git_output(
     kill_rx: Option<oneshot::Receiver<()>>,
     feeder_handle: Option<tokio::task::JoinHandle<()>>,
     token: CancellationToken,
+    after_exit: Option<futures_util::future::BoxFuture<'static, ()>>,
+    kill_on_disconnect: bool,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::stream;
     use tokio_util::io::ReaderStream;
@@ -472,7 +825,7 @@ fn stream_git_output(
                 let _ = child.start_kill();
                 child.wait().await
             }
-            _ = supervisor_token.cancelled() => {
+            _ = supervisor_token.cancelled(), if kill_on_disconnect => {
                 // Client disconnected (response body dropped its guard).
                 let _ = child.start_kill();
                 child.wait().await
@@ -508,6 +861,12 @@ fn stream_git_output(
             );
         }
 
+        // Post-push metadata replay (stage 7), still holding the repository
+        // lock and git permit.
+        if let Some(after_exit) = after_exit {
+            after_exit.await;
+        }
+
         drop(permit);
     });
 
@@ -524,13 +883,13 @@ fn stream_git_output(
         Box::new(prefix_item.chain(stdout_stream))
     };
 
-    let guard = token.clone().drop_guard();
+    let guard = kill_on_disconnect.then(|| token.clone().drop_guard());
     let sleep = Box::pin(tokio::time::sleep_until(deadline));
     let deadline_stream = DeadlineStream {
         inner: full_stream,
         sleep,
         token,
-        guard: Some(guard),
+        guard,
         finished: false,
     };
 
@@ -626,12 +985,12 @@ impl<S: Unpin> Unpin for DeadlineStream<S> {}
 enum GitHttpError {
     NotFound,
     BadRequest(&'static str),
-    PushNotEnabled,
     Auth(StatusCode, &'static str),
     ConcurrencyExhausted,
     PayloadTooLarge,
     ServerError,
     UnsupportedContentEncoding,
+    Diverged,
 }
 
 impl IntoResponse for GitHttpError {
@@ -639,9 +998,6 @@ impl IntoResponse for GitHttpError {
         match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            Self::PushNotEnabled => {
-                (StatusCode::FORBIDDEN, "push is not enabled yet").into_response()
-            }
             Self::Auth(status, msg) => git_admission::AuthError(status, msg).into_response(),
             Self::ConcurrencyExhausted => {
                 let mut response =
@@ -662,6 +1018,7 @@ impl IntoResponse for GitHttpError {
                 "unsupported Content-Encoding",
             )
                 .into_response(),
+            Self::Diverged => (StatusCode::CONFLICT, "repository needs repair").into_response(),
         }
     }
 }
@@ -674,6 +1031,35 @@ impl IntoResponse for GitHttpError {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
+
+    #[test]
+    fn hook_request_parsing_accepts_and_rejects() {
+        let ok = parse_hook_updates(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/main 1\n",
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 1);
+        assert!(ok[0].1, "ff flag parsed as true");
+
+        let no_ff = parse_hook_updates(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/main 0\n",
+        )
+        .unwrap();
+        assert!(!no_ff[0].1);
+
+        assert_eq!(
+            parse_hook_updates("short line\n").unwrap_err(),
+            "malformed ref update"
+        );
+        assert_eq!(
+            parse_hook_updates("a a refs/heads/main 1 extra\n").unwrap_err(),
+            "malformed ref update"
+        );
+        assert_eq!(
+            parse_hook_updates("").unwrap_err(),
+            "no ref updates in the hook request"
+        );
+    }
 
     #[test]
     fn protocol_v2_detection_by_component() {

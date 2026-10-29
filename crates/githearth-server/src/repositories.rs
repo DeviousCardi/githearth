@@ -3,7 +3,7 @@ use githearth_core::RepositoryStatus;
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RepositoryRow {
     pub id: Uuid,
     pub organization_id: Uuid,

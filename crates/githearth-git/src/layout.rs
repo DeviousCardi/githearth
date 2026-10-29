@@ -259,7 +259,7 @@ impl Storage {
             .len()
     }
 
-    fn repository_path(&self, repository: Uuid) -> PathBuf {
+    pub fn repository_path(&self, repository: Uuid) -> PathBuf {
         let id = simple(repository);
         self.root
             .join("repositories")
@@ -501,6 +501,44 @@ impl Storage {
         Ok(cmd)
     }
 
+    pub fn receive_pack(
+        &self,
+        repository: Uuid,
+        advertise: bool,
+        protocol: Option<&str>,
+        hooks_dir: &Path,
+    ) -> Result<std::process::Command, StorageError> {
+        let path = self.verified_dir(&self.repository_path(repository))?;
+        let mut cmd = crate::git();
+        // Repositories created before hooks existed still run our hooks.
+        if !hooks_dir.as_os_str().is_empty() {
+            cmd.arg("-c")
+                .arg(format!("core.hooksPath={}", hooks_dir.display()));
+        }
+        cmd.arg("receive-pack").arg("--stateless-rpc");
+        if advertise {
+            cmd.arg("--advertise-refs");
+        }
+        cmd.arg(&path);
+        if let Some(proto) = protocol {
+            validate_git_protocol(proto)?;
+            cmd.env("GIT_PROTOCOL", proto);
+        }
+        Ok(cmd)
+    }
+
+    /// Removes stale `*.lock` files under the repository's `refs/` and its
+    /// `packed-refs.lock`, left behind by a receive-pack killed mid-update.
+    ///
+    /// Safe because the caller holds the per-repository lock: pushes and
+    /// replay are serialized by it and nothing else writes refs.  Never
+    /// follows symlinks; a lock that happens to be a symlink is unlinked.
+    pub fn remove_stale_locks(&self, repository: Uuid) -> Result<(), StorageError> {
+        let path = self.verified_dir(&self.repository_path(repository))?;
+        remove_lock_file(&path.join("packed-refs.lock"))?;
+        remove_lock_files_recursively(&path.join("refs"))
+    }
+
     pub fn scan(&self) -> Result<Scan, StorageError> {
         let mut repositories = Vec::new();
         let mut malformed = Vec::new();
@@ -625,6 +663,35 @@ fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
 }
 
+/// Unlink one lock file, tolerating its absence.
+fn remove_lock_file(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Recursively unlink `*.lock` files.  Symlinked directories are not followed
+/// (their metadata is read without following); a `.lock` symlink is unlinked.
+fn remove_lock_files_recursively(dir: &Path) -> Result<(), StorageError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() {
+            remove_lock_files_recursively(&entry.path())?;
+        } else if entry.file_name().to_string_lossy().ends_with(".lock") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_git_protocol(value: &str) -> Result<(), StorageError> {
     if value.is_empty() || value.len() > 256 {
         return Err(StorageError::Invalid(
@@ -642,6 +709,33 @@ pub fn validate_git_protocol(value: &str) -> Result<(), StorageError> {
         }
     }
     Ok(())
+}
+
+/// Current `refs/heads/*` and `refs/tags/*` as `refname -> ObjectId`, for
+/// journal classification.
+pub fn read_refs(repo_path: &Path) -> Result<HashMap<String, ObjectId>, StorageError> {
+    let output = checked(
+        git()
+            .arg("--git-dir")
+            .arg(repo_path)
+            .args(["for-each-ref", "--format=%(objectname) %(refname)"])
+            .args(["refs/heads/", "refs/tags/"])
+            .output()?,
+    )?;
+    let text = String::from_utf8(output)
+        .map_err(|e| StorageError::Invalid(format!("non-UTF-8 ref output: {e}")))?;
+    let mut refs = HashMap::new();
+    for line in text.lines() {
+        let (oid, name) = line
+            .split_once(' ')
+            .ok_or_else(|| StorageError::Invalid("unexpected ref record".into()))?;
+        refs.insert(
+            name.to_owned(),
+            oid.parse()
+                .map_err(|e: githearth_core::InvalidId| StorageError::Invalid(e.to_string()))?,
+        );
+    }
+    Ok(refs)
 }
 
 impl Storage {

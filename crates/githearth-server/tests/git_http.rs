@@ -87,6 +87,23 @@ async fn git_fail(cmd: Command) {
     assert!(!out.status.success());
 }
 
+/// Seed a bare repository with the commit at a work tree's HEAD, bypassing
+/// the receive-pack hooks (which now refuse updates that do not come through
+/// the GitHearth server).
+async fn seed_bare(repo_path: &str, work_dir: &str) {
+    git_ok(git_cmd(&[
+        "--git-dir",
+        repo_path,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        work_dir,
+        "main:refs/heads/main",
+    ]))
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Database fixtures
 // ---------------------------------------------------------------------------
@@ -232,16 +249,9 @@ async fn setup_with_repo_on_disk() -> (
     ]))
     .await;
 
-    // Push to the bare repo on disk.
-    git_ok(git_cmd(&[
-        "-C",
-        tw,
-        "push",
-        "--",
-        repo_path.to_str().unwrap(),
-        "main",
-    ]))
-    .await;
+    // Seed the bare repo without receive-pack (its hooks would refuse this
+    // direct update).
+    seed_bare(repo_path.to_str().unwrap(), tw).await;
 
     // Record the commit hash.
     let head_commit = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
@@ -419,7 +429,7 @@ async fn fetch_after_new_commit() {
     ]))
     .await;
     let new_head = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
-    git_ok(git_cmd(&["-C", tw, "push", "origin", "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     // Fetch into the clone.
@@ -561,33 +571,63 @@ async fn non_active_repository_404() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn receive_pack_refused_403() {
-    let (app, pool, storage_root, _owner, username, org_slug, repo_name, _repo_id, _head) =
+async fn active_row_without_directory_storage_error() {
+    let (app, pool, storage_root, _owner, username, org_slug, _repo_name, _repo_id, _head) =
         setup_with_repo_on_disk().await;
 
-    // GET info/refs with service=git-receive-pack
-    let (status, _headers, body) = raw_request(
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let ghost_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) VALUES ($1,$2,'ghost-repo',$3,$4,'active','private')")
+        .bind(ghost_id)
+        .bind(org_id)
+        .bind(_owner)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Fetch and upload-pack resolve the (missing) directory and fail 500.
+    let (status, _headers, _body) = raw_request(
         &app,
         "GET",
-        &format!("/{org_slug}/{repo_name}.git/info/refs?service=git-receive-pack"),
+        &format!("/{org_slug}/ghost-repo.git/info/refs?service=git-upload-pack"),
         &[("authorization", &basic_auth(&username, "testpass"))],
         vec![],
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(String::from_utf8_lossy(&body).contains("push is not enabled"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    // POST git-receive-pack
-    let (status, _headers, body) = raw_request(
+    let (status, _headers, _body) = raw_request(
         &app,
         "POST",
-        &format!("/{org_slug}/{repo_name}.git/git-receive-pack"),
-        &[("authorization", &basic_auth(&username, "testpass"))],
-        vec![],
+        &format!("/{org_slug}/ghost-repo.git/git-upload-pack"),
+        &[
+            ("authorization", &basic_auth(&username, "testpass")),
+            ("content-type", "application/x-git-upload-pack-request"),
+        ],
+        b"0000".to_vec(),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(String::from_utf8_lossy(&body).contains("push is not enabled"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Receive-pack replays the (missing) journal first: a Journal error is a
+    // 500, not a divergence.
+    let (status, _headers, _body) = raw_request(
+        &app,
+        "POST",
+        &format!("/{org_slug}/ghost-repo.git/git-receive-pack"),
+        &[
+            ("authorization", &basic_auth(&username, "testpass")),
+            ("content-type", "application/x-git-receive-pack-request"),
+        ],
+        b"0000".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
     cleanup(&storage_root);
     pool.close().await;
@@ -763,7 +803,7 @@ async fn request_over_limit_content_length_413() {
         "m",
     ]))
     .await;
-    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     let app = router(state);
@@ -848,7 +888,7 @@ async fn request_over_limit_streaming_kills_git() {
         "m",
     ]))
     .await;
-    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     let app = router(state);
@@ -941,7 +981,7 @@ async fn git_timeout_kills_child() {
         "m",
     ]))
     .await;
-    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     // Read the real commit SHA from the bare repo.
@@ -1121,7 +1161,7 @@ async fn slow_reader_gets_timeout() {
         "m",
     ]))
     .await;
-    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     let real_sha = git_output(git_cmd(&["-C", rps, "rev-parse", "main"])).await;
@@ -1229,7 +1269,7 @@ async fn v0_info_refs_prefix_governed_by_deadline() {
         "m",
     ]))
     .await;
-    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     let app = router(state);
@@ -1346,7 +1386,7 @@ async fn client_disconnect_releases_permit() {
         "m",
     ]))
     .await;
-    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     let real_sha = git_output(git_cmd(&["-C", rps, "rev-parse", "main"])).await;
@@ -1482,7 +1522,7 @@ async fn git_concurrency_exhausted_503_with_retry_after() {
         "m",
     ]))
     .await;
-    git_ok(git_cmd(&["-C", tw, "push", "--", rps, "main"])).await;
+    seed_bare(rps, tw).await;
     let _ = std::fs::remove_dir_all(&tmp_work);
 
     let app = router(state.clone());

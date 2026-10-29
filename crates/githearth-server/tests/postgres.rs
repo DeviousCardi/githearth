@@ -80,12 +80,19 @@ async fn fresh_database(name: &str) -> String {
     format!("{origin}/{name}")
 }
 
+/// A unique storage root in the system temp dir so AppState setup never
+/// writes under the source tree.
+fn temp_storage_root() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("githearth-postgres-{}", Uuid::new_v4()))
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn postgres_foundation_contract() {
     let config = Config {
         database_url: fresh_database("githearth_t1a_foundation").await,
         database_timeout_seconds: 1,
+        storage_root: temp_storage_root(),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
@@ -558,6 +565,7 @@ async fn postgres_facts_pool() -> (PgPool, Config) {
             .expect("set GITHEARTH_TEST_DATABASE_URL to a disposable database"),
         database_max_connections: 4,
         database_timeout_seconds: 1,
+        storage_root: temp_storage_root(),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
@@ -1205,6 +1213,7 @@ async fn suspended_account_cannot_sign_in_or_create_organizations() {
     let config = Config {
         database_url: fresh_database("githearth_suspended_login").await,
         database_timeout_seconds: 1,
+        storage_root: temp_storage_root(),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();

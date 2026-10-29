@@ -10,6 +10,7 @@ use githearth_authz::{
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct Facts {
     pub account: Account,
     pub teams: Vec<Team>,

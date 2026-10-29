@@ -321,6 +321,63 @@ fn detect_rejects_non_repository() {
     assert!(detect_object_format(&empty).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn remove_stale_locks_unlinks_only_lock_files() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::new_v4();
+    let repo = storage
+        .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+
+    // Nested ref lock, a packed-refs lock, and non-lock files that must survive.
+    let nested = repo.join("refs").join("heads").join("a").join("b.lock");
+    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    fs::write(&nested, b"").unwrap();
+    let packed = repo.join("packed-refs.lock");
+    fs::write(&packed, b"").unwrap();
+    let keep_dir = repo.join("refs").join("heads").join("a").join("keep");
+    fs::create_dir_all(&keep_dir).unwrap();
+    fs::write(keep_dir.join("file"), b"not a lock").unwrap();
+    let keep_file = repo.join("refs").join("heads").join("main");
+    fs::write(&keep_file, b"ref content").unwrap();
+
+    storage.remove_stale_locks(id).unwrap();
+
+    assert!(!nested.exists(), "nested .lock removed");
+    assert!(!packed.exists(), "packed-refs.lock removed");
+    assert!(keep_dir.is_dir(), "non-lock directory kept");
+    assert!(keep_dir.join("file").exists(), "non-lock file kept");
+    assert!(keep_file.exists(), "non-lock ref file kept");
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_stale_locks_does_not_follow_symlinked_dirs() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::new_v4();
+    let repo = storage
+        .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+
+    // A symlinked directory inside refs/ must not be traversed.
+    let outside = fixture.0.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret.lock"), b"").unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("refs").join("linked")).unwrap();
+
+    storage.remove_stale_locks(id).unwrap();
+
+    assert!(
+        outside.join("secret.lock").exists(),
+        "symlinked directory must not be traversed"
+    );
+}
+
 #[test]
 fn restore_refuses_non_trash_path() {
     let fixture = Fixture::new();

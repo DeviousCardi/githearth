@@ -109,3 +109,4 @@ A consistent backup is a PostgreSQL backup plus a storage snapshot taken *after*
 - Personal access tokens and their scopes, and whether a token counts as fresh authentication for the `sensitive` actions `ref.force_push` and `ref.delete`. Until decided, only password-authenticated requests count as fresh.
 - SSH transport (before M4) reuses stages 2–7 with a different admission step.
 - Measure the per-push cost of the journal fsync at the enterprise profile before M4.
+- M2 decision: a `write` grant allows `ref.force_push` and `ref.delete` over Basic auth (fresh per request); branch protection (M3) is where this is tightened.

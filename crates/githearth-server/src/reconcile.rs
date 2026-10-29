@@ -18,6 +18,7 @@
 //! the only connection while waiting for the lock would deadlock with it.
 
 use crate::AppState;
+use crate::pushes;
 use crate::repositories;
 use githearth_core::RepositoryStatus;
 use githearth_git::layout::{ObjectFormat, TmpEntry};
@@ -214,7 +215,77 @@ pub async fn reconcile_once(
         .map_err(|e| anyhow::anyhow!("purge_trash task panicked: {e}"))??;
     summary.trash_purged = purged;
 
+    // ---- push journal replay ----------------------------------------------
+    push_replay(state).await?;
+
     Ok(summary)
+}
+
+/// Applies journaled pushes that Git committed but metadata never recorded
+/// (ADR 0003 "Recovery").  Runs after the lifecycle work so a repository
+/// activated this pass is replayed too.
+///
+/// `// shortcut:` opens every active repository's journal each pass instead of
+/// tracking which repositories gained records; rotation keeps each journal
+/// bounded, and the replay itself is a no-op when nothing is pending.
+async fn push_replay(state: &AppState) -> anyhow::Result<()> {
+    let mut conn = state.pool.acquire().await?;
+    let active: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM repositories WHERE status = 'active'")
+            .fetch_all(&mut *conn)
+            .await?;
+    drop(conn);
+
+    let mut committed = 0usize;
+    let mut aborted = 0usize;
+    for id in active {
+        // Lock BEFORE any pool connection (module-level lock ordering).
+        let guard = state.storage.repository_lock(id).lock_owned().await;
+
+        let mut conn = state.pool.acquire().await?;
+        let applied = pushes::applied_through(&mut conn, id).await?;
+        drop(conn);
+
+        let storage = state.storage.clone();
+        let pending = tokio::task::spawn_blocking(move || {
+            let path = storage.repository_path(id);
+            match githearth_git::journal::Journal::open(&path) {
+                Ok(journal) => journal.records_after(applied).next().is_some(),
+                Err(e) => {
+                    tracing::warn!(repository_id = %id, error = %e, "cannot open journal; skipped");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !pending {
+            drop(guard);
+            continue;
+        }
+
+        match pushes::replay(state, id).await {
+            Ok(s) => {
+                committed += s.committed;
+                aborted += s.aborted;
+            }
+            Err(pushes::ReplayError::Diverged { sequence, .. }) => {
+                tracing::error!(
+                    repository_id = %id,
+                    sequence,
+                    "push journal replay diverged; repository needs repair"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(repository_id = %id, error = %e, "push journal replay failed; will retry");
+            }
+        }
+        drop(guard);
+    }
+    if committed > 0 || aborted > 0 {
+        tracing::info!(committed, aborted, "push journal replay applied records");
+    }
+    Ok(())
 }
 
 /// Fetch rows eligible for reconciliation: `creating` or `deleting`, past the
