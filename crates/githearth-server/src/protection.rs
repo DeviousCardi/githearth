@@ -150,11 +150,22 @@ pub(crate) async fn load_rules_with_generation(
     conn: &mut PgConnection,
     repository_id: Uuid,
 ) -> Result<(Vec<ProtectionRule>, i64), sqlx::Error> {
+    snapshot(conn, repository_id, async {}).await
+}
+
+/// `load_rules_with_generation`, awaiting `between` after the rules are read;
+/// tests use it to commit a rule change between the two reads.
+async fn snapshot(
+    conn: &mut PgConnection,
+    repository_id: Uuid,
+    between: impl std::future::Future<Output = ()>,
+) -> Result<(Vec<ProtectionRule>, i64), sqlx::Error> {
     let mut tx = conn.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await?;
     let rules = load_rules(&mut tx, repository_id).await?;
+    between.await;
     let generation = current_generation(&mut tx, repository_id).await?;
     tx.commit().await?;
     Ok((rules, generation))
@@ -660,6 +671,23 @@ mod tests {
         let (rules, generation) = load_rules_with_generation(&mut conn, repo).await.unwrap();
         assert_eq!(generation, 2);
         assert_eq!(rules.len(), 1);
+
+        // A rule change committed from another connection between the two
+        // reads must not pair the old rules with the new generation.
+        let change = async {
+            let mut other = pool.begin().await.unwrap();
+            sqlx::query("DELETE FROM branch_protection_rules WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&mut *other)
+                .await
+                .unwrap();
+            bump_generation(&mut other, repo).await.unwrap();
+            other.commit().await.unwrap();
+        };
+        let (rules, generation) = snapshot(&mut conn, repo, change).await.unwrap();
+        assert_eq!((rules.len(), generation), (1, 2));
+        let (rules, generation) = load_rules_with_generation(&mut conn, repo).await.unwrap();
+        assert_eq!((rules.len(), generation), (0, 3));
 
         pool.close().await;
     }

@@ -815,6 +815,54 @@ async fn edited_resubmit_with_the_same_key_shows_the_422_notice_and_keeps_the_te
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn submit_while_the_same_key_is_in_flight_shows_the_409_notice() {
+    let f = fixture().await;
+    let (_, form) = get(&f.app, &format!("{}/issues/new", f.base), Some(&f.cookie)).await;
+    let (token, k) = (csrf(&form), key(&form));
+
+    // A first submit with this key is still running: its claim is fresh.
+    sqlx::query(
+        "INSERT INTO operations (actor_id, key, request_hash, status, expires_at) \
+         SELECT account_id, $2, sha256('in flight'::bytea), 'running', clock_timestamp() + interval '1 hour' \
+         FROM sessions WHERE token_hash = sha256($1::bytea)",
+    )
+    .bind(&f.token)
+    .bind(&k)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let (status, _, page) = post_form(
+        &f.app,
+        &format!("{}/issues", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &k),
+            ("title", "double click"),
+            ("body", "kept body"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        page.contains("This form is already being submitted. Reload the page to see the result."),
+        "{page}"
+    );
+    assert!(page.contains("double click"), "{page}");
+    assert!(page.contains("kept body"), "{page}");
+    let issues: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issues WHERE title = 'double click'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(issues, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn comment_resubmit_with_the_same_key_shows_the_422_notice() {
     let f = fixture().await;
     let (status, _) = api(
