@@ -18,6 +18,7 @@ pub mod pushes;
 pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
+mod tokens;
 pub mod ui;
 
 use anyhow::Context;
@@ -229,6 +230,7 @@ pub fn router(state: AppState) -> Router {
         .merge(audit::router())
         .merge(ui::router())
         .merge(browse::router())
+        .merge(tokens::router())
         .route(
             "/api/v1/organizations/{org}/repositories",
             post(repository_api::create).get(repository_api::list),
@@ -320,6 +322,11 @@ fn unauthorized() -> ApiError {
 }
 pub(crate) fn invalid() -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "invalid input")
+}
+
+/// A read-only scoped access token is refused any write with 403.
+pub(crate) fn read_only_denied() -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, "read-only token")
 }
 
 async fn ready(State(state): State<AppState>) -> StatusCode {
@@ -500,15 +507,47 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiRe
     }))
 }
 pub(crate) fn bearer(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
+    Ok(bearer_credential(headers)?.hash())
+}
+
+/// A Bearer credential is either a 64-hex session token or a personal access
+/// token (`ghp_` followed by 64 hex). Both resolve to their SHA-256 for a
+/// database lookup; the kind only changes which table the hash is matched in.
+pub(crate) enum Credential {
+    Session { token_hash: Vec<u8> },
+    AccessToken { token_hash: Vec<u8> },
+}
+
+impl Credential {
+    fn hash(&self) -> Vec<u8> {
+        match self {
+            Credential::Session { token_hash } | Credential::AccessToken { token_hash } => {
+                token_hash.clone()
+            }
+        }
+    }
+}
+
+pub(crate) fn bearer_credential(headers: &HeaderMap) -> ApiResult<Credential> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(unauthorized)?;
-    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if let Some(rest) = token.strip_prefix("ghp_") {
+        if rest.len() == 64 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(Credential::AccessToken {
+                token_hash: Sha256::digest(token.as_bytes()).to_vec(),
+            });
+        }
         return Err(unauthorized());
     }
-    Ok(Sha256::digest(token.as_bytes()).to_vec())
+    if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(Credential::Session {
+            token_hash: Sha256::digest(token.as_bytes()).to_vec(),
+        });
+    }
+    Err(unauthorized())
 }
 
 pub(crate) async fn authenticate_token_hash(
@@ -527,6 +566,7 @@ pub(crate) async fn authenticate_token_hash(
             id: row.0,
             username: row.1,
             is_admin: row.2,
+            read_only: false,
         },
         row.3.max(0) as u64,
     ))
@@ -536,9 +576,88 @@ pub(crate) struct Account {
     id: Uuid,
     username: String,
     is_admin: bool,
+    #[serde(skip)]
+    read_only: bool,
 }
+impl Account {
+    /// `repo:read`-only access tokens may never perform writes.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+/// Authenticates a Bearer credential. A session token yields its real
+/// `auth_age`; a personal access token can never satisfy a recent-auth (sudo)
+/// check, so its `auth_age` is set to a value beyond any freshness window.
 pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> ApiResult<(Account, u64)> {
-    authenticate_token_hash(pool, bearer(headers)?).await
+    authenticate_credential(pool, bearer_credential(headers)?).await
+}
+
+pub(crate) async fn authenticate_credential(
+    pool: &PgPool,
+    credential: Credential,
+) -> ApiResult<(Account, u64)> {
+    match credential {
+        Credential::Session { token_hash } => authenticate_token_hash(pool, token_hash).await,
+        Credential::AccessToken { token_hash } => authenticate_access_token(pool, token_hash).await,
+    }
+}
+
+/// Resolves a personal access token: reject revoked, expired and
+/// suspended-account tokens, return the account with `read_only` set whenever
+/// the token lacks `repo:write`, and `auth_age` large enough that sensitive
+/// actions keep requiring a fresh session. `last_used_at` is refreshed, at a
+/// throttled rate so a burst of Git requests does not write per-request.
+pub(crate) async fn authenticate_access_token(
+    pool: &PgPool,
+    token_hash: Vec<u8>,
+) -> ApiResult<(Account, u64)> {
+    let row = sqlx::query_as::<_, (Uuid, String, bool, Vec<String>, Option<bool>)>(
+        "SELECT a.id, a.username, a.is_admin, t.scopes, (t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp()) AS expired \
+         FROM accounts a JOIN access_tokens t ON t.account_id = a.id \
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND NOT a.suspended",
+    )
+    .bind(&token_hash)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(unauthorized)?;
+    if row.4.unwrap_or(false) {
+        return Err(unauthorized());
+    }
+    let (account_id, username, is_admin, scopes, _) = row;
+    // shortcut: scopes collapse to read-only vs read-write here. `repo:write`
+    // (which implies repo:read) is the only capability beyond reading, so a
+    // token without it is treated as read-only for every scope check.
+    let read_only = !scopes.iter().any(|s| s == "repo:write");
+    // Throttle the last_used_at refresh: touch only when stale by >60s.
+    let _ = sqlx::query(
+        "UPDATE access_tokens SET last_used_at = clock_timestamp() \
+         WHERE token_hash = $1 AND (last_used_at IS NULL OR last_used_at < clock_timestamp() - interval '60 seconds')",
+    )
+    .bind(&token_hash)
+    .execute(pool)
+    .await?;
+    Ok((
+        Account {
+            id: account_id,
+            username,
+            is_admin,
+            read_only,
+        },
+        u64::MAX,
+    ))
+}
+/// Resolves an access token from its plaintext `ghp_` string, for transports
+/// that receive the token directly (e.g. the Git Basic-auth path).
+pub(crate) async fn authenticate_access_token_plaintext(
+    pool: &PgPool,
+    token: &str,
+) -> ApiResult<(Account, u64)> {
+    let rest = token.strip_prefix("ghp_").ok_or_else(unauthorized)?;
+    if rest.len() != 64 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(unauthorized());
+    }
+    authenticate_access_token(pool, Sha256::digest(token.as_bytes()).to_vec()).await
 }
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Account>> {
     Ok(Json(authenticate(&state.pool, &headers).await?.0))
@@ -574,6 +693,9 @@ async fn create_organization(
     Json(input): Json<NewOrganization>,
 ) -> ApiResult<(StatusCode, Json<Organization>)> {
     let (account, _) = authenticate(&state.pool, &headers).await?;
+    if account.is_read_only() {
+        return Err(read_only_denied());
+    }
     if input.slug.is_empty()
         || input.slug.len() > 64
         || input.slug.starts_with('-')

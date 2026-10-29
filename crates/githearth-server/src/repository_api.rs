@@ -12,7 +12,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, Page, authenticate, event, facts, idempotency, invalid, repositories,
+    ApiError, AppState, Page, authenticate, event, facts, idempotency, invalid, read_only_denied,
+    repositories,
 };
 
 fn not_found() -> ApiError {
@@ -187,6 +188,9 @@ pub(crate) async fn create(
     let input: NewRepository = serde_json::from_slice(&body).map_err(|_| invalid())?;
 
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    if actor.is_read_only() {
+        return Err(read_only_denied());
+    }
 
     if !valid_repo_name(&input.name) || input.description.len() > 1000 {
         return Err(invalid());
@@ -449,6 +453,9 @@ pub(crate) async fn update(
     body: Bytes,
 ) -> Result<Json<RepositoryJson>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    if actor.is_read_only() {
+        return Err(read_only_denied());
+    }
 
     let state = &state;
     let body = &body;
@@ -532,6 +539,9 @@ macro_rules! archive_handler {
             Path((org_slug, name)): Path<(String, String)>,
         ) -> Result<(StatusCode, Json<RepositoryJson>), ApiError> {
             let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+            if actor.is_read_only() {
+                return Err(read_only_denied());
+            }
 
             let suffix = if $archived { "archive" } else { "unarchive" };
             let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}/{suffix}");
@@ -607,6 +617,9 @@ pub(crate) async fn delete(
     Path((org_slug, name)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    if actor.is_read_only() {
+        return Err(read_only_denied());
+    }
 
     let state = &state;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}");
@@ -814,6 +827,9 @@ pub(crate) async fn grant_access(
     body: Bytes,
 ) -> Result<(StatusCode, Json<AccessGrant>), ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    if actor.is_read_only() {
+        return Err(read_only_denied());
+    }
 
     let state = &state;
     let body = &body;
@@ -928,6 +944,9 @@ pub(crate) async fn revoke_access(
     Path((org_slug, name, grant_id)): Path<(String, String, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    if actor.is_read_only() {
+        return Err(read_only_denied());
+    }
 
     let state = &state;
     let path_str =

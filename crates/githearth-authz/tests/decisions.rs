@@ -208,6 +208,7 @@ impl World {
             resource,
             merge,
             auth_age: Some(Duration::ZERO),
+            read_only: false,
         })
     }
 
@@ -229,6 +230,7 @@ impl World {
             resource,
             merge,
             auth_age: None,
+            read_only: false,
         })
     }
 
@@ -607,6 +609,7 @@ fn inconsistent_or_incomplete_facts_fail_closed() {
         resource: Resource::Ref(&w.private, &w.feature),
         merge: None,
         auth_age: Some(Duration::ZERO),
+        read_only: false,
     }));
     // A team whose parent was not loaded.
     invalid(engine.authorize(&Request {
@@ -618,6 +621,7 @@ fn inconsistent_or_incomplete_facts_fail_closed() {
         resource: Resource::Ref(&w.private, &w.feature),
         merge: None,
         auth_age: Some(Duration::ZERO),
+        read_only: false,
     }));
     let push = |principal: &Account, teams: &[Team]| {
         engine.authorize(&Request {
@@ -629,6 +633,7 @@ fn inconsistent_or_incomplete_facts_fail_closed() {
             resource: Resource::Ref(&w.private, &w.feature),
             merge: None,
             auth_age: Some(Duration::ZERO),
+            read_only: false,
         })
     };
     // The same team loaded twice.
@@ -692,6 +697,7 @@ fn unusable_grants_grant_nothing() {
         resource: Resource::Repository(&w.private),
         merge: None,
         auth_age: Some(Duration::ZERO),
+        read_only: false,
     });
     assert_eq!(d, Decision::Deny(vec![]));
 }
@@ -772,6 +778,7 @@ fn anonymous_cannot_carry_grants_or_teams() {
         resource: Resource::Repository(&w.public),
         merge: None,
         auth_age: None,
+        read_only: false,
     }));
     // So are teams.
     invalid(engine.authorize(&Request {
@@ -783,6 +790,7 @@ fn anonymous_cannot_carry_grants_or_teams() {
         resource: Resource::Repository(&w.public),
         merge: None,
         auth_age: None,
+        read_only: false,
     }));
 }
 
@@ -849,6 +857,7 @@ fn rust_sensitivity_matches_the_schema_sensitive_group() {
             resource,
             merge,
             auth_age: Some(Duration::ZERO),
+            read_only: false,
         });
         assert_eq!(d.is_allowed(), action.is_sensitive(), "{action:?}: {d:?}");
     }
@@ -874,6 +883,7 @@ fn sensitive_actions_require_fresh_authentication() {
             resource: Resource::Organization,
             merge: None,
             auth_age: age,
+            read_only: false,
         })
     };
     assert!(fresh(&engine, Some(Duration::from_secs(60))).is_allowed());
@@ -906,6 +916,7 @@ fn sensitive_actions_require_fresh_authentication() {
         resource: Resource::Organization,
         merge: None,
         auth_age: None,
+        read_only: false,
     });
     assert!(d.is_allowed(), "{d:?}");
 }

@@ -16,6 +16,9 @@ pub struct Facts {
     pub teams: Vec<Team>,
     pub grants: Vec<Grant>,
     pub organization: Organization,
+    /// True when the request presented a read-only scoped access token: the
+    /// engine refuses every action outside the read group regardless of grants.
+    pub read_only: bool,
 }
 
 impl Facts {
@@ -34,6 +37,7 @@ impl Facts {
             resource,
             merge: None,
             auth_age,
+            read_only: self.read_only,
         }
     }
 }
@@ -53,6 +57,21 @@ pub async fn load(
     conn: &mut PgConnection,
     account_id: Uuid,
     organization_id: Uuid,
+) -> Result<Option<Facts>, sqlx::Error> {
+    // shortcut: the frozen `load_repo`/`require` ABI used by pulls.rs and
+    // protection.rs (off-limits for this change) never threads read_only, so
+    // those callers load facts as fully-privileged. Read-only enforcement is
+    // applied at the handler and Git-transport boundaries instead.
+    load_scoped(conn, account_id, organization_id, false).await
+}
+
+/// The same snapshot as [`load`], but marking the principal as read-only when
+/// the request authenticated with a scoped access token lacking `repo:write`.
+pub async fn load_scoped(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+    read_only: bool,
 ) -> Result<Option<Facts>, sqlx::Error> {
     let mut tx = conn.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
@@ -174,5 +193,6 @@ pub async fn load(
         teams,
         grants,
         organization,
+        read_only,
     }))
 }

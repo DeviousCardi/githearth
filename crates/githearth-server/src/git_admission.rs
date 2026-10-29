@@ -23,6 +23,8 @@ pub struct Admitted {
     pub repository: RepositoryRow,
     pub facts: crate::facts::Facts,
     pub rules: Vec<crate::protection::ProtectionRule>,
+    /// True when the credential was a read-only scoped access token.
+    pub read_only: bool,
 }
 
 impl std::fmt::Debug for Admitted {
@@ -96,21 +98,48 @@ pub async fn admit(
     want: Want,
 ) -> Result<Admitted, AuthError> {
     let (username, password) = parse_basic(headers)?;
-    let Some(account_id) = crate::verify_password(state, &username, &password)
-        .await
-        // Busy or unavailable is not a bad password: the client must not re-prompt.
-        .map_err(|e| match e.0 {
-            StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, "authentication busy"),
-            _ => AuthError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication unavailable",
-            ),
-        })?
-    else {
-        return Err(AuthError(
-            StatusCode::UNAUTHORIZED,
-            "invalid or expired credentials",
-        ));
+    // A personal access token may be supplied as the Basic password (or the
+    // username when only the token is embedded in the URL). Detect `ghp_` and
+    // short-circuit to the access-token path before password verification.
+    let (account_id, read_only) = if password.starts_with("ghp_") || username.starts_with("ghp_") {
+        let token = if password.starts_with("ghp_") {
+            &password
+        } else {
+            &username
+        };
+        match crate::authenticate_access_token_plaintext(&state.pool, token).await {
+            Ok((account, _)) => (account.id, account.is_read_only()),
+            Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
+                return Err(AuthError(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or expired credentials",
+                ));
+            }
+            Err(_) => {
+                return Err(AuthError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication unavailable",
+                ));
+            }
+        }
+    } else {
+        let Some(account_id) = crate::verify_password(state, &username, &password)
+            .await
+            // Busy or unavailable is not a bad password: the client must not re-prompt.
+            .map_err(|e| match e.0 {
+                StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, "authentication busy"),
+                _ => AuthError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication unavailable",
+                ),
+            })?
+        else {
+            return Err(AuthError(
+                StatusCode::UNAUTHORIZED,
+                "invalid or expired credentials",
+            ));
+        };
+        (account_id, false)
     };
 
     let mut conn = state
@@ -125,7 +154,7 @@ pub async fn admit(
         .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?
         .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
 
-    let Some(facts) = crate::facts::load(&mut conn, account_id, org_id)
+    let Some(facts) = crate::facts::load_scoped(&mut conn, account_id, org_id, read_only)
         .await
         .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?
     else {
@@ -173,6 +202,7 @@ pub async fn admit(
         repository: repo,
         facts,
         rules,
+        read_only,
     })
 }
 
@@ -181,10 +211,15 @@ pub async fn admit(
 pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, AuthError> {
     let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
     let mut conn = state.pool.acquire().await.map_err(unavailable)?;
-    let facts = crate::facts::load(&mut conn, admitted.account, admitted.organization)
-        .await
-        .map_err(unavailable)?
-        .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    let facts = crate::facts::load_scoped(
+        &mut conn,
+        admitted.account,
+        admitted.organization,
+        admitted.read_only,
+    )
+    .await
+    .map_err(unavailable)?
+    .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
     let repository = repositories::get(&mut conn, admitted.repository.id)
         .await
         .map_err(unavailable)?
@@ -199,6 +234,7 @@ pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, A
         repository,
         facts,
         rules,
+        read_only: admitted.read_only,
     })
 }
 
@@ -346,8 +382,10 @@ mod tests {
                 teams: vec![],
                 grants,
                 organization,
+                read_only: false,
             },
             rules: vec![],
+            read_only: false,
         }
     }
 
