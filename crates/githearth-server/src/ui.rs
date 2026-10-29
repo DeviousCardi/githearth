@@ -682,5 +682,6 @@ pub fn router() -> Router<AppState> {
         .route("/organizations/{slug}/repositories/{name}", get(repository))
         .merge(crate::issues_ui::router())
         .merge(crate::pulls_ui::router())
+        .merge(crate::browse_ui::router())
         .layer(axum::middleware::map_response(page_headers))
 }

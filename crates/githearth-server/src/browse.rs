@@ -47,7 +47,6 @@ pub fn router() -> Router<AppState> {
             "/api/v1/organizations/{org}/repositories/{repo}/compare/{spec}",
             get(compare),
         )
-        .merge(crate::browse_ui::router())
 }
 
 fn not_found() -> ApiError {

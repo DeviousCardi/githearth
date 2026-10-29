@@ -375,6 +375,59 @@ fn ui_base(f: &UiFixture) -> String {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn tree_and_compare_pages_carry_u_i_headers() {
+    let f = build_fixture().await;
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{}/tree/main", ui_base(&f)))
+                .header("cookie", &f.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert_eq!(resp.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_page_carries_u_i_headers() {
+    let f = build_compare_ui_fixture().await;
+    let resp = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{}/compare/main...feature", cmp_ui_base(&f)))
+                .header("cookie", &f.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert_eq!(resp.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    finish_cmp_ui(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn browse_pages_require_login() {
     let f = build_fixture().await;
     let (status, _) = get_page(&f.app, &format!("{}/tree/main", ui_base(&f)), None).await;
