@@ -368,15 +368,15 @@ pub(crate) async fn read_issue(
     Ok(issue)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PatchIssue {
+pub(crate) struct PatchIssue {
     #[serde(default)]
-    title: Option<String>,
+    pub(crate) title: Option<String>,
     #[serde(default)]
-    body: Option<String>,
+    pub(crate) body: Option<String>,
     #[serde(default)]
-    state: Option<String>,
+    pub(crate) state: Option<String>,
 }
 
 async fn update(
@@ -386,6 +386,16 @@ async fn update(
     body: Bytes,
 ) -> Result<Json<IssueJson>, ApiError> {
     let input: PatchIssue = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let key = idempotency::extract_key(&headers).transpose()?;
+    let value = update_issue(
+        &state, actor.id, auth_age, &org_slug, &repo_name, number, input, key,
+    )
+    .await?;
+    Ok(Json(serde_json::from_value(value).unwrap()))
+}
+
+fn validate_patch(input: &PatchIssue) -> Result<(), ApiError> {
     if input.title.is_none() && input.body.is_none() && input.state.is_none() {
         return Err(invalid());
     }
@@ -404,29 +414,39 @@ async fn update(
     {
         return Err(invalid());
     }
+    Ok(())
+}
 
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    let state = &state;
-    let key = idempotency::extract_key(&headers).transpose()?;
+/// Applies a patch (title/body/state) to an issue as `actor_id`; shared by the
+/// JSON API and the browser forms. Closing, reopening and editing all gate on
+/// the same triage action, and reuse the same SQL and audit events.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn update_issue(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    input: PatchIssue,
+    key: Option<&str>,
+) -> Result<serde_json::Value, ApiError> {
+    validate_patch(&input)?;
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/issues/{number}");
+    let raw_body = serde_json::to_vec(&input).map_err(|_| invalid())?;
 
     let (_, value) = idempotency::run(
         &state.pool,
-        actor.id,
+        actor_id,
         "PATCH",
         &path_str,
-        &body,
+        &raw_body,
         key,
         |idem| async move {
-            let loaded = repository_api::load_current(
-                state,
-                actor.id,
-                auth_age,
-                &org_slug,
-                &repo_name,
-            )
-            .await?;
+            let loaded =
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
+                    .await?;
 
             let mut conn = state.pool.acquire().await?;
             let issue = find_issue(&mut conn, loaded.repo.id, number)
@@ -434,7 +454,6 @@ async fn update(
                 .ok_or_else(not_found)?;
             drop(conn);
 
-            // Closing, reopening and editing all gate on the same triage action.
             require_issue(state, &loaded, &issue, Action::IssueClose)?;
 
             if loaded.repo.status != RepositoryStatus::Active {
@@ -469,7 +488,7 @@ async fn update(
             } else {
                 "issue.updated"
             };
-            event(&mut tx, Some(loaded.org_id), actor.id, kind).await?;
+            event(&mut tx, Some(loaded.org_id), actor_id, kind).await?;
 
             let updated = fetch_issue(&mut tx, issue.id).await?.unwrap();
             let status = StatusCode::OK;
@@ -482,7 +501,32 @@ async fn update(
         },
     )
     .await?;
-    Ok(Json(serde_json::from_value(value).unwrap()))
+    Ok(value)
+}
+
+/// Whether `actor_id` may close/reopen/edit the issue (`Action::IssueClose`).
+/// `false` means the issue is readable but the actor lacks write access.
+pub(crate) async fn can_update(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<bool, ApiError> {
+    let loaded =
+        repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name).await?;
+    require_readable_repo(&loaded)?;
+    let mut conn = state.pool.acquire().await?;
+    let issue = find_issue(&mut conn, loaded.repo.id, number)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    match require_issue(state, &loaded, &issue, Action::IssueClose) {
+        Ok(()) => Ok(true),
+        Err(e) if e.status_code() == StatusCode::FORBIDDEN => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Deserialize)]
