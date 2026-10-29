@@ -66,6 +66,7 @@ async fn apply_once_true_and_rows_created() {
         operation: Uuid::new_v4(),
         kind: Kind::Prepared,
         actor: Some(actor),
+        origin: None,
         updates: vec![Update {
             old: sha1('a'),
             new: sha1('b'),
@@ -141,6 +142,7 @@ async fn apply_twice_no_duplicates() {
         operation: Uuid::new_v4(),
         kind: Kind::Prepared,
         actor: Some(actor),
+        origin: None,
         updates: vec![Update {
             old: sha1('0'),
             new: sha1('1'),
@@ -178,6 +180,7 @@ async fn out_of_order_keeps_highest_watermark() {
         operation: Uuid::new_v4(),
         kind: Kind::Prepared,
         actor: Some(actor),
+        origin: None,
         updates: vec![Update {
             old: sha1('0'),
             new: sha1('5'),
@@ -189,6 +192,7 @@ async fn out_of_order_keeps_highest_watermark() {
         operation: Uuid::new_v4(),
         kind: Kind::Prepared,
         actor: Some(actor),
+        origin: None,
         updates: vec![Update {
             old: sha1('0'),
             new: sha1('3'),
@@ -237,6 +241,7 @@ async fn all_invalid_cases_table_driven() {
                 operation: Uuid::new_v4(),
                 kind: Kind::Committed,
                 actor: Some(actor),
+                origin: None,
                 updates: vec![Update {
                     old: good_oid.clone(),
                     new: good_oid.clone(),
@@ -251,6 +256,7 @@ async fn all_invalid_cases_table_driven() {
                 operation: Uuid::new_v4(),
                 kind: Kind::Prepared,
                 actor: Some(actor),
+                origin: None,
                 updates: vec![],
             },
         ),
@@ -261,6 +267,7 @@ async fn all_invalid_cases_table_driven() {
                 operation: Uuid::new_v4(),
                 kind: Kind::Prepared,
                 actor: None,
+                origin: None,
                 updates: vec![Update {
                     old: good_oid.clone(),
                     new: good_oid.clone(),
@@ -275,6 +282,7 @@ async fn all_invalid_cases_table_driven() {
                 operation: Uuid::new_v4(),
                 kind: Kind::Prepared,
                 actor: Some(actor),
+                origin: None,
                 updates: vec![Update {
                     old: "short".into(),
                     new: good_oid.clone(),
@@ -289,6 +297,7 @@ async fn all_invalid_cases_table_driven() {
                 operation: Uuid::new_v4(),
                 kind: Kind::Prepared,
                 actor: Some(actor),
+                origin: None,
                 updates: vec![Update {
                     old: good_oid.clone(),
                     new: "short".into(),
@@ -303,6 +312,7 @@ async fn all_invalid_cases_table_driven() {
                 operation: Uuid::new_v4(),
                 kind: Kind::Prepared,
                 actor: Some(actor),
+                origin: None,
                 updates: vec![Update {
                     old: good_oid.clone(),
                     new: "b".repeat(64),
@@ -317,6 +327,7 @@ async fn all_invalid_cases_table_driven() {
                 operation: Uuid::new_v4(),
                 kind: Kind::Prepared,
                 actor: Some(actor),
+                origin: None,
                 updates: vec![Update {
                     old: good_oid.clone(),
                     new: good_oid,
@@ -389,6 +400,7 @@ async fn sha256_oid_accepted() {
         operation: Uuid::new_v4(),
         kind: Kind::Prepared,
         actor: Some(actor),
+        origin: None,
         updates: vec![Update {
             old: sha256('a'),
             new: sha256('b'),

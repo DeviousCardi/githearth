@@ -12,6 +12,7 @@ use crate::browse::{
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Most commits a rebase will replay before giving up.
 pub const MAX_REBASE_COMMITS: usize = 1000;
@@ -65,6 +66,61 @@ fn valid_offset(value: &str) -> bool {
     bytes.len() == 5
         && matches!(bytes[0], b'+' | b'-')
         && bytes[1..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// Compare-and-swap a branch through `git update-ref --stdin`, journaled by the
+/// `reference-transaction` hook exactly as a push would be (ADR 0004).
+#[allow(clippy::too_many_arguments)]
+pub fn update_ref_expected(
+    repo: &Path,
+    hooks_dir: &Path,
+    reference: &str,
+    new_oid: &str,
+    expected_old_oid: &str,
+    operation: Uuid,
+    actor: Uuid,
+    timeout: Duration,
+) -> Result<(), StorageError> {
+    // The name goes into `update-ref --stdin`, so whitespace or a newline
+    // would inject a second command; git checks the remaining rules.
+    if !reference
+        .strip_prefix("refs/heads/")
+        .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        return Err(StorageError::Invalid(
+            "merge target must be a branch".into(),
+        ));
+    }
+    if !valid_oid(new_oid) || !valid_oid(expected_old_oid) {
+        return Err(StorageError::Invalid(
+            "merge object ids must be full commit ids".into(),
+        ));
+    }
+    let mut command = cmd(repo);
+    if !hooks_dir.as_os_str().is_empty() {
+        command
+            .arg("-c")
+            .arg(format!("core.hooksPath={}", hooks_dir.display()));
+    }
+    command
+        .arg("update-ref")
+        .arg("--stdin")
+        .env("GITHEARTH_OPERATION", operation.to_string())
+        .env("GITHEARTH_ACTOR", actor.to_string())
+        .env("GITHEARTH_MERGE", "1");
+    let input = format!("update {reference} {new_oid} {expected_old_oid}\n");
+    let result = run_bounded_input(command, input.as_bytes(), MAX_OUTPUT_BYTES, timeout)?;
+    if result.success {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // "is at X but expected Y", or the branch was deleted meanwhile.
+    if stderr.contains("cannot lock ref")
+        && (stderr.contains("but expected") || stderr.contains("unable to resolve reference"))
+    {
+        return Err(StorageError::RefMoved(stderr.trim().to_owned()));
+    }
+    Err(stderr_error(&result.stderr))
 }
 
 pub fn build_candidate(

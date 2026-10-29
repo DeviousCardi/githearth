@@ -51,6 +51,14 @@ pub enum Kind {
     Aborted,
 }
 
+/// Where a prepared record came from.  Records without it are pushes, so
+/// journals written before merges existed stay valid (ADR 0004).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    Merge,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Update {
     pub old: String,
@@ -66,6 +74,8 @@ pub struct Record {
     pub kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub updates: Vec<Update>,
 }
@@ -218,6 +228,7 @@ impl Journal {
         operation: Uuid,
         actor: Option<Uuid>,
         updates: Vec<Update>,
+        origin: Option<Origin>,
     ) -> Result<u64, JournalError> {
         self.append(Record {
             sequence: 0,
@@ -225,6 +236,7 @@ impl Journal {
             kind: Kind::Prepared,
             actor,
             updates,
+            origin,
         })
     }
 
@@ -236,6 +248,7 @@ impl Journal {
             kind,
             actor: None,
             updates: Vec::new(),
+            origin: None,
         })
     }
 

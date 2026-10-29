@@ -14,12 +14,13 @@ use std::process::Command;
 use std::time::Duration;
 use uuid::Uuid;
 
-use githearth_git::journal::{Journal, Kind, Update};
+use githearth_git::journal::{Journal, Kind, Origin, Update};
 
 const HOOK_SOCKET: &str = "GITHEARTH_HOOK_SOCKET";
 const HOOK_TOKEN: &str = "GITHEARTH_HOOK_TOKEN";
 const HOOK_OPERATION: &str = "GITHEARTH_OPERATION";
 const HOOK_ACTOR: &str = "GITHEARTH_ACTOR";
+const HOOK_MERGE: &str = "GITHEARTH_MERGE";
 const REFUSE: &str = "ref updates must go through GitHearth";
 const RESPONSE_LIMIT: u64 = 4096;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,6 +65,10 @@ fn has_hook_env(env: &HashMap<String, String>) -> bool {
         && env.contains_key(HOOK_TOKEN)
         && env.contains_key(HOOK_OPERATION)
         && env.contains_key(HOOK_ACTOR)
+}
+
+fn has_journal_env(env: &HashMap<String, String>) -> bool {
+    env.contains_key(HOOK_OPERATION) && env.contains_key(HOOK_ACTOR)
 }
 
 fn is_zero(oid: &str) -> bool {
@@ -227,7 +232,7 @@ fn reference_transaction(
     if !matches!(state, "prepared" | "committed" | "aborted") {
         return 0;
     }
-    if !has_hook_env(env) {
+    if !has_journal_env(env) {
         let _ = writeln!(stderr, "{REFUSE}");
         return 1;
     }
@@ -284,9 +289,14 @@ fn append_prepared(
     let operation =
         Uuid::parse_str(&env[HOOK_OPERATION]).map_err(|e| format!("invalid operation: {e}"))?;
     let actor = Uuid::parse_str(&env[HOOK_ACTOR]).map_err(|e| format!("invalid actor: {e}"))?;
+    let origin = if env.get(HOOK_MERGE).is_some_and(|v| v == "1") {
+        Some(Origin::Merge)
+    } else {
+        None
+    };
     let mut journal = Journal::open(repo).map_err(|e| e.to_string())?;
     journal
-        .append_prepared(operation, Some(actor), updates)
+        .append_prepared(operation, Some(actor), updates, origin)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -309,6 +319,16 @@ mod tests {
         let mut env = HashMap::new();
         env.insert(HOOK_SOCKET.into(), "/nonexistent/hook.sock".into());
         env.insert(HOOK_TOKEN.into(), "a".repeat(64));
+        env.insert(HOOK_OPERATION.into(), Uuid::new_v4().to_string());
+        env.insert(HOOK_ACTOR.into(), Uuid::new_v4().to_string());
+        for (k, v) in extra {
+            env.insert((*k).into(), (*v).into());
+        }
+        env
+    }
+
+    fn journal_env(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut env = HashMap::new();
         env.insert(HOOK_OPERATION.into(), Uuid::new_v4().to_string());
         env.insert(HOOK_ACTOR.into(), Uuid::new_v4().to_string());
         for (k, v) in extra {
@@ -388,12 +408,20 @@ mod tests {
     }
 
     #[test]
-    fn reference_transaction_missing_env_refuses() {
-        let mut env = env_with(&[]);
-        env.remove(HOOK_TOKEN);
+    fn reference_transaction_requires_only_operation_and_actor() {
+        for missing in [HOOK_OPERATION, HOOK_ACTOR] {
+            let mut env = journal_env(&[]);
+            env.remove(missing);
+            let (code, err) = run_with("reference-transaction", &["prepared"], &env, UPDATE);
+            assert_eq!(code, 1, "missing {missing}");
+            assert!(err.contains(REFUSE), "missing {missing}: {err}");
+        }
+        // The socket and token are not required for journaling.
+        let repo = temp_repo();
+        let env = journal_env(&[("GIT_DIR", repo.to_str().unwrap())]);
         let (code, err) = run_with("reference-transaction", &["prepared"], &env, UPDATE);
-        assert_eq!(code, 1);
-        assert!(err.contains(REFUSE), "{err}");
+        assert_eq!(code, 0, "{err}");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -600,6 +628,29 @@ mod tests {
         assert_eq!(records[0].kind, Kind::Prepared);
         assert_eq!(records[0].updates.len(), 1);
         assert_eq!(records[0].updates[0].reference, "refs/heads/main");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn merge_env_sets_origin_on_the_prepared_record() {
+        let repo = temp_repo();
+        let env = journal_env(&[("GIT_DIR", repo.to_str().unwrap()), (HOOK_MERGE, "1")]);
+        let (code, err) = run_with("reference-transaction", &["prepared"], &env, UPDATE);
+        assert_eq!(code, 0, "{err}");
+        let journal = Journal::open(&repo).unwrap();
+        let records: Vec<_> = journal.records_after(0).cloned().collect();
+        assert_eq!(records[0].origin, Some(Origin::Merge));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn without_merge_env_origin_is_none() {
+        let repo = temp_repo();
+        let env = journal_env(&[("GIT_DIR", repo.to_str().unwrap())]);
+        let (_code, _err) = run_with("reference-transaction", &["prepared"], &env, UPDATE);
+        let journal = Journal::open(&repo).unwrap();
+        let records: Vec<_> = journal.records_after(0).cloned().collect();
+        assert_eq!(records[0].origin, None);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

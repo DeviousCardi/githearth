@@ -1,5 +1,7 @@
 use githearth_git::StorageError;
-use githearth_git::merge::{Candidate, Identity, Method, Request, build_candidate};
+use githearth_git::merge::{
+    Candidate, Identity, Method, Request, build_candidate, update_ref_expected,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -672,4 +674,179 @@ fn a_zero_timeout_is_reported_as_timeout() {
         Duration::ZERO,
     );
     assert!(matches!(result, Err(StorageError::Timeout)));
+}
+
+/// A hooks directory whose `reference-transaction` script appends its state,
+/// the `GITHEARTH_*` environment variables and stdin to a log file.
+struct StubHooks {
+    dir: PathBuf,
+    log: PathBuf,
+}
+
+impl StubHooks {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "githearth-merge-hooks-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("hook.log");
+        let script = format!(
+            "#!/bin/sh\nLOG={}\n{{\n  printf 'state=%s\\n' \"$1\"\n  printf 'operation=%s\\n' \"$GITHEARTH_OPERATION\"\n  printf 'actor=%s\\n' \"$GITHEARTH_ACTOR\"\n  printf 'merge=%s\\n' \"$GITHEARTH_MERGE\"\n  cat\n  printf -- '---\\n'\n}} >> \"$LOG\"\nexit 0\n",
+            log.display()
+        );
+        let hook = dir.join("reference-transaction");
+        fs::write(&hook, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self { dir, log }
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    fn read(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for StubHooks {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn update_ref_expected_moves_branch_and_journals_through_hooks() {
+    let f = Fixture::new();
+    f.write("base.txt", "base\n");
+    let base = f.commit_all("base");
+    f.write("child.txt", "child\n");
+    let child = f.commit_all("child");
+    git(&f.dir, &["branch", "target", &base]);
+
+    let hooks = StubHooks::new();
+    let op = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    update_ref_expected(
+        &f.repo(),
+        hooks.path(),
+        "refs/heads/target",
+        &child,
+        &base,
+        op,
+        actor,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    assert_eq!(f.oid("target"), child);
+
+    let log = hooks.read();
+    assert!(log.contains("state=prepared"), "{log}");
+    assert!(log.contains("state=committed"), "{log}");
+    assert!(log.contains(&format!("operation={op}")), "{log}");
+    assert!(log.contains(&format!("actor={actor}")), "{log}");
+    assert!(log.contains("merge=1"), "{log}");
+    assert!(
+        log.contains(&format!("{base} {child} refs/heads/target")),
+        "{log}"
+    );
+}
+
+#[test]
+fn update_ref_expected_mismatch_returns_ref_moved_and_leaves_ref() {
+    let f = Fixture::new();
+    f.write("base.txt", "base\n");
+    let base = f.commit_all("base");
+    f.write("one.txt", "one\n");
+    f.commit_all("one");
+    f.write("two.txt", "two\n");
+    let two = f.commit_all("two");
+
+    let hooks = StubHooks::new();
+    let result = update_ref_expected(
+        &f.repo(),
+        hooks.path(),
+        "refs/heads/main",
+        &two,
+        &base,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Duration::from_secs(10),
+    );
+    assert!(matches!(result, Err(StorageError::RefMoved(_))));
+    assert_eq!(f.oid("main"), two, "ref must not move");
+}
+
+#[test]
+fn update_ref_expected_on_a_deleted_branch_returns_ref_moved() {
+    let f = Fixture::new();
+    f.write("base.txt", "base\n");
+    let base = f.commit_all("base");
+    let hooks = StubHooks::new();
+    let result = update_ref_expected(
+        &f.repo(),
+        hooks.path(),
+        "refs/heads/gone",
+        &base,
+        &base,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Duration::from_secs(10),
+    );
+    assert!(
+        matches!(result, Err(StorageError::RefMoved(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn update_ref_expected_rejects_invalid_ref_and_oid_before_git() {
+    let f = Fixture::new();
+    f.write("base.txt", "base\n");
+    let base = f.commit_all("base");
+    f.write("child.txt", "child\n");
+    let child = f.commit_all("child");
+
+    let hooks = StubHooks::new();
+    let op = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+
+    for (reference, new, old) in [
+        ("refs/tags/v1", child.as_str(), base.as_str()),
+        ("refs/heads/main", "zzz", base.as_str()),
+        ("refs/heads/main", child.as_str(), "zzz"),
+        ("refs/heads/", child.as_str(), base.as_str()),
+        // A newline or space would inject a second `update-ref --stdin` command.
+        (
+            "refs/heads/x 0 0\nupdate refs/heads/main",
+            child.as_str(),
+            base.as_str(),
+        ),
+        ("refs/heads/a b", child.as_str(), base.as_str()),
+    ] {
+        assert!(
+            matches!(
+                update_ref_expected(
+                    &f.repo(),
+                    hooks.path(),
+                    reference,
+                    new,
+                    old,
+                    op,
+                    actor,
+                    Duration::from_secs(10),
+                ),
+                Err(StorageError::Invalid(_))
+            ),
+            "{reference}"
+        );
+    }
+    assert_eq!(hooks.read(), "", "no git process, so no hook invocations");
 }

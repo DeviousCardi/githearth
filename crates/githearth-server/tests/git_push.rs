@@ -1,7 +1,7 @@
 //! End-to-end push pipeline tests: real Git clients pushing to the in-process
 //! server, plus journal replay into PostgreSQL (ADR 0003).
 use axum::Router;
-use githearth_git::journal::{Journal, Kind, Record, Update};
+use githearth_git::journal::{Journal, Kind, Origin, Record, Update};
 use githearth_git::layout::ObjectFormat;
 use githearth_server::{AppState, MIGRATOR, config::Config, connect, pushes, reconcile, router};
 use sqlx::PgPool;
@@ -1028,6 +1028,7 @@ async fn append_prepared(fx: &Fixture, actor: Uuid, old: &str, new: &str) -> u64
                 new: new.to_owned(),
                 reference: "refs/heads/main".into(),
             }],
+            None,
         )
         .unwrap()
 }
@@ -1186,6 +1187,7 @@ async fn replay_marker_lost_does_not_skip_later_records() {
                 new: main_child,
                 reference: "refs/heads/main".into(),
             }],
+            None,
         )
         .unwrap();
     let op_b = Uuid::new_v4();
@@ -1198,6 +1200,7 @@ async fn replay_marker_lost_does_not_skip_later_records() {
                 new: feature_child,
                 reference: "refs/heads/feature".into(),
             }],
+            None,
         )
         .unwrap();
     journal.append_marker(op_b, Kind::Committed).unwrap();
@@ -1287,6 +1290,7 @@ async fn replay_diverged_then_next_push_409() {
                     reference: "refs/heads/feature".into(),
                 },
             ],
+            None,
         )
         .unwrap();
 
@@ -1415,6 +1419,7 @@ async fn replay_prepared_plus_aborted_marker_skips() {
                 new,
                 reference: "refs/heads/main".into(),
             }],
+            None,
         )
         .unwrap();
     journal.append_marker(op, Kind::Aborted).unwrap();
@@ -1958,6 +1963,383 @@ async fn require_pull_request_refuses_direct_push() {
         String::from_utf8_lossy(&out.stderr).contains("protected branch: ref.push"),
         "push reason: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replay_skips_merge_record_and_applies_following_push() {
+    let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
+
+    // Two child commits on two branches, fetched into the bare repo so the
+    // refs and their objects exist: main (merge) and feature (push).
+    let work = std::env::temp_dir().join(format!("git-push-merge-replay-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("merged"), "m").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "merged"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "merge",
+    ]))
+    .await;
+    let merge_oid = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "checkout",
+        "-q",
+        "-b",
+        "feature",
+        fx.base_commit.as_str(),
+    ]))
+    .await;
+    std::fs::write(work.join("feature"), "f").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "feature"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "feature",
+    ]))
+    .await;
+    let push_oid = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+
+    seed_bare(fx.repo_path_str(), tw, "main:refs/heads/main").await;
+    seed_bare(fx.repo_path_str(), tw, "feature:refs/heads/feature").await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    let mut journal = Journal::open(&fx.repo_path).unwrap();
+    let merge_op = Uuid::new_v4();
+    journal
+        .append_prepared(
+            merge_op,
+            Some(owner),
+            vec![Update {
+                old: fx.base_commit.clone(),
+                new: merge_oid,
+                reference: "refs/heads/main".into(),
+            }],
+            Some(Origin::Merge),
+        )
+        .unwrap();
+    journal.append_marker(merge_op, Kind::Committed).unwrap();
+    let push_op = Uuid::new_v4();
+    journal
+        .append_prepared(
+            push_op,
+            Some(owner),
+            vec![Update {
+                old: "0".repeat(40),
+                new: push_oid,
+                reference: "refs/heads/feature".into(),
+            }],
+            None,
+        )
+        .unwrap();
+    journal.append_marker(push_op, Kind::Committed).unwrap();
+
+    let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!(summary.committed, 2);
+
+    // Only the push created metadata.
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 1, "merge record must not create push metadata");
+    let rc: i64 = sqlx::query_scalar("SELECT count(*) FROM ref_updates WHERE repository_id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(rc, 1);
+    let feature_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ref_updates WHERE repository_id=$1 AND ref_name='refs/heads/feature'",
+    )
+    .bind(fx.repo_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(feature_rows, 1);
+
+    // The high-water mark passes both records.
+    let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(ja, 4);
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn update_ref_expected_journals_merge_origin_and_replay_skips_it() {
+    let fx = setup(1 << 30).await;
+
+    // Build a child commit and bring its object into the bare repo without
+    // moving any branch ref (objects only).
+    let work = std::env::temp_dir().join(format!("git-push-merge-journal-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("merged"), "m").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "merged"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "merge",
+    ]))
+    .await;
+    let child = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        tw,
+        "HEAD:refs/remotes/tmp/merge",
+    ]))
+    .await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    let op = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let repo_path = fx.repo_path.clone();
+    let hooks_dir = fx.storage_root.join("hooks");
+    let expected_old = fx.base_commit.clone();
+    let new_oid = child.clone();
+    let guard = fx
+        .state
+        .storage
+        .repository_lock(fx.repo_id)
+        .lock_owned()
+        .await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        githearth_git::merge::update_ref_expected(
+            &repo_path,
+            &hooks_dir,
+            "refs/heads/main",
+            &new_oid,
+            &expected_old,
+            op,
+            actor,
+            Duration::from_secs(30),
+        )
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+
+    assert_eq!(
+        git_output(git_cmd(&[
+            "--git-dir",
+            fx.repo_path_str(),
+            "rev-parse",
+            "main"
+        ]))
+        .await,
+        child
+    );
+
+    let records = journal_records(&fx.repo_path);
+    let prepared = records
+        .iter()
+        .find(|r| r.operation == op && r.kind == Kind::Prepared)
+        .expect("merge prepared record");
+    assert_eq!(prepared.origin, Some(Origin::Merge));
+    assert_eq!(prepared.actor, Some(actor));
+    assert_eq!(prepared.updates.len(), 1);
+    assert_eq!(prepared.updates[0].reference, "refs/heads/main");
+    assert_eq!(prepared.updates[0].old, fx.base_commit);
+    assert_eq!(prepared.updates[0].new, child);
+    assert!(
+        records
+            .iter()
+            .any(|r| r.operation == op && r.kind == Kind::Committed),
+        "committed marker follows the prepared record"
+    );
+
+    let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!(summary.committed, 1);
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 0, "merge record must not be recorded as a push");
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn push_and_merge_serialize_on_the_repository_lock() {
+    let fx = setup(1 << 30).await;
+
+    // The pusher clones main at the base commit and builds a child commit.
+    let clone = std::env::temp_dir().join(format!("git-push-merge-lock-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap().to_owned();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd.as_str()])).await;
+    std::fs::write(clone.join("p"), "p").unwrap();
+    git_ok(git_cmd(&["-C", cd.as_str(), "add", "p"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd.as_str(),
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "p",
+    ]))
+    .await;
+
+    // The merge commit is a different child of base, so the push becomes
+    // non-fast-forward once the merge moves main.
+    let merge_work = std::env::temp_dir().join(format!("git-push-merge-mw-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&merge_work).unwrap();
+    let mw = merge_work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", mw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(merge_work.join("merged"), "m").unwrap();
+    git_ok(git_cmd(&["-C", mw, "add", "merged"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        mw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "merge",
+    ]))
+    .await;
+    let merge_oid = git_output(git_cmd(&["-C", mw, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        mw,
+        "HEAD:refs/remotes/tmp/merge",
+    ]))
+    .await;
+    let _ = std::fs::remove_dir_all(&merge_work);
+
+    // Hold the per-repository lock, exactly as execute_intent will.
+    let guard = fx
+        .state
+        .storage
+        .repository_lock(fx.repo_id)
+        .lock_owned()
+        .await;
+
+    // Start the push. Its lock-free advertisement completes against the base
+    // commit, then the receive-pack POST holds a git permit while it blocks on
+    // the per-repository lock.
+    let initial_permits = fx.state.git_slots.available_permits();
+    let push_task = tokio::spawn(async move {
+        git_run(git_cmd(&["-C", cd.as_str(), "push", "origin", "main"])).await
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while fx.state.git_slots.available_permits() >= initial_permits
+        && tokio::time::Instant::now() < deadline
+    {
+        assert!(
+            !push_task.is_finished(),
+            "push completed instead of blocking on the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        fx.state.git_slots.available_permits() < initial_permits,
+        "push never reached the server"
+    );
+    // Let the advertisement finish so the client is now waiting on the lock.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !push_task.is_finished(),
+        "push must still be blocked while the merge holds the lock"
+    );
+
+    // Move main to the merge commit while holding the lock.
+    let repo_path = fx.repo_path.clone();
+    let hooks_dir = fx.storage_root.join("hooks");
+    let expected_old = fx.base_commit.clone();
+    let new_oid = merge_oid.clone();
+    let op = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        githearth_git::merge::update_ref_expected(
+            &repo_path,
+            &hooks_dir,
+            "refs/heads/main",
+            &new_oid,
+            &expected_old,
+            op,
+            actor,
+            Duration::from_secs(30),
+        )
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+
+    // The lock is released when the closure returned; the push now proceeds
+    // and is judged against the moved ref (a compare-and-swap the pushed ref
+    // no longer satisfies), so it is rejected and the branch stays put.
+    let out = push_task.await.unwrap();
+    assert!(!out.status.success(), "stale push must be rejected");
+
+    assert_eq!(
+        git_output(git_cmd(&[
+            "--git-dir",
+            fx.repo_path_str(),
+            "rev-parse",
+            "main"
+        ]))
+        .await,
+        merge_oid
     );
 
     let _ = std::fs::remove_dir_all(&clone);
