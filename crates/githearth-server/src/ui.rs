@@ -39,6 +39,11 @@ struct LoginQuery {
 }
 
 pub(crate) struct UiError(Box<Response>);
+impl From<Response> for UiError {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
 impl axum::response::IntoResponse for UiError {
     fn into_response(self) -> Response {
         *self.0
@@ -105,7 +110,7 @@ pub(crate) async fn browser_auth(
 }
 
 /// Compares digests so the time taken does not reveal how much of the secret matched.
-fn csrf_matches(supplied: &str, expected: &str) -> bool {
+pub(crate) fn csrf_matches(supplied: &str, expected: &str) -> bool {
     use sha2::{Digest, Sha256};
     !expected.is_empty() && Sha256::digest(supplied) == Sha256::digest(expected)
 }
@@ -253,7 +258,7 @@ fn busy_page() -> UiError {
     ))
 }
 
-fn forbidden_page() -> UiError {
+pub(crate) fn forbidden_page() -> UiError {
     UiError(Box::new(
         (
             StatusCode::FORBIDDEN,
@@ -627,6 +632,11 @@ async fn repository(
             None => {}
         }
     }
+    browse_section.push_str(&format!(
+        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a></p>",
+        url_encode(&slug),
+        url_encode(&repo.name)
+    ));
     let body = format!(
         "<h1>{}</h1><div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>",
         esc(&repo.name),
@@ -663,5 +673,6 @@ pub fn router() -> Router<AppState> {
         .route("/organizations/{slug}", get(organization))
         .route("/organizations/{slug}/repositories", get(organization))
         .route("/organizations/{slug}/repositories/{name}", get(repository))
+        .merge(crate::issues_ui::router())
         .layer(axum::middleware::map_response(page_headers))
 }

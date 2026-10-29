@@ -141,7 +141,7 @@ Migration files are embedded and versioned through SQLx. Never edit an applied m
 
 ## M2 verification
 
-The M2 workflow (Git hosting, browsing, issues and recovery) is verified by the executable acceptance harness in [`scripts/verify-m2.py`](../scripts/verify-m2.py), which builds the release binary, drives real `git` clients against a disposable `postgres:17-bookworm` container, and covers push/clone, browsing, issues/comments idempotency, access isolation, crash recovery, restart and the ADR 0003 fresh-restore procedure. Run it with
+The M2 workflow (Git hosting, browsing, issues and recovery) is verified by the executable acceptance harness in [`scripts/verify-m2.py`](../scripts/verify-m2.py), which builds the release binary, drives real `git` clients against a disposable `postgres:17-bookworm` container, and covers push/clone, browsing, issues/comments idempotency and the browser issue pages, access isolation, crash recovery, restart and the ADR 0003 fresh-restore procedure. Run it with
 
 ```bash
 python3 scripts/verify-m2.py --report /tmp/m2-report.json
@@ -153,3 +153,7 @@ It prints PASS/FAIL per scenario, exits non-zero on any failure, records whole-w
 ## Browser login (M2)
 
 The server-rendered UI is available at `http://127.0.0.1:8080/`. Sign in with the bootstrapped administrator; session cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` by default. The local Compose profile sets `GITHEARTH_SECURE_COOKIES=false` because it serves plain HTTP on loopback; production deployments should leave Secure enabled (or set `secure_cookies = true`) and terminate TLS at a trusted ingress.
+
+## Issue pages (M2)
+
+Signed-in browsers can list a repository's issues (open, closed or all, 30 per page, newest first), open an issue with its comments (30 per page, oldest first), create an issue and add a comment at `/organizations/{org}/repositories/{repo}/issues`. The pages use the browser session cookie; every form carries the session's CSRF token, and a bad token gets 403. They call the same functions as the JSON issue API, so authorization, validation, idempotency storage and audit and outbox events are identical. Closing, reopening and editing issues are API-only.

@@ -57,26 +57,26 @@ const COMMENT_COLUMNS: &str = "id, author_id, body, seq, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
 
 #[derive(Serialize, Deserialize, sqlx::FromRow)]
-struct IssueJson {
-    id: Uuid,
-    number: i32,
-    title: String,
-    body: String,
-    state: String,
-    author_id: Uuid,
-    created_at: String,
-    updated_at: String,
-    closed_at: Option<String>,
+pub(crate) struct IssueJson {
+    pub(crate) id: Uuid,
+    pub(crate) number: i32,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) state: String,
+    pub(crate) author_id: Uuid,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) closed_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow)]
-struct CommentJson {
-    id: Uuid,
-    author_id: Uuid,
-    body: String,
-    seq: i32,
-    created_at: String,
-    updated_at: String,
+pub(crate) struct CommentJson {
+    pub(crate) id: Uuid,
+    pub(crate) author_id: Uuid,
+    pub(crate) body: String,
+    pub(crate) seq: i32,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
 }
 
 async fn fetch_issue(conn: &mut PgConnection, id: Uuid) -> Result<Option<IssueJson>, sqlx::Error> {
@@ -171,26 +171,47 @@ async fn create(
     Path((org_slug, repo_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IssueJson>), ApiError> {
-    let input: NewIssue = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    new_issue(&body)?;
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let key = idempotency::extract_key(&headers).transpose()?;
+    let (status, value) = create_issue(
+        &state, actor.id, auth_age, &org_slug, &repo_name, &body, key,
+    )
+    .await?;
+    Ok((status, Json(serde_json::from_value(value).unwrap())))
+}
+
+fn new_issue(body: &[u8]) -> Result<NewIssue, ApiError> {
+    let input: NewIssue = serde_json::from_slice(body).map_err(|_| invalid())?;
     if !(1..=256).contains(&input.title.chars().count()) || input.body.chars().count() > 65536 {
         return Err(invalid());
     }
+    Ok(input)
+}
 
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    let state = &state;
-    let key = idempotency::extract_key(&headers).transpose()?;
+/// Creates an issue as `actor_id`; shared by the JSON API and the browser form.
+pub(crate) async fn create_issue(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    body: &[u8],
+    key: Option<&str>,
+) -> Result<(StatusCode, serde_json::Value), ApiError> {
+    let input = new_issue(body)?;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/issues");
 
-    let (status, value) = idempotency::run(
+    idempotency::run(
         &state.pool,
-        actor.id,
+        actor_id,
         "POST",
         &path_str,
-        &body,
+        body,
         key,
         |idem| async move {
             let loaded =
-                repository_api::load_current(state, actor.id, auth_age, &org_slug, &repo_name)
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
                     .await?;
             repository_api::require(state, &loaded, Action::IssueCreate)?;
             if loaded.repo.status != RepositoryStatus::Active {
@@ -212,10 +233,10 @@ async fn create(
             .bind(number)
             .bind(&input.title)
             .bind(&input.body)
-            .bind(actor.id)
+            .bind(actor_id)
             .execute(&mut *tx)
             .await?;
-            event(&mut tx, Some(loaded.org_id), actor.id, "issue.created").await?;
+            event(&mut tx, Some(loaded.org_id), actor_id, "issue.created").await?;
 
             let issue = fetch_issue(&mut tx, id).await?.unwrap();
             let status = StatusCode::CREATED;
@@ -227,25 +248,24 @@ async fn create(
             Ok((status, body))
         },
     )
-    .await?;
-    Ok((status, Json(serde_json::from_value(value).unwrap())))
+    .await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct ListQuery {
+pub(crate) struct ListQuery {
     #[serde(default)]
-    state: Option<String>,
+    pub(crate) state: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    pub(crate) limit: Option<i64>,
     #[serde(default)]
-    after: Option<i32>,
+    pub(crate) after: Option<i32>,
 }
 
 #[derive(Serialize)]
-struct IssuePage {
-    items: Vec<IssueJson>,
-    next: Option<i32>,
+pub(crate) struct IssuePage {
+    pub(crate) items: Vec<IssueJson>,
+    pub(crate) next: Option<i32>,
 }
 
 async fn list(
@@ -255,6 +275,19 @@ async fn list(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<IssuePage>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    list_issues(&state, actor.id, auth_age, &org_slug, &repo_name, query)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn list_issues(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    query: ListQuery,
+) -> Result<IssuePage, ApiError> {
     let state_filter = query.state.as_deref().unwrap_or("open");
     if !matches!(state_filter, "open" | "closed" | "all") {
         return Err(invalid());
@@ -264,9 +297,8 @@ async fn list(
         return Err(invalid());
     }
 
-    let loaded =
-        repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
-    repository_api::require(&state, &loaded, Action::RepositoryRead)?;
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    repository_api::require(state, &loaded, Action::RepositoryRead)?;
     require_readable_repo(&loaded)?;
 
     let mut conn = state.pool.acquire().await?;
@@ -297,7 +329,7 @@ async fn list(
     } else {
         None
     };
-    Ok(Json(IssuePage { items, next }))
+    Ok(IssuePage { items, next })
 }
 
 async fn read(
@@ -306,15 +338,27 @@ async fn read(
     Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
 ) -> Result<Json<IssueJson>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    let loaded =
-        repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    read_issue(&state, actor.id, auth_age, &org_slug, &repo_name, number)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn read_issue(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<IssueJson, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let mut conn = state.pool.acquire().await?;
     let issue = find_issue(&mut conn, loaded.repo.id, number)
         .await?
         .ok_or_else(not_found)?;
-    require_issue(&state, &loaded, &issue, Action::IssueRead)?;
-    Ok(Json(issue))
+    require_issue(state, &loaded, &issue, Action::IssueRead)?;
+    Ok(issue)
 }
 
 #[derive(Deserialize)]
@@ -446,34 +490,52 @@ async fn create_comment(
     Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<CommentJson>), ApiError> {
-    let input: NewComment = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    new_comment(&body)?;
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let key = idempotency::extract_key(&headers).transpose()?;
+    let (status, value) = create_issue_comment(
+        &state, actor.id, auth_age, &org_slug, &repo_name, number, &body, key,
+    )
+    .await?;
+    Ok((status, Json(serde_json::from_value(value).unwrap())))
+}
+
+fn new_comment(body: &[u8]) -> Result<NewComment, ApiError> {
+    let input: NewComment = serde_json::from_slice(body).map_err(|_| invalid())?;
     if !(1..=65536).contains(&input.body.chars().count()) {
         return Err(invalid());
     }
+    Ok(input)
+}
 
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    let state = &state;
-    let key = idempotency::extract_key(&headers).transpose()?;
+/// Comments on an issue as `actor_id`; shared by the JSON API and the browser form.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_issue_comment(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    body: &[u8],
+    key: Option<&str>,
+) -> Result<(StatusCode, serde_json::Value), ApiError> {
+    let input = new_comment(body)?;
     let path_str = format!(
         "/api/v1/organizations/{org_slug}/repositories/{repo_name}/issues/{number}/comments"
     );
 
-    let (status, value) = idempotency::run(
+    idempotency::run(
         &state.pool,
-        actor.id,
+        actor_id,
         "POST",
         &path_str,
-        &body,
+        body,
         key,
         |idem| async move {
-            let loaded = repository_api::load_current(
-                state,
-                actor.id,
-                auth_age,
-                &org_slug,
-                &repo_name,
-            )
-            .await?;
+            let loaded =
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
+                    .await?;
 
             let mut conn = state.pool.acquire().await?;
             let issue = find_issue(&mut conn, loaded.repo.id, number)
@@ -497,7 +559,7 @@ async fn create_comment(
             )
             .bind(id)
             .bind(issue.id)
-            .bind(actor.id)
+            .bind(actor_id)
             .bind(&input.body)
             .bind(seq)
             .execute(&mut *tx)
@@ -506,7 +568,7 @@ async fn create_comment(
                 .bind(issue.id)
                 .execute(&mut *tx)
                 .await?;
-            event(&mut tx, Some(loaded.org_id), actor.id, "issue.commented").await?;
+            event(&mut tx, Some(loaded.org_id), actor_id, "issue.commented").await?;
 
             let comment: CommentJson = sqlx::query_as(&format!(
                 "SELECT {COMMENT_COLUMNS} FROM issue_comments WHERE id = $1"
@@ -523,23 +585,22 @@ async fn create_comment(
             Ok((status, body))
         },
     )
-    .await?;
-    Ok((status, Json(serde_json::from_value(value).unwrap())))
+    .await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct CommentListQuery {
+pub(crate) struct CommentListQuery {
     #[serde(default)]
-    limit: Option<i64>,
+    pub(crate) limit: Option<i64>,
     #[serde(default)]
-    after: Option<i32>,
+    pub(crate) after: Option<i32>,
 }
 
 #[derive(Serialize)]
-struct CommentPage {
-    items: Vec<CommentJson>,
-    next: Option<i32>,
+pub(crate) struct CommentPage {
+    pub(crate) items: Vec<CommentJson>,
+    pub(crate) next: Option<i32>,
 }
 
 async fn list_comments(
@@ -549,6 +610,22 @@ async fn list_comments(
     Query(query): Query<CommentListQuery>,
 ) -> Result<Json<CommentPage>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    list_issue_comments(
+        &state, actor.id, auth_age, &org_slug, &repo_name, number, query,
+    )
+    .await
+    .map(Json)
+}
+
+pub(crate) async fn list_issue_comments(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    query: CommentListQuery,
+) -> Result<CommentPage, ApiError> {
     let limit = query.limit.unwrap_or(30);
     if !(1..=100).contains(&limit) {
         return Err(invalid());
@@ -560,15 +637,14 @@ async fn list_comments(
         return Err(invalid());
     }
 
-    let loaded =
-        repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
 
     let mut conn = state.pool.acquire().await?;
     let issue = find_issue(&mut conn, loaded.repo.id, number)
         .await?
         .ok_or_else(not_found)?;
-    require_issue(&state, &loaded, &issue, Action::IssueRead)?;
+    require_issue(state, &loaded, &issue, Action::IssueRead)?;
 
     let rows = sqlx::query_as::<_, CommentJson>(&format!(
         "SELECT {COMMENT_COLUMNS} FROM issue_comments WHERE issue_id = $1 \
@@ -589,5 +665,5 @@ async fn list_comments(
     } else {
         None
     };
-    Ok(Json(CommentPage { items, next }))
+    Ok(CommentPage { items, next })
 }

@@ -9,6 +9,7 @@ URLs), and every disposable container and temp dir is cleaned up.
 """
 import argparse
 import base64
+import html
 import json
 import os
 import platform
@@ -615,6 +616,7 @@ class Harness:
         session_cookie = self.get_cookie(headers, "githearth_session")
         if not session_cookie:
             raise HarnessError("browser login did not set a session cookie")
+        self.browser_cookie = session_cookie
         status, _, body = self.api(
             "GET", "/organizations/m2-org/repositories/m2-repo/tree/main",
             headers={"Cookie": f"githearth_session={session_cookie}"},
@@ -734,6 +736,72 @@ class Harness:
             cursor = page["next"]
         if len(got) != 3:
             raise HarnessError("comment pagination mismatch")
+
+        self.s3_issue_pages()
+
+    def s3_issue_pages(self):
+        """Browser pages: list, create, view and comment through the HTML forms."""
+        ui = "/organizations/m2-org/repositories/m2-repo/issues"
+        cookie = {"Cookie": f"githearth_session={self.browser_cookie}"}
+        form_headers = dict(cookie, **{"Content-Type": "application/x-www-form-urlencoded"})
+
+        def page(path):
+            status, _, body = self.api("GET", path, headers=cookie)
+            if status != 200:
+                raise HarnessError(f"issue page {path} status {status}")
+            match = re.search(rb'name="csrf_token" value="([0-9a-f]{32})"', body)
+            if not match:
+                raise HarnessError(f"no CSRF token on {path}")
+            return body, match.group(1).decode()
+
+        body, _ = page(ui)
+        for title in self.issue_titles:
+            if html.escape(title).encode() not in body:
+                raise HarnessError(f"issue list page missing {title!r}")
+        status, _, _ = self.api("GET", ui)
+        if status != 303:
+            raise HarnessError(f"issue list without a session status {status}")
+
+        _, csrf = page(ui + "/new")
+        status, _, _ = self.api(
+            "POST", ui, headers=form_headers,
+            body=urllib.parse.urlencode({"csrf_token": "0" * 32, "title": "forged"}).encode(),
+        )
+        if status != 403:
+            raise HarnessError(f"issue form with a bad CSRF token status {status}")
+        title = "UI issue <b>escaped</b>"
+        status, headers, _ = self.api(
+            "POST", ui, headers=form_headers,
+            body=urllib.parse.urlencode(
+                {"csrf_token": csrf, "title": title, "body": "made in the browser"}
+            ).encode(),
+        )
+        location = dict((k.lower(), v) for k, v in headers).get("location", "")
+        if status != 303 or not location.startswith(ui + "/"):
+            raise HarnessError(f"issue form status {status} location {location!r}")
+        number = int(location.rsplit("/", 1)[1])
+        self.issue_numbers.append(number)
+        self.issue_titles.append(title)
+
+        body, csrf = page(location)
+        if html.escape(title).encode() not in body or b"<b>escaped</b>" in body:
+            raise HarnessError("issue page does not show the escaped title")
+        status, _, _ = self.api(
+            "POST", location + "/comments", headers=form_headers,
+            body=urllib.parse.urlencode({"csrf_token": csrf, "body": "browser comment"}).encode(),
+        )
+        if status != 303:
+            raise HarnessError(f"comment form status {status}")
+        body, _ = page(location)
+        if b"browser comment" not in body:
+            raise HarnessError("issue page missing the new comment")
+        status, comments = self.api_json(
+            "GET",
+            f"/api/v1/organizations/m2-org/repositories/m2-repo/issues/{number}/comments",
+            token=self.admin_token,
+        )
+        if status != 200 or [c["body"] for c in comments["items"]] != ["browser comment"]:
+            raise HarnessError("API does not see the browser comment")
 
     def s4_isolation_archive(self):
         repo_path = "/api/v1/organizations/m2-org/repositories/m2-repo"
@@ -970,7 +1038,7 @@ class Harness:
         status, issues = self.api_json(
             "GET", "/api/v1/organizations/m2-org/repositories/m2-repo/issues", token=tok
         )
-        if status != 200 or len(issues["items"]) != 3:
+        if status != 200 or len(issues["items"]) != len(self.issue_numbers):
             raise HarnessError("issues unreadable after restart")
         out = self.git(
             "ls-remote", self.repo_url, cwd=str(ROOT),
