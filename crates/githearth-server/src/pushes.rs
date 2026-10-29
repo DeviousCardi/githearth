@@ -1,4 +1,4 @@
-use githearth_git::journal::{Kind, Record};
+use githearth_git::journal::{Kind, Record, classify};
 use sqlx::{Connection, PgConnection};
 use std::fmt;
 use uuid::Uuid;
@@ -174,4 +174,265 @@ pub async fn applied_through(
         .fetch_one(conn)
         .await?;
     Ok(val as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Journal replay (ADR 0003 "Recovery")
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct ReplaySummary {
+    pub committed: usize,
+    pub aborted: usize,
+}
+
+#[derive(Debug)]
+pub enum ReplayError {
+    Diverged { repository: Uuid, sequence: u64 },
+    Journal(githearth_git::journal::JournalError),
+    Storage(githearth_git::StorageError),
+    Database(sqlx::Error),
+    Invalid(&'static str),
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplayError::Diverged {
+                repository,
+                sequence,
+            } => write!(
+                f,
+                "repository {repository} diverged at journal sequence {sequence}; repair required"
+            ),
+            ReplayError::Journal(e) => write!(f, "journal error: {e}"),
+            ReplayError::Storage(e) => write!(f, "storage error: {e}"),
+            ReplayError::Database(e) => write!(f, "database error: {e}"),
+            ReplayError::Invalid(m) => write!(f, "invalid journal record: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReplayError::Journal(e) => Some(e),
+            ReplayError::Storage(e) => Some(e),
+            ReplayError::Database(e) => Some(e),
+            ReplayError::Diverged { .. } | ReplayError::Invalid(_) => None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for ReplayError {
+    fn from(e: sqlx::Error) -> Self {
+        ReplayError::Database(e)
+    }
+}
+
+impl From<PushError> for ReplayError {
+    fn from(e: PushError) -> Self {
+        match e {
+            PushError::Database(e) => ReplayError::Database(e),
+            PushError::Invalid(m) => ReplayError::Invalid(m),
+        }
+    }
+}
+
+/// Replays journal records newer than the repository's high-water mark into
+/// PostgreSQL, exactly per ADR 0003.  The caller must already hold the
+/// per-repository lock.
+pub async fn replay(
+    state: &crate::AppState,
+    repository: Uuid,
+) -> Result<ReplaySummary, ReplayError> {
+    let mut conn = state.pool.acquire().await?;
+    let applied = applied_through(&mut conn, repository).await?;
+    drop(conn);
+
+    let storage = state.storage.clone();
+    let repo_path = storage.repository_path(repository);
+
+    let (records, refs_now) = tokio::task::spawn_blocking(move || {
+        let journal =
+            githearth_git::journal::Journal::open(&repo_path).map_err(ReplayError::Journal)?;
+        let records: Vec<Record> = journal.records_after(applied).cloned().collect();
+        let refs_now =
+            githearth_git::layout::read_refs(&repo_path).map_err(ReplayError::Storage)?;
+        Ok::<_, ReplayError>((records, refs_now))
+    })
+    .await
+    .map_err(|_| ReplayError::Invalid("journal task panicked"))??;
+
+    let mut summary = ReplaySummary::default();
+    let mut conn = state.pool.acquire().await?;
+    let mut i = 0;
+    while i < records.len() {
+        let prepared = records[i].clone();
+        if prepared.kind != Kind::Prepared {
+            // A resolved marker with no preceding prepared record: skip past it.
+            advance(&mut conn, repository, prepared.sequence).await?;
+            i += 1;
+            continue;
+        }
+        let marker = match records.get(i + 1) {
+            Some(next) if next.kind != Kind::Prepared && next.operation == prepared.operation => {
+                Some(next.kind)
+            }
+            _ => None,
+        };
+        match classify(&prepared, marker, &refs_now) {
+            githearth_git::journal::Outcome::Committed => {
+                apply_committed(&mut conn, repository, &prepared).await?;
+                let seq = marker
+                    .map(|_| records[i + 1].sequence)
+                    .unwrap_or(prepared.sequence);
+                advance(&mut conn, repository, seq).await?;
+                summary.committed += 1;
+                i += if marker.is_some() { 2 } else { 1 };
+            }
+            githearth_git::journal::Outcome::CommittedMarkerLost => {
+                // Append the marker, but advance only to the prepared record:
+                // the marker lands at the end of the journal, past records this
+                // pass has not applied yet.  It is skipped as a lone marker
+                // on the next pass.
+                append_marker(
+                    &state.storage,
+                    repository,
+                    prepared.operation,
+                    Kind::Committed,
+                )
+                .await?;
+                apply_committed(&mut conn, repository, &prepared).await?;
+                advance(&mut conn, repository, prepared.sequence).await?;
+                summary.committed += 1;
+                i += 1;
+            }
+            githearth_git::journal::Outcome::Aborted => {
+                advance(&mut conn, repository, records[i + 1].sequence).await?;
+                summary.aborted += 1;
+                i += 2;
+            }
+            githearth_git::journal::Outcome::AbortedMarkerLost => {
+                append_marker(
+                    &state.storage,
+                    repository,
+                    prepared.operation,
+                    Kind::Aborted,
+                )
+                .await?;
+                advance(&mut conn, repository, prepared.sequence).await?;
+                summary.aborted += 1;
+                i += 1;
+            }
+            githearth_git::journal::Outcome::Diverged => {
+                tracing::error!(
+                    repository_id = %repository,
+                    sequence = prepared.sequence,
+                    "journal replay diverged; repository needs repair"
+                );
+                return Err(ReplayError::Diverged {
+                    repository,
+                    sequence: prepared.sequence,
+                });
+            }
+        }
+    }
+    Ok(summary)
+}
+
+async fn append_marker(
+    storage: &std::sync::Arc<githearth_git::layout::Storage>,
+    repository: Uuid,
+    operation: Uuid,
+    kind: Kind,
+) -> Result<u64, ReplayError> {
+    let storage = storage.clone();
+    let repo_path = storage.repository_path(repository);
+    tokio::task::spawn_blocking(move || {
+        let mut journal =
+            githearth_git::journal::Journal::open(&repo_path).map_err(ReplayError::Journal)?;
+        journal
+            .append_marker(operation, kind)
+            .map_err(ReplayError::Journal)
+    })
+    .await
+    .map_err(|_| ReplayError::Invalid("journal task panicked"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn push_error_display_source_and_from() {
+        assert_eq!(
+            PushError::Invalid("bad").to_string(),
+            "invalid push record: bad"
+        );
+        let db = PushError::Database(sqlx::Error::RowNotFound);
+        assert!(db.to_string().contains("database error"));
+        assert!(db.source().is_some());
+        assert!(PushError::Invalid("x").source().is_none());
+        assert!(matches!(
+            PushError::from(sqlx::Error::RowNotFound),
+            PushError::Database(_)
+        ));
+    }
+
+    #[test]
+    fn replay_error_display_source_and_from() {
+        let id = Uuid::new_v4();
+        let diverged = ReplayError::Diverged {
+            repository: id,
+            sequence: 7,
+        };
+        assert!(diverged.to_string().contains(&id.to_string()));
+        assert!(diverged.source().is_none());
+
+        let journal = ReplayError::Journal(githearth_git::journal::JournalError::Io(
+            std::io::Error::other("io"),
+        ));
+        assert!(journal.to_string().contains("journal error"));
+        assert!(journal.source().is_some());
+
+        let storage = ReplayError::Storage(githearth_git::StorageError::Invalid("s".into()));
+        assert!(storage.to_string().contains("storage error"));
+        assert!(storage.source().is_some());
+
+        let db = ReplayError::Database(sqlx::Error::RowNotFound);
+        assert!(db.to_string().contains("database error"));
+        assert!(db.source().is_some());
+
+        let invalid = ReplayError::Invalid("m");
+        assert!(invalid.to_string().contains("invalid journal record"));
+        assert!(invalid.source().is_none());
+
+        assert!(matches!(
+            ReplayError::from(sqlx::Error::RowNotFound),
+            ReplayError::Database(_)
+        ));
+        assert!(matches!(
+            ReplayError::from(PushError::Invalid("m")),
+            ReplayError::Invalid(_)
+        ));
+        assert!(matches!(
+            ReplayError::from(PushError::Database(sqlx::Error::RowNotFound)),
+            ReplayError::Database(_)
+        ));
+    }
+
+    #[test]
+    fn valid_oid_and_ref_name_rules() {
+        assert!(valid_oid(&"a".repeat(40)));
+        assert!(valid_oid(&"b".repeat(64)));
+        assert!(!valid_oid("short"));
+        assert!(!valid_oid(&"Z".repeat(40)));
+        assert!(valid_ref_name("refs/heads/main"));
+        assert!(valid_ref_name("refs/tags/v1"));
+        assert!(!valid_ref_name("refs/heads/"));
+        assert!(!valid_ref_name("refs/notes/x"));
+        assert!(!valid_ref_name("HEAD"));
+    }
 }

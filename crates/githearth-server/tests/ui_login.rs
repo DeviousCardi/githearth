@@ -36,6 +36,11 @@ async fn setup_with_secure(secure: bool) -> (Router, PgPool, String) {
         database_max_connections: 4,
         database_timeout_seconds: 3,
         secure_cookies: secure,
+        storage_root: std::env::temp_dir().join(format!(
+            "githearth-ui-login-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        )),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();

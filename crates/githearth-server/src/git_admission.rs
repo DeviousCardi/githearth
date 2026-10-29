@@ -16,6 +16,7 @@ pub enum Want {
     Push,
 }
 
+#[derive(Clone)]
 pub struct Admitted {
     pub account: Uuid,
     pub organization: Uuid,
@@ -267,6 +268,8 @@ mod tests {
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(engine),
             storage: Arc::new(storage),
+            hook_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            hook_socket_path: std::path::PathBuf::from("/nonexistent/hook.sock"),
         }
     }
 

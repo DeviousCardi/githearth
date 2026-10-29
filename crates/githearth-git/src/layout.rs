@@ -259,7 +259,7 @@ impl Storage {
             .len()
     }
 
-    fn repository_path(&self, repository: Uuid) -> PathBuf {
+    pub fn repository_path(&self, repository: Uuid) -> PathBuf {
         let id = simple(repository);
         self.root
             .join("repositories")
@@ -501,6 +501,32 @@ impl Storage {
         Ok(cmd)
     }
 
+    pub fn receive_pack(
+        &self,
+        repository: Uuid,
+        advertise: bool,
+        protocol: Option<&str>,
+        hooks_dir: &Path,
+    ) -> Result<std::process::Command, StorageError> {
+        let path = self.verified_dir(&self.repository_path(repository))?;
+        let mut cmd = crate::git();
+        // Repositories created before hooks existed still run our hooks.
+        if !hooks_dir.as_os_str().is_empty() {
+            cmd.arg("-c")
+                .arg(format!("core.hooksPath={}", hooks_dir.display()));
+        }
+        cmd.arg("receive-pack").arg("--stateless-rpc");
+        if advertise {
+            cmd.arg("--advertise-refs");
+        }
+        cmd.arg(&path);
+        if let Some(proto) = protocol {
+            validate_git_protocol(proto)?;
+            cmd.env("GIT_PROTOCOL", proto);
+        }
+        Ok(cmd)
+    }
+
     pub fn scan(&self) -> Result<Scan, StorageError> {
         let mut repositories = Vec::new();
         let mut malformed = Vec::new();
@@ -642,6 +668,33 @@ pub fn validate_git_protocol(value: &str) -> Result<(), StorageError> {
         }
     }
     Ok(())
+}
+
+/// Current `refs/heads/*` and `refs/tags/*` as `refname -> ObjectId`, for
+/// journal classification.
+pub fn read_refs(repo_path: &Path) -> Result<HashMap<String, ObjectId>, StorageError> {
+    let output = checked(
+        git()
+            .arg("--git-dir")
+            .arg(repo_path)
+            .args(["for-each-ref", "--format=%(objectname) %(refname)"])
+            .args(["refs/heads/", "refs/tags/"])
+            .output()?,
+    )?;
+    let text = String::from_utf8(output)
+        .map_err(|e| StorageError::Invalid(format!("non-UTF-8 ref output: {e}")))?;
+    let mut refs = HashMap::new();
+    for line in text.lines() {
+        let (oid, name) = line
+            .split_once(' ')
+            .ok_or_else(|| StorageError::Invalid("unexpected ref record".into()))?;
+        refs.insert(
+            name.to_owned(),
+            oid.parse()
+                .map_err(|e: githearth_core::InvalidId| StorageError::Invalid(e.to_string()))?,
+        );
+    }
+    Ok(refs)
 }
 
 impl Storage {

@@ -1,0 +1,1482 @@
+//! End-to-end push pipeline tests: real Git clients pushing to the in-process
+//! server, plus journal replay into PostgreSQL (ADR 0003).
+use axum::Router;
+use githearth_git::journal::{Journal, Kind, Record, Update};
+use githearth_git::layout::ObjectFormat;
+use githearth_server::{AppState, MIGRATOR, config::Config, connect, pushes, reconcile, router};
+use sqlx::PgPool;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Git helpers
+// ---------------------------------------------------------------------------
+
+fn git_cmd(args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .env("GIT_SSL_NO_VERIFY", "1")
+        .args(["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=30"])
+        .args(args);
+    cmd
+}
+
+async fn git_run(mut cmd: Command) -> std::process::Output {
+    match tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || cmd.output()),
+    )
+    .await
+    {
+        Ok(Ok(Ok(out))) => out,
+        Ok(Ok(Err(e))) => panic!("git command failed to launch: {e}"),
+        Ok(Err(_)) => panic!("spawn_blocking join error"),
+        Err(_) => panic!("git command timed out after 60 s"),
+    }
+}
+
+async fn git_ok(cmd: Command) {
+    let out = git_run(cmd).await;
+    assert!(
+        out.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+async fn git_output(cmd: Command) -> String {
+    let out = git_run(cmd).await;
+    assert!(
+        out.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// Seed a bare repo with the commit at a work tree's HEAD, bypassing hooks.
+async fn seed_bare(repo_path: &str, work_dir: &str, refspec: &str) {
+    git_ok(git_cmd(&[
+        "--git-dir",
+        repo_path,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        work_dir,
+        refspec,
+    ]))
+    .await;
+}
+
+fn tag(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::new_v4().simple())
+}
+
+fn basic_auth(user: &str, pass: &str) -> String {
+    use base64::Engine;
+    let cred = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    format!("Basic {cred}")
+}
+
+// ---------------------------------------------------------------------------
+// Database fixtures
+// ---------------------------------------------------------------------------
+
+async fn fixture_account(pool: &PgPool, username: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused') RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn set_password(pool: &PgPool, account: Uuid, password: &str) {
+    let hash = githearth_server::hash_password(password).unwrap();
+    sqlx::query("UPDATE accounts SET password_hash=$1 WHERE id=$2")
+        .bind(hash)
+        .bind(account)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn fixture_organization(pool: &PgPool, owner: Uuid) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let slug = tag("org");
+    sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')")
+        .bind(id)
+        .bind(&slug)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'owner')")
+        .bind(id)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'owner','account',$2,'organization',$3,$2)")
+        .bind(Uuid::new_v4())
+        .bind(owner)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    (id, slug)
+}
+
+async fn create_active_repo(pool: &PgPool, org_id: Uuid, name: &str, owner: Uuid) -> Uuid {
+    let repo_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) VALUES ($1,$2,$3,$4,$5,'active','private')")
+        .bind(repo_id)
+        .bind(org_id)
+        .bind(name)
+        .bind(owner)
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await
+        .unwrap();
+    repo_id
+}
+
+async fn member_with_repo_grant(
+    pool: &PgPool,
+    org_id: Uuid,
+    repo_id: Uuid,
+    role: &str,
+) -> (Uuid, String) {
+    let account = fixture_account(pool, &tag("user")).await;
+    set_password(pool, account, "testpass").await;
+    let username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(account)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(account)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,repository_id,granted_by) VALUES ($1,$2,'account',$3,'repository',$4,$5,$3)")
+        .bind(Uuid::new_v4())
+        .bind(role)
+        .bind(account)
+        .bind(org_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    (account, username)
+}
+
+// ---------------------------------------------------------------------------
+// Fixture
+// ---------------------------------------------------------------------------
+
+struct Fixture {
+    app: Router,
+    state: AppState,
+    pool: PgPool,
+    storage_root: PathBuf,
+    username: String,
+    org_slug: String,
+    repo_name: String,
+    repo_id: Uuid,
+    repo_path: PathBuf,
+    base_commit: String,
+    port: u16,
+}
+
+impl Fixture {
+    fn url(&self) -> String {
+        format!(
+            "http://{}:testpass@127.0.0.1:{}/{}/{}.git",
+            self.username, self.port, self.org_slug, self.repo_name
+        )
+    }
+
+    fn repo_path_str(&self) -> &str {
+        self.repo_path.to_str().unwrap()
+    }
+}
+
+async fn setup(git_push_limit_bytes: usize) -> Fixture {
+    setup_with_concurrency(git_push_limit_bytes, 8).await
+}
+
+async fn setup_with_concurrency(git_push_limit_bytes: usize, git_concurrency: usize) -> Fixture {
+    let storage_root = std::env::temp_dir().join(format!("githearth-push-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
+        git_push_limit_bytes,
+        git_concurrency,
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let owner = fixture_account(&pool, &tag("owner")).await;
+    set_password(&pool, owner, "testpass").await;
+    let username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (org_id, org_slug) = fixture_organization(&pool, owner).await;
+    let repo_name = tag("repo");
+    let repo_id = create_active_repo(&pool, org_id, &repo_name, owner).await;
+
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let repo_path = state
+        .storage
+        .create(repo_id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+
+    // Seed one commit on main without running the hooks.
+    let work = std::env::temp_dir().join(format!("githearth-push-seed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+    std::fs::write(work.join("README.md"), "# Hello\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "README.md"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "initial",
+    ]))
+    .await;
+    let base_commit = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    seed_bare(repo_path.to_str().unwrap(), tw, "main:refs/heads/main").await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    let app = router(state.clone());
+    let port = find_port_and_serve(&app).await;
+
+    Fixture {
+        app,
+        state,
+        pool,
+        storage_root,
+        username,
+        org_slug,
+        repo_name,
+        repo_id,
+        repo_path,
+        base_commit,
+        port,
+    }
+}
+
+async fn find_port_and_serve(app: &Router) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    port
+}
+
+fn cleanup(storage_root: &Path) {
+    let _ = std::fs::remove_dir_all(storage_root);
+}
+
+fn journal_records(repo_path: &Path) -> Vec<Record> {
+    Journal::open(repo_path)
+        .unwrap()
+        .records_after(0)
+        .cloned()
+        .collect()
+}
+
+/// The server applies a committed push after git exits (stage 7); wait for the
+/// high-water mark to catch up before asserting on metadata.
+async fn wait_for_journal_applied(pool: &PgPool, repo_id: Uuid, min: i64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        if ja >= min {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "journal_applied {ja} never reached {min}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metadata / journal assertions
+// ---------------------------------------------------------------------------
+
+async fn assert_push_metadata(pool: &PgPool, repo_id: Uuid, expected_pushes: i64) {
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, expected_pushes, "repository_pushes count");
+    let rc: i64 = sqlx::query_scalar("SELECT count(*) FROM ref_updates WHERE repository_id=$1")
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(rc >= expected_pushes, "ref_updates count {rc}");
+    let ac: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE kind='repository.pushed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(ac >= expected_pushes, "audit_events count {ac}");
+    let oc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox_events WHERE kind='repository.pushed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(oc >= expected_pushes, "outbox_events count {oc}");
+    let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(ja > 0, "journal_applied must advance");
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn push_new_branch_fast_forward_tag_and_clone_back() {
+    let fx = setup(1 << 30).await;
+
+    // Clone over HTTP.
+    let clone = std::env::temp_dir().join(format!("git-push-clone-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // New branch.
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "feature"])).await;
+    std::fs::write(clone.join("FEATURE.md"), "# feature\n").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "FEATURE.md"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "feature",
+    ]))
+    .await;
+    let feature_sha = git_output(git_cmd(&["-C", cd, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
+
+    // Fast-forward main.
+    git_ok(git_cmd(&["-C", cd, "checkout", "main"])).await;
+    std::fs::write(clone.join("MAIN.md"), "# main\n").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "MAIN.md"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "main",
+    ]))
+    .await;
+    let main_sha = git_output(git_cmd(&["-C", cd, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+
+    // Tag.
+    git_ok(git_cmd(&["-C", cd, "tag", "v1"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "v1"])).await;
+
+    // Clone back and compare.
+    let clone2 = std::env::temp_dir().join(format!("git-push-clone2-{}", Uuid::new_v4()));
+    let cd2 = clone2.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd2])).await;
+    assert_eq!(
+        git_output(git_cmd(&["-C", cd2, "rev-parse", "HEAD"])).await,
+        main_sha
+    );
+    assert_eq!(
+        git_output(git_cmd(&["-C", cd2, "rev-parse", "origin/feature"])).await,
+        feature_sha
+    );
+    assert_eq!(
+        git_output(git_cmd(&["-C", cd2, "rev-parse", "v1"])).await,
+        main_sha
+    );
+
+    assert_push_metadata(&fx.pool, fx.repo_id, 3).await;
+
+    // Journal has prepared+committed pairs.
+    let records = journal_records(&fx.repo_path);
+    let prepared = records.iter().filter(|r| r.kind == Kind::Prepared).count();
+    let committed = records.iter().filter(|r| r.kind == Kind::Committed).count();
+    assert!(prepared >= 3, "prepared records: {prepared}");
+    assert_eq!(prepared, committed, "one marker per prepared record");
+
+    let _ = std::fs::remove_dir_all(&clone);
+    let _ = std::fs::remove_dir_all(&clone2);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn force_push_and_delete_allowed_for_owner() {
+    let fx = setup(1 << 30).await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-ff-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // Build a commit, then rewind and force-push it.
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "wip"])).await;
+    std::fs::write(clone.join("a"), "a").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "a"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "wip1",
+    ]))
+    .await;
+    let wip1 = git_output(git_cmd(&["-C", cd, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "wip"])).await;
+
+    git_ok(git_cmd(&["-C", cd, "reset", "--hard", "HEAD~1"])).await;
+    let wip2 = git_output(git_cmd(&["-C", cd, "rev-parse", "HEAD"])).await;
+    assert_ne!(wip1, wip2);
+    git_ok(git_cmd(&["-C", cd, "push", "--force", "origin", "wip"])).await;
+
+    // Delete the branch.
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "--delete", "wip"])).await;
+
+    // Packed-refs deletion: journal the deletion exactly once, not the
+    // zero-to-zero packed-refs half-transaction Git also reports.
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "packed"])).await;
+    std::fs::write(clone.join("p"), "p").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "p"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "p",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "packed"])).await;
+    git_ok(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "pack-refs",
+        "--all",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "--delete", "packed"])).await;
+
+    // Wait for the stage-7 metadata apply of the last push.
+    wait_for_journal_applied(&fx.pool, fx.repo_id, 10).await;
+
+    // Force push and delete were allowed; both journaled as committed.
+    let records = journal_records(&fx.repo_path);
+    let committed = records.iter().filter(|r| r.kind == Kind::Committed).count();
+    assert!(
+        committed >= 3,
+        "force push + two deletes all committed; got {committed}"
+    );
+    let deletes: Vec<&Record> = records
+        .iter()
+        .filter(|r| {
+            r.kind == Kind::Prepared && r.updates.iter().any(|u| u.new.bytes().all(|b| b == b'0'))
+        })
+        .collect();
+    assert_eq!(deletes.len(), 2, "each deletion journaled exactly once");
+
+    // Each deletion leaves one ref_updates row with an all-zero new oid.
+    let del_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ref_updates WHERE repository_id=$1 AND new_oid ~ '^0+$'",
+    )
+    .bind(fx.repo_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(del_rows, 2, "two all-zero ref_updates rows");
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn read_only_user_push_denied_and_ref_unchanged() {
+    let fx = setup(1 << 30).await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    let (_reader, username) = member_with_repo_grant(&fx.pool, org_id, fx.repo_id, "read").await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-ro-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    let url = format!(
+        "http://{username}:testpass@127.0.0.1:{}/{}/{}.git",
+        fx.port, fx.org_slug, fx.repo_name
+    );
+    git_ok(git_cmd(&["clone", "--", &url, cd])).await;
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "feature"])).await;
+    std::fs::write(clone.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
+    assert!(!out.status.success(), "read-only push must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("permission denied: ref.push"),
+        "reason relayed as remote: {stderr}"
+    );
+
+    // Nothing journaled as committed.
+    assert!(journal_records(&fx.repo_path).is_empty());
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 0);
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn writer_can_push_force_push_and_delete_per_policy() {
+    // The authz engine puts ref.push, ref.force_push and ref.delete all in the
+    // "write" group; Basic push counts as fresh authentication, so a plain
+    // write grant admits force pushes and deletions too.
+    let fx = setup(1 << 30).await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    let (_writer, username) = member_with_repo_grant(&fx.pool, org_id, fx.repo_id, "write").await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-writer-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    let url = format!(
+        "http://{username}:testpass@127.0.0.1:{}/{}/{}.git",
+        fx.port, fx.org_slug, fx.repo_name
+    );
+    git_ok(git_cmd(&["clone", "--", &url, cd])).await;
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "wip"])).await;
+    std::fs::write(clone.join("a"), "a").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "a"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "wip1",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "wip"])).await;
+    git_ok(git_cmd(&["-C", cd, "reset", "--hard", "HEAD~1"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "--force", "origin", "wip"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "--delete", "wip"])).await;
+
+    let records = journal_records(&fx.repo_path);
+    let committed = records.iter().filter(|r| r.kind == Kind::Committed).count();
+    assert!(
+        committed >= 3,
+        "push + force push + delete committed; got {committed}"
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn receive_pack_concurrency_exhausted_503() {
+    let fx = setup_with_concurrency(1 << 30, 1).await;
+
+    use axum::{body::Body, http::Request};
+    let _held = fx.state.git_slots.clone().try_acquire_owned().unwrap();
+    let response = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/{}/{}.git/git-receive-pack",
+                fx.org_slug, fx.repo_name
+            ))
+            .header("authorization", basic_auth(&fx.username, "testpass"))
+            .header("content-type", "application/x-git-receive-pack-request")
+            .body(Body::from(Vec::<u8>::new()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn no_credentials_401_and_unrelated_user_404() {
+    let fx = setup(1 << 30).await;
+
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+
+    // No credentials: 401 with WWW-Authenticate on the advertise.
+    let response = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/{}/{}.git/info/refs?service=git-receive-pack",
+                fx.org_slug, fx.repo_name
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert!(response.headers().contains_key("www-authenticate"));
+
+    // Unrelated user: 404.
+    let stranger = fixture_account(&fx.pool, &tag("stranger")).await;
+    set_password(&fx.pool, stranger, "strangerpass").await;
+    let stranger_username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(stranger)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    let response = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/{}/{}.git/info/refs?service=git-receive-pack",
+                fx.org_slug, fx.repo_name
+            ))
+            .header(
+                "authorization",
+                basic_auth(&stranger_username, "strangerpass"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    let _ = response.into_body().collect().await;
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn archived_repository_push_denied() {
+    let fx = setup(1 << 30).await;
+    sqlx::query("UPDATE repositories SET archived = true WHERE id = $1")
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let clone = std::env::temp_dir().join(format!("git-push-arch-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "feature"])).await;
+    std::fs::write(clone.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("permission denied: ref.push"));
+    assert!(journal_records(&fx.repo_path).is_empty());
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn foreign_ref_namespace_denied() {
+    let fx = setup(1 << 30).await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-foreign-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    std::fs::write(clone.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let sha = git_output(git_cmd(&["-C", cd, "rev-parse", "HEAD"])).await;
+
+    let out = git_run(git_cmd(&[
+        "-C",
+        cd,
+        "push",
+        "origin",
+        &format!("{sha}:refs/notes/commits"),
+    ]))
+    .await;
+    assert!(!out.status.success(), "foreign ref push must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("read-only") || stderr.contains("ref namespace"),
+        "reason: {stderr}"
+    );
+    assert!(journal_records(&fx.repo_path).is_empty());
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn atomic_and_non_atomic_multi_ref_one_record_per_transaction() {
+    let fx = setup(1 << 30).await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-atomic-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "b1"])).await;
+    std::fs::write(clone.join("x"), "1").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "x"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "b1",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "checkout", "main"])).await;
+    git_ok(git_cmd(&["-C", cd, "checkout", "-b", "b2"])).await;
+    std::fs::write(clone.join("y"), "2").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "y"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "b2",
+    ]))
+    .await;
+
+    // Non-atomic: two transactions, two prepared records (one update each).
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "b1", "b2"])).await;
+    let non_atomic = journal_records(&fx.repo_path);
+    let prepared_two: Vec<&Record> = non_atomic
+        .iter()
+        .filter(|r| r.kind == Kind::Prepared)
+        .collect();
+    assert_eq!(prepared_two.len(), 2, "non-atomic: one prepared per ref");
+    assert!(prepared_two.iter().all(|r| r.updates.len() == 1));
+
+    // Atomic: one transaction holding both refs (new commits force a real update).
+    git_ok(git_cmd(&["-C", cd, "checkout", "b1"])).await;
+    std::fs::write(clone.join("x"), "1b").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "b1b",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "checkout", "b2"])).await;
+    std::fs::write(clone.join("y"), "2b").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        "b2b",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C", cd, "push", "--atomic", "origin", "b1", "b2",
+    ]))
+    .await;
+    let atomic = journal_records(&fx.repo_path);
+    let prepared_after: Vec<&Record> = atomic.iter().filter(|r| r.kind == Kind::Prepared).collect();
+    assert_eq!(prepared_after.len(), 3, "atomic added one prepared record");
+    let atomic_record = prepared_after.last().unwrap();
+    assert_eq!(
+        atomic_record.updates.len(),
+        2,
+        "atomic transaction holds both refs"
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+
+/// Build a child commit on top of the bare repo's `main` and fetch it in.
+async fn make_child(fx: &Fixture) -> (String, String) {
+    let work = std::env::temp_dir().join(format!("git-push-child-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("child"), "child").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "child"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "child",
+    ]))
+    .await;
+    let child = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    seed_bare(fx.repo_path_str(), tw, "main:refs/heads/main").await;
+    let _ = std::fs::remove_dir_all(&work);
+    (fx.base_commit.clone(), child)
+}
+
+async fn append_prepared(fx: &Fixture, actor: Uuid, old: &str, new: &str) -> u64 {
+    let mut journal = Journal::open(&fx.repo_path).unwrap();
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            Some(actor),
+            vec![Update {
+                old: old.to_owned(),
+                new: new.to_owned(),
+                reference: "refs/heads/main".into(),
+            }],
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replay_prepared_only_refs_at_new_applies_and_appends_marker() {
+    let fx = setup(1 << 30).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+
+    let (old, new) = make_child(&fx).await; // refs now at new
+    append_prepared(&fx, owner_id, &old, &new).await;
+
+    let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!(summary.committed, 1);
+
+    let records = journal_records(&fx.repo_path);
+    assert!(records.iter().any(|r| r.kind == Kind::Committed));
+
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 1);
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replay_prepared_only_refs_at_old_appends_aborted_marker() {
+    let fx = setup(1 << 30).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+
+    // Build a child commit but leave the ref at the old value.
+    let work = std::env::temp_dir().join(format!("git-push-old-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("child"), "child").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "child"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "child",
+    ]))
+    .await;
+    let new = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    // Fetch the object but keep the ref at old.
+    git_ok(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        tw,
+        "main:refs/remotes/tmp/child",
+    ]))
+    .await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    append_prepared(&fx, owner_id, &fx.base_commit, &new).await;
+    let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!(summary.aborted, 1);
+
+    let records = journal_records(&fx.repo_path);
+    assert!(records.iter().any(|r| r.kind == Kind::Aborted));
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 0, "aborted push must not create metadata");
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replay_marker_lost_does_not_skip_later_records() {
+    let fx = setup(1 << 30).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+
+    // Two branches on top of base: main_child and feature_child.
+    let work = std::env::temp_dir().join(format!("git-push-marker-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("m"), "m").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "m"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let main_child = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&["-C", tw, "checkout", "-b", "feature"])).await;
+    std::fs::write(work.join("f"), "f").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "f",
+    ]))
+    .await;
+    let feature_child = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    seed_bare(fx.repo_path_str(), tw, "main:refs/heads/main").await;
+    seed_bare(fx.repo_path_str(), tw, "feature:refs/heads/feature").await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    // prepared A (marker lost), then prepared B + committed B.
+    let mut journal = Journal::open(&fx.repo_path).unwrap();
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            Some(owner_id),
+            vec![Update {
+                old: fx.base_commit.clone(),
+                new: main_child,
+                reference: "refs/heads/main".into(),
+            }],
+        )
+        .unwrap();
+    let op_b = Uuid::new_v4();
+    journal
+        .append_prepared(
+            op_b,
+            Some(owner_id),
+            vec![Update {
+                old: fx.base_commit.clone(),
+                new: feature_child,
+                reference: "refs/heads/feature".into(),
+            }],
+        )
+        .unwrap();
+    journal.append_marker(op_b, Kind::Committed).unwrap();
+
+    let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!(summary.committed, 2, "both records applied");
+
+    let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ja, 3,
+        "advance stops at the applied records, not the appended marker"
+    );
+
+    let rc: i64 = sqlx::query_scalar("SELECT count(*) FROM ref_updates WHERE repository_id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(rc, 2);
+
+    let second = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!((second.committed, second.aborted), (0, 0));
+    let ja2: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(ja2, 4, "the appended marker is skipped on the next pass");
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replay_diverged_then_next_push_409() {
+    let fx = setup(1 << 30).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+
+    // Mixed: main moved to a child commit, but `feature` is absent — the
+    // prepared record claims both, so classification diverges.
+    let work = std::env::temp_dir().join(format!("git-push-mixed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("x"), "x").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "x"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let main_new = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    // Move main to the child; leave `feature` untouched (it does not exist).
+    seed_bare(fx.repo_path_str(), tw, "main:refs/heads/main").await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    let mut journal = Journal::open(&fx.repo_path).unwrap();
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            Some(owner_id),
+            vec![
+                Update {
+                    old: fx.base_commit.clone(),
+                    new: main_new.clone(),
+                    reference: "refs/heads/main".into(),
+                },
+                Update {
+                    old: fx.base_commit.clone(),
+                    new: main_new,
+                    reference: "refs/heads/feature".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+    let err = pushes::replay(&fx.state, fx.repo_id).await.unwrap_err();
+    assert!(matches!(err, pushes::ReplayError::Diverged { .. }));
+
+    // The reconciler logs the divergence and keeps going.
+    let mut attempts = std::collections::HashMap::new();
+    reconcile::reconcile_once(&fx.state, &mut attempts)
+        .await
+        .unwrap();
+
+    // The next push is refused with 409.
+    let clone = std::env::temp_dir().join(format!("git-push-div-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    std::fs::write(clone.join("f"), "x").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("409") || stderr.contains("needs repair"),
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replay_twice_is_a_noop() {
+    let fx = setup(1 << 30).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+
+    let (old, new) = make_child(&fx).await;
+    append_prepared(&fx, owner_id, &old, &new).await;
+
+    let first = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!(first.committed, 1);
+    let second = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!((second.committed, second.aborted), (0, 0));
+
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 1);
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replay_prepared_plus_aborted_marker_skips() {
+    let fx = setup(1 << 30).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+
+    // Build a child commit but leave the ref at the old value.
+    let work = std::env::temp_dir().join(format!("git-push-ab-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    std::fs::write(work.join("child"), "child").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "child"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "child",
+    ]))
+    .await;
+    let new = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        tw,
+        "main:refs/remotes/tmp/child",
+    ]))
+    .await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    // prepared + aborted marker: classify as Aborted, skip, no metadata.
+    let op = Uuid::new_v4();
+    let mut journal = Journal::open(&fx.repo_path).unwrap();
+    journal
+        .append_prepared(
+            op,
+            Some(owner_id),
+            vec![Update {
+                old: fx.base_commit.clone(),
+                new,
+                reference: "refs/heads/main".into(),
+            }],
+        )
+        .unwrap();
+    journal.append_marker(op, Kind::Aborted).unwrap();
+
+    let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
+    assert_eq!((summary.committed, summary.aborted), (0, 1));
+
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 0, "aborted push creates no metadata");
+    let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(ja, 2, "advanced past prepared and its aborted marker");
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reconciler_replays_pending_and_skips_missing_journal() {
+    let fx = setup(1 << 30).await;
+    let owner_id: Uuid = sqlx::query_scalar("SELECT created_by FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    let (old, new) = make_child(&fx).await;
+    append_prepared(&fx, owner_id, &old, &new).await;
+
+    // An active row with no on-disk directory: its journal open fails and the
+    // pass must keep going.
+    let org_id: Uuid = sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    create_active_repo(&fx.pool, org_id, &tag("no-dir"), owner_id).await;
+
+    let mut attempts = std::collections::HashMap::new();
+    reconcile::reconcile_once(&fx.state, &mut attempts)
+        .await
+        .unwrap();
+
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 1, "reconciler applied the pending push");
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn oversized_push_rejected() {
+    // A tiny push limit: the git pack exceeds it before receive-pack runs.
+    let fx = setup(1024).await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-big-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    // Incompressible bytes: zlib would shrink repetitive data below the limit.
+    let mut data = Vec::with_capacity(64 * 1024);
+    let mut x = 0x9e3779b9u32;
+    while data.len() < 64 * 1024 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        data.extend_from_slice(&x.to_le_bytes());
+    }
+    std::fs::write(clone.join("big"), data).unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "big"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "big",
+    ]))
+    .await;
+
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+    assert!(!out.status.success(), "oversized push must fail");
+    assert!(journal_records(&fx.repo_path).is_empty());
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}

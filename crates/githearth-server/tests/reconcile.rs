@@ -70,7 +70,9 @@ impl TestDb {
     }
 
     async fn drop_db(self) {
-        self.pool.close().await;
+        // close() waits for checked-out connections, and some tests still hold
+        // one here; DROP ... WITH (FORCE) disconnects whatever remains.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.pool.close()).await;
         let mut admin_conn = self.admin_opts.connect().await.unwrap();
         let _ = sqlx::query(&format!("DROP DATABASE \"{}\" WITH (FORCE)", self.db_name))
             .execute(&mut admin_conn)
@@ -1061,4 +1063,75 @@ async fn single_connection_pool_no_lock_order_deadlock() {
     assert_eq!(summary.activated, 1);
 
     teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn spawn_runs_initial_pass_and_logs_changes() {
+    let env = setup(30).await;
+    let mut conn = env.pool.acquire().await.unwrap();
+    let row = repositories::insert_creating(
+        &mut conn,
+        env.org,
+        "spawn-pass",
+        env.owner,
+        Uuid::new_v4(),
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
+    backdate(&env.pool, row.id).await;
+    drop(conn);
+
+    let handle = reconcile::spawn(env.state.clone());
+    // The initial pass activates the row; the interval tick then parks the loop.
+    let activated = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut conn = env.pool.acquire().await.unwrap();
+            let status: String = sqlx::query_scalar("SELECT status FROM repositories WHERE id=$1")
+                .bind(row.id)
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            drop(conn);
+            if status == "active" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    handle.abort();
+    let _ = handle.await;
+    assert!(activated.is_ok(), "reconciler did not activate the row");
+    teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn spawn_logs_reconcile_pass_error() {
+    // A lazy pool that never connects: the initial pass fails and is logged,
+    // and the loop keeps going (aborted before the next tick).
+    let storage_root =
+        std::env::temp_dir().join(format!("githearth-reconcile-err-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: "postgres://localhost:1/unused".into(),
+        database_max_connections: 1,
+        database_timeout_seconds: 1,
+        storage_root: storage_root.clone(),
+        ..Config::default()
+    };
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(1))
+        .connect_lazy("postgres://localhost:1/unused")
+        .unwrap();
+    let state = AppState::new(pool, config).await.unwrap();
+    let handle = reconcile::spawn(state);
+    // The pass waits out the pool acquire timeout before it errors and logs.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    handle.abort();
+    let _ = handle.await;
+    let _ = std::fs::remove_dir_all(&storage_root);
 }
