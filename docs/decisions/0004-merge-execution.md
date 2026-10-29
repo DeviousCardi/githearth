@@ -44,7 +44,7 @@ Columns only; A designs the migration and lease columns.
 | `method` | `merge` \| `squash` \| `rebase` \| `ff_only` |
 | `candidate_oid` | Result commit returned by `build_candidate`; A's worker stores it |
 | `policy_generation` | Branch-protection generation the intent was validated against |
-| `checks_approvals_digest` | Hash of the approval/check IDs and the source OID they bound |
+| `checks_approvals_digest` | Hash of `source_oid` plus the IDs of each reviewer's latest non-comment review at `source_oid` (approvals and change requests, so a new change request also makes the intent stale) and the check results |
 | `actor_id` | The merging account |
 | `state` | See state machine below |
 | lease columns | A's claim fence (holder, attempt, expires) for the queue |
@@ -52,6 +52,7 @@ Columns only; A designs the migration and lease columns.
 State machine: `queued → validating → executing → merged | conflicted | stale | failed | cancelled`.
 
 - A performs `queued → validating`, `validating → executing` (its worker), and `* → cancelled` (queue cancellation before commit).
+- `pull_requests.state` gains `merged` (with `merged_at`) in A's intent migration; `record_merge_result` sets it in the same transaction as the intent.
 - `→ merged` happens only through `record_merge_result` (from `execute_intent` or the reconciler). A's worker applies `executing → conflicted | stale | failed` from the returned outcome; `AlreadyMerged` needs no transition.
 - `cancelled` is refused once the intent is `executing`; cancellation after that point loses to a ref commit.
 
@@ -63,16 +64,17 @@ The server checks Git ≥ 2.38 at startup for these (2.43 is in use). `git repla
 | --- | --- |
 | Merge commit | `git merge-tree --write-tree <target> <source>` for the tree; `git commit-tree <tree> -p <target> -p <source>` |
 | Squash | Same tree as merge commit; `git commit-tree <tree> -p <target>` with the PR title/body as the message |
-| Rebase (cherry-pick sequence) | For each commit `C` in `git rev-list --reverse target..source`, `git merge-tree --write-tree --merge-base=C^ <previous> C` (with `<previous>` starting at the target tip), then `git commit-tree <tree> -p <previous>`. A range containing a merge commit is refused (`Failed`, "cannot rebase merge commits"); a commit whose result tree equals its parent's is dropped |
+| Rebase (cherry-pick sequence) | For each commit `C` in `git rev-list --reverse target..source`, `git merge-tree --write-tree --merge-base=C^ <previous> C` (with `<previous>` starting at the target tip), then `git commit-tree <tree> -p <previous>`. A range containing a merge commit is refused (`Failed`, "cannot rebase merge commits"); a commit whose result tree equals its parent's is dropped, which also drops intentionally empty commits |
 | Fast-forward only | No new object; `source_oid` is the new target value, accepted only when `target_oid` is an ancestor of `source_oid` |
 
-Committer identity is the configured server identity. The merging actor authors merge commits; squash commits are authored by the merging actor in M3 (see open items); each rebased commit keeps its original author, author date and message. `build_candidate` receives every identity and timestamp from the caller, so it never reads configuration or the clock. A conflict makes `build_candidate` return the conflicting paths; the intent goes `conflicted`, no ref changes, and the paths are reported. Candidate objects are unreferenced until the ref moves and are left to scheduled maintenance: the scheduled GC never prunes objects unreferenced for less than 48 hours (configurable, and longer than any intent's queue lifetime), so a candidate survives the execute window and a crash recovery.
+Committer identity is the configured server identity. The merging actor authors merge commits; the squash author is set by A (see open items); each rebased commit keeps its original author, author date and message. `build_candidate` receives every identity and timestamp from the caller, so it never reads configuration or the clock. A conflict makes `build_candidate` return the conflicting paths; the intent goes `conflicted`, no ref changes, and the paths are reported. Candidate objects are unreferenced until the ref moves and are left to scheduled maintenance: the scheduled GC never prunes objects unreferenced for less than 48 hours (configurable, and longer than any intent's queue lifetime), so a candidate survives the execute window and a crash recovery.
 
 ## Execution
 
 Under the per-repository lock (`Storage::repository_lock`, acquired before any pool connection), `execute_intent`:
 
 1. Re-reads the intent and revalidates every fact it recorded:
+   - the pull request still open, and its source and target branches still equal the intent's `source_ref` and `target_ref` (A cancels `queued` intents when a PR closes, but that can race a worker already `executing`, so this check sits under the lock);
    - target still at `expected_target_oid`, source still at `source_oid`;
    - `policy_generation` unchanged;
    - actor still authorized (`pull_request.merge` through the Cedar engine with merge facts for the exact head/target OIDs);
@@ -80,13 +82,15 @@ Under the per-repository lock (`Storage::repository_lock`, acquired before any p
 2. Reuses the stored `candidate_oid` when its first parent is the current target tip, otherwise builds a new one. Candidate OIDs include commit timestamps, so a rebuilt candidate is a different OID; nothing in M3 binds to candidate OIDs (see below).
 3. Runs `git update-ref --stdin` with `update <target_ref> <candidate_oid> <expected_target_oid>` (`<source_oid>` for ff-only), launched with `core.hooksPath` and the environment carrying `GITHEARTH_OPERATION`, `GITHEARTH_ACTOR` and `GITHEARTH_MERGE=1`. The `reference-transaction` hook's environment guard changes to require only operation and actor; the socket and token stay required for `pre-receive`, which `update-ref` never runs. The hook journals the transaction exactly as for a push, so a merge ref change is durable before `update-ref` returns success.
 
-No `pre-receive` runs for merges: policy was decided at revalidation. This is equivalent because the server computed the exact ref update itself and holds the per-repository lock that serializes every ref writer, including `receive-pack` pushes; no other writer can move the target between the decision and the ref commit, so a second policy decision at commit time would evaluate the same facts and cannot change the outcome. The `reference-transaction` hook that does run is journaling, not policy.
+No `pre-receive` runs for merges: policy was decided at revalidation. This is equivalent because the server computed the exact ref update itself and holds the per-repository lock that serializes every ref writer, including `receive-pack` pushes (`git_http` takes the same lock before `receive-pack` touches any ref); no other writer can move the target between the decision and the ref commit, so a second policy decision at commit time would evaluate the same facts and cannot change the outcome. The `reference-transaction` hook that does run is journaling, not policy.
+
+`Storage::repository_lock` is an in-process `tokio::sync::Mutex`, so this argument holds for one server process. M5 (several gateways) must replace it with a fenced, cross-process lock: expected-old still prevents a double merge across processes, but policy-at-revalidation would no longer be equivalent to a commit-time decision.
 
 ## Stale authorization and checks
 
-In M3, checks and approvals bind to code by the source head OID only. Binding checks to a tested candidate (merge queue) needs deterministic or persisted candidates and is decided with the queue increment.
+In M3, checks and approvals bind to code by the source head OID only. Until a check system exists (M6), "no checks recorded" means `checks_passed = false`, so a rule with `require_checks` refuses every merge rather than passing silently. Binding checks to a tested candidate (merge queue) needs deterministic or persisted candidates and is decided with the queue increment.
 
-- Target moved (`expected_target_oid` mismatch), source unchanged: approvals/checks still bind to the same source code, so no new approval is required; only a recomputed candidate against the new target tip is needed. The intent goes `stale` and the queue re-drives it with the new `expected_target_oid`, unless branch protection requires the source to be up to date with the target, in which case the author must update the branch.
+- Target moved (`expected_target_oid` mismatch), source unchanged: approvals/checks still bind to the same source code, so no new approval is required; only a recomputed candidate against the new target tip is needed. The intent goes `stale` and the queue re-drives it with the new `expected_target_oid`, unless branch protection requires the source to be up to date with the target (a future `require_up_to_date` rule flag, which A adds with merge intents; #30 has no such flag yet), in which case the author must update the branch.
 - Source moved (`source_oid` mismatch): existing approvals/checks do not bind to the new head; new approvals/checks are required, and the intent goes `stale`.
 - Revocation race (admission rule): authorization is evaluated at revalidation under the lock. A grant, approval or check revocation that commits after that point does not stop that one ref transaction; it applies to every later admission, exactly as in ADR 0003's push acknowledgement boundary.
 
@@ -129,5 +133,5 @@ The merge's prepared record gains an optional `origin` field, `"merge"`, copied 
 - Fork contributions: cross-repository source refs; M3 merges same-repository refs only (phase 4/5).
 - Merge queue batching: rebasing/retesting each queued PR against the previous one (phase 4/5).
 - Code owners as an approval source (phase 4/5).
-- Squash commit author: the merging actor in M3; crediting the pull request author (and co-authors) is A's decision with the PR model.
+- Squash commit author: A's decision is the pull request author as author, with the merging actor recorded in a trailer; settled when A builds the intent.
 - Binding checks to tested candidates for the merge queue (see Stale authorization and checks).
