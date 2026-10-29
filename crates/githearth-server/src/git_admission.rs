@@ -22,6 +22,7 @@ pub struct Admitted {
     pub organization: Uuid,
     pub repository: RepositoryRow,
     pub facts: crate::facts::Facts,
+    pub rules: Vec<crate::protection::ProtectionRule>,
 }
 
 impl std::fmt::Debug for Admitted {
@@ -162,11 +163,16 @@ pub async fn admit(
         }
     }
 
+    let rules = crate::protection::load_rules(&mut conn, repo.id)
+        .await
+        .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?;
+
     Ok(Admitted {
         account: account_id,
         organization: org_id,
         repository: repo,
         facts,
+        rules,
     })
 }
 
@@ -184,11 +190,15 @@ pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, A
         .map_err(unavailable)?
         .filter(|r| r.status == githearth_core::RepositoryStatus::Active)
         .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    let rules = crate::protection::load_rules(&mut conn, admitted.repository.id)
+        .await
+        .map_err(unavailable)?;
     Ok(Admitted {
         account: admitted.account,
         organization: admitted.organization,
         repository,
         facts,
+        rules,
     })
 }
 
@@ -217,7 +227,7 @@ pub fn decide_ref(
     let reference = Ref {
         repository: admitted.repository.id,
         name: update.reference.clone(),
-        protection: None,
+        protection: crate::protection::matching(&admitted.rules, &update.reference),
     };
     let decision = state.authz.authorize(&admitted.facts.request(
         action,
@@ -229,7 +239,24 @@ pub fn decide_ref(
         return Ok(());
     }
 
+    // The deny reason names the policy id that refused the update. Branch
+    // protection forbids report their own ids, which map to clearer reasons;
+    // everything else keeps the existing `permission denied:` strings.
+    let denied_by = |id: &str| match &decision {
+        githearth_authz::Decision::Deny(reasons) => reasons.iter().any(|r| r == id),
+        _ => false,
+    };
     let reason = match action {
+        _ if denied_by("protected-no-force-push")
+            || denied_by("protected-requires-pull-request") =>
+        {
+            if action == Action::RefForcePush {
+                "protected branch: ref.force_push"
+            } else {
+                "protected branch: ref.push"
+            }
+        }
+        _ if denied_by("protected-no-deletion") => "protected branch: ref.delete",
         Action::RefDelete => "permission denied: ref.delete",
         Action::RefForcePush => "permission denied: ref.force_push",
         _ => "permission denied: ref.push",
@@ -317,6 +344,7 @@ mod tests {
                 grants,
                 organization,
             },
+            rules: vec![],
         }
     }
 
