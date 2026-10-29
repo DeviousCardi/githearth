@@ -298,7 +298,11 @@ async fn enforce_read_only_boundary(
     };
     match authenticate_credential(&state.pool, Credential::AccessToken { token_hash }).await {
         Ok((account, _)) if account.is_read_only() => read_only_denied().into_response(),
-        _ => next.run(request).await,
+        Ok((_account, _)) => next.run(request).await,
+        // A lookup failure (pool timeout, dropped database, a failed
+        // `last_used_at` refresh) must fail closed: never run the handler,
+        // or a transient error would let a read-only token's write through.
+        Err(e) => e.into_response(),
     }
 }
 

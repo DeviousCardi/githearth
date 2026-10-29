@@ -294,6 +294,50 @@ async fn read_token_can_read_but_not_write() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn read_only_boundary_fails_closed_when_lookup_errors() {
+    let (pool, app) = api_pool().await;
+    let username = tag("user");
+    fixture_account(&pool, &username, "correct horse battery staple").await;
+    let session = login(&app, &username, "correct horse battery staple").await;
+    let (_id, token) = create_token(&app, &session, &["repo:read"], None).await;
+
+    // Break the middleware lookup: closing the pool makes
+    // `authenticate_access_token` error, so the boundary must refuse the write
+    // instead of falling through to the handler.
+    pool.close().await;
+
+    let slug = tag("blocked-org");
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v1/organizations",
+        Some(&token),
+        json!({"slug": slug, "name": "Blocked"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    // Reconnect to prove the write was never applied.
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: std::env::temp_dir().join(format!("githearth-tok-{}", Uuid::new_v4())),
+        ..Config::default()
+    };
+    let check = connect(&config).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM organizations WHERE slug = $1")
+        .bind(&slug)
+        .fetch_one(&check)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    check.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn read_token_blocked_from_pulls_reviews_and_protection() {
     let (pool, app) = api_pool().await;
     let username = tag("user");
