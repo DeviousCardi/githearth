@@ -8,6 +8,7 @@ pub mod git_hooks;
 pub mod git_http;
 pub mod idempotency;
 pub mod issues;
+mod issues_ui;
 pub mod pushes;
 pub mod reconcile;
 pub mod repositories;
