@@ -8,8 +8,9 @@ pub mod git_hooks;
 pub mod git_http;
 pub mod idempotency;
 pub mod issues;
-pub mod pulls;
 mod issues_ui;
+pub mod pulls;
+mod pulls_ui;
 pub mod pushes;
 pub mod reconcile;
 pub mod repositories;
@@ -289,6 +290,9 @@ impl IntoResponse for ApiError {
 impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         self.0
+    }
+    pub fn message(&self) -> &'static str {
+        self.1
     }
 }
 impl From<sqlx::Error> for ApiError {

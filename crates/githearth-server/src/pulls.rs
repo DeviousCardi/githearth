@@ -155,10 +155,12 @@ pub(crate) struct ReviewJson {
 }
 
 async fn fetch_pull(conn: &mut PgConnection, id: Uuid) -> Result<Option<PullJson>, sqlx::Error> {
-    sqlx::query_as(&format!("SELECT {PULL_COLUMNS} FROM pull_requests WHERE id = $1"))
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await
+    sqlx::query_as(&format!(
+        "SELECT {PULL_COLUMNS} FROM pull_requests WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
 }
 
 async fn find_pull(
@@ -255,7 +257,11 @@ type Tips = (Option<String>, Option<String>);
 
 /// Builds the detail on `conn`, so a caller inside a transaction needs no
 /// second connection; `tips` are resolved beforehand, outside it.
-async fn detail(conn: &mut PgConnection, pull: PullJson, tips: Tips) -> Result<PullDetail, ApiError> {
+async fn detail(
+    conn: &mut PgConnection,
+    pull: PullJson,
+    tips: Tips,
+) -> Result<PullDetail, ApiError> {
     let (head_id, base_id) = tips;
     let (approvals, changes_requested) = match &head_id {
         // Each reviewer's latest verdict at this head; comment-only reviews
@@ -317,8 +323,10 @@ async fn create(
     new_pull(&body)?;
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let key = idempotency::extract_key(&headers).transpose()?;
-    let (status, value) =
-        create_pull(&state, actor.id, auth_age, &org_slug, &repo_name, &body, key).await?;
+    let (status, value) = create_pull(
+        &state, actor.id, auth_age, &org_slug, &repo_name, &body, key,
+    )
+    .await?;
     Ok((status, Json(serde_json::from_value(value).unwrap())))
 }
 
@@ -382,7 +390,13 @@ pub(crate) async fn create_pull(
             if inserted.rows_affected() == 0 {
                 return Err(already_open());
             }
-            event(&mut tx, Some(loaded.org_id), actor_id, "pull_request.created").await?;
+            event(
+                &mut tx,
+                Some(loaded.org_id),
+                actor_id,
+                "pull_request.created",
+            )
+            .await?;
 
             let pull = fetch_pull(&mut tx, id).await?.unwrap();
             let status = StatusCode::CREATED;
@@ -523,7 +537,10 @@ async fn update(
             .title
             .as_ref()
             .is_some_and(|t| t.trim().is_empty() || t.chars().count() > 256)
-        || input.body.as_ref().is_some_and(|b| b.chars().count() > 65536)
+        || input
+            .body
+            .as_ref()
+            .is_some_and(|b| b.chars().count() > 65536)
         || input
             .state
             .as_ref()
@@ -546,10 +563,9 @@ async fn update(
         &body,
         key,
         |idem| async move {
-            let loaded = repository_api::load_current(
-                state, actor.id, auth_age, &org_slug, &repo_name,
-            )
-            .await?;
+            let loaded =
+                repository_api::load_current(state, actor.id, auth_age, &org_slug, &repo_name)
+                    .await?;
             // Closing, reopening and editing all gate on the same triage action.
             let pull = load_pull(state, &loaded, number, Action::PullRequestClose).await?;
             if loaded.repo.status != RepositoryStatus::Active {
@@ -686,7 +702,9 @@ pub(crate) async fn create_pull_comment(
                 return Err(not_active());
             }
             if let Some(commit) = &input.commit_id
-                && branch_tip(state, loaded.repo.id, &pull.source_branch).await?.as_ref()
+                && branch_tip(state, loaded.repo.id, &pull.source_branch)
+                    .await?
+                    .as_ref()
                     != Some(commit)
             {
                 return Err(head_moved());
@@ -738,7 +756,13 @@ pub(crate) async fn create_pull_comment(
                 .bind(pull.id)
                 .execute(&mut *tx)
                 .await?;
-            event(&mut tx, Some(loaded.org_id), actor_id, "pull_request.commented").await?;
+            event(
+                &mut tx,
+                Some(loaded.org_id),
+                actor_id,
+                "pull_request.commented",
+            )
+            .await?;
 
             let comment: CommentJson = sqlx::query_as(&format!(
                 "SELECT {COMMENT_COLUMNS} FROM pull_request_comments WHERE id = $1"
@@ -807,9 +831,11 @@ async fn list_comments(
     Query(query): Query<SeqQuery>,
 ) -> Result<Json<Page<CommentJson>>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    list_pull_comments(&state, actor.id, auth_age, &org_slug, &repo_name, number, query)
-        .await
-        .map(Json)
+    list_pull_comments(
+        &state, actor.id, auth_age, &org_slug, &repo_name, number, query,
+    )
+    .await
+    .map(Json)
 }
 
 /// Oldest first, threads flattened; a reply names its parent.
@@ -822,8 +848,10 @@ pub(crate) async fn list_pull_comments(
     number: i32,
     query: SeqQuery,
 ) -> Result<Page<CommentJson>, ApiError> {
-    let (pull, limit) =
-        seq_page_start(state, actor_id, auth_age, org_slug, repo_name, number, &query).await?;
+    let (pull, limit) = seq_page_start(
+        state, actor_id, auth_age, org_slug, repo_name, number, &query,
+    )
+    .await?;
     let mut conn = state.pool.acquire().await?;
     let rows = sqlx::query_as::<_, CommentJson>(&format!(
         "SELECT {COMMENT_COLUMNS} FROM pull_request_comments WHERE pull_request_id = $1 \
@@ -853,8 +881,7 @@ fn new_review(body: &[u8]) -> Result<NewReview, ApiError> {
         "commented" => !input.body.trim().is_empty(),
         _ => false,
     };
-    if !valid_verdict || !valid_commit_id(&input.commit_id) || input.body.chars().count() > 65536
-    {
+    if !valid_verdict || !valid_commit_id(&input.commit_id) || input.body.chars().count() > 65536 {
         return Err(invalid());
     }
     Ok(input)
@@ -892,9 +919,8 @@ pub(crate) async fn create_pull_review(
     key: Option<&str>,
 ) -> Result<(StatusCode, serde_json::Value), ApiError> {
     let input = new_review(body)?;
-    let path_str = format!(
-        "/api/v1/organizations/{org_slug}/repositories/{repo_name}/pulls/{number}/reviews"
-    );
+    let path_str =
+        format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/pulls/{number}/reviews");
 
     idempotency::run(
         &state.pool,
@@ -921,7 +947,9 @@ pub(crate) async fn create_pull_review(
             }
             // A push racing this check leaves a review bound to the commit the
             // reviewer saw, which simply stops counting.
-            if branch_tip(state, loaded.repo.id, &pull.source_branch).await?.as_ref()
+            if branch_tip(state, loaded.repo.id, &pull.source_branch)
+                .await?
+                .as_ref()
                 != Some(&input.commit_id)
             {
                 return Err(head_moved());
@@ -975,9 +1003,11 @@ async fn list_reviews(
     Query(query): Query<SeqQuery>,
 ) -> Result<Json<Page<ReviewJson>>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    list_pull_reviews(&state, actor.id, auth_age, &org_slug, &repo_name, number, query)
-        .await
-        .map(Json)
+    list_pull_reviews(
+        &state, actor.id, auth_age, &org_slug, &repo_name, number, query,
+    )
+    .await
+    .map(Json)
 }
 
 /// Every review in order, stale ones included; `commit_id` says which head
@@ -991,8 +1021,10 @@ pub(crate) async fn list_pull_reviews(
     number: i32,
     query: SeqQuery,
 ) -> Result<Page<ReviewJson>, ApiError> {
-    let (pull, limit) =
-        seq_page_start(state, actor_id, auth_age, org_slug, repo_name, number, &query).await?;
+    let (pull, limit) = seq_page_start(
+        state, actor_id, auth_age, org_slug, repo_name, number, &query,
+    )
+    .await?;
     let mut conn = state.pool.acquire().await?;
     let rows = sqlx::query_as::<_, ReviewJson>(&format!(
         "SELECT {REVIEW_COLUMNS} FROM pull_request_reviews WHERE pull_request_id = $1 \
@@ -1016,8 +1048,27 @@ mod tests {
             assert!(valid_branch(ok), "{ok}");
         }
         for bad in [
-            "", "refs/heads/main", "-x", "a..b", "a~1", "a^", "a@{1}", "@", "a b", "a:b",
-            "x.lock", "/a", "a/", "a//b", "a/.b", ".a", "a.", "a*", "a?", "a[", "a\\b",
+            "",
+            "refs/heads/main",
+            "-x",
+            "a..b",
+            "a~1",
+            "a^",
+            "a@{1}",
+            "@",
+            "a b",
+            "a:b",
+            "x.lock",
+            "/a",
+            "a/",
+            "a//b",
+            "a/.b",
+            ".a",
+            "a.",
+            "a*",
+            "a?",
+            "a[",
+            "a\\b",
         ] {
             assert!(!valid_branch(bad), "{bad}");
         }
@@ -1029,13 +1080,27 @@ mod tests {
         let id = "a".repeat(40);
         let ok = |v: serde_json::Value| new_comment(v.to_string().as_bytes()).is_ok();
         assert!(ok(serde_json::json!({"body": "x"})));
-        assert!(ok(serde_json::json!({"body": "x", "commit_id": id, "path": "a.rs", "line": 3})));
-        assert!(!ok(serde_json::json!({"body": "x", "commit_id": id, "path": "a.rs"})));
-        assert!(!ok(serde_json::json!({"body": "x", "path": "a.rs", "line": 1})));
-        assert!(!ok(serde_json::json!({"body": "x", "commit_id": id.to_uppercase(), "path": "a", "line": 1})));
-        assert!(!ok(serde_json::json!({"body": "x", "commit_id": id, "path": "../a", "line": 1})));
-        assert!(!ok(serde_json::json!({"body": "x", "commit_id": id, "path": "a", "line": 0})));
-        assert!(!ok(serde_json::json!({"body": " ", "in_reply_to": Uuid::nil()})));
+        assert!(ok(
+            serde_json::json!({"body": "x", "commit_id": id, "path": "a.rs", "line": 3})
+        ));
+        assert!(!ok(
+            serde_json::json!({"body": "x", "commit_id": id, "path": "a.rs"})
+        ));
+        assert!(!ok(
+            serde_json::json!({"body": "x", "path": "a.rs", "line": 1})
+        ));
+        assert!(!ok(
+            serde_json::json!({"body": "x", "commit_id": id.to_uppercase(), "path": "a", "line": 1})
+        ));
+        assert!(!ok(
+            serde_json::json!({"body": "x", "commit_id": id, "path": "../a", "line": 1})
+        ));
+        assert!(!ok(
+            serde_json::json!({"body": "x", "commit_id": id, "path": "a", "line": 0})
+        ));
+        assert!(!ok(
+            serde_json::json!({"body": " ", "in_reply_to": Uuid::nil()})
+        ));
         assert!(!ok(serde_json::json!({
             "body": "x", "commit_id": id, "path": "a", "line": 1, "in_reply_to": Uuid::nil()
         })));
@@ -1045,11 +1110,23 @@ mod tests {
     fn comment_reviews_need_a_body() {
         let id = "b".repeat(64);
         let ok = |v: serde_json::Value| new_review(v.to_string().as_bytes()).is_ok();
-        assert!(ok(serde_json::json!({"verdict": "approved", "commit_id": id})));
-        assert!(ok(serde_json::json!({"verdict": "changes_requested", "commit_id": id})));
-        assert!(!ok(serde_json::json!({"verdict": "commented", "commit_id": id})));
-        assert!(ok(serde_json::json!({"verdict": "commented", "commit_id": id, "body": "hm"})));
-        assert!(!ok(serde_json::json!({"verdict": "merged", "commit_id": id})));
-        assert!(!ok(serde_json::json!({"verdict": "approved", "commit_id": "main"})));
+        assert!(ok(
+            serde_json::json!({"verdict": "approved", "commit_id": id})
+        ));
+        assert!(ok(
+            serde_json::json!({"verdict": "changes_requested", "commit_id": id})
+        ));
+        assert!(!ok(
+            serde_json::json!({"verdict": "commented", "commit_id": id})
+        ));
+        assert!(ok(
+            serde_json::json!({"verdict": "commented", "commit_id": id, "body": "hm"})
+        ));
+        assert!(!ok(
+            serde_json::json!({"verdict": "merged", "commit_id": id})
+        ));
+        assert!(!ok(
+            serde_json::json!({"verdict": "approved", "commit_id": "main"})
+        ));
     }
 }

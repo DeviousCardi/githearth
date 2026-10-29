@@ -633,7 +633,9 @@ async fn repository(
         }
     }
     browse_section.push_str(&format!(
-        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a></p>",
+        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a></p>",
+        url_encode(&slug),
+        url_encode(&repo.name),
         url_encode(&slug),
         url_encode(&repo.name)
     ));
@@ -674,5 +676,6 @@ pub fn router() -> Router<AppState> {
         .route("/organizations/{slug}/repositories", get(organization))
         .route("/organizations/{slug}/repositories/{name}", get(repository))
         .merge(crate::issues_ui::router())
+        .merge(crate::pulls_ui::router())
         .layer(axum::middleware::map_response(page_headers))
 }

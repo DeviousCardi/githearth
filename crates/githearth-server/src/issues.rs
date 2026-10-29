@@ -135,7 +135,10 @@ fn require_issue(
     }
 }
 
-pub(crate) async fn allocate_number(conn: &mut PgConnection, repository_id: Uuid) -> Result<i32, sqlx::Error> {
+pub(crate) async fn allocate_number(
+    conn: &mut PgConnection,
+    repository_id: Uuid,
+) -> Result<i32, sqlx::Error> {
     sqlx::query_scalar(
         "INSERT INTO issue_counters (repository_id, last) VALUES ($1, 1) \
          ON CONFLICT (repository_id) DO UPDATE SET last = issue_counters.last + 1 \
