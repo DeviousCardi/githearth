@@ -839,7 +839,7 @@ async fn submit_while_the_same_key_is_in_flight_shows_the_409_notice() {
         &[
             ("csrf_token", &token),
             ("idempotency_key", &k),
-            ("title", "double click"),
+            ("title", "in-flight submit"),
             ("body", "kept body"),
         ],
     )
@@ -849,13 +849,18 @@ async fn submit_while_the_same_key_is_in_flight_shows_the_409_notice() {
         page.contains("This form is already being submitted. Reload the page to see the result."),
         "{page}"
     );
-    assert!(page.contains("double click"), "{page}");
+    assert!(page.contains("in-flight submit"), "{page}");
     assert!(page.contains("kept body"), "{page}");
-    let issues: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM issues WHERE title = 'double click'")
-            .fetch_one(&f.pool)
-            .await
-            .unwrap();
+    // Scoped to this fixture's organization: tests share one database and
+    // run in parallel.
+    let issues: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM issues i JOIN repositories r ON r.id = i.repository_id \
+         WHERE r.organization_id = $1",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
     assert_eq!(issues, 0);
 
     finish(f).await;

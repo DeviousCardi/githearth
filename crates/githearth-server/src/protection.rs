@@ -689,6 +689,8 @@ mod tests {
         let (rules, generation) = load_rules_with_generation(&mut conn, repo).await.unwrap();
         assert_eq!((rules.len(), generation), (0, 3));
 
+        // close() waits for every checked-out connection, so return ours first.
+        drop(conn);
         pool.close().await;
     }
 
