@@ -1,4 +1,4 @@
-//! Server-rendered issue and comment pages: list, view and create.
+//! Server-rendered issue and comment pages: list, view, create, edit and close/reopen.
 //!
 //! Pages use the browser session cookie; every form carries the session's
 //! CSRF token. All reads and writes go through the same functions as the JSON
@@ -30,6 +30,14 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/organizations/{slug}/repositories/{name}/issues/{number}",
             get(issue_page),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/issues/{number}/state",
+            axum::routing::post(state_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/issues/{number}/edit",
+            get(edit_page).post(edit_submit),
         )
         .route(
             "/organizations/{slug}/repositories/{name}/issues/{number}/comments",
@@ -428,6 +436,9 @@ async fn render_issue(
     let issue = issues::read_issue(state, s.account.id, s.auth_age, slug, name, number)
         .await
         .map_err(|e| api_error(s, e))?;
+    let readable = issues::can_update(state, s.account.id, s.auth_age, slug, name, number)
+        .await
+        .unwrap_or(false);
     let comments = issues::list_issue_comments(
         state,
         s.account.id,
@@ -476,6 +487,33 @@ async fn render_issue(
             "<a href=\"{base}/issues/{number}?after={next}\" rel=\"next\">More comments</a>"
         ));
     }
+    let controls = if readable {
+        let target_state = if issue.state == "open" {
+            "closed"
+        } else {
+            "open"
+        };
+        let action = if issue.state == "open" {
+            "Close issue"
+        } else {
+            "Reopen issue"
+        };
+        format!(
+            "<p class=\"card\" style=\"padding:.5rem 1rem\">\
+<a href=\"{base}/issues/{number}/edit\">Edit</a> · \
+<form method=\"post\" action=\"{base}/issues/{number}/state\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<input type=\"hidden\" name=\"idempotency_key\" value=\"{}\">\
+<input type=\"hidden\" name=\"state\" value=\"{}\">\
+<button type=\"submit\">{}</button></form></p>",
+            ui::esc(&s.csrf),
+            ui::esc(&new_key()),
+            ui::esc(target_state),
+            ui::esc(action),
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/issues\">Issues</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
@@ -484,7 +522,8 @@ async fn render_issue(
 <h2>Comments</h2>{list}<p>{pager}</p>{error}\
 <form class=\"card\" method=\"post\" action=\"{base}/issues/{number}/comments\">{}\
 <label for=\"comment\">Add a comment</label><textarea id=\"comment\" name=\"body\" rows=\"5\" required style=\"width:100%;box-sizing:border-box\">{}</textarea>\
-<p><button type=\"submit\">Comment</button></p></form>",
+<p><button type=\"submit\">Comment</button></p></form>\
+{controls}",
         ui::esc(name),
         ui::esc(&issue.title),
         ui::esc(&issue.state),
@@ -545,6 +584,175 @@ async fn comment_submit(
         &name,
         number,
         payload.as_bytes(),
+        Some(key),
+    )
+    .await
+    .map_err(|e| api_error(&s, e))?;
+    Ok(Redirect::to(&format!("{}/issues/{number}", repo_href(&slug, &name))).into_response())
+}
+
+#[derive(Deserialize)]
+struct StateForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    #[serde(default)]
+    state: String,
+}
+
+async fn state_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<StateForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    let key = checked_key(&s, &form.idempotency_key)?;
+    if !matches!(form.state.as_str(), "open" | "closed") {
+        return Err(message_page(
+            &s,
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "Check the form and try again.",
+        ));
+    }
+    issues::update_issue(
+        &state,
+        s.account.id,
+        s.auth_age,
+        &slug,
+        &name,
+        number,
+        issues::PatchIssue {
+            title: None,
+            body: None,
+            state: Some(form.state),
+        },
+        Some(key),
+    )
+    .await
+    .map_err(|e| api_error(&s, e))?;
+    Ok(Redirect::to(&format!("{}/issues/{number}", repo_href(&slug, &name))).into_response())
+}
+
+fn edit_form_body(
+    s: &Session,
+    base: &str,
+    number: i32,
+    title: &str,
+    text: &str,
+    key: &str,
+    error: Option<&str>,
+) -> String {
+    let error = error
+        .map(|e| format!("<p class=\"error\" role=\"alert\">{}</p>", ui::esc(e)))
+        .unwrap_or_default();
+    format!(
+        "<nav aria-label=\"Breadcrumb\"><a href=\"{base}/issues\">Issues</a> / <a href=\"{base}/issues/{number}\">#{number}</a> / Edit</nav>\
+<h1>Edit issue <span class=\"muted\">#{number}</span></h1>{error}\
+<form class=\"card\" method=\"post\" action=\"{base}/issues/{number}/edit\">{}\
+<label for=\"title\">Title</label><input id=\"title\" name=\"title\" required maxlength=\"256\" value=\"{}\">\
+<label for=\"body\">Description</label><textarea id=\"body\" name=\"body\" rows=\"8\" style=\"width:100%;box-sizing:border-box\">{}</textarea>\
+<p><button type=\"submit\">Save changes</button></p></form>",
+        form_fields(s, key),
+        ui::esc(title),
+        ui::esc(text),
+    )
+}
+
+async fn edit_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+) -> Result<Response, ui::UiError> {
+    let s = session(&state, &headers).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    let issue = issues::read_issue(&state, s.account.id, s.auth_age, &slug, &name, number)
+        .await
+        .map_err(|e| api_error(&s, e))?;
+    if !issues::can_update(&state, s.account.id, s.auth_age, &slug, &name, number)
+        .await
+        .map_err(|e| api_error(&s, e))?
+    {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    }
+    let base = repo_href(&slug, &name);
+    Ok(page(
+        &s,
+        StatusCode::OK,
+        "Edit issue",
+        &edit_form_body(
+            &s,
+            &base,
+            number,
+            &issue.title,
+            &issue.body,
+            &new_key(),
+            None,
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+struct EditForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn edit_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<EditForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    let key = checked_key(&s, &form.idempotency_key)?;
+    let base = repo_href(&slug, &name);
+    if !title_ok(&form.title) || form.body.chars().count() > 65536 {
+        return Ok(page(
+            &s,
+            StatusCode::BAD_REQUEST,
+            "Edit issue",
+            &edit_form_body(
+                &s,
+                &base,
+                number,
+                &form.title,
+                &form.body,
+                key,
+                Some(
+                    "A title of 1 to 256 characters is required; the description is limited to 65536 characters.",
+                ),
+            ),
+        ));
+    }
+    issues::update_issue(
+        &state,
+        s.account.id,
+        s.auth_age,
+        &slug,
+        &name,
+        number,
+        issues::PatchIssue {
+            title: Some(form.title),
+            body: Some(form.body),
+            state: None,
+        },
         Some(key),
     )
     .await

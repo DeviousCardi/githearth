@@ -123,6 +123,16 @@ fn key(html: &str) -> String {
     hidden(html, "idempotency_key")
 }
 
+/// The idempotency key of the close/reopen form, the only form carrying a
+/// hidden `state` field.
+fn state_key(html: &str) -> String {
+    let marker = "name=\"state\"";
+    let head = &html[..html.find(marker).unwrap()];
+    let key_marker = "name=\"idempotency_key\" value=\"";
+    let start = head.rfind(key_marker).unwrap() + key_marker.len();
+    head[start..].split('"').next().unwrap().to_owned()
+}
+
 /// An account with a browser session; returns (id, username, session token).
 async fn account(pool: &PgPool) -> (Uuid, String, String) {
     let id = Uuid::new_v4();
@@ -611,5 +621,264 @@ async fn resubmitted_forms_do_not_duplicate() {
     .await
     .unwrap();
     assert_eq!(counts, (1, 1, 2));
+    finish(f).await;
+}
+
+/// Creates a `read`-role account (member) that can read, create and comment on
+/// issues but has no write/triage access. Returns the session cookie.
+async fn reader(f: &Fixture) -> String {
+    let (reader, _, reader_token) = account(&f.pool).await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(f.org_id)
+    .bind(reader)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'read','account',$2,'organization',$3,$2)")
+        .bind(Uuid::new_v4())
+        .bind(reader)
+        .bind(f.org_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    format!("githearth_session={reader_token}")
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn close_reopen_and_edit_issues_from_the_ui() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "original", "body": "before"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("Close issue"), "{page}");
+    assert!(page.contains("Edit"), "{page}");
+    assert!(page.contains("original"));
+
+    // Close the issue.
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/state", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &state_key(&page)),
+            ("state", "closed"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some(&*format!("{}/issues/1", f.base)));
+
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("closed"), "{page}");
+    assert!(page.contains("Reopen issue"), "{page}");
+
+    // Reopen it.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/state", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &state_key(&page)),
+            ("state", "open"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("open"), "{page}");
+    assert!(page.contains("Close issue"), "{page}");
+
+    // Edit title and body.
+    let (status, form) = get(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        Some(&f.cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(form.contains("original"), "{form}");
+    assert!(form.contains("before"), "{form}");
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&form)),
+            ("idempotency_key", &key(&form)),
+            ("title", "edited title"),
+            ("body", "edited body"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some(&*format!("{}/issues/1", f.base)));
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("edited title"), "{page}");
+    assert!(page.contains("edited body"), "{page}");
+
+    // The API reports the same final state and audit events.
+    let (_, body) = api(
+        &f.app,
+        "GET",
+        &format!("{}/issues/1", f.api_base),
+        &f.token,
+        json!(null),
+    )
+    .await;
+    assert_eq!(body["state"], "open");
+    assert_eq!(body["title"], "edited title");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND kind IN ('issue.closed','issue.reopened','issue.updated')",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 3);
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn issue_edits_and_state_require_csrf_and_escape_titles() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "t", "body": "b"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // CSRF rejected on both POST endpoints.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/state", f.base),
+        &f.cookie,
+        &[("csrf_token", "wrong"), ("state", "closed")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        &f.cookie,
+        &[("csrf_token", "wrong"), ("title", "x")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A hostile title is escaped on the edit form and the resulting page.
+    let (_, form) = get(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        Some(&f.cookie),
+    )
+    .await;
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&form)),
+            ("idempotency_key", &key(&form)),
+            ("title", "<script>alert('x')</script>"),
+            ("body", "body & <b>text</b>"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    assert!(
+        page.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
+        "{page}"
+    );
+    assert!(!page.contains("<script>alert"), "{page}");
+    assert!(
+        page.contains("body &amp; &lt;b&gt;text&lt;/b&gt;"),
+        "{page}"
+    );
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn issue_edits_and_state_enforce_write_access_and_require_signin() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "locked", "body": "hidden"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A reader (read role, no triage access) sees the issue but no controls.
+    let cookie = reader(&f).await;
+    let (status, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("Close issue"), "{page}");
+    assert!(!page.contains("Reopen issue"), "{page}");
+    assert!(!page.contains("/edit"), "{page}");
+
+    // The edit form page is refused for the reader.
+    let (status, _) = get(&f.app, &format!("{}/issues/1/edit", f.base), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Posting to the state or edit endpoints is refused too.
+    let (_, home) = get(&f.app, "/", Some(&cookie)).await;
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/state", f.base),
+        &cookie,
+        &[
+            ("csrf_token", &csrf(&home)),
+            ("idempotency_key", "r1"),
+            ("state", "closed"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        &cookie,
+        &[
+            ("csrf_token", &csrf(&home)),
+            ("idempotency_key", "r2"),
+            ("title", "x"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An unauthenticated request is redirected to sign-in.
+    let (status, _) = get(&f.app, &format!("{}/issues/1/edit", f.base), None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, _location, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/edit", f.base),
+        "githearth_session=notarealtoken",
+        &[("csrf_token", "x"), ("title", "x")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
     finish(f).await;
 }
