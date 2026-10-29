@@ -139,6 +139,16 @@ The contract covers an uninitialized schema, fresh migration, repeated migration
 
 Migration files are embedded and versioned through SQLx. Never edit an applied migration; add the next version and test upgrading from the previous schema. Back up the database before migrations. M1 has no automatic down migration or backup/restore tooling. Use a dedicated migration owner and a least-privilege application role before production deployment; the local Compose fixture deliberately uses one development database owner.
 
+## M2 verification
+
+The M2 workflow (Git hosting, browsing, issues and recovery) is verified by the executable acceptance harness in [`scripts/verify-m2.py`](../scripts/verify-m2.py), which builds the release binary, drives real `git` clients against a disposable `postgres:17-bookworm` container, and covers push/clone, browsing, issues/comments idempotency, access isolation, crash recovery, restart and the ADR 0003 fresh-restore procedure. Run it with
+
+```bash
+python3 scripts/verify-m2.py --report /tmp/m2-report.json
+```
+
+It prints PASS/FAIL per scenario, exits non-zero on any failure, records whole-workflow resource measurements as JSON, and cleans up its container and temp dirs. Recorded results are in [`docs/verification/m2-workflow.md`](verification/m2-workflow.md).
+
 
 ## Browser login (M2)
 
