@@ -296,6 +296,23 @@ async fn home_lists_orgs_with_cookie() {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
+async fn suspended_account_loses_browser_session_access() {
+    let (app, pool, _db) = setup().await;
+    let cookie = login(&app, "alice", "password123456").await;
+    assert_eq!(get_page(&app, "/", Some(&cookie)).await.0, StatusCode::OK);
+    sqlx::query("UPDATE accounts SET suspended=true WHERE username='alice'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_page(&app, "/", Some(&cookie)).await.0,
+        StatusCode::SEE_OTHER
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
 async fn org_page_lists_readable_repo_and_escapes() {
     let (app, pool, _db) = setup().await;
     let cookie = login(&app, "alice", "password123456").await;
