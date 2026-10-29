@@ -1,0 +1,457 @@
+//! Server-rendered, accessible repository browsing pages.
+//!
+//! Every interpolated value is escaped and every link is URL-encoded. Binary
+//! and truncated files render a notice instead of their content, and diffs
+//! rely on the `+`/`-` text markers, not color alone.
+
+use axum::{
+    Router,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::get,
+};
+use githearth_authz::Action;
+use githearth_core::RepositoryStatus;
+use githearth_git::{StorageError, browse};
+use std::path::Path as FsPath;
+use std::time::Duration;
+use uuid::Uuid;
+
+use crate::{AppState, repository_api, ui};
+
+pub(crate) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/organizations/{slug}/repositories/{name}/tree/{rev}",
+            get(tree_root),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/tree/{rev}/{*path}",
+            get(tree_path),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/blob/{rev}/{*path}",
+            get(blob_page),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/commits/{rev}",
+            get(commits_page),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/commit/{id}",
+            get(commit_page),
+        )
+}
+
+fn encode_segments(path: &str) -> String {
+    path.split('/')
+        .map(ui::url_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn load_error(error: crate::ApiError, username: &str) -> ui::UiError {
+    if error.status_code() == StatusCode::NOT_FOUND {
+        ui::not_found_page(Some(username))
+    } else {
+        ui::unavailable_page(Some(username))
+    }
+}
+
+async fn load_repo_ui(
+    state: &AppState,
+    headers: &HeaderMap,
+    slug: &str,
+    name: &str,
+) -> Result<(crate::Account, repository_api::Loaded), ui::UiError> {
+    let (account, auth_age) = match ui::browser_auth(state, headers).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(ui::auth_required()),
+        Err(_) => return Err(ui::unavailable_page(None)),
+    };
+    let loaded = repository_api::load_repo(state, account.id, auth_age, slug, name)
+        .await
+        .map_err(|error| load_error(error, &account.username))?;
+    if repository_api::require(state, &loaded, Action::RepositoryRead).is_err() {
+        return Err(ui::not_found_page(Some(&account.username)));
+    }
+    if loaded.repo.status != RepositoryStatus::Active {
+        return Err(ui::not_found_page(Some(&account.username)));
+    }
+    Ok((account, loaded))
+}
+
+async fn git_work_ui<T>(
+    state: &AppState,
+    repo_id: Uuid,
+    username: &str,
+    work: impl FnOnce(&FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
+) -> Result<T, ui::UiError>
+where
+    T: Send + 'static,
+{
+    let permit = state
+        .git_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ui::unavailable_page(Some(username)))?;
+    let storage = state.storage.clone();
+    let timeout = Duration::from_secs(state.config.git_timeout_seconds);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let path = storage.read_path(repo_id)?;
+        work(&path, timeout)
+    })
+    .await
+    .map_err(|_| ui::unavailable_page(Some(username)))?
+    .map_err(|error| map_work_error(repo_id, username, error))
+}
+
+fn map_work_error(repo_id: Uuid, username: &str, error: StorageError) -> ui::UiError {
+    match error {
+        StorageError::TooLarge { .. } | StorageError::Timeout => {
+            ui::unavailable_page(Some(username))
+        }
+        _ => {
+            // The error may embed Git's stderr (paths included); log only a category.
+            tracing::error!(category = "git", repository_id = %repo_id, "repository read failed");
+            ui::unavailable_page(Some(username))
+        }
+    }
+}
+
+async fn resolve_ui(
+    state: &AppState,
+    repo_id: Uuid,
+    username: &str,
+    rev: &str,
+) -> Result<String, ui::UiError> {
+    let rev = rev.to_owned();
+    git_work_ui(state, repo_id, username, move |path, timeout| {
+        browse::resolve(path, &rev, timeout)
+    })
+    .await?
+    .ok_or_else(|| ui::not_found_page(Some(username)))
+}
+
+async fn tree_root(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, rev)): Path<(String, String, String)>,
+) -> Result<Response, ui::UiError> {
+    render_tree(&state, &headers, &slug, &name, &rev, None).await
+}
+
+async fn tree_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, rev, path)): Path<(String, String, String, String)>,
+) -> Result<Response, ui::UiError> {
+    render_tree(&state, &headers, &slug, &name, &rev, Some(&path)).await
+}
+
+async fn render_tree(
+    state: &AppState,
+    headers: &HeaderMap,
+    slug: &str,
+    name: &str,
+    rev: &str,
+    path: Option<&str>,
+) -> Result<Response, ui::UiError> {
+    let (account, loaded) = load_repo_ui(state, headers, slug, name).await?;
+    let username = account.username.clone();
+    let path = path.filter(|p| !p.is_empty());
+    if !browse::valid_rev(rev) {
+        return Err(ui::not_found_page(Some(&username)));
+    }
+    if let Some(path) = path
+        && !browse::valid_path(path)
+    {
+        return Err(ui::not_found_page(Some(&username)));
+    }
+
+    let repo_id = loaded.repo.id;
+    let id = resolve_ui(state, repo_id, &username, rev).await?;
+    let path_owned = path.map(str::to_owned);
+    let entries = git_work_ui(state, repo_id, &username, move |fs_path, timeout| {
+        browse::tree(fs_path, &id, path_owned.as_deref(), timeout)
+    })
+    .await?
+    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+
+    let repo_href = format!(
+        "/organizations/{}/repositories/{}",
+        ui::url_encode(slug),
+        ui::url_encode(name)
+    );
+    let mut crumbs = format!(
+        "<a href=\"{repo_href}/tree/{}\">{}</a>",
+        ui::url_encode(rev),
+        ui::esc(name)
+    );
+    if let Some(path) = path {
+        let mut acc = String::new();
+        for segment in path.split('/') {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(segment);
+            crumbs.push_str(&format!(
+                " / <a href=\"{repo_href}/tree/{}/{}\">{}</a>",
+                ui::url_encode(rev),
+                encode_segments(&acc),
+                ui::esc(segment)
+            ));
+        }
+    }
+    let nav = format!("<nav aria-label=\"Breadcrumb\">{crumbs}</nav>");
+
+    let mut rows = String::new();
+    for entry in &entries {
+        let kind = match entry.kind {
+            browse::EntryKind::Blob => "blob",
+            browse::EntryKind::Tree => "tree",
+            browse::EntryKind::Commit => "commit",
+            browse::EntryKind::Symlink => "symlink",
+        };
+        let entry_path = match path {
+            Some(parent) => format!("{parent}/{}", entry.name),
+            None => entry.name.clone(),
+        };
+        let is_dir = matches!(
+            entry.kind,
+            browse::EntryKind::Tree | browse::EntryKind::Commit
+        );
+        let link = if is_dir {
+            format!(
+                "{repo_href}/tree/{}/{}",
+                ui::url_encode(rev),
+                encode_segments(&entry_path)
+            )
+        } else {
+            format!(
+                "{repo_href}/blob/{}/{}",
+                ui::url_encode(rev),
+                encode_segments(&entry_path)
+            )
+        };
+        rows.push_str(&format!(
+            "<tr><td><a href=\"{link}\">{}</a></td><td>{}</td><td>{}</td></tr>",
+            ui::esc(&entry.name),
+            ui::esc(kind),
+            entry.size.map(|s| s.to_string()).unwrap_or_default()
+        ));
+    }
+
+    let body = format!(
+        "<h1>{}</h1>{nav}<div class=\"card\"><table><thead><tr>\
+<th scope=\"col\">Name</th><th scope=\"col\">Type</th><th scope=\"col\">Size</th>\
+</tr></thead><tbody>{rows}</tbody></table></div>",
+        ui::esc(name)
+    );
+    let csrf = Some(ui::csrf_expected(
+        &ui::browser_token_hash(headers).unwrap_or_default(),
+    ));
+    Ok(Html(ui::render_page(
+        "Tree",
+        Some(&username),
+        csrf.as_deref(),
+        &body,
+    ))
+    .into_response())
+}
+
+async fn blob_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, rev, path)): Path<(String, String, String, String)>,
+) -> Result<Response, ui::UiError> {
+    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = account.username.clone();
+    if !browse::valid_rev(&rev) || !browse::valid_path(&path) {
+        return Err(ui::not_found_page(Some(&username)));
+    }
+
+    let repo_id = loaded.repo.id;
+    let id = resolve_ui(&state, repo_id, &username, &rev).await?;
+    let path_for_git = path.clone();
+    let blob = git_work_ui(&state, repo_id, &username, move |fs_path, timeout| {
+        browse::blob(fs_path, &id, &path_for_git, browse::MAX_BLOB_BYTES, timeout)
+    })
+    .await?
+    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+
+    let content = if blob.binary || blob.truncated {
+        format!(
+            "<p class=\"muted\">Binary or truncated file ({} bytes); content is not shown.</p>",
+            blob.size
+        )
+    } else {
+        let text = String::from_utf8_lossy(&blob.content);
+        format!("<pre>{}</pre>", ui::esc(&text))
+    };
+    let body = format!(
+        "<h1>{}</h1><p class=\"muted\">{} bytes</p><div class=\"card\">{}</div>",
+        ui::esc(&path),
+        blob.size,
+        content
+    );
+    let csrf = Some(ui::csrf_expected(
+        &ui::browser_token_hash(&headers).unwrap_or_default(),
+    ));
+    Ok(Html(ui::render_page(
+        "File",
+        Some(&username),
+        csrf.as_deref(),
+        &body,
+    ))
+    .into_response())
+}
+
+async fn commits_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, rev)): Path<(String, String, String)>,
+) -> Result<Response, ui::UiError> {
+    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = account.username.clone();
+    if !browse::valid_rev(&rev) {
+        return Err(ui::not_found_page(Some(&username)));
+    }
+
+    let repo_id = loaded.repo.id;
+    let id = resolve_ui(&state, repo_id, &username, &rev).await?;
+    let id_for_git = id.clone();
+    let commits = git_work_ui(&state, repo_id, &username, move |fs_path, timeout| {
+        browse::log(
+            fs_path,
+            &id_for_git,
+            None,
+            Some(0),
+            browse::MAX_LOG_LIMIT,
+            timeout,
+        )
+    })
+    .await?;
+
+    let repo_href = format!(
+        "/organizations/{}/repositories/{}",
+        ui::url_encode(&slug),
+        ui::url_encode(&name)
+    );
+    let mut items = String::new();
+    for commit in &commits {
+        items.push_str(&format!(
+            "<li><a href=\"{repo_href}/commit/{}\">{}</a> <span class=\"muted\">{}</span></li>",
+            ui::url_encode(&commit.id),
+            ui::esc(&commit.summary),
+            ui::esc(&commit.author_name)
+        ));
+    }
+    let body = format!(
+        "<h1>Commits</h1><p class=\"muted\">{} @ {}</p><div class=\"card\"><ul>{}</ul></div>",
+        ui::esc(&name),
+        ui::esc(&rev),
+        items
+    );
+    let csrf = Some(ui::csrf_expected(
+        &ui::browser_token_hash(&headers).unwrap_or_default(),
+    ));
+    Ok(Html(ui::render_page(
+        "Commits",
+        Some(&username),
+        csrf.as_deref(),
+        &body,
+    ))
+    .into_response())
+}
+
+async fn commit_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, id)): Path<(String, String, String)>,
+) -> Result<Response, ui::UiError> {
+    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = account.username.clone();
+    if !crate::browse::is_commit_id(&id) {
+        return Err(ui::not_found_page(Some(&username)));
+    }
+
+    let repo_id = loaded.repo.id;
+    let detail = git_work_ui(&state, repo_id, &username, move |fs_path, timeout| {
+        browse::commit(fs_path, &id, timeout)
+    })
+    .await?
+    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+
+    let mut files = String::new();
+    for file in &detail.files {
+        if file.binary {
+            files.push_str(&format!(
+                "<p class=\"muted\">Binary file: {} ({} / {} additions/deletions)</p>",
+                ui::esc(&file.new_path),
+                file.additions,
+                file.deletions
+            ));
+        } else {
+            files.push_str(&format!("<pre>{}</pre>", ui::esc(&file.patch)));
+        }
+    }
+    if detail.truncated {
+        files.push_str("<p class=\"muted\">Diff output truncated.</p>");
+    }
+    let body = format!(
+        "<h1>{}</h1><p class=\"muted\">{} &lt;{}&gt;</p>\
+<pre>{}</pre><div class=\"card\">{}</div>",
+        ui::esc(&detail.id),
+        ui::esc(&detail.author_name),
+        ui::esc(&detail.author_email),
+        ui::esc(&detail.message),
+        files
+    );
+    let csrf = Some(ui::csrf_expected(
+        &ui::browser_token_hash(&headers).unwrap_or_default(),
+    ));
+    Ok(Html(ui::render_page(
+        "Commit",
+        Some(&username),
+        csrf.as_deref(),
+        &body,
+    ))
+    .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn work_errors_render_the_unavailable_page() {
+        let repo_id = Uuid::new_v4();
+        for error in [
+            StorageError::TooLarge { size: 2, limit: 1 },
+            StorageError::Timeout,
+            StorageError::Git("boom".into()),
+            StorageError::Invalid("boom".into()),
+        ] {
+            let response = map_work_error(repo_id, "alice", error).into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[test]
+    fn load_error_distinguishes_not_found_from_unavailable() {
+        let not_found = load_error(crate::ApiError(StatusCode::NOT_FOUND, "not found"), "alice")
+            .into_response();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+        let unavailable = load_error(
+            crate::ApiError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"),
+            "alice",
+        )
+        .into_response();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
