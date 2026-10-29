@@ -8,6 +8,7 @@ pub mod git_hooks;
 pub mod git_http;
 pub mod idempotency;
 pub mod issues;
+pub mod pulls;
 mod issues_ui;
 pub mod pushes;
 pub mod reconcile;
@@ -218,6 +219,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
         .merge(issues::router())
+        .merge(pulls::router())
         .merge(audit::router())
         .merge(ui::router())
         .merge(browse::router())
