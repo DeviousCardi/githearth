@@ -7,7 +7,7 @@
 
 use crate::{StorageError, git};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -43,7 +43,7 @@ pub fn valid_path(path: &str) -> bool {
             .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
-fn cmd(repo: &Path) -> Command {
+pub(crate) fn cmd(repo: &Path) -> Command {
     let mut c = git();
     c.arg("--git-dir")
         .arg(repo)
@@ -69,21 +69,43 @@ fn read_capped(mut reader: impl Read, cap: usize) -> Vec<u8> {
     out
 }
 
-struct RunResult {
-    success: bool,
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
+pub(crate) struct RunResult {
+    pub(crate) success: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
-fn run_bounded(
-    mut command: Command,
+pub(crate) fn run_bounded(
+    command: Command,
     max_output: usize,
     timeout: Duration,
 ) -> Result<RunResult, StorageError> {
+    run_bounded_impl(command, None, max_output, timeout)
+}
+
+pub(crate) fn run_bounded_input(
+    command: Command,
+    input: &[u8],
+    max_output: usize,
+    timeout: Duration,
+) -> Result<RunResult, StorageError> {
+    run_bounded_impl(command, Some(input), max_output, timeout)
+}
+
+fn run_bounded_impl(
+    mut command: Command,
+    input: Option<&[u8]>,
+    max_output: usize,
+    timeout: Duration,
+) -> Result<RunResult, StorageError> {
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     let mut child = command
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -98,6 +120,19 @@ fn run_bounded(
     let stdout_thread = std::thread::spawn(move || read_capped(stdout, max_output));
     let stderr_thread = std::thread::spawn(move || read_capped(stderr, 64 * 1024));
 
+    // Write stdin from a thread so a child that stops reading cannot block us
+    // past the deadline; killing the child breaks the pipe and ends the write.
+    // The child's exit status reports a short write, so EPIPE is ignored.
+    let stdin_thread = match (input, child.stdin.take()) {
+        (Some(data), Some(mut stdin)) => {
+            let data = data.to_vec();
+            Some(std::thread::spawn(move || {
+                let _ = stdin.write_all(&data);
+            }))
+        }
+        _ => None,
+    };
+
     let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -110,6 +145,11 @@ fn run_bounded(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    if let Some(writer) = stdin_thread {
+        writer
+            .join()
+            .map_err(|_| StorageError::Invalid("git writer panicked".into()))?;
+    }
     let stdout = stdout_thread
         .join()
         .map_err(|_| StorageError::Invalid("git reader panicked".into()))?;
@@ -141,7 +181,7 @@ fn run(command: Command, timeout: Duration, max_output: usize) -> Result<Vec<u8>
 }
 
 /// NUL-separated fields, dropping only the final empty trailing field.
-fn nul_fields(bytes: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn nul_fields(bytes: &[u8]) -> Vec<&[u8]> {
     let mut fields: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
     if fields.last().is_some_and(|f| f.is_empty()) {
         fields.pop();
@@ -149,7 +189,7 @@ fn nul_fields(bytes: &[u8]) -> Vec<&[u8]> {
     fields
 }
 
-fn utf8(bytes: &[u8]) -> Result<String, StorageError> {
+pub(crate) fn utf8(bytes: &[u8]) -> Result<String, StorageError> {
     String::from_utf8(bytes.to_vec())
         .map_err(|_| StorageError::Invalid("git output is not UTF-8".into()))
 }
@@ -828,25 +868,44 @@ fn run_merge_tree(
         .env("GIT_OBJECT_DIRECTORY", scratch)
         .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", repo.join("objects"));
     let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
-    parse_merge_tree(
-        result.code,
-        &result.stdout,
-        &result.stderr,
-        result.truncated,
+    Ok(
+        match parse_merge_tree(
+            result.code,
+            &result.stdout,
+            &result.stderr,
+            result.truncated,
+        )? {
+            MergeTree::Clean(_) => Mergeability::Clean,
+            MergeTree::Conflicts(paths) => Mergeability::Conflicts(paths),
+        },
     )
+}
+
+/// Outcome of `git merge-tree --write-tree`: the written tree id, or the
+/// conflicted paths.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MergeTree {
+    Clean(String),
+    Conflicts(Vec<String>),
 }
 
 /// Interpret `git merge-tree --write-tree --name-only --no-messages -z`
 /// output: exit 0 is clean, exit 1 lists conflicted paths after the tree id
 /// line (NUL-separated); anything else is an error.
-fn parse_merge_tree(
+pub(crate) fn parse_merge_tree(
     code: Option<i32>,
     stdout: &[u8],
     stderr: &[u8],
     truncated: bool,
-) -> Result<Mergeability, StorageError> {
+) -> Result<MergeTree, StorageError> {
     match code {
-        Some(0) => Ok(Mergeability::Clean),
+        Some(0) => Ok(MergeTree::Clean(
+            nul_fields(stdout)
+                .first()
+                .map(|f| utf8(f))
+                .transpose()?
+                .unwrap_or_default(),
+        )),
         Some(1) => {
             if truncated {
                 return Err(StorageError::TooLarge {
@@ -861,13 +920,13 @@ fn parse_merge_tree(
                 .skip(1)
                 .map(utf8)
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Mergeability::Conflicts(paths))
+            Ok(MergeTree::Conflicts(paths))
         }
         _ => Err(stderr_error(stderr)),
     }
 }
 
-fn stderr_error(stderr: &[u8]) -> StorageError {
+pub(crate) fn stderr_error(stderr: &[u8]) -> StorageError {
     let message = String::from_utf8_lossy(stderr);
     let message = message.trim();
     StorageError::Git(if message.is_empty() {
@@ -1341,16 +1400,16 @@ mod tests {
     fn merge_tree_parser_distinguishes_outcomes() {
         assert_eq!(
             parse_merge_tree(Some(0), b"abc\0", b"", false).unwrap(),
-            Mergeability::Clean
+            MergeTree::Clean("abc".into())
         );
         assert_eq!(
             parse_merge_tree(Some(1), b"abc\0a.txt\0b/c.txt\0", b"", false).unwrap(),
-            Mergeability::Conflicts(vec!["a.txt".into(), "b/c.txt".into()])
+            MergeTree::Conflicts(vec!["a.txt".into(), "b/c.txt".into()])
         );
         // A tree id with no paths is an empty conflict list, not an error.
         assert_eq!(
             parse_merge_tree(Some(1), b"abc\0", b"", false).unwrap(),
-            Mergeability::Conflicts(vec![])
+            MergeTree::Conflicts(vec![])
         );
         // Truncated conflict listing is an error, never a partial answer.
         assert!(matches!(
@@ -1507,5 +1566,29 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_bounded_input_survives_child_exiting_before_reading_stdin() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        let big = vec![b'x'; 256 * 1024];
+        let result = run_bounded_input(command, &big, 1024, Duration::from_secs(5)).unwrap();
+        assert!(!result.success);
+    }
+
+    #[test]
+    fn run_bounded_input_times_out_when_child_never_reads_stdin() {
+        // More than a pipe buffer, to a child that neither reads nor exits:
+        // the deadline must still fire.
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let big = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        assert!(matches!(
+            run_bounded_input(command, &big, 1024, Duration::from_millis(300)),
+            Err(StorageError::Timeout)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

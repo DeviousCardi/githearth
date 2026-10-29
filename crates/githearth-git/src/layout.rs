@@ -64,9 +64,9 @@ pub fn parse_version(text: &str) -> Result<GitVersion, StorageError> {
         .next()
         .and_then(|p| p.parse().ok())
         .ok_or_else(|| StorageError::Invalid("unrecognized git --version output".into()))?;
-    if major < 2 || (major == 2 && minor < 36) {
+    if major < 2 || (major == 2 && minor < 38) {
         return Err(StorageError::Invalid(format!(
-            "git {major}.{minor} is older than 2.36"
+            "git {major}.{minor} is older than 2.38"
         )));
     }
     Ok(GitVersion { major, minor })
