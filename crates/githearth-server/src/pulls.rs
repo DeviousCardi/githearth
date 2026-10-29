@@ -202,7 +202,7 @@ async fn fetch_pull(conn: &mut PgConnection, id: Uuid) -> Result<Option<PullJson
     .await
 }
 
-async fn find_pull(
+pub(crate) async fn find_pull(
     conn: &mut PgConnection,
     repository_id: Uuid,
     number: i32,
@@ -232,7 +232,7 @@ async fn load_pull(
     Ok(pull)
 }
 
-fn require_pull(
+pub(crate) fn require_pull(
     state: &AppState,
     loaded: &Loaded,
     pull: &PullJson,
@@ -645,6 +645,19 @@ async fn update(
                 _ => "pull_request.updated",
             };
             event(&mut tx, Some(loaded.org_id), actor.id, kind).await?;
+
+            // Closing a pull request cancels any queued or validating merge
+            // intent; an executing intent is not cancelled here (the ref commit
+            // wins, and record_merge_result / the reconciler settle it).
+            if locked.state == "open" && new_state == "closed" {
+                sqlx::query(
+                    "UPDATE merge_intents SET state = 'cancelled', updated_at = now() \
+                     WHERE pull_request_id = $1 AND state IN ('queued', 'validating')",
+                )
+                .bind(locked.id)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
             let status = StatusCode::OK;

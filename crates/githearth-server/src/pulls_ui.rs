@@ -534,6 +534,12 @@ async fn render_pull(
     let head_id = detail.head_id.as_deref().unwrap_or("(deleted)");
     let base_id = detail.base_id.as_deref().unwrap_or("(deleted)");
 
+    let state_badge = if detail.pull.state == "merged" {
+        "<span class=\"badge\">Merged</span> "
+    } else {
+        ""
+    };
+
     let mut review_list = String::new();
     for r in &reviews.items {
         review_list.push_str(&format!(
@@ -605,7 +611,7 @@ async fn render_pull(
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
-<p class=\"muted\">{} · {} → {} · by {} at {}</p>\
+<p class=\"muted\">{} {} · {} → {} · by {} at {}</p>\
 <div class=\"card\"><dl>\
 <dt>Head</dt><dd>{}</dd>\
 <dt>Base</dt><dd>{}</dd>\
@@ -625,6 +631,7 @@ async fn render_pull(
 <p><button type=\"submit\">Submit review</button></p></form>",
         ui::esc(name),
         ui::esc(&detail.pull.title),
+        state_badge,
         ui::esc(&detail.pull.state),
         ui::esc(&detail.pull.source_branch),
         ui::esc(&detail.pull.target_branch),
