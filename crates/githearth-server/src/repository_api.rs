@@ -28,14 +28,6 @@ fn name_taken() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository name already taken")
 }
 
-/// Serializes the filesystem create/trash stage so a stalled handler and its
-/// re-claimer cannot both build the same temporary directory. It also lets a
-/// create re-check the row's status before touching disk, so a stale handler
-/// cannot recreate the directory of an already-deleted repository.
-/// shortcut: single-process only — if the server ever forked/ran as multiple
-/// processes on one node, this must be replaced with an inter-process lock.
-static STORAGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NewRepository {
@@ -299,27 +291,29 @@ pub(crate) async fn create(
             let operation_id = repo.operation_id;
             tx.commit().await?;
 
-            // Re-check the row's status under the filesystem lock: a later delete
-            // may have already removed it, and a stale handler must never recreate
-            // the directory of a deleted repository. The guard is then moved into
-            // the blocking worker, so a cancelled request cannot drop the lock
-            // while the directory operator is still running.
-            let guard = STORAGE_LOCK.lock().await;
+            // Acquire the per-repository filesystem lock and re-check the
+            // row's status: a later delete may have already removed it, and
+            // a stale handler must never recreate the directory of a deleted
+            // repository. The guard is then moved into the blocking worker,
+            // so a cancelled request cannot drop the lock while the directory
+            // operator is still running.
+            let repo_id = repo.id;
+            let storage = state.storage.clone();
+            let guard = storage.repository_lock(repo_id).lock_owned().await;
             let current_status = {
                 let mut conn = state.pool.acquire().await?;
-                let row = repositories::get(&mut conn, repo.id)
+                let row = repositories::get(&mut conn, repo_id)
                     .await?
                     .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
                 drop(conn);
                 row.status
             };
-            let storage = state.storage.clone();
             match current_status {
                 RepositoryStatus::Creating => {
                     tokio::task::spawn_blocking(move || {
                         let _guard = guard;
                         storage.create(
-                            repo.id,
+                            repo_id,
                             operation_id,
                             githearth_git::layout::ObjectFormat::Sha1,
                         )
@@ -687,11 +681,12 @@ pub(crate) async fn delete(
 
             // A failed create never produced a directory; a resumed delete may
             // already have moved it to trash, so a missing source is not an error.
-            // The lock is held by the blocking worker so a cancelled request
-            // cannot drop it while the directory operator is still running.
+            // The per-repository lock is held by the blocking worker so a
+            // cancelled request cannot drop it while the directory operator is
+            // still running.
             let repo_id = loaded.repo.id;
             let storage = state.storage.clone();
-            let guard = STORAGE_LOCK.lock().await;
+            let guard = storage.repository_lock(repo_id).lock_owned().await;
             let trash_result = tokio::task::spawn_blocking(move || {
                 let _guard = guard;
                 if was_failed {
@@ -979,24 +974,31 @@ pub(crate) async fn revoke_access(
 
 #[cfg(test)]
 mod tests {
-    use super::STORAGE_LOCK;
+    use githearth_git::layout::Storage;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use uuid::Uuid;
 
-    /// The storage lock must live inside the blocking worker, not the awaiting
-    /// task: if the awaiting task is cancelled the worker must keep the lock
-    /// until it exits, so a re-claimed handler cannot start the same directory
-    /// operation concurrently.
+    /// The repository lock must live inside the blocking worker, not the
+    /// awaiting task: if the awaiting task is cancelled the worker must keep
+    /// the lock until it exits, so a re-claimed handler cannot start the same
+    /// directory operation concurrently.
     #[tokio::test]
     async fn storage_lock_lives_in_the_blocking_worker_until_it_exits() {
+        let temp =
+            std::env::temp_dir().join(format!("githearth-lock-test-{}", Uuid::new_v4().simple()));
+        let storage = Storage::open(&temp).unwrap();
+        let repo_id = Uuid::new_v4();
+
         let entered = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
 
         let entered_w = entered.clone();
         let release_w = release.clone();
-        let guard = STORAGE_LOCK.lock().await;
+        let lock = storage.repository_lock(repo_id);
+        let guard = lock.lock_owned().await;
         let worker = tokio::task::spawn_blocking(move || {
             let _held = guard;
             entered_w.store(true, Ordering::SeqCst);
@@ -1014,8 +1016,9 @@ mod tests {
 
         let acquired = Arc::new(AtomicBool::new(false));
         let acquired_w = acquired.clone();
+        let lock2 = storage.repository_lock(repo_id);
         let waiter = tokio::spawn(async move {
-            let _g = STORAGE_LOCK.lock().await;
+            let _g = lock2.lock_owned().await;
             acquired_w.store(true, Ordering::SeqCst);
         });
 
@@ -1028,5 +1031,8 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         waiter.await.unwrap();
         assert!(acquired.load(Ordering::SeqCst));
+
+        // Cleanup.
+        std::fs::remove_dir_all(&temp).unwrap();
     }
 }
