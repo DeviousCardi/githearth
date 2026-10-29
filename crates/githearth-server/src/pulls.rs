@@ -1279,6 +1279,8 @@ mod tests {
         assert_eq!(error.status_code(), StatusCode::CONFLICT);
         assert_eq!(error.message(), "pull request is not open");
 
+        // close() waits for every checked-out connection, so return ours first.
+        drop(conn);
         pool.close().await;
     }
 }
