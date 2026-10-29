@@ -284,6 +284,9 @@ pub struct Ref {
     /// Full ref name, such as `refs/heads/main`.
     pub name: String,
     pub protection: Option<Protection>,
+    /// Whether the ref already exists: false only while it is being created
+    /// (old oid all zeros), which the require-pull-request rule lets through.
+    pub exists: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -747,6 +750,7 @@ fn build_entities(request: &Request<'_>) -> (EntityUid, Vec<Entity>) {
                     RestrictedExpression::new_long(i64::from(p.required_approvals)),
                 ),
                 ("require_checks", bool_(p.require_checks)),
+                ("exists", bool_(r.exists)),
             ],
             [repo_uid],
         )

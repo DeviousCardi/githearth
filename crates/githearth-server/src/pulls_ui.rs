@@ -384,13 +384,13 @@ async fn create_submit(
         ));
     }
     let payload = serde_json::json!({
-        "source_branch": form.source_branch,
-        "target_branch": form.target_branch,
-        "title": form.title,
-        "body": form.body,
+        "source_branch": &form.source_branch,
+        "target_branch": &form.target_branch,
+        "title": &form.title,
+        "body": &form.body,
     })
     .to_string();
-    let (_, value) = pulls::create_pull(
+    let (_, value) = match pulls::create_pull(
         &state,
         s.account.id,
         s.auth_age,
@@ -400,7 +400,30 @@ async fn create_submit(
         Some(key),
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(message) = ui::idempotency_notice(&e) {
+                return Ok(page(
+                    &s,
+                    e.status_code(),
+                    "New pull request",
+                    &new_pull_body(
+                        &s,
+                        &base,
+                        &name,
+                        &form.source_branch,
+                        &form.target_branch,
+                        &form.title,
+                        &form.body,
+                        key,
+                        Some(message),
+                    ),
+                ));
+            }
+            return Err(api_error(&s, e));
+        }
+    };
     let number = value["number"].as_i64().unwrap_or_default();
     Ok(Redirect::to(&format!("{base}/pulls/{number}")).into_response())
 }
@@ -668,8 +691,8 @@ async fn comment_submit(
         )
         .await;
     }
-    let payload = serde_json::json!({ "body": form.body }).to_string();
-    pulls::create_pull_comment(
+    let payload = serde_json::json!({ "body": &form.body }).to_string();
+    if let Err(e) = pulls::create_pull_comment(
         &state,
         s.account.id,
         s.auth_age,
@@ -680,7 +703,34 @@ async fn comment_submit(
         Some(key),
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+    {
+        if let Some(message) = ui::idempotency_notice(&e) {
+            let draft = Draft {
+                text: &form.body,
+                key,
+                error: Some(message),
+            };
+            let review = ReviewDraft {
+                verdict: "approved",
+                body: "",
+                key: &new_key(),
+                error: None,
+            };
+            return render_pull(
+                &state,
+                &s,
+                &slug,
+                &name,
+                number,
+                None,
+                draft,
+                review,
+                e.status_code(),
+            )
+            .await;
+        }
+        return Err(api_error(&s, e));
+    }
     Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
 }
 
@@ -740,12 +790,12 @@ async fn review_submit(
         .await;
     }
     let payload = serde_json::json!({
-        "verdict": form.verdict,
-        "commit_id": form.commit_id,
-        "body": form.body,
+        "verdict": &form.verdict,
+        "commit_id": &form.commit_id,
+        "body": &form.body,
     })
     .to_string();
-    pulls::create_pull_review(
+    if let Err(e) = pulls::create_pull_review(
         &state,
         s.account.id,
         s.auth_age,
@@ -756,6 +806,33 @@ async fn review_submit(
         Some(key),
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+    {
+        if let Some(message) = ui::idempotency_notice(&e) {
+            let draft = Draft {
+                text: "",
+                key: &new_key(),
+                error: None,
+            };
+            let review = ReviewDraft {
+                verdict: &form.verdict,
+                body: &form.body,
+                key,
+                error: Some(message),
+            };
+            return render_pull(
+                &state,
+                &s,
+                &slug,
+                &name,
+                number,
+                None,
+                draft,
+                review,
+                e.status_code(),
+            )
+            .await;
+        }
+        return Err(api_error(&s, e));
+    }
     Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
 }

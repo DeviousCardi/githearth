@@ -366,8 +366,8 @@ async fn create_submit(
             ),
         ));
     }
-    let payload = serde_json::json!({ "title": form.title, "body": form.body }).to_string();
-    let (_, value) = issues::create_issue(
+    let payload = serde_json::json!({ "title": &form.title, "body": &form.body }).to_string();
+    let (_, value) = match issues::create_issue(
         &state,
         s.account.id,
         s.auth_age,
@@ -377,7 +377,28 @@ async fn create_submit(
         Some(key),
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(message) = ui::idempotency_notice(&e) {
+                return Ok(page(
+                    &s,
+                    e.status_code(),
+                    "New issue",
+                    &new_issue_body(
+                        &s,
+                        &base,
+                        &name,
+                        &form.title,
+                        &form.body,
+                        key,
+                        Some(message),
+                    ),
+                ));
+            }
+            return Err(api_error(&s, e));
+        }
+    };
     let number = value["number"].as_i64().unwrap_or_default();
     Ok(Redirect::to(&format!("{base}/issues/{number}")).into_response())
 }
@@ -575,8 +596,8 @@ async fn comment_submit(
         )
         .await;
     }
-    let payload = serde_json::json!({ "body": form.body }).to_string();
-    issues::create_issue_comment(
+    let payload = serde_json::json!({ "body": &form.body }).to_string();
+    if let Err(e) = issues::create_issue_comment(
         &state,
         s.account.id,
         s.auth_age,
@@ -587,7 +608,27 @@ async fn comment_submit(
         Some(key),
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+    {
+        if let Some(message) = ui::idempotency_notice(&e) {
+            let draft = Draft {
+                text: &form.body,
+                key,
+                error: Some(message),
+            };
+            return render_issue(
+                &state,
+                &s,
+                &slug,
+                &name,
+                number,
+                None,
+                draft,
+                e.status_code(),
+            )
+            .await;
+        }
+        return Err(api_error(&s, e));
+    }
     Ok(Redirect::to(&format!("{}/issues/{number}", repo_href(&slug, &name))).into_response())
 }
 
@@ -620,7 +661,7 @@ async fn state_submit(
             "Check the form and try again.",
         ));
     }
-    issues::update_issue(
+    if let Err(e) = issues::update_issue(
         &state,
         s.account.id,
         s.auth_age,
@@ -635,7 +676,27 @@ async fn state_submit(
         Some(key),
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+    {
+        if let Some(message) = ui::idempotency_notice(&e) {
+            let draft = Draft {
+                text: "",
+                key: &new_key(),
+                error: Some(message),
+            };
+            return render_issue(
+                &state,
+                &s,
+                &slug,
+                &name,
+                number,
+                None,
+                draft,
+                e.status_code(),
+            )
+            .await;
+        }
+        return Err(api_error(&s, e));
+    }
     Ok(Redirect::to(&format!("{}/issues/{number}", repo_href(&slug, &name))).into_response())
 }
 
@@ -741,7 +802,7 @@ async fn edit_submit(
             ),
         ));
     }
-    issues::update_issue(
+    if let Err(e) = issues::update_issue(
         &state,
         s.account.id,
         s.auth_age,
@@ -749,13 +810,31 @@ async fn edit_submit(
         &name,
         number,
         issues::PatchIssue {
-            title: Some(form.title),
-            body: Some(form.body),
+            title: Some(form.title.clone()),
+            body: Some(form.body.clone()),
             state: None,
         },
         Some(key),
     )
     .await
-    .map_err(|e| api_error(&s, e))?;
+    {
+        if let Some(message) = ui::idempotency_notice(&e) {
+            return Ok(page(
+                &s,
+                e.status_code(),
+                "Edit issue",
+                &edit_form_body(
+                    &s,
+                    &base,
+                    number,
+                    &form.title,
+                    &form.body,
+                    key,
+                    Some(message),
+                ),
+            ));
+        }
+        return Err(api_error(&s, e));
+    }
     Ok(Redirect::to(&format!("{}/issues/{number}", repo_href(&slug, &name))).into_response())
 }

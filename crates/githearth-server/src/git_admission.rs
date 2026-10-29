@@ -228,6 +228,9 @@ pub fn decide_ref(
         repository: admitted.repository.id,
         name: update.reference.clone(),
         protection: crate::protection::matching(&admitted.rules, &update.reference),
+        // A create (old oid all zeros) may target a protected glob; the rule
+        // then applies to every later push.
+        exists: !all_zero_old,
     };
     let decision = state.authz.authorize(&admitted.facts.request(
         action,
@@ -402,6 +405,46 @@ mod tests {
         assert_eq!(
             decide_ref(&test_state(), &admitted(false, false), &u, true).unwrap_err(),
             "permission denied: ref.push"
+        );
+    }
+
+    fn protected_rule(
+        pattern: &str,
+        require_pull_request: bool,
+    ) -> crate::protection::ProtectionRule {
+        crate::protection::ProtectionRule {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            pattern: pattern.to_owned(),
+            allow_force_push: false,
+            allow_deletion: false,
+            require_pull_request,
+            required_approvals: 0,
+            require_checks: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_ref_creation_of_a_protected_branch_is_allowed_but_updates_are_refused() {
+        let mut a = admitted(true, false);
+        a.rules = vec![protected_rule("release/*", true)];
+
+        // Creating release/2.0 (old all zeros) is allowed; the rule applies
+        // from the next push onward.
+        let create = update(ZERO, A, "refs/heads/release/2.0");
+        assert!(decide_ref(&test_state(), &a, &create, false).is_ok());
+
+        // A fast-forward push to the now-existing branch is refused.
+        let push = update(
+            A,
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "refs/heads/release/2.0",
+        );
+        assert_eq!(
+            decide_ref(&test_state(), &a, &push, true).unwrap_err(),
+            "protected branch: ref.push"
         );
     }
 

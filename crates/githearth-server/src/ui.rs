@@ -273,6 +273,22 @@ pub(crate) fn forbidden_page() -> UiError {
     ))
 }
 
+/// The friendly message a browser form should show when its submit ran into
+/// the idempotency layer: 409 (the same key is still running) or 422 (the same
+/// key was already used with a different body). Any other error is `None`, and
+/// callers fall back to their usual error page.
+pub(crate) fn idempotency_notice(error: &crate::ApiError) -> Option<&'static str> {
+    match (error.status_code(), error.message()) {
+        (StatusCode::CONFLICT, crate::idempotency::KEY_CONFLICT) => {
+            Some("This form is already being submitted. Reload the page to see the result.")
+        }
+        (StatusCode::UNPROCESSABLE_ENTITY, crate::idempotency::KEY_REUSED) => {
+            Some("This form was already submitted. Reload the page to start a new one.")
+        }
+        _ => None,
+    }
+}
+
 async fn login_page(
     Query(q): Query<LoginQuery>,
     headers: HeaderMap,

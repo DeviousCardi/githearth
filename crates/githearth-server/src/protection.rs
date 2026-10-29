@@ -7,7 +7,7 @@ use axum::{
 use githearth_authz::{Action, Protection};
 use githearth_core::RepositoryStatus;
 use serde::{Deserialize, Serialize};
-use sqlx::PgConnection;
+use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
 use crate::{
@@ -55,9 +55,10 @@ const RULE_COLUMNS: &str = "id, repository_id, pattern, allow_force_push, allow_
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
 
-/// A pattern is a concrete branch name, or a glob with exactly one trailing
-/// `*` segment-free wildcard. Returns the literal (`main`) and glob prefix
-/// (`release/`) parts, or `None` when the pattern is not valid.
+/// A pattern is a concrete branch name, or a glob with one trailing `*`.
+/// The `*` is a prefix wildcard, so `release/*` also protects `release/a/b`.
+/// Returns the literal (`main`) and glob prefix (`release/`) parts, or `None`
+/// when the pattern is not valid.
 pub(crate) fn parse_pattern(pattern: &str) -> Option<(Option<&str>, Option<&str>)> {
     if pattern.is_empty() {
         return None;
@@ -92,7 +93,8 @@ fn valid_segments(segments: &str) -> bool {
 
 /// Map a full ref name to the most specific matching rule's protection:
 /// an exact branch name beats any glob, and among globs the longest prefix
-/// (`refs/heads/release/v1` picks `release/v1/*` over `release/*`).
+/// (`refs/heads/release/v1` picks `release/v1/*` over `release/*`). A
+/// trailing `*` is a prefix match, so `release/*` also protects `release/a/b`.
 pub(crate) fn matching(rules: &[ProtectionRule], ref_name: &str) -> Option<Protection> {
     let branch = ref_name.strip_prefix("refs/heads/")?;
     let mut best_glob: Option<(&str, &ProtectionRule)> = None;
@@ -140,6 +142,24 @@ pub(crate) async fn load_rules(
     .await
 }
 
+/// Loads the rules and the generation as one snapshot, so a caller binding a
+/// ruleset to a generation (such as the merge path) can never pair a stale
+/// ruleset with a fresh generation. Both reads happen inside one
+/// `REPEATABLE READ` read-only transaction.
+pub(crate) async fn load_rules_with_generation(
+    conn: &mut PgConnection,
+    repository_id: Uuid,
+) -> Result<(Vec<ProtectionRule>, i64), sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let rules = load_rules(&mut tx, repository_id).await?;
+    let generation = current_generation(&mut tx, repository_id).await?;
+    tx.commit().await?;
+    Ok((rules, generation))
+}
+
 async fn current_generation(
     conn: &mut PgConnection,
     repository_id: Uuid,
@@ -184,8 +204,7 @@ async fn list(
         return Err(not_found());
     }
     let mut conn = state.pool.acquire().await?;
-    let items = load_rules(&mut conn, loaded.repo.id).await?;
-    let generation = current_generation(&mut conn, loaded.repo.id).await?;
+    let (items, generation) = load_rules_with_generation(&mut conn, loaded.repo.id).await?;
     Ok(Json(ProtectionList { generation, items }))
 }
 
@@ -562,6 +581,87 @@ mod tests {
     fn a_malformed_rule_does_not_disable_the_others() {
         let rules = [rule("bad/../x", &|_| {}), rule("main", &|_| {})];
         assert!(matching(&rules, "refs/heads/main").is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn load_rules_with_generation_returns_a_consistent_pair() {
+        use sqlx::{ConnectOptions, postgres::PgPoolOptions};
+        use std::str::FromStr;
+
+        let url =
+            std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .disable_statement_logging();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused')")
+            .bind(account)
+            .bind(format!("pg-{}", Uuid::new_v4().simple()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let org = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')",
+        )
+        .bind(org)
+        .bind(format!("o-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'r',$3,$4,'active','private')",
+        )
+        .bind(repo)
+        .bind(org)
+        .bind(account)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let (rules, generation) = load_rules_with_generation(&mut conn, repo).await.unwrap();
+        assert_eq!(generation, 0);
+        assert!(rules.is_empty());
+
+        // Create a rule and bump the generation exactly as create/update/delete do.
+        sqlx::query(
+            "INSERT INTO branch_protection_rules \
+             (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, require_checks, created_by) \
+             VALUES ($1, $2, 'main', false, false, true, 2, false, $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+        bump_generation(&mut conn, repo).await.unwrap();
+
+        let (rules, generation) = load_rules_with_generation(&mut conn, repo).await.unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "main");
+        assert!(rules[0].require_pull_request);
+
+        // Another bump changes the generation, not the rules.
+        bump_generation(&mut conn, repo).await.unwrap();
+        let (rules, generation) = load_rules_with_generation(&mut conn, repo).await.unwrap();
+        assert_eq!(generation, 2);
+        assert_eq!(rules.len(), 1);
+
+        pool.close().await;
     }
 
     #[test]

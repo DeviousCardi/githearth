@@ -105,11 +105,13 @@ impl World {
                 require_checks: true,
                 ..Protection::default()
             }),
+            exists: true,
         };
         let feature = Ref {
             repository: private.id,
             name: "refs/heads/feature".into(),
             protection: None,
+            exists: true,
         };
         let owner = account(&[acme.id], &[]);
         let member = account(&[acme.id], &[]);
@@ -292,6 +294,7 @@ fn site_on<'a>(repository: &'a Repository, author: Uuid, branch: &str) -> Site<'
         repository: repository.id,
         name: branch.into(),
         protection: None,
+        exists: true,
     };
     let issue = Issue {
         id: Uuid::new_v4(),
@@ -402,6 +405,42 @@ fn decision_table() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn branch_creation_is_allowed_under_require_pull_request() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    // Creating a ref that matches a protected glob (old oid all zeros) is a
+    // plain ref.push on a ref that does not exist yet: allowed.
+    let new_branch = Ref {
+        exists: false,
+        ..w.main.clone()
+    };
+    let d = w.decide(
+        &engine,
+        &w.developer,
+        Action::RefPush,
+        &w.acme,
+        Resource::Ref(&w.private, &new_branch),
+        None,
+    );
+    assert!(d.is_allowed(), "creation push must be allowed: {d:?}");
+
+    // Once the ref exists, the require_pull_request rule applies and refuses
+    // the same fast-forward push.
+    let d = w.decide(
+        &engine,
+        &w.developer,
+        Action::RefPush,
+        &w.acme,
+        Resource::Ref(&w.private, &w.main),
+        None,
+    );
+    assert_eq!(
+        d,
+        Decision::Deny(vec!["protected-requires-pull-request".into()])
+    );
 }
 
 #[test]

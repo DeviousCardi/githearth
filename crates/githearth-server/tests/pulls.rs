@@ -1023,6 +1023,107 @@ async fn comments_general_anchored_reply_and_pagination() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn anchored_comments_validate_path_and_line_at_the_commit() {
+    let f = build_fixture().await;
+
+    // Extend feature with a directory and a three-line file.
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "checkout",
+        "-q",
+        "feature",
+    ]))
+    .await;
+    std::fs::create_dir_all(f.work.join("dir")).unwrap();
+    std::fs::write(f.work.join("dir/inner.txt"), "one\ntwo\nthree\n").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "add",
+        "dir/inner.txt",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "nested",
+    ]))
+    .await;
+    let new_head = git_output(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "rev-parse",
+        "HEAD",
+    ]))
+    .await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    // The last line of the file is a valid anchor.
+    let (status, _) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "last", "commit_id": new_head, "path": "dir/inner.txt", "line": 3}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A line past the end is out of range.
+    let (status, _) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "past", "commit_id": new_head, "path": "dir/inner.txt", "line": 4}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A missing path is refused.
+    let (status, _) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "missing", "commit_id": new_head, "path": "nope.txt", "line": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A directory is not a line anchor.
+    let (status, _) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "dir", "commit_id": new_head, "path": "dir", "line": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn close_reopen_and_reopen_conflict() {
     let f = build_fixture().await;
 
