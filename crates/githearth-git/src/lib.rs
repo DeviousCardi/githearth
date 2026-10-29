@@ -3,6 +3,7 @@
 pub mod browse;
 pub mod journal;
 pub mod layout;
+pub mod merge;
 
 use std::{
     error::Error,

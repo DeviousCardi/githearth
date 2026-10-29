@@ -36,7 +36,7 @@ Every repository is created with:
 | `receive.maxInputSize` | configured pack limit | Bounded uploads |
 | `gc.auto` | `0` | Maintenance is scheduled, never inline in a push |
 
-Git runs with the sanitized environment (`env_clear`, no system or global config, fixed `PATH`, `LC_ALL=C`). Object format is detected from the repository (`extensions.objectFormat`); new repositories default to SHA-1 and may be created as SHA-256. The supported Git range is 2.36 or newer, checked at startup.
+Git runs with the sanitized environment (`env_clear`, no system or global config, fixed `PATH`, `LC_ALL=C`). Object format is detected from the repository (`extensions.objectFormat`); new repositories default to SHA-1 and may be created as SHA-256. The supported Git range is 2.38 or newer, checked at startup.
 
 ## Push transaction
 

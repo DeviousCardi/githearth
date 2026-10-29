@@ -7,7 +7,7 @@
 
 use crate::{StorageError, git};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -43,7 +43,7 @@ pub fn valid_path(path: &str) -> bool {
             .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
-fn cmd(repo: &Path) -> Command {
+pub(crate) fn cmd(repo: &Path) -> Command {
     let mut c = git();
     c.arg("--git-dir")
         .arg(repo)
@@ -69,21 +69,43 @@ fn read_capped(mut reader: impl Read, cap: usize) -> Vec<u8> {
     out
 }
 
-struct RunResult {
-    success: bool,
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
+pub(crate) struct RunResult {
+    pub(crate) success: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
-fn run_bounded(
-    mut command: Command,
+pub(crate) fn run_bounded(
+    command: Command,
     max_output: usize,
     timeout: Duration,
 ) -> Result<RunResult, StorageError> {
+    run_bounded_impl(command, None, max_output, timeout)
+}
+
+pub(crate) fn run_bounded_input(
+    command: Command,
+    input: &[u8],
+    max_output: usize,
+    timeout: Duration,
+) -> Result<RunResult, StorageError> {
+    run_bounded_impl(command, Some(input), max_output, timeout)
+}
+
+fn run_bounded_impl(
+    mut command: Command,
+    input: Option<&[u8]>,
+    max_output: usize,
+    timeout: Duration,
+) -> Result<RunResult, StorageError> {
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     let mut child = command
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -97,6 +119,13 @@ fn run_bounded(
         .ok_or_else(|| StorageError::Invalid("git stderr unavailable".into()))?;
     let stdout_thread = std::thread::spawn(move || read_capped(stdout, max_output));
     let stderr_thread = std::thread::spawn(move || read_capped(stderr, 64 * 1024));
+
+    if let Some(data) = input
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        // The child's exit status reports a short stdin write; ignore EPIPE here.
+        let _ = stdin.write_all(data);
+    }
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -141,7 +170,7 @@ fn run(command: Command, timeout: Duration, max_output: usize) -> Result<Vec<u8>
 }
 
 /// NUL-separated fields, dropping only the final empty trailing field.
-fn nul_fields(bytes: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn nul_fields(bytes: &[u8]) -> Vec<&[u8]> {
     let mut fields: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
     if fields.last().is_some_and(|f| f.is_empty()) {
         fields.pop();
@@ -149,7 +178,7 @@ fn nul_fields(bytes: &[u8]) -> Vec<&[u8]> {
     fields
 }
 
-fn utf8(bytes: &[u8]) -> Result<String, StorageError> {
+pub(crate) fn utf8(bytes: &[u8]) -> Result<String, StorageError> {
     String::from_utf8(bytes.to_vec())
         .map_err(|_| StorageError::Invalid("git output is not UTF-8".into()))
 }
@@ -867,7 +896,7 @@ fn parse_merge_tree(
     }
 }
 
-fn stderr_error(stderr: &[u8]) -> StorageError {
+pub(crate) fn stderr_error(stderr: &[u8]) -> StorageError {
     let message = String::from_utf8_lossy(stderr);
     let message = message.trim();
     StorageError::Git(if message.is_empty() {
@@ -1507,5 +1536,14 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_bounded_input_survives_child_exiting_before_reading_stdin() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        let big = vec![b'x'; 256 * 1024];
+        let result = run_bounded_input(command, &big, 1024, Duration::from_secs(5)).unwrap();
+        assert!(!result.success);
     }
 }
