@@ -1,4 +1,4 @@
-use githearth_git::journal::{Kind, Record, classify};
+use githearth_git::journal::{Kind, Origin, Record, classify};
 use sqlx::{Connection, PgConnection};
 use std::fmt;
 use uuid::Uuid;
@@ -283,7 +283,11 @@ pub async fn replay(
         };
         match classify(&prepared, marker, &refs_now) {
             githearth_git::journal::Outcome::Committed => {
-                apply_committed(&mut conn, repository, &prepared).await?;
+                if prepared.origin == Some(Origin::Merge) {
+                    crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                } else {
+                    apply_committed(&mut conn, repository, &prepared).await?;
+                }
                 let seq = marker
                     .map(|_| records[i + 1].sequence)
                     .unwrap_or(prepared.sequence);
@@ -303,7 +307,11 @@ pub async fn replay(
                     Kind::Committed,
                 )
                 .await?;
-                apply_committed(&mut conn, repository, &prepared).await?;
+                if prepared.origin == Some(Origin::Merge) {
+                    crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                } else {
+                    apply_committed(&mut conn, repository, &prepared).await?;
+                }
                 advance(&mut conn, repository, prepared.sequence).await?;
                 summary.committed += 1;
                 i += 1;

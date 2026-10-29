@@ -9,6 +9,7 @@ pub mod git_http;
 pub mod idempotency;
 pub mod issues;
 mod issues_ui;
+pub mod merge;
 pub mod protection;
 pub mod pulls;
 mod pulls_ui;

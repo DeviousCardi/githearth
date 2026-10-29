@@ -1,6 +1,7 @@
 use githearth_core::ObjectId;
 use githearth_git::journal::{
-    Journal, JournalError, Kind, MAX_RECORD_BYTES, Outcome, Record, Update, classify, crc32c,
+    Journal, JournalError, Kind, MAX_RECORD_BYTES, Origin, Outcome, Record, Update, classify,
+    crc32c,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -88,7 +89,7 @@ fn round_trips_across_reopen() {
     let (seq_prepared, seq_marker);
     let mut journal = Journal::open(&repo).unwrap();
     seq_prepared = journal
-        .append_prepared(op, Some(actor), updates.clone())
+        .append_prepared(op, Some(actor), updates.clone(), None)
         .unwrap();
     seq_marker = journal.append_marker(op, Kind::Committed).unwrap();
     drop(journal);
@@ -108,6 +109,57 @@ fn round_trips_across_reopen() {
 }
 
 #[test]
+fn origin_round_trips_with_and_without() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let updates = vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")];
+
+    let mut journal = Journal::open(&repo).unwrap();
+    journal
+        .append_prepared(Uuid::new_v4(), None, updates.clone(), Some(Origin::Merge))
+        .unwrap();
+    journal
+        .append_prepared(Uuid::new_v4(), None, updates, None)
+        .unwrap();
+    drop(journal);
+
+    let journal = Journal::open(&repo).unwrap();
+    let records: Vec<&Record> = journal.records_after(0).collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].origin, Some(Origin::Merge));
+    assert_eq!(records[1].origin, None);
+}
+
+#[test]
+fn old_format_without_origin_parses_as_none() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let payload = serde_json::json!({
+        "sequence": 1u64,
+        "operation": Uuid::new_v4(),
+        "kind": "prepared",
+        "actor": null,
+        "updates": [{
+            "old": "0".repeat(40),
+            "new": "a".repeat(40),
+            "ref": "refs/heads/main",
+        }],
+    });
+    let payload = serde_json::to_vec(&payload).unwrap();
+    let mut bytes = Vec::with_capacity(8 + payload.len());
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&crc32c(&payload).to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    fs::write(repo.join("githearth").join("journal"), bytes).unwrap();
+
+    let journal = Journal::open(&repo).unwrap();
+    let records: Vec<&Record> = journal.records_after(0).collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, Kind::Prepared);
+    assert_eq!(records[0].origin, None);
+}
+
+#[test]
 fn truncates_torn_length_and_crc_fields() {
     // Torn length field: only part of the 4-byte length remains.
     let fixture = Fixture::new();
@@ -118,6 +170,7 @@ fn truncates_torn_length_and_crc_fields() {
             Uuid::new_v4(),
             None,
             vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
         )
         .unwrap();
     drop(journal);
@@ -138,6 +191,7 @@ fn truncates_torn_length_and_crc_fields() {
             Uuid::new_v4(),
             None,
             vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
         )
         .unwrap();
     drop(journal);
@@ -161,6 +215,7 @@ fn truncates_torn_final_record() {
             op,
             None,
             vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
         )
         .unwrap();
     journal.append_marker(op, Kind::Committed).unwrap();
@@ -190,6 +245,7 @@ fn truncates_bad_crc_in_final_record() {
             op,
             None,
             vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
         )
         .unwrap();
     journal.append_marker(op, Kind::Committed).unwrap();
@@ -217,6 +273,7 @@ fn refuses_corruption_in_middle_record_and_appends() {
             op,
             None,
             vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
         )
         .unwrap();
     journal.append_marker(op, Kind::Committed).unwrap();
@@ -225,6 +282,7 @@ fn refuses_corruption_in_middle_record_and_appends() {
             op,
             None,
             vec![update(&"0".repeat(40), &"b".repeat(40), "refs/heads/other")],
+            None,
         )
         .unwrap();
     drop(journal);
@@ -272,7 +330,7 @@ fn refuses_oversize_append() {
         "refs/heads/main",
     )];
     assert!(matches!(
-        journal.append_prepared(Uuid::new_v4(), None, updates),
+        journal.append_prepared(Uuid::new_v4(), None, updates, None),
         Err(JournalError::TooLarge { .. })
     ));
 }
@@ -293,6 +351,7 @@ fn rotation_keeps_unapplied_and_sequences() {
                     &format!("{i:040x}"),
                     "refs/heads/main",
                 )],
+                None,
             )
             .unwrap();
     }
@@ -318,6 +377,7 @@ fn rotation_keeps_unapplied_and_sequences() {
             op,
             None,
             vec![update(&"0".repeat(40), &"c".repeat(40), "refs/heads/x")],
+            None,
         )
         .unwrap();
     assert_eq!(next, 5);
@@ -338,6 +398,7 @@ fn rotation_of_a_fully_applied_journal_keeps_sequences_after_reopen() {
                     &format!("{i:040x}"),
                     "refs/heads/main",
                 )],
+                None,
             )
             .unwrap();
     }
@@ -352,6 +413,7 @@ fn rotation_of_a_fully_applied_journal_keeps_sequences_after_reopen() {
             Uuid::new_v4(),
             None,
             vec![update(&"0".repeat(40), &"d".repeat(40), "refs/heads/main")],
+            None,
         )
         .unwrap();
     assert_eq!(next, 4);
@@ -372,6 +434,7 @@ fn rotation_rewrites_an_archive_left_by_a_crashed_rotation() {
                     &format!("{i:040x}"),
                     "refs/heads/main",
                 )],
+                None,
             )
             .unwrap();
     }
@@ -399,6 +462,7 @@ fn classify_covers_every_outcome() {
         operation: Uuid::nil(),
         kind: Kind::Prepared,
         actor: None,
+        origin: None,
         updates,
     };
     let u = vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")];

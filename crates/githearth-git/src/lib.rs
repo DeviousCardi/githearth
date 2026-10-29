@@ -18,6 +18,7 @@ pub enum StorageError {
     Git(String),
     TooLarge { size: u64, limit: usize },
     Timeout,
+    RefMoved(String),
 }
 
 impl fmt::Display for StorageError {
@@ -28,6 +29,7 @@ impl fmt::Display for StorageError {
             Self::Git(e) => write!(f, "Git failed: {e}"),
             Self::TooLarge { size, limit } => write!(f, "blob is {size} bytes; limit is {limit}"),
             Self::Timeout => write!(f, "git process timed out"),
+            Self::RefMoved(e) => write!(f, "ref moved: {e}"),
         }
     }
 }
