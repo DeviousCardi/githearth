@@ -648,6 +648,36 @@ impl Storage {
         }
         Ok(removed)
     }
+
+    /// Create a fresh scratch directory under `tmp/` for read-only commands
+    /// that must write objects without touching any repository (e.g. compare's
+    /// merge-tree). Its UUID name is removed on drop and, if leaked, by the
+    /// existing two-phase [`clean_tmp`] (which removes UUID-named entries that
+    /// are not live `creating` operations). If `clean_tmp` removes it while
+    /// still in use, any Git command writing through it fails instead of
+    /// producing a wrong answer.
+    pub fn scratch_dir(&self) -> Result<ScratchDir, StorageError> {
+        let path = self.tmp_path(Uuid::new_v4());
+        fs::create_dir(&path)?;
+        Ok(ScratchDir { path })
+    }
+}
+
+/// A fresh scratch directory under `<root>/tmp/`; removed on drop.
+pub struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 /// A single entry under `tmp/` returned by [`Storage::list_tmp`].

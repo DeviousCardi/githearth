@@ -22,6 +22,8 @@ pub const MAX_OUTPUT_BYTES: usize = 1 << 20;
 pub const MAX_DIFF_FILES: usize = 300;
 /// Largest user-facing log page.
 pub const MAX_LOG_LIMIT: usize = 100;
+/// Most commits reported by a comparison's commit list.
+pub const MAX_COMPARE_COMMITS: usize = 250;
 
 pub fn valid_rev(rev: &str) -> bool {
     !rev.is_empty()
@@ -69,6 +71,7 @@ fn read_capped(mut reader: impl Read, cap: usize) -> Vec<u8> {
 
 struct RunResult {
     success: bool,
+    code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
@@ -115,6 +118,7 @@ fn run_bounded(
         .map_err(|_| StorageError::Invalid("git reader panicked".into()))?;
     Ok(RunResult {
         success: status.success(),
+        code: status.code(),
         truncated: stdout.len() > max_output,
         stdout,
         stderr,
@@ -540,68 +544,98 @@ fn commit_impl(
         .expect("a successful `log -1` always yields one commit");
 
     let root = summary.parents.is_empty();
-    let first_parent = summary.parents.first();
-
-    // Status + paths for every changed file (rename-aware). A listing larger
-    // than `max_output` is truncated: only complete records are kept and the
-    // result is flagged, not failed.
-    let mut command = cmd(repo);
-    command.arg("-c").arg("core.quotePath=false");
-    command.args([
-        "diff-tree",
-        "-r",
-        "-M",
-        "--name-status",
-        "-z",
-        "--no-commit-id",
-    ]);
-    if root {
-        command.arg("--root").arg(id);
+    let left = if root {
+        None
     } else {
-        command
-            .arg(first_parent.expect("non-root has a parent"))
-            .arg(id);
+        Some(
+            summary
+                .parents
+                .first()
+                .expect("non-root has a parent")
+                .as_str(),
+        )
+    };
+    let (files, truncated) = diff_between(repo, left, id, timeout, max_output)?;
+
+    Ok(Some(CommitDetail {
+        id: summary.id,
+        parents: summary.parents,
+        author_name: summary.author_name,
+        author_email: summary.author_email,
+        author_time: summary.author_time,
+        committer_name: summary.committer_name,
+        committer_email: summary.committer_email,
+        committer_time: summary.committer_time,
+        message: summary.summary,
+        truncated,
+        files,
+    }))
+}
+
+/// Diff two trees (the empty tree when `left` is `None`), rename-aware, with
+/// the same per-file shape, bounds and truncation flags as `commit`. Shared by
+/// [`commit_impl`] and [`compare`].
+fn diff_between(
+    repo: &Path,
+    left: Option<&str>,
+    right: &str,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<(Vec<FileDiff>, bool), StorageError> {
+    // Runs one of the three diff-tree listings against `left..right`.
+    fn diff(
+        repo: &Path,
+        left: Option<&str>,
+        right: &str,
+        flags: &[&str],
+        cap: usize,
+        timeout: Duration,
+    ) -> Result<RunResult, StorageError> {
+        let mut command = cmd(repo);
+        command.arg("-c").arg("core.quotePath=false");
+        command.arg("diff-tree").arg("-r").arg("-M");
+        command.args(flags);
+        command.arg("--no-commit-id");
+        match left {
+            None => {
+                command.arg("--root").arg(right);
+            }
+            Some(left) => {
+                command.arg(left).arg(right);
+            }
+        }
+        run_bounded(command, cap, timeout)
     }
-    let name_status = run_bounded(command, max_output, timeout)?;
+
+    // Status + paths for every changed file. A listing larger than
+    // `max_output` is truncated: only complete records are kept and the
+    // result is flagged, not failed.
+    let name_status = diff(
+        repo,
+        left,
+        right,
+        &["--name-status", "-z"],
+        max_output,
+        timeout,
+    )?;
     let mut truncated = name_status.truncated;
     let statuses = parse_name_status(&name_status.stdout, name_status.truncated)?;
 
-    // Per-file addition/deletion counts (rename-aware).
-    let mut command = cmd(repo);
-    command.arg("-c").arg("core.quotePath=false");
-    command.args(["diff-tree", "-r", "-M", "--numstat", "-z", "--no-commit-id"]);
-    if root {
-        command.arg("--root").arg(id);
-    } else {
-        command
-            .arg(first_parent.expect("non-root has a parent"))
-            .arg(id);
-    }
-    let numstat = run_bounded(command, max_output, timeout)?;
+    // Per-file addition/deletion counts.
+    let numstat = diff(repo, left, right, &["--numstat", "-z"], max_output, timeout)?;
     truncated |= numstat.truncated;
     let counts = parse_numstat(&numstat.stdout, numstat.truncated)?;
 
     // Bounded unified patch text.
-    let mut command = cmd(repo);
-    command.arg("-c").arg("core.quotePath=false");
-    command.args([
-        "diff-tree",
-        "-r",
-        "-M",
-        "-p",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-commit-id",
-    ]);
-    if root {
-        command.arg("--root").arg(id);
-    } else {
-        command
-            .arg(first_parent.expect("non-root has a parent"))
-            .arg(id);
-    }
-    let patch = run_bounded(command, MAX_PATCH_BYTES, timeout)?;
-    let patch_truncated = patch.truncated;
+    let patch = diff(
+        repo,
+        left,
+        right,
+        &["-p", "--no-ext-diff", "--no-textconv"],
+        MAX_PATCH_BYTES,
+        timeout,
+    )?;
+    truncated |= patch.truncated;
     let patch_text = String::from_utf8_lossy(&patch.stdout).into_owned();
 
     let mut stats: HashMap<(String, String), (u64, u64, bool)> = HashMap::new();
@@ -626,7 +660,6 @@ fn commit_impl(
         });
     }
 
-    truncated |= patch_truncated;
     if files.len() > MAX_DIFF_FILES {
         truncated = true;
         files.truncate(MAX_DIFF_FILES);
@@ -651,19 +684,187 @@ fn commit_impl(
         truncated = true;
     }
 
-    Ok(Some(CommitDetail {
-        id: summary.id,
-        parents: summary.parents,
-        author_name: summary.author_name,
-        author_email: summary.author_email,
-        author_time: summary.author_time,
-        committer_name: summary.committer_name,
-        committer_email: summary.committer_email,
-        committer_time: summary.committer_time,
-        message: summary.summary,
-        truncated,
+    Ok((files, truncated))
+}
+
+/// Mergeability of a comparison's head into its base.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mergeability {
+    Clean,
+    Conflicts(Vec<String>),
+    Unrelated,
+    UpToDate,
+}
+
+/// Read-only comparison of two revisions of one repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comparison {
+    pub base_id: String,
+    pub head_id: String,
+    pub merge_base: Option<String>,
+    pub ahead_by: u64,
+    pub behind_by: u64,
+    pub commits: Vec<CommitSummary>,
+    pub commits_truncated: bool,
+    pub mergeable: Mergeability,
+    pub files: Vec<FileDiff>,
+    pub truncated: bool,
+}
+
+/// Compare `base` and `head`, writing merge-tree objects into `scratch`
+/// instead of the repository. `None` means one of the revisions was not found.
+pub fn compare(
+    repo: &Path,
+    scratch: &Path,
+    base: &str,
+    head: &str,
+    timeout: Duration,
+) -> Result<Option<Comparison>, StorageError> {
+    if !valid_rev(base) || !valid_rev(head) {
+        return Err(StorageError::Invalid("invalid revision".into()));
+    }
+    let Some(base_id) = resolve(repo, base, timeout)? else {
+        return Ok(None);
+    };
+    let Some(head_id) = resolve(repo, head, timeout)? else {
+        return Ok(None);
+    };
+
+    // `git merge-base` exits 1 when the histories share no ancestor.
+    let merge_base = {
+        let mut command = cmd(repo);
+        command.args(["merge-base", &base_id, &head_id]);
+        let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
+        if result.success {
+            Some(String::from_utf8_lossy(&result.stdout).trim().to_owned())
+        } else if result.code == Some(1) {
+            None
+        } else {
+            return Err(stderr_error(&result.stderr));
+        }
+    };
+
+    let (ahead_by, behind_by) = {
+        let mut command = cmd(repo);
+        command.args([
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base_id}...{head_id}"),
+        ]);
+        let out = run(command, timeout, MAX_OUTPUT_BYTES)?;
+        parse_left_right(&out)?
+    };
+
+    // Commits in head but not in base, newest first, capped at 250.
+    let mut command = cmd(repo);
+    command.args(["log", "-z", &format!("--format={LOG_FORMAT}")]);
+    command.arg(format!("--max-count={}", MAX_COMPARE_COMMITS + 1));
+    command.arg(format!("{base_id}..{head_id}"));
+    let out = run(command, timeout, MAX_OUTPUT_BYTES)?;
+    let mut commits = parse_commits(&out, true)?;
+    let commits_truncated = commits.len() > MAX_COMPARE_COMMITS;
+    commits.truncate(MAX_COMPARE_COMMITS);
+
+    // Three-dot diff: merge base to head; unrelated histories diff base..head.
+    let diff_left = merge_base.as_deref().unwrap_or(&base_id);
+    let (files, truncated) =
+        diff_between(repo, Some(diff_left), &head_id, timeout, MAX_OUTPUT_BYTES)?;
+
+    let mergeable = match &merge_base {
+        None => Mergeability::Unrelated,
+        Some(_) if ahead_by == 0 => Mergeability::UpToDate,
+        Some(_) => run_merge_tree(repo, scratch, &base_id, &head_id, timeout)?,
+    };
+
+    Ok(Some(Comparison {
+        base_id,
+        head_id,
+        merge_base,
+        ahead_by,
+        behind_by,
+        commits,
+        commits_truncated,
+        mergeable,
         files,
+        truncated,
     }))
+}
+
+/// Parse `rev-list --left-right --count base...head` output
+/// `<base-only>\t<head-only>` into `(ahead_by, behind_by)`.
+fn parse_left_right(bytes: &[u8]) -> Result<(u64, u64), StorageError> {
+    let text = utf8(bytes)?;
+    let mut parts = text.split_whitespace();
+    let err = || StorageError::Invalid("unexpected rev-list output".into());
+    let left: u64 = parts.next().ok_or_else(err)?.parse().map_err(|_| err())?;
+    let right: u64 = parts.next().ok_or_else(err)?.parse().map_err(|_| err())?;
+    Ok((right, left))
+}
+
+/// Run `git merge-tree --write-tree` writing objects to `scratch` only.
+///
+/// Exit 0 is clean, exit 1 lists conflicted paths after the tree id line
+/// (NUL-separated with `-z`); anything else is an error. A scratch directory
+/// removed mid-run makes Git fail here rather than return a wrong answer.
+fn run_merge_tree(
+    repo: &Path,
+    scratch: &Path,
+    base: &str,
+    head: &str,
+    timeout: Duration,
+) -> Result<Mergeability, StorageError> {
+    let mut command = cmd(repo);
+    command
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+        ])
+        .arg(base)
+        .arg(head)
+        .env("GIT_OBJECT_DIRECTORY", scratch)
+        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", repo.join("objects"));
+    let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
+    parse_merge_tree(
+        result.code,
+        &result.stdout,
+        &result.stderr,
+        result.truncated,
+    )
+}
+
+/// Interpret `git merge-tree --write-tree --name-only --no-messages -z`
+/// output: exit 0 is clean, exit 1 lists conflicted paths after the tree id
+/// line (NUL-separated); anything else is an error.
+fn parse_merge_tree(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    truncated: bool,
+) -> Result<Mergeability, StorageError> {
+    match code {
+        Some(0) => Ok(Mergeability::Clean),
+        Some(1) => {
+            if truncated {
+                return Err(StorageError::TooLarge {
+                    size: stdout.len() as u64,
+                    limit: MAX_OUTPUT_BYTES,
+                });
+            }
+            let fields = nul_fields(stdout);
+            // First field is the written tree id; the rest are conflicted paths.
+            let paths = fields
+                .into_iter()
+                .skip(1)
+                .map(utf8)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Mergeability::Conflicts(paths))
+        }
+        _ => Err(stderr_error(stderr)),
+    }
 }
 
 fn stderr_error(stderr: &[u8]) -> StorageError {
@@ -1134,5 +1335,177 @@ mod tests {
             run_bounded(command, 1024, Duration::from_millis(20)),
             Err(StorageError::Timeout)
         ));
+    }
+
+    #[test]
+    fn merge_tree_parser_distinguishes_outcomes() {
+        assert_eq!(
+            parse_merge_tree(Some(0), b"abc\0", b"", false).unwrap(),
+            Mergeability::Clean
+        );
+        assert_eq!(
+            parse_merge_tree(Some(1), b"abc\0a.txt\0b/c.txt\0", b"", false).unwrap(),
+            Mergeability::Conflicts(vec!["a.txt".into(), "b/c.txt".into()])
+        );
+        // A tree id with no paths is an empty conflict list, not an error.
+        assert_eq!(
+            parse_merge_tree(Some(1), b"abc\0", b"", false).unwrap(),
+            Mergeability::Conflicts(vec![])
+        );
+        // Truncated conflict listing is an error, never a partial answer.
+        assert!(matches!(
+            parse_merge_tree(Some(1), b"abc\0a.txt\0", b"", true),
+            Err(StorageError::TooLarge { .. })
+        ));
+        // Any other exit code is an error carrying stderr.
+        assert!(matches!(
+            parse_merge_tree(Some(128), b"", b"fatal: boom\n", false),
+            Err(StorageError::Git(m)) if m == "fatal: boom"
+        ));
+        // Killed by a signal (no exit code) is an error, never a wrong answer.
+        assert!(matches!(
+            parse_merge_tree(None, b"", b"", false),
+            Err(StorageError::Git(_))
+        ));
+    }
+
+    #[test]
+    fn left_right_parser_reads_ahead_and_behind() {
+        assert_eq!(parse_left_right(b"2\t3\n").unwrap(), (3, 2));
+        assert_eq!(parse_left_right(b"0\t0\n").unwrap(), (0, 0));
+        assert!(matches!(
+            parse_left_right(b""),
+            Err(StorageError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_left_right(b"1"),
+            Err(StorageError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_left_right(b"x\ty"),
+            Err(StorageError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn compare_reports_clean_conflict_up_to_date_and_unrelated() {
+        let dir = std::env::temp_dir().join(format!("browse-cmp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let repo = dir.join(".git");
+        run_git(&["init", "-q", "-b", "main", d]);
+        std::fs::write(dir.join("shared.txt"), "v1\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "root",
+        ]);
+        let root = run_git(&["-C", d, "rev-parse", "HEAD"]);
+        run_git(&["-C", d, "checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("shared.txt"), "v2f\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "F",
+        ]);
+        run_git(&["-C", d, "checkout", "-q", "main"]);
+        std::fs::write(dir.join("shared.txt"), "v2m\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "M",
+        ]);
+        run_git(&["-C", d, "checkout", "-q", "--orphan", "unrelated"]);
+        run_git(&["-C", d, "rm", "-qrf", "."]);
+        std::fs::write(dir.join("u.txt"), "u\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "U",
+        ]);
+        run_git(&["-C", d, "checkout", "-q", "main"]);
+        let main = run_git(&["-C", d, "rev-parse", "main"]);
+        let feature = run_git(&["-C", d, "rev-parse", "feature"]);
+        let unrelated = run_git(&["-C", d, "rev-parse", "unrelated"]);
+
+        let scratch = dir.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let timeout = Duration::from_secs(10);
+
+        // Fast-forward: root is an ancestor of feature.
+        let ff = compare(&repo, &scratch, &root, &feature, timeout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ff.mergeable, Mergeability::Clean);
+        assert_eq!((ff.ahead_by, ff.behind_by), (1, 0));
+
+        // Conflicting: both sides changed shared.txt.
+        let conflict = compare(&repo, &scratch, &main, &feature, timeout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            conflict.mergeable,
+            Mergeability::Conflicts(vec!["shared.txt".into()])
+        );
+        assert_eq!((conflict.ahead_by, conflict.behind_by), (1, 1));
+
+        // Up to date: head is already contained in base.
+        let uptodate = compare(&repo, &scratch, &main, &root, timeout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(uptodate.mergeable, Mergeability::UpToDate);
+        assert_eq!(uptodate.ahead_by, 0);
+
+        // Unrelated histories.
+        let unrelated_cmp = compare(&repo, &scratch, &main, &unrelated, timeout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unrelated_cmp.mergeable, Mergeability::Unrelated);
+        assert_eq!(unrelated_cmp.merge_base, None);
+
+        // Unknown revision is None, invalid revision is an error.
+        assert!(
+            compare(&repo, &scratch, "main", "nope", timeout)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            compare(&repo, &scratch, "a..b", "main", timeout),
+            Err(StorageError::Invalid(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

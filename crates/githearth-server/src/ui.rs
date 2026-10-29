@@ -616,9 +616,14 @@ async fn repository(
                     .or_else(|| refs.branches.first().map(|b| b.name.clone()))
                     .unwrap_or_else(|| "main".to_owned());
                 browse_section = format!(
-                    "<p><a href=\"/organizations/{}/repositories/{}/tree/{}\">Browse files</a></p>",
+                    "<p><a href=\"/organizations/{}/repositories/{}/tree/{}\">Browse files</a> · \
+<a href=\"/organizations/{}/repositories/{}/compare/{}...{}\">Compare</a></p>",
                     url_encode(&slug),
                     url_encode(&repo.name),
+                    url_encode(&branch),
+                    url_encode(&slug),
+                    url_encode(&repo.name),
+                    url_encode(&branch),
                     url_encode(&branch)
                 );
             }
