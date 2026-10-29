@@ -58,10 +58,10 @@ pub async fn load(
     account_id: Uuid,
     organization_id: Uuid,
 ) -> Result<Option<Facts>, sqlx::Error> {
-    // shortcut: the frozen `load_repo`/`require` ABI used by pulls.rs and
-    // protection.rs (off-limits for this change) never threads read_only, so
-    // those callers load facts as fully-privileged. Read-only enforcement is
-    // applied at the handler and Git-transport boundaries instead.
+    // Read-only enforcement for JSON API writes is applied at the router
+    // boundary (a middleware layer), which has the credential and therefore
+    // knows the token's scopes; this ABI only sees an account id and loads a
+    // fully-privileged snapshot.
     load_scoped(conn, account_id, organization_id, false).await
 }
 

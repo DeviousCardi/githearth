@@ -29,7 +29,7 @@ use argon2::{
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -261,6 +261,10 @@ pub fn router(state: AppState) -> Router {
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(state.config.request_timeout_seconds),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            enforce_read_only_boundary,
         ));
 
     let git = git_http::router(&state.config);
@@ -268,6 +272,34 @@ pub fn router(state: AppState) -> Router {
     json.merge(git)
         .layer(axum::middleware::from_fn(observe))
         .with_state(state)
+}
+
+/// Fail-closed read-only boundary for the JSON API. Read-only enforcement must
+/// not depend on every handler remembering to call `is_read_only()`; this layer
+/// refuses any non-GET/HEAD request whose Bearer credential is a personal
+/// access token without `repo:write`, so new handlers are safe by default.
+/// Session credentials and anonymous requests pass through untouched. The Git
+/// routes are not under `/api/v1` and keep their own transport check.
+async fn enforce_read_only_boundary(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = request.method().clone();
+    if method == Method::GET || method == Method::HEAD {
+        return next.run(request).await;
+    }
+    // Only a valid `ghp_` access token is intercepted; anything else (no
+    // credential, a session token, or a malformed token) falls through to the
+    // handler, which authenticates as it always has.
+    let token_hash = match bearer_credential(request.headers()) {
+        Ok(Credential::AccessToken { token_hash }) => token_hash,
+        _ => return next.run(request).await,
+    };
+    match authenticate_credential(&state.pool, Credential::AccessToken { token_hash }).await {
+        Ok((account, _)) if account.is_read_only() => read_only_denied().into_response(),
+        _ => next.run(request).await,
+    }
 }
 
 async fn observe(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -693,9 +725,6 @@ async fn create_organization(
     Json(input): Json<NewOrganization>,
 ) -> ApiResult<(StatusCode, Json<Organization>)> {
     let (account, _) = authenticate(&state.pool, &headers).await?;
-    if account.is_read_only() {
-        return Err(read_only_denied());
-    }
     if input.slug.is_empty()
         || input.slug.len() > 64
         || input.slug.starts_with('-')

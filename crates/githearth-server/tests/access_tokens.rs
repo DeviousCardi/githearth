@@ -294,6 +294,67 @@ async fn read_token_can_read_but_not_write() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn read_token_blocked_from_pulls_reviews_and_protection() {
+    let (pool, app) = api_pool().await;
+    let username = tag("user");
+    let owner = fixture_account(&pool, &username, "correct horse battery staple").await;
+    let session = login(&app, &username, "correct horse battery staple").await;
+    let org_id = fixture_organization(&pool, owner).await;
+    let org_slug: String = sqlx::query_scalar("SELECT slug FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_name = tag("repo");
+    fixture_repo(&pool, org_id, &repo_name, owner).await;
+
+    let (_id, token) = create_token(&app, &session, &["repo:read"], None).await;
+    let pulls_path = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/pulls");
+
+    // Opening a pull request is a write the layer must refuse for a read token.
+    let (status, body) = request(
+        &app,
+        "POST",
+        &pulls_path,
+        Some(&token),
+        json!({"title": "blocked", "source_branch": "feature", "target_branch": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Submitting a review (approval) is a write too.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("{pulls_path}/1/reviews"),
+            Some(&token),
+            json!({"verdict": "approved", "commit_id": "0123456789abcdef0123456789abcdef01234567"}),
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+
+    // Creating a branch protection rule is a write too.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/protection"),
+            Some(&token),
+            json!({"pattern": "main"}),
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn token_cannot_manage_tokens() {
     let (pool, app) = api_pool().await;
     let username = tag("user");
@@ -582,6 +643,146 @@ async fn git_clone_with_token_and_push_fails_for_read_token() {
     git_ok(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
 
     let _ = std::fs::remove_dir_all(&clone_dir);
+    let _ = std::fs::remove_dir_all(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Write boundary: a repo:write token can open a pull request
+// ---------------------------------------------------------------------------
+
+/// A repository with `main` (target) and `feature` (source) branches, plus a
+/// session, a read token and a write token for its owner. Refs are seeded
+/// directly into storage (no HTTP transport needed for the API tests).
+struct PrFixture {
+    pool: PgPool,
+    storage_root: PathBuf,
+    org_slug: String,
+    repo_name: String,
+    write_token: String,
+    app: Router,
+}
+
+async fn pr_fixture() -> PrFixture {
+    let storage_root = std::env::temp_dir().join(format!("githearth-tok-pr-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let username = tag("owner");
+    let owner = fixture_account(&pool, &username, "testpass").await;
+    let org_id = fixture_organization(&pool, owner).await;
+    let org_slug: String = sqlx::query_scalar("SELECT slug FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo_name = tag("repo");
+    let repo_id = fixture_repo(&pool, org_id, &repo_name, owner).await;
+
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let repo_path = state
+        .storage
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha1,
+        )
+        .unwrap();
+
+    let work = std::env::temp_dir().join(format!("githearth-tok-pr-seed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+    std::fs::write(work.join("README.md"), "# Hello\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "README.md"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "initial",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "-b", "feature"])).await;
+    std::fs::write(work.join("FEATURE.md"), "# feature\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "FEATURE.md"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "feature",
+    ]))
+    .await;
+
+    // Direct storage pushes bypass GitHearth, so skip its ref-transaction hooks.
+    let repo_path_str = repo_path.to_str().unwrap();
+    git_ok(git_cmd(&[
+        "--git-dir",
+        repo_path_str,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        tw,
+        "main:refs/heads/main",
+        "feature:refs/heads/feature",
+    ]))
+    .await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    let app = router(state);
+    let session = login(&app, &username, "testpass").await;
+    let (_wid, write_token) = create_token(&app, &session, &["repo:write"], None).await;
+
+    PrFixture {
+        pool,
+        storage_root,
+        org_slug,
+        repo_name,
+        write_token,
+        app,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn write_token_can_open_pull_request() {
+    let fx = pr_fixture().await;
+    let pulls_path = format!(
+        "/api/v1/organizations/{}/repositories/{}/pulls",
+        fx.org_slug, fx.repo_name
+    );
+
+    let (status, body) = request(
+        &fx.app,
+        "POST",
+        &pulls_path,
+        Some(&fx.write_token),
+        json!({"title": "open", "source_branch": "feature", "target_branch": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["source_branch"], "feature");
+
     let _ = std::fs::remove_dir_all(&fx.storage_root);
     fx.pool.close().await;
 }

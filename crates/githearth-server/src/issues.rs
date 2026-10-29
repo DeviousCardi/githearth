@@ -12,7 +12,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, event, idempotency, invalid, read_only_denied, repositories,
+    ApiError, AppState, authenticate, event, idempotency, invalid, repositories,
     repository_api::{self, Loaded},
 };
 
@@ -176,9 +176,6 @@ async fn create(
 ) -> Result<(StatusCode, Json<IssueJson>), ApiError> {
     new_issue(&body)?;
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    if actor.is_read_only() {
-        return Err(read_only_denied());
-    }
     let key = idempotency::extract_key(&headers).transpose()?;
     let (status, value) = create_issue(
         &state, actor.id, auth_age, &org_slug, &repo_name, &body, key,
@@ -390,9 +387,6 @@ async fn update(
 ) -> Result<Json<IssueJson>, ApiError> {
     let input: PatchIssue = serde_json::from_slice(&body).map_err(|_| invalid())?;
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    if actor.is_read_only() {
-        return Err(read_only_denied());
-    }
     let key = idempotency::extract_key(&headers).transpose()?;
     let value = update_issue(
         &state, actor.id, auth_age, &org_slug, &repo_name, number, input, key,
@@ -549,9 +543,6 @@ async fn create_comment(
 ) -> Result<(StatusCode, Json<CommentJson>), ApiError> {
     new_comment(&body)?;
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    if actor.is_read_only() {
-        return Err(read_only_denied());
-    }
     let key = idempotency::extract_key(&headers).transpose()?;
     let (status, value) = create_issue_comment(
         &state, actor.id, auth_age, &org_slug, &repo_name, number, &body, key,
