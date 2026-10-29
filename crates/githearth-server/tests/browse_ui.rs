@@ -673,3 +673,292 @@ async fn database_failure_renders_unavailable() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let _ = std::fs::remove_dir_all(&f.storage_root);
 }
+
+// ---- comparison pages ------------------------------------------------------
+
+struct CompareUiFixture {
+    app: Router,
+    pool: PgPool,
+    storage_root: PathBuf,
+    org_slug: String,
+    repo_name: String,
+    cookie: String,
+}
+
+async fn build_compare_ui_fixture() -> CompareUiFixture {
+    let storage_root = std::env::temp_dir().join(format!("githearth-cmp-ui-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let owner = Uuid::new_v4();
+    let username = tag("cmp-alice");
+    let hash = hash_password("password123456").unwrap();
+    sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,$3)")
+        .bind(owner)
+        .bind(&username)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO sessions (token_hash,account_id,expires_at) VALUES (sha256($1::bytea),$2,clock_timestamp() + interval '1 hour')")
+        .bind(&token)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let org_id = Uuid::new_v4();
+    let org_slug = tag("cmp-org");
+    sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')")
+        .bind(org_id)
+        .bind(&org_slug)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'owner')")
+        .bind(org_id)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'owner','account',$2,'organization',$3,$2)")
+        .bind(Uuid::new_v4())
+        .bind(owner)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let app = router(state);
+
+    let repo_name = tag("cmp-repo");
+    let (status, body) = api(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        json!({"name": repo_name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let repo_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let repo_path = state_repo_path(&storage_root, repo_id);
+
+    let work = std::env::temp_dir().join(format!("git-cmp-ui-work-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+    std::fs::write(work.join("shared.txt"), "v1\n").unwrap();
+    std::fs::write(work.join("base.txt"), "base\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "root",
+    ]))
+    .await;
+    let root = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+
+    git_ok(git_cmd(&[
+        "-C", tw, "checkout", "-q", "-b", "feature", &root,
+    ]))
+    .await;
+    std::fs::write(work.join("shared.txt"), "v2f\n").unwrap();
+    std::fs::write(work.join("feature.txt"), "feature\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "F1",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    std::fs::write(work.join("shared.txt"), "v2m\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "M2",
+    ]))
+    .await;
+
+    let xss_branch = "<script>alert(1)</script>";
+    git_ok(git_cmd(&[
+        "-C", tw, "checkout", "-q", "-b", xss_branch, &root,
+    ]))
+    .await;
+    std::fs::write(work.join("<script>alert(1).txt"), "x\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "X1",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+        "feature",
+        xss_branch,
+    ]))
+    .await;
+    std::fs::remove_dir_all(&work).unwrap();
+
+    let cookie = login(&app, &username, "password123456").await;
+
+    CompareUiFixture {
+        app,
+        pool,
+        storage_root,
+        org_slug,
+        repo_name,
+        cookie,
+    }
+}
+
+fn cmp_ui_base(f: &CompareUiFixture) -> String {
+    format!("/organizations/{}/repositories/{}", f.org_slug, f.repo_name)
+}
+
+async fn finish_cmp_ui(f: CompareUiFixture) {
+    let _ = std::fs::remove_dir_all(&f.storage_root);
+    f.pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_page_renders_mergeability_conflicts_commits_and_diff() {
+    let f = build_compare_ui_fixture().await;
+    let (status, body) = get_page(
+        &f.app,
+        &format!("{}/compare/main...feature", cmp_ui_base(&f)),
+        Some(&f.cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Compare main...feature"));
+    assert!(body.contains("Conflicts"));
+    assert!(body.contains("<li>shared.txt</li>"));
+    assert!(body.contains("1 ahead, 1 behind"));
+    assert!(body.contains("Files changed"));
+    assert!(body.contains("<table>"));
+    assert!(body.contains("feature.txt"));
+    assert!(body.contains(&format!("{}/commit/", cmp_ui_base(&f))));
+    finish_cmp_ui(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_page_escapes_branch_and_file_names() {
+    let f = build_compare_ui_fixture().await;
+    let spec = "main...%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    let (status, body) = get_page(
+        &f.app,
+        &format!("{}/compare/{spec}", cmp_ui_base(&f)),
+        Some(&f.cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(body.contains("&lt;script&gt;alert(1).txt"));
+    assert!(!body.contains("<script>alert(1)"));
+    finish_cmp_ui(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn repository_page_links_to_compare_and_compare_form_redirects() {
+    let f = build_compare_ui_fixture().await;
+
+    let (status, body) = get_page(&f.app, &cmp_ui_base(&f), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&format!("{}/compare/main...main", cmp_ui_base(&f))));
+
+    // The small GET form redirects to the canonical compare/<base>...<head> path.
+    let resp = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "{}/compare?base=main&head=feature",
+                    cmp_ui_base(&f)
+                ))
+                .header("cookie", &f.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert_eq!(
+        location,
+        format!("{}/compare/main...feature", cmp_ui_base(&f))
+    );
+    finish_cmp_ui(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_page_requires_login() {
+    let f = build_compare_ui_fixture().await;
+    let (status, _) = get_page(
+        &f.app,
+        &format!("{}/compare/main...feature", cmp_ui_base(&f)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    finish_cmp_ui(f).await;
+}

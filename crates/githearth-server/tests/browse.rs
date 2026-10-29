@@ -997,3 +997,653 @@ async fn non_active_repository_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     finish(f).await;
 }
+
+// ---- comparisons -----------------------------------------------------------
+
+struct CompareFixture {
+    app: Router,
+    pool: PgPool,
+    storage_root: PathBuf,
+    org_slug: String,
+    token: String,
+    repo_name: String,
+    repo_path: PathBuf,
+    root: String,
+}
+
+/// A repository with diverged, conflicting, clean, unrelated, rename and
+/// 260-commit histories, plus an XSS-named branch.
+async fn build_compare_fixture() -> CompareFixture {
+    let storage_root = std::env::temp_dir().join(format!("githearth-cmp-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let owner = fixture_account(&pool, &tag("cmp-owner")).await;
+    let token = fixture_session(&pool, owner).await;
+    let (_org_id, org_slug) = fixture_organization(&pool, owner).await;
+
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let app = router(state);
+
+    let repo_name = tag("cmp-repo");
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        json!({"name": repo_name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let repo_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let repo_path = state_repo_path(&storage_root, repo_id);
+
+    let work = std::env::temp_dir().join(format!("git-cmp-work-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+
+    std::fs::write(work.join("shared.txt"), "v1\n").unwrap();
+    std::fs::write(work.join("base.txt"), "base\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "root",
+    ]))
+    .await;
+    let root = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+
+    git_ok(git_cmd(&["-C", tw, "mv", "base.txt", "renamed.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "rename",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&[
+        "-C", tw, "checkout", "-q", "-b", "feature", &root,
+    ]))
+    .await;
+    std::fs::write(work.join("shared.txt"), "v2f\n").unwrap();
+    std::fs::write(work.join("feature.txt"), "feature\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "F1",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    std::fs::write(work.join("shared.txt"), "v2m\n").unwrap();
+    std::fs::write(work.join("main-only.txt"), "main\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "M2",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "-b", "clean", &root])).await;
+    std::fs::write(work.join("clean.txt"), "clean\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "C1",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "-b", "many", &root])).await;
+    for _ in 0..260 {
+        git_ok(git_cmd(&[
+            "-C",
+            tw,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "n",
+        ]))
+        .await;
+    }
+
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "checkout",
+        "-q",
+        "--orphan",
+        "unrelated",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", tw, "rm", "-qrf", "."])).await;
+    std::fs::write(work.join("u.txt"), "u\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "U1",
+    ]))
+    .await;
+
+    let xss_branch = "<script>alert(1)</script>";
+    git_ok(git_cmd(&[
+        "-C", tw, "checkout", "-q", "-b", xss_branch, &root,
+    ]))
+    .await;
+    std::fs::write(work.join("<script>alert(1).txt"), "x\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "X1",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+        "feature",
+        "clean",
+        "many",
+        "unrelated",
+        xss_branch,
+    ]))
+    .await;
+    std::fs::remove_dir_all(&work).unwrap();
+
+    CompareFixture {
+        app,
+        pool,
+        storage_root,
+        org_slug,
+        token,
+        repo_name,
+        repo_path,
+        root,
+    }
+}
+
+impl CompareFixture {
+    fn cmp(&self, spec: &str) -> String {
+        format!(
+            "/api/v1/organizations/{}/repositories/{}/compare/{spec}",
+            self.org_slug, self.repo_name
+        )
+    }
+}
+
+async fn finish_cmp(f: CompareFixture) {
+    let _ = std::fs::remove_dir_all(&f.storage_root);
+    f.pool.close().await;
+}
+
+async fn object_count(repo_path: &Path) -> u64 {
+    let out = git_run(git_cmd(&[
+        "--git-dir",
+        repo_path.to_str().unwrap(),
+        "count-objects",
+        "-v",
+    ]))
+    .await;
+    let text = String::from_utf8(out.stdout).unwrap();
+    text.lines().fold(0, |total, line| {
+        if let Some(v) = line
+            .strip_prefix("count: ")
+            .or_else(|| line.strip_prefix("in-pack: "))
+        {
+            total + v.trim().parse::<u64>().unwrap()
+        } else {
+            total
+        }
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_clean_and_conflicting_merges() {
+    let f = build_compare_fixture().await;
+
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp("main...clean"),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "clean");
+    assert_eq!(body["ahead_by"], 1);
+    assert_eq!(body["behind_by"], 2);
+    let files = body["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["new_path"], "clean.txt");
+    assert_eq!(files[0]["status"], "A");
+
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp("main...feature"),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "conflicts");
+    assert_eq!(body["mergeable"]["conflicts"], json!(["shared.txt"]));
+    assert_eq!(body["ahead_by"], 1);
+    assert_eq!(body["behind_by"], 2);
+    let files = body["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().any(|f| f["new_path"] == "feature.txt"));
+    assert!(files.iter().any(|f| f["new_path"] == "shared.txt"));
+
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_up_to_date_identical_and_fast_forward() {
+    let f = build_compare_fixture().await;
+
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp(&format!("main...{}", f.root)),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "up_to_date");
+    assert_eq!(body["ahead_by"], 0);
+    assert_eq!(body["behind_by"], 2);
+    assert!(body["files"].as_array().unwrap().is_empty());
+
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp(&format!("{}...{}", f.root, f.root)),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "up_to_date");
+    assert_eq!(body["ahead_by"], 0);
+    assert_eq!(body["behind_by"], 0);
+    assert_eq!(body["commits"].as_array().unwrap().len(), 0);
+
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp(&format!("{}...feature", f.root)),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "clean");
+    assert_eq!(body["ahead_by"], 1);
+    assert_eq!(body["behind_by"], 0);
+
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_diverged_diff_excludes_base_only_changes_and_detects_rename() {
+    let f = build_compare_fixture().await;
+
+    // main...clean diverges (ahead 1, behind 2): the three-dot diff must show
+    // only clean.txt, not main's rename/main-only changes.
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp("main...clean"),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ahead_by"], 1);
+    assert_eq!(body["behind_by"], 2);
+    let paths: Vec<String> = body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["new_path"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(paths, vec!["clean.txt".to_owned()]);
+
+    // root...main carries the base.txt -> renamed.txt rename.
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp(&format!("{}...main", f.root)),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "clean");
+    let files = body["files"].as_array().unwrap();
+    let rename = files
+        .iter()
+        .find(|f| f["old_path"] == "base.txt")
+        .expect("rename detected");
+    assert!(rename["status"].as_str().unwrap().starts_with('R'));
+    assert_eq!(rename["new_path"], "renamed.txt");
+
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_unrelated_histories() {
+    let f = build_compare_fixture().await;
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp("main...unrelated"),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "unrelated");
+    assert_eq!(body["mergeable"]["conflicts"], json!([]));
+    assert!(body["merge_base"].is_null());
+    assert_eq!(body["ahead_by"], 1);
+    assert_eq!(body["behind_by"], 3);
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_more_than_250_commits_truncated() {
+    let f = build_compare_fixture().await;
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp(&format!("{}...many", f.root)),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ahead_by"], 260);
+    assert_eq!(body["commits_truncated"], true);
+    assert_eq!(body["commits"].as_array().unwrap().len(), 250);
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_bad_spec_and_rev_400_unknown_rev_404() {
+    let f = build_compare_fixture().await;
+    for spec in [
+        "main",
+        "main..feature",
+        "main...a..b",
+        "-foo...main",
+        "main...-bar",
+    ] {
+        let (status, _) = request(&f.app, "GET", &f.cmp(spec), Some(&f.token), Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "spec {spec}");
+    }
+    for spec in ["main...nope", "nope...main"] {
+        let (status, body) =
+            request(&f.app, "GET", &f.cmp(spec), Some(&f.token), Value::Null).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "spec {spec}");
+        assert_eq!(body["error"], "revision not found");
+    }
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_denies_unrelated_user_and_unauthenticated() {
+    let f = build_compare_fixture().await;
+    let stranger = fixture_account(&f.pool, &tag("cmp-stranger")).await;
+    let stranger_token = fixture_session(&f.pool, stranger).await;
+    let root_main = format!("{}...main", f.root);
+    let (status, _) = request(
+        &f.app,
+        "GET",
+        &f.cmp(&root_main),
+        Some(&stranger_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = request(&f.app, "GET", &f.cmp(&root_main), None, Value::Null).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_leaves_repository_untouched_and_removes_scratch() {
+    let f = build_compare_fixture().await;
+    let before = object_count(&f.repo_path).await;
+
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &f.cmp("main...feature"),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "conflicts");
+
+    assert_eq!(
+        object_count(&f.repo_path).await,
+        before,
+        "a conflicting compare must not add objects to the repository"
+    );
+    let tmp = f.storage_root.join("tmp");
+    let leftovers = std::fs::read_dir(&tmp).unwrap().count();
+    assert_eq!(
+        leftovers, 0,
+        "the compare scratch directory must be removed"
+    );
+
+    finish_cmp(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn compare_works_in_a_sha256_repository() {
+    let storage_root = std::env::temp_dir().join(format!("githearth-cmp-256-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let owner = fixture_account(&pool, &tag("cmp256-owner")).await;
+    let token = fixture_session(&pool, owner).await;
+    let (org_id, org_slug) = fixture_organization(&pool, owner).await;
+    let repo_name = tag("cmp256");
+    let repo_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) VALUES ($1,$2,$3,$4,$5,'active','private')")
+        .bind(repo_id)
+        .bind(org_id)
+        .bind(&repo_name)
+        .bind(owner)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let repo_path = state
+        .storage
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha256,
+        )
+        .unwrap();
+
+    let work = std::env::temp_dir().join(format!("git-cmp-256-work-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "init",
+        "--object-format=sha256",
+        "-b",
+        "main",
+    ]))
+    .await;
+    std::fs::write(work.join("f.txt"), "v1\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "root",
+    ]))
+    .await;
+    let root = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "-b", "feature"])).await;
+    std::fs::write(work.join("g.txt"), "v2\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "-A"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "F1",
+    ]))
+    .await;
+    let feature = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    assert_eq!(root.len(), 64);
+    assert_eq!(feature.len(), 64);
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+        "feature",
+    ]))
+    .await;
+    std::fs::remove_dir_all(&work).unwrap();
+
+    let app = router(state);
+    let base = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}");
+    let (status, body) = request(
+        &app,
+        "GET",
+        &format!("{base}/compare/{root}...{feature}"),
+        Some(&token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mergeable"]["status"], "clean");
+    assert_eq!(body["ahead_by"], 1);
+    assert_eq!(body["behind_by"], 0);
+
+    let _ = std::fs::remove_dir_all(&storage_root);
+    pool.close().await;
+}

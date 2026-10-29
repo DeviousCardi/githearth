@@ -283,6 +283,38 @@ fn clean_tmp_candidate_vanished_is_skipped_without_error() {
 }
 
 #[test]
+fn scratch_dir_is_removed_on_drop_and_when_leaked() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+
+    // Dropping the guard removes the directory.
+    let scratch = storage.scratch_dir().unwrap();
+    let path = scratch.path().to_path_buf();
+    assert!(path.starts_with(root.join("tmp")));
+    assert!(path.is_dir());
+    drop(scratch);
+    assert!(!path.exists());
+
+    // A leaked scratch (never dropped) is listed and cleaned as dead tmp.
+    let leaked = storage.scratch_dir().unwrap();
+    let leaked_path = leaked.path().to_path_buf();
+    std::mem::forget(leaked);
+    let candidates = storage.list_tmp().unwrap();
+    let dead: Vec<_> = candidates
+        .iter()
+        .filter(|c| c.name == leaked_path.file_name().unwrap().to_string_lossy())
+        .collect();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(
+        storage.clean_tmp(&candidates, &HashSet::new()).unwrap(),
+        1,
+        "a leaked scratch must be removed by clean_tmp"
+    );
+    assert!(!leaked_path.exists());
+}
+
+#[test]
 fn scan_reports_malformed_names() {
     let fixture = Fixture::new();
     let root = fixture.0.join("storage");

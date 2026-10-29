@@ -6,14 +6,15 @@
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use githearth_authz::Action;
 use githearth_core::RepositoryStatus;
 use githearth_git::{StorageError, browse};
+use serde::Deserialize;
 use std::path::Path as FsPath;
 use std::time::Duration;
 use uuid::Uuid;
@@ -41,6 +42,14 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/organizations/{slug}/repositories/{name}/commit/{id}",
             get(commit_page),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/compare/{spec}",
+            get(compare_page),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/compare",
+            get(compare_form),
         )
 }
 
@@ -119,6 +128,35 @@ fn map_work_error(repo_id: Uuid, username: &str, error: StorageError) -> ui::UiE
             ui::unavailable_page(Some(username))
         }
     }
+}
+
+/// Like [`git_work_ui`], but also creates a scratch directory (removed when
+/// the worker returns) for Git commands that must write objects off-repository.
+async fn git_compare_ui<T>(
+    state: &AppState,
+    repo_id: Uuid,
+    username: &str,
+    work: impl FnOnce(&FsPath, &FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
+) -> Result<T, ui::UiError>
+where
+    T: Send + 'static,
+{
+    let permit = state
+        .git_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ui::unavailable_page(Some(username)))?;
+    let storage = state.storage.clone();
+    let timeout = Duration::from_secs(state.config.git_timeout_seconds);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let path = storage.read_path(repo_id)?;
+        let scratch = storage.scratch_dir()?;
+        work(&path, scratch.path(), timeout)
+    })
+    .await
+    .map_err(|_| ui::unavailable_page(Some(username)))?
+    .map_err(|error| map_work_error(repo_id, username, error))
 }
 
 async fn resolve_ui(
@@ -368,6 +406,28 @@ async fn commits_page(
     .into_response())
 }
 
+/// Render a diff exactly as the commit page does: binary notices, escaped
+/// patch text, and a truncation notice.
+fn render_diff(files: &[browse::FileDiff], truncated: bool) -> String {
+    let mut out = String::new();
+    for file in files {
+        if file.binary {
+            out.push_str(&format!(
+                "<p class=\"muted\">Binary file: {} ({} / {} additions/deletions)</p>",
+                ui::esc(&file.new_path),
+                file.additions,
+                file.deletions
+            ));
+        } else {
+            out.push_str(&format!("<pre>{}</pre>", ui::esc(&file.patch)));
+        }
+    }
+    if truncated {
+        out.push_str("<p class=\"muted\">Diff output truncated.</p>");
+    }
+    out
+}
+
 async fn commit_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -386,22 +446,6 @@ async fn commit_page(
     .await?
     .ok_or_else(|| ui::not_found_page(Some(&username)))?;
 
-    let mut files = String::new();
-    for file in &detail.files {
-        if file.binary {
-            files.push_str(&format!(
-                "<p class=\"muted\">Binary file: {} ({} / {} additions/deletions)</p>",
-                ui::esc(&file.new_path),
-                file.additions,
-                file.deletions
-            ));
-        } else {
-            files.push_str(&format!("<pre>{}</pre>", ui::esc(&file.patch)));
-        }
-    }
-    if detail.truncated {
-        files.push_str("<p class=\"muted\">Diff output truncated.</p>");
-    }
     let body = format!(
         "<h1>{}</h1><p class=\"muted\">{} &lt;{}&gt;</p>\
 <pre>{}</pre><div class=\"card\">{}</div>",
@@ -409,13 +453,134 @@ async fn commit_page(
         ui::esc(&detail.author_name),
         ui::esc(&detail.author_email),
         ui::esc(&detail.message),
-        files
+        render_diff(&detail.files, detail.truncated)
     );
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
     Ok(Html(ui::render_page(
         "Commit",
+        Some(&username),
+        csrf.as_deref(),
+        &body,
+    ))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct CompareQuery {
+    #[serde(default)]
+    base: String,
+    #[serde(default)]
+    head: String,
+}
+
+/// Redirect a `GET /compare?base=..&head=..` form submission to the canonical
+/// `compare/<base>...<head>` path.
+async fn compare_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name)): Path<(String, String)>,
+    Query(query): Query<CompareQuery>,
+) -> Result<Response, ui::UiError> {
+    let (account, _loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = account.username.clone();
+    let spec = format!("{}...{}", query.base, query.head);
+    let Some((base, head)) = crate::browse::split_spec(&spec) else {
+        return Err(ui::not_found_page(Some(&username)));
+    };
+    Ok(Redirect::to(&format!(
+        "/organizations/{}/repositories/{}/compare/{}...{}",
+        ui::url_encode(&slug),
+        ui::url_encode(&name),
+        ui::url_encode(base),
+        ui::url_encode(head)
+    ))
+    .into_response())
+}
+
+async fn compare_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, spec)): Path<(String, String, String)>,
+) -> Result<Response, ui::UiError> {
+    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = account.username.clone();
+    let Some((base, head)) = crate::browse::split_spec(&spec) else {
+        return Err(ui::not_found_page(Some(&username)));
+    };
+    let repo_id = loaded.repo.id;
+    let (base_owned, head_owned) = (base.to_owned(), head.to_owned());
+    let comparison = git_compare_ui(
+        &state,
+        repo_id,
+        &username,
+        move |fs_path, scratch, timeout| {
+            browse::compare(fs_path, scratch, &base_owned, &head_owned, timeout)
+        },
+    )
+    .await?
+    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+
+    let repo_href = format!(
+        "/organizations/{}/repositories/{}",
+        ui::url_encode(&slug),
+        ui::url_encode(&name)
+    );
+    let (status_text, conflicts) = match &comparison.mergeable {
+        browse::Mergeability::Clean => ("Clean", Vec::new()),
+        browse::Mergeability::Conflicts(paths) => ("Conflicts", paths.clone()),
+        browse::Mergeability::Unrelated => ("Unrelated histories", Vec::new()),
+        browse::Mergeability::UpToDate => ("Up to date", Vec::new()),
+    };
+    let conflict_html = if conflicts.is_empty() {
+        String::new()
+    } else {
+        let items = conflicts
+            .iter()
+            .map(|p| format!("<li>{}</li>", ui::esc(p)))
+            .collect::<String>();
+        format!("<ul>{items}</ul>")
+    };
+    let mut commits = String::new();
+    for commit in &comparison.commits {
+        commits.push_str(&format!(
+            "<tr><td><a href=\"{repo_href}/commit/{}\">{}</a></td><td>{}</td><td>{}</td></tr>",
+            ui::url_encode(&commit.id),
+            ui::esc(&commit.id),
+            ui::esc(&commit.summary),
+            ui::esc(&commit.author_name)
+        ));
+    }
+    if comparison.commits_truncated {
+        commits.push_str("<tr><td colspan=\"3\" class=\"muted\">Commit list truncated.</td></tr>");
+    }
+    let body = format!(
+        "<h1>Compare {}...{}</h1>\
+<p class=\"muted\">{} ahead, {} behind &middot; {}</p>\
+{conflict_html}\
+<form method=\"get\" action=\"{repo_href}/compare\">\
+<label for=\"base\">Base</label><input id=\"base\" name=\"base\" value=\"{}\">\
+<label for=\"head\">Head</label><input id=\"head\" name=\"head\" value=\"{}\">\
+<button type=\"submit\">Compare</button></form>\
+<div class=\"card\"><table><thead><tr>\
+<th scope=\"col\">Commit</th><th scope=\"col\">Summary</th><th scope=\"col\">Author</th>\
+</tr></thead><tbody>{commits}</tbody></table></div>\
+<h2>Files changed</h2><div class=\"card\">{}</div>",
+        ui::esc(base),
+        ui::esc(head),
+        comparison.ahead_by,
+        comparison.behind_by,
+        ui::esc(status_text),
+        ui::esc(base),
+        ui::esc(head),
+        render_diff(&comparison.files, comparison.truncated)
+    );
+    let csrf = Some(ui::csrf_expected(
+        &ui::browser_token_hash(&headers).unwrap_or_default(),
+    ));
+    Ok(Html(ui::render_page(
+        "Compare",
         Some(&username),
         csrf.as_deref(),
         &body,

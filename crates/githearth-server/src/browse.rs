@@ -43,6 +43,10 @@ pub fn router() -> Router<AppState> {
             "/api/v1/organizations/{org}/repositories/{repo}/commit/{id}",
             get(commit),
         )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{repo}/compare/{spec}",
+            get(compare),
+        )
         .merge(crate::browse_ui::router())
 }
 
@@ -106,6 +110,43 @@ where
         )
     })?
     .map_err(|error| map_storage_error(repo_id, error))
+}
+
+/// Like [`git_read`], but also creates a scratch directory (removed when the
+/// worker returns) for Git commands that must write objects off-repository.
+async fn git_compare<T>(
+    state: &AppState,
+    repo_id: Uuid,
+    work: impl FnOnce(&FsPath, &FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+{
+    let permit = acquire_permit(state).await?;
+    let storage = state.storage.clone();
+    let timeout = Duration::from_secs(state.config.git_timeout_seconds);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let path = storage.read_path(repo_id)?;
+        let scratch = storage.scratch_dir()?;
+        work(&path, scratch.path(), timeout)
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage operation failed",
+        )
+    })?
+    .map_err(|error| map_storage_error(repo_id, error))
+}
+
+/// Split a `<base>...<head>` spec on the first `...`. Both sides must pass
+/// `valid_rev`, which rejects `..`, so the split is unambiguous and a missing
+/// or extra separator is `None`.
+pub(crate) fn split_spec(spec: &str) -> Option<(&str, &str)> {
+    let (base, head) = spec.split_once("...")?;
+    (browse::valid_rev(base) && browse::valid_rev(head)).then_some((base, head))
 }
 
 fn map_storage_error(repo_id: Uuid, error: StorageError) -> ApiError {
@@ -479,6 +520,93 @@ async fn commit(
     }))
 }
 
+#[derive(Serialize)]
+struct MergeableJson {
+    status: &'static str,
+    conflicts: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CompareJson {
+    base_id: String,
+    head_id: String,
+    merge_base: Option<String>,
+    ahead_by: u64,
+    behind_by: u64,
+    commits_truncated: bool,
+    mergeable: MergeableJson,
+    commits: Vec<CommitSummaryJson>,
+    truncated: bool,
+    files: Vec<FileDiffJson>,
+}
+
+async fn compare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo, spec)): Path<(String, String, String)>,
+) -> Result<Json<CompareJson>, ApiError> {
+    let loaded = load_readable(&state, &headers, &org, &repo).await?;
+    let Some((base, head)) = split_spec(&spec) else {
+        return Err(invalid());
+    };
+    let (base, head) = (base.to_owned(), head.to_owned());
+    let repo_id = loaded.repo.id;
+    let comparison = git_compare(&state, repo_id, move |fs_path, scratch, timeout| {
+        browse::compare(fs_path, scratch, &base, &head, timeout)
+    })
+    .await?
+    .ok_or_else(revision_not_found)?;
+
+    let (status, conflicts) = match comparison.mergeable {
+        browse::Mergeability::Clean => ("clean", vec![]),
+        browse::Mergeability::Conflicts(paths) => ("conflicts", paths),
+        browse::Mergeability::Unrelated => ("unrelated", vec![]),
+        browse::Mergeability::UpToDate => ("up_to_date", vec![]),
+    };
+    Ok(Json(CompareJson {
+        base_id: comparison.base_id,
+        head_id: comparison.head_id,
+        merge_base: comparison.merge_base,
+        ahead_by: comparison.ahead_by,
+        behind_by: comparison.behind_by,
+        commits_truncated: comparison.commits_truncated,
+        mergeable: MergeableJson { status, conflicts },
+        commits: comparison
+            .commits
+            .into_iter()
+            .map(|c| CommitSummaryJson {
+                author: AuthorJson {
+                    name: c.author_name,
+                    email: c.author_email,
+                    time: c.author_time,
+                },
+                committer: AuthorJson {
+                    name: c.committer_name,
+                    email: c.committer_email,
+                    time: c.committer_time,
+                },
+                id: c.id,
+                parents: c.parents,
+                summary: c.summary,
+            })
+            .collect(),
+        truncated: comparison.truncated,
+        files: comparison
+            .files
+            .into_iter()
+            .map(|f| FileDiffJson {
+                old_path: f.old_path,
+                new_path: f.new_path,
+                status: f.status,
+                additions: f.additions,
+                deletions: f.deletions,
+                binary: f.binary,
+                patch: f.patch,
+            })
+            .collect(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +635,26 @@ mod tests {
             map_storage_error(repo_id, StorageError::Invalid("boom".into())).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn split_spec_requires_exactly_one_valid_separator() {
+        for (spec, expected) in [
+            ("main...feature", Some(("main", "feature"))),
+            ("v1.0...v2.0", Some(("v1.0", "v2.0"))),
+            ("a...b...c", None),
+            ("main..feature", None),
+            ("main", None),
+            ("...feature", None),
+            ("main...", None),
+            ("...", None),
+            ("....", None),
+            ("-foo...main", None),
+            ("main...-bar", None),
+            ("main...a..b", None),
+        ] {
+            assert_eq!(split_spec(spec), expected, "spec {spec:?}");
+        }
     }
 
     #[tokio::test]
