@@ -127,13 +127,20 @@ async fn setup() -> (Router, PgPool, PathBuf, Uuid, Uuid, String) {
 async fn setup_with_connections(
     max_connections: u32,
 ) -> (Router, PgPool, PathBuf, Uuid, Uuid, String) {
+    setup_with_pool(max_connections, 1).await
+}
+
+async fn setup_with_pool(
+    max_connections: u32,
+    acquire_timeout_seconds: u64,
+) -> (Router, PgPool, PathBuf, Uuid, Uuid, String) {
     let storage_root = std::env::temp_dir().join(format!("githearth-issues-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
     let config = Config {
         database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
             .expect("set GITHEARTH_TEST_DATABASE_URL"),
         database_max_connections: max_connections,
-        database_timeout_seconds: 1,
+        database_timeout_seconds: acquire_timeout_seconds,
         body_limit_bytes: 200_000,
         storage_root: storage_root.clone(),
         ..Config::default()
@@ -1029,7 +1036,9 @@ async fn concurrent_patches_do_not_lose_updates() {
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn concurrent_comments_page_without_skips_or_duplicates() {
-    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    // 20 posts queue for 4 connections while their transactions serialize on
+    // the issue's counter row; allow the queue more than the default 1 s.
+    let (app, pool, storage, owner, org_id, slug) = setup_with_pool(4, 10).await;
     let token = fixture_session(&pool, owner).await;
     fixture_repository(&pool, org_id, "mp", owner, "private", false).await;
     create_issue(&app, &token, &slug, "mp", "x", "").await;
