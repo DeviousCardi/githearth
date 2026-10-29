@@ -54,8 +54,9 @@ fn revision_not_found() -> ApiError {
 }
 
 /// Authenticate, load the repository by name and require read access. Archived
-/// repositories stay readable; any other status is indistinguishable from a
-/// missing repository.
+/// repositories stay readable: `archived` is a flag, not a status — an
+/// archived repository still has status `active`. Only non-`active` statuses
+/// are treated like a missing repository (404).
 async fn load_readable(
     state: &AppState,
     headers: &HeaderMap,

@@ -232,7 +232,8 @@ async fn build_fixture() -> Fixture {
     let root_commit = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
     git_ok(git_cmd(&["-C", tw, "tag", "v1.0", &root_commit])).await;
 
-    // A gitlink (submodule) entry pointing at the just-created commit.
+    // A gitlink (submodule) entry pointing at the just-created commit, and one
+    // pointing at a commit that does not exist in this repository.
     git_ok(git_cmd(&[
         "-C",
         tw,
@@ -240,6 +241,15 @@ async fn build_fixture() -> Fixture {
         "--add",
         "--cacheinfo",
         &format!("160000,{root_commit},submod"),
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "160000,1111111111111111111111111111111111111111,submod-missing",
     ]))
     .await;
     git_ok(git_cmd(&[
@@ -859,6 +869,26 @@ async fn invalid_utf8_blob_is_base64_not_binary() {
 async fn blob_of_directory_or_missing_path_is_404() {
     let f = build_fixture().await;
     for path in ["docs", "nope"] {
+        let (status, _) = request(
+            &f.app,
+            "GET",
+            &format!("{}/blob/main?path={path}", f.base()),
+            Some(&f.token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "path={path}");
+    }
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn blob_of_submodule_path_is_404() {
+    let f = build_fixture().await;
+    // A gitlink whose target exists, and one whose target is absent: both are
+    // "not found", never a 500.
+    for path in ["submod", "submod-missing"] {
         let (status, _) = request(
             &f.app,
             "GET",

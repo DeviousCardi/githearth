@@ -373,8 +373,10 @@ pub fn blob(
 
     let mut command = cmd(repo);
     command.args(["cat-file", "-t", &id]);
-    let kind = run(command, timeout, MAX_OUTPUT_BYTES)?;
-    if String::from_utf8_lossy(&kind).trim() != "blob" {
+    let kind = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
+    // A gitlink points at a commit object that need not exist in this
+    // repository; a missing or non-blob object is "not found", not an error.
+    if !kind.success || String::from_utf8_lossy(&kind.stdout).trim() != "blob" {
         return Ok(None);
     }
 
@@ -631,8 +633,19 @@ fn commit_impl(
     }
 
     let chunks = split_patch(&patch_text);
-    for (file, chunk) in files.iter_mut().zip(chunks) {
-        file.patch = chunk;
+    // A type change is one `T` name-status record but two `diff --git`
+    // chunks (delete + add); every other record has exactly one. Assign by
+    // that count rather than position so later files keep their own patch.
+    let mut chunks = chunks.into_iter();
+    for file in &mut files {
+        let mut patch = String::new();
+        let pieces = if file.status == "T" { 2 } else { 1 };
+        for _ in 0..pieces {
+            if let Some(chunk) = chunks.next() {
+                patch.push_str(&chunk);
+            }
+        }
+        file.patch = patch;
     }
     if files.iter().any(|f| f.patch.is_empty() && !f.binary) {
         truncated = true;
@@ -862,6 +875,79 @@ mod tests {
         assert!(!detail.files.is_empty());
         assert!(detail.files.len() < 3);
         assert!(detail.files.iter().all(|f| f.status == "A"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_assigns_type_change_chunks_to_the_right_files() {
+        let dir = std::env::temp_dir().join(format!("browse-type-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        run_git(&["init", "-q", "-b", "main", d]);
+        std::fs::write(dir.join("f"), "a\n").unwrap();
+        std::fs::write(dir.join("z"), "b\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "1",
+        ]);
+        std::fs::remove_file(dir.join("f")).unwrap();
+        std::os::unix::fs::symlink("z", dir.join("f")).unwrap();
+        std::fs::write(dir.join("z"), "b\nc\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "2",
+        ]);
+        let head = run_git(&["-C", d, "rev-parse", "HEAD"]);
+        let repo = dir.join(".git");
+
+        let detail = commit(&repo, &head, Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let files = &detail.files;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, "T");
+        assert_eq!(files[0].new_path, "f");
+        assert!(
+            files[0].patch.contains("120000"),
+            "type change keeps its add chunk: {}",
+            files[0].patch
+        );
+        assert!(
+            !files[0].patch.contains("+c"),
+            "type change patch must not leak z: {}",
+            files[0].patch
+        );
+        assert_eq!(files[1].status, "M");
+        assert_eq!(files[1].new_path, "z");
+        assert!(
+            files[1].patch.contains("+c"),
+            "z patch keeps its own content: {}",
+            files[1].patch
+        );
+        assert!(
+            !files[1].patch.contains("120000"),
+            "z patch must not leak f: {}",
+            files[1].patch
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

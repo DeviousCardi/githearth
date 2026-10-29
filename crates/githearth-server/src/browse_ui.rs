@@ -219,26 +219,27 @@ async fn render_tree(
             Some(parent) => format!("{parent}/{}", entry.name),
             None => entry.name.clone(),
         };
-        let is_dir = matches!(
-            entry.kind,
-            browse::EntryKind::Tree | browse::EntryKind::Commit
-        );
-        let link = if is_dir {
-            format!(
+        // Submodules (`commit` kind) have no content to browse: render their
+        // name as plain text, unlinked.
+        let link = match entry.kind {
+            browse::EntryKind::Tree => Some(format!(
                 "{repo_href}/tree/{}/{}",
                 ui::url_encode(rev),
                 encode_segments(&entry_path)
-            )
-        } else {
-            format!(
+            )),
+            browse::EntryKind::Commit => None,
+            _ => Some(format!(
                 "{repo_href}/blob/{}/{}",
                 ui::url_encode(rev),
                 encode_segments(&entry_path)
-            )
+            )),
+        };
+        let name_cell = match link {
+            Some(link) => format!("<a href=\"{link}\">{}</a>", ui::esc(&entry.name)),
+            None => ui::esc(&entry.name),
         };
         rows.push_str(&format!(
-            "<tr><td><a href=\"{link}\">{}</a></td><td>{}</td><td>{}</td></tr>",
-            ui::esc(&entry.name),
+            "<tr><td>{name_cell}</td><td>{}</td><td>{}</td></tr>",
             ui::esc(kind),
             entry.size.map(|s| s.to_string()).unwrap_or_default()
         ));

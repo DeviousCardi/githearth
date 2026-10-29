@@ -523,6 +523,8 @@ async fn tree_subdir_renders_breadcrumbs_and_kinds() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("symlink"));
     assert!(body.contains("commit"));
+    // The submodule is rendered as plain text, not as a link.
+    assert!(body.contains("<td>submod</td>"));
     finish(f).await;
 }
 
