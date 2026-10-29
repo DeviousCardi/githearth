@@ -54,7 +54,7 @@ Two existing boundaries need explicit resolution in phase 0:
 - The prototype reader uses flat `<id>.git` paths; the newer storage uses sharded UUID paths. B connects them before browsing depends on the reader.
 - JSON body/time limits currently apply globally in the server. A and B agree separate bounded Git routes before transport integration.
 
-Follow [ADR 0003](../decisions/0003-git-push-and-repository-lifecycle.md) for lifecycle and push durability. Revise the decision explicitly if implementation evidence requires a change.
+Follow [ADR 0003](../decisions/0003-git-push-and-repository-lifecycle.md) for lifecycle and push durability. Merge execution follows [ADR 0004](../decisions/0004-merge-execution.md) (proposed for M3, pending Person A review). Revise either decision explicitly if implementation evidence requires a change.
 
 ## Conflict prevention
 

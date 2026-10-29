@@ -70,3 +70,5 @@ Unknown write outcomes require eventual operation-ID support. M1 organization cr
 6. Issues/comments with atomic idempotency/outbox and cursor pagination.
 7. End-to-end negative-access, crash-recovery and fresh restore scenario.
 8. Whole-workflow benchmark and single-node resource report.
+
+Merge execution is specified in [ADR 0004](../decisions/0004-merge-execution.md) (proposed for M3, pending Person A review).
