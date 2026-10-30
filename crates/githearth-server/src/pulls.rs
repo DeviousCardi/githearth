@@ -68,6 +68,9 @@ fn line_out_of_range() -> ApiError {
 fn not_open() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is not open")
 }
+fn already_merged() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "pull request is merged")
+}
 
 /// Re-checks inside the transaction, on the same row lock the PATCH
 /// close/reopen path takes, that the pull request is still open. A close that
@@ -623,6 +626,11 @@ async fn update(
             .bind(pull.id)
             .fetch_one(&mut *tx)
             .await?;
+            // Merged is terminal: its title and body stay editable, but it can
+            // be neither reopened nor closed.
+            if locked.state == "merged" && input.state.is_some() {
+                return Err(already_merged());
+            }
             let new_state = input.state.as_deref().unwrap_or(locked.state.as_str());
             let updated = sqlx::query(
                 "UPDATE pull_requests SET title = $1, body = $2, state = $3, updated_at = now() \

@@ -515,10 +515,12 @@ pub async fn record_merge_result(
         .execute(&mut *tx)
         .await?;
 
+        // The ref has moved, so Git won: a close that committed after
+        // execute_intent revalidated still ends with the pull request merged.
         sqlx::query(
             "UPDATE pull_requests SET state = 'merged', merged_at = now(), merged_by = $1, \
              updated_at = now() WHERE id = (SELECT pull_request_id FROM merge_intents \
-             WHERE operation_id = $2) AND state = 'open'",
+             WHERE operation_id = $2) AND state IN ('open', 'closed')",
         )
         .bind(actor)
         .bind(operation_id)

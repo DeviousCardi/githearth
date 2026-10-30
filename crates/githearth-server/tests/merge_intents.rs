@@ -635,6 +635,86 @@ async fn record_merge_result_is_idempotent() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn close_during_execution_still_ends_merged_and_merged_is_terminal() {
+    let f = build_fixture().await;
+    let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let operation_id: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    let pull_id: Uuid = intent["pull_request_id"].as_str().unwrap().parse().unwrap();
+    let href = format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number);
+
+    // The intent is executing, so closing the pull request does not cancel it.
+    sqlx::query("UPDATE merge_intents SET state = 'executing' WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &href,
+        Some(&f.token),
+        None,
+        json!({"state": "closed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The ref moved anyway, so recording it marks the closed pull request merged.
+    let mut conn = f.pool.acquire().await.unwrap();
+    githearth_server::merge_intents::record_merge_result(
+        &mut conn,
+        f.repo_id,
+        43,
+        operation_id,
+        f.owner_id,
+        &f.head,
+        &"c".repeat(40),
+        "refs/heads/main",
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    let pull_state: String = sqlx::query_scalar("SELECT state FROM pull_requests WHERE id = $1")
+        .bind(pull_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(pull_state, "merged");
+
+    // A merged pull request can be neither reopened nor closed.
+    for target in ["open", "closed"] {
+        let (status, body) = request(
+            &f.app,
+            "PATCH",
+            &href,
+            Some(&f.token),
+            None,
+            json!({"state": target}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{target}: {body}");
+        assert_eq!(body["error"], "pull request is merged");
+    }
+    // Its title stays editable.
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &href,
+        Some(&f.token),
+        None,
+        json!({"title": "renamed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "merged");
+    assert_eq!(body["title"], "renamed");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn closing_a_pull_request_cancels_its_queued_intent() {
     let f = build_fixture().await;
     let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
