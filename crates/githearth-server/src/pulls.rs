@@ -68,6 +68,9 @@ fn line_out_of_range() -> ApiError {
 fn not_open() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is not open")
 }
+fn already_merged() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "pull request is merged")
+}
 
 /// Re-checks inside the transaction, on the same row lock the PATCH
 /// close/reopen path takes, that the pull request is still open. A close that
@@ -202,7 +205,7 @@ async fn fetch_pull(conn: &mut PgConnection, id: Uuid) -> Result<Option<PullJson
     .await
 }
 
-async fn find_pull(
+pub(crate) async fn find_pull(
     conn: &mut PgConnection,
     repository_id: Uuid,
     number: i32,
@@ -232,7 +235,7 @@ async fn load_pull(
     Ok(pull)
 }
 
-fn require_pull(
+pub(crate) fn require_pull(
     state: &AppState,
     loaded: &Loaded,
     pull: &PullJson,
@@ -623,6 +626,11 @@ async fn update(
             .bind(pull.id)
             .fetch_one(&mut *tx)
             .await?;
+            // Merged is terminal: its title and body stay editable, but it can
+            // be neither reopened nor closed.
+            if locked.state == "merged" && input.state.is_some() {
+                return Err(already_merged());
+            }
             let new_state = input.state.as_deref().unwrap_or(locked.state.as_str());
             let updated = sqlx::query(
                 "UPDATE pull_requests SET title = $1, body = $2, state = $3, updated_at = now() \
@@ -645,6 +653,19 @@ async fn update(
                 _ => "pull_request.updated",
             };
             event(&mut tx, Some(loaded.org_id), actor.id, kind).await?;
+
+            // Closing a pull request cancels any queued or validating merge
+            // intent; an executing intent is not cancelled here (the ref commit
+            // wins, and record_merge_result / the reconciler settle it).
+            if locked.state == "open" && new_state == "closed" {
+                sqlx::query(
+                    "UPDATE merge_intents SET state = 'cancelled', updated_at = now() \
+                     WHERE pull_request_id = $1 AND state IN ('queued', 'validating')",
+                )
+                .bind(locked.id)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
             let status = StatusCode::OK;
