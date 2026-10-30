@@ -201,6 +201,7 @@ fn require_merge(
             checks_passed,
         }),
         auth_age: Some(Duration::from_secs(loaded.auth_age)),
+        read_only: loaded.facts.read_only,
     };
     let decision = state.authz.authorize(&request);
     if decision.is_allowed() {

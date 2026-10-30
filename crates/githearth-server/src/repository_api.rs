@@ -449,7 +449,6 @@ pub(crate) async fn update(
     body: Bytes,
 ) -> Result<Json<RepositoryJson>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-
     let state = &state;
     let body = &body;
     let key = idempotency::extract_key(&headers).transpose()?;
@@ -607,7 +606,6 @@ pub(crate) async fn delete(
     Path((org_slug, name)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-
     let state = &state;
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}");
     let key = idempotency::extract_key(&headers).transpose()?;
@@ -814,7 +812,6 @@ pub(crate) async fn grant_access(
     body: Bytes,
 ) -> Result<(StatusCode, Json<AccessGrant>), ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-
     let state = &state;
     let body = &body;
     let key = idempotency::extract_key(&headers).transpose()?;
@@ -928,7 +925,6 @@ pub(crate) async fn revoke_access(
     Path((org_slug, name, grant_id)): Path<(String, String, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-
     let state = &state;
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{name}/access/{grant_id}");

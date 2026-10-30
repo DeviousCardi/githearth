@@ -99,6 +99,19 @@ actions! {
 }
 
 impl Action {
+    /// The actions a read-only scoped token may still perform: everything in
+    /// the schema's `read` / `public_read` groups, and nothing that mutates.
+    pub fn read_only_permitted(self) -> bool {
+        matches!(
+            self,
+            Action::OrganizationRead
+                | Action::RepositoryRead
+                | Action::RepositoryClone
+                | Action::IssueRead
+                | Action::PullRequestRead
+        )
+    }
+
     fn resource_kind(self) -> Kind {
         use Action::*;
         match self {
@@ -356,6 +369,10 @@ pub struct Request<'a> {
     /// Time since the account last presented its password; `None` for
     /// anonymous or unknown recency, which counts as stale.
     pub auth_age: Option<Duration>,
+    /// True when the credential is a scoped personal access token without
+    /// `repo:write`, restricting it to read-only actions regardless of the
+    /// account's grants.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -598,6 +615,9 @@ fn role_template(role: &Role, text: &str) -> Result<Template, Error> {
 fn check_facts(request: &Request<'_>) -> Result<(), &'static str> {
     if request.action.resource_kind() != request.resource.kind() {
         return Err("action does not apply to this resource");
+    }
+    if request.read_only && !request.action.read_only_permitted() {
+        return Err("read-only credential forbids this action");
     }
     if request.merge.is_some() != (request.action == Action::PullRequestMerge) {
         return Err("merge facts are required for merges only");
