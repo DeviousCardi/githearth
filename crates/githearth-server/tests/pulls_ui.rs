@@ -858,10 +858,14 @@ async fn merged_pull_header_shows_the_badge_once_and_not_the_raw_state() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    sqlx::query("UPDATE pull_requests SET state = 'merged' WHERE number = 1")
-        .execute(&f.pool)
-        .await
-        .unwrap();
+    // Scoped to this fixture's repository: tests share one database.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'merged' WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
 
     let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
     assert_eq!(status, StatusCode::OK);

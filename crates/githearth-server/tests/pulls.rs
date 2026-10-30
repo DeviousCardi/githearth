@@ -555,10 +555,14 @@ async fn list_paginates_and_filters_state() {
     )
     .await;
     assert_eq!(merged.0, StatusCode::OK);
-    sqlx::query("UPDATE pull_requests SET state = 'merged' WHERE number = 4")
-        .execute(&f.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'merged' WHERE number = 4 \
+         AND repository_id IN (SELECT id FROM repositories WHERE organization_id = $1)",
+    )
+    .bind(f.org_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
 
     let (_, body) = request(
         &f.app,

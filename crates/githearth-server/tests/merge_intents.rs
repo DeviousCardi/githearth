@@ -458,11 +458,15 @@ async fn create_refuses_closed_head_moved_no_permission_few_approvals_checks_and
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn create_refuses_a_closed_pull_request() {
     let f = build_fixture().await;
-    let pull_id: Uuid = sqlx::query_scalar("SELECT id FROM pull_requests WHERE number = $1")
-        .bind(f.number as i32)
-        .fetch_one(&f.pool)
-        .await
-        .unwrap();
+    let pull_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM pull_requests WHERE number = $1 \
+         AND repository_id IN (SELECT id FROM repositories WHERE organization_id = $2)",
+    )
+    .bind(f.number as i32)
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
     // Close the pull request first.
     request(
         &f.app,
