@@ -38,9 +38,6 @@ pub fn router() -> Router<AppState> {
 fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "merge intent not found")
 }
-fn not_open() -> ApiError {
-    ApiError(StatusCode::CONFLICT, "pull request is not open")
-}
 fn head_moved() -> ApiError {
     ApiError(StatusCode::CONFLICT, "commit is not the pull request head")
 }
@@ -287,10 +284,6 @@ async fn create(
                 crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
             drop(conn);
 
-            if pull.state != "open" {
-                return Err(not_open());
-            }
-
             let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
             let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
             let (Some(head), Some(base)) = (head, base) else {
@@ -317,6 +310,9 @@ async fn create(
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
                 return Err(issues::not_active());
             }
+            // Re-check under the pull request row lock that a concurrent close
+            // could not slip in between the earlier read and this insert.
+            pulls::require_open(&mut tx, pull.id).await?;
             let inserted = sqlx::query(
                 "INSERT INTO merge_intents \
                  (operation_id, repository_id, pull_request_id, source_ref, source_oid, \
@@ -588,4 +584,95 @@ pub async fn record_merge_result(
 
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn create_locks_and_rejects_a_closed_pull_request() {
+        use sqlx::{ConnectOptions, postgres::PgPoolOptions};
+        use std::str::FromStr;
+
+        let url =
+            std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .disable_statement_logging();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused')")
+            .bind(account)
+            .bind(format!("mi-{}", Uuid::new_v4().simple()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let org = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')",
+        )
+        .bind(org)
+        .bind(format!("o-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'r',$3,$4,'active','private')",
+        )
+        .bind(repo)
+        .bind(org)
+        .bind(account)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pull = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+        )
+        .bind(pull)
+        .bind(repo)
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The pull request is open, so the re-check passes.
+        let mut conn = pool.acquire().await.unwrap();
+        pulls::require_open(&mut conn, pull).await.unwrap();
+
+        // A close committing before the intent insert leaves the pull request
+        // closed; the row-locked re-check must refuse it rather than queueing.
+        sqlx::query("UPDATE pull_requests SET state = 'closed', closed_at = now() WHERE id = $1")
+            .bind(pull)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = pulls::require_open(&mut conn, pull).await.unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.message(), "pull request is not open");
+
+        let intents: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE pull_request_id = $1")
+                .bind(pull)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(intents, 0);
+
+        // close() waits for every checked-out connection, so return ours first.
+        drop(conn);
+        pool.close().await;
+    }
 }

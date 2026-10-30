@@ -458,6 +458,11 @@ async fn create_refuses_closed_head_moved_no_permission_few_approvals_checks_and
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn create_refuses_a_closed_pull_request() {
     let f = build_fixture().await;
+    let pull_id: Uuid = sqlx::query_scalar("SELECT id FROM pull_requests WHERE number = $1")
+        .bind(f.number as i32)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
     // Close the pull request first.
     request(
         &f.app,
@@ -470,6 +475,15 @@ async fn create_refuses_a_closed_pull_request() {
     .await;
     let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
     assert_eq!(status, StatusCode::CONFLICT);
+
+    // No intent may be queued on a closed pull request.
+    let intents: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE pull_request_id = $1")
+            .bind(pull_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(intents, 0);
 
     finish(f).await;
 }

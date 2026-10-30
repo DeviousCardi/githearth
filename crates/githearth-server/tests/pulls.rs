@@ -544,6 +544,46 @@ async fn list_paginates_and_filters_state() {
     .await;
     assert_eq!(body["items"].as_array().unwrap().len(), 5);
 
+    // Merge number 4 and filter by merged.
+    let merged = request(
+        &f.app,
+        "PATCH",
+        &format!("{repo_path}/4"),
+        Some(&f.token),
+        None,
+        json!({"state": "closed"}),
+    )
+    .await;
+    assert_eq!(merged.0, StatusCode::OK);
+    sqlx::query("UPDATE pull_requests SET state = 'merged' WHERE number = 4")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let (_, body) = request(
+        &f.app,
+        "GET",
+        &format!("{repo_path}?state=merged"),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["number"], 4);
+
+    let (_, body) = request(
+        &f.app,
+        "GET",
+        &format!("{repo_path}?state=all"),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 5);
+
     let (status, _) = request(
         &f.app,
         "GET",

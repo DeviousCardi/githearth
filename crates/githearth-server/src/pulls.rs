@@ -76,7 +76,7 @@ fn already_merged() -> ApiError {
 /// close/reopen path takes, that the pull request is still open. A close that
 /// commits between the earlier head check and the review insert must not leave
 /// a review on a closed pull request.
-async fn require_open(conn: &mut PgConnection, id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn require_open(conn: &mut PgConnection, id: Uuid) -> Result<(), ApiError> {
     let state: Option<String> =
         sqlx::query_scalar("SELECT state FROM pull_requests WHERE id = $1 FOR UPDATE")
             .bind(id)
@@ -496,7 +496,7 @@ pub(crate) async fn list_pulls(
     query: ListQuery,
 ) -> Result<PullPage, ApiError> {
     let state_filter = query.state.as_deref().unwrap_or("open");
-    if !matches!(state_filter, "open" | "closed" | "all") {
+    if !matches!(state_filter, "open" | "closed" | "merged" | "all") {
         return Err(invalid());
     }
     let limit = query.limit.unwrap_or(30);

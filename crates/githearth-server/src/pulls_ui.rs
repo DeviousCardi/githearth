@@ -224,7 +224,7 @@ async fn list_page(
     .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
     let base = repo_href(&slug, &name);
 
-    let tabs = ["open", "closed", "all"]
+    let tabs = ["open", "closed", "merged", "all"]
         .iter()
         .map(|f| {
             if *f == filter {
@@ -534,10 +534,10 @@ async fn render_pull(
     let head_id = detail.head_id.as_deref().unwrap_or("(deleted)");
     let base_id = detail.base_id.as_deref().unwrap_or("(deleted)");
 
-    let state_badge = if detail.pull.state == "merged" {
-        "<span class=\"badge\">Merged</span> "
+    let state_label = if detail.pull.state == "merged" {
+        "<span class=\"badge\">Merged</span>".to_owned()
     } else {
-        ""
+        ui::esc(&detail.pull.state)
     };
 
     let mut review_list = String::new();
@@ -611,7 +611,7 @@ async fn render_pull(
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
-<p class=\"muted\">{} {} · {} → {} · by {} at {}</p>\
+<p class=\"muted\">{} · {} → {} · by {} at {}</p>\
 <div class=\"card\"><dl>\
 <dt>Head</dt><dd>{}</dd>\
 <dt>Base</dt><dd>{}</dd>\
@@ -631,8 +631,7 @@ async fn render_pull(
 <p><button type=\"submit\">Submit review</button></p></form>",
         ui::esc(name),
         ui::esc(&detail.pull.title),
-        state_badge,
-        ui::esc(&detail.pull.state),
+        state_label,
         ui::esc(&detail.pull.source_branch),
         ui::esc(&detail.pull.target_branch),
         who(&names, &detail.pull.author_id),
