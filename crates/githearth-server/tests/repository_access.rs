@@ -808,3 +808,201 @@ async fn grant_expiry_is_validated_and_rendered_in_utc() {
     cleanup(&storage_root);
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn list_access_paginates() {
+    let (app, pool, storage_root, owner, org_slug, org_id) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    create_repository(&app, &org_slug, &token, "paged-repo").await;
+
+    let mut subjects = Vec::new();
+    for _ in 0..3 {
+        let member = fixture_account(&pool, &tag("page-member")).await;
+        sqlx::query(
+            "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+        )
+        .bind(org_id)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .unwrap();
+        subjects.push(member);
+    }
+    for subject in &subjects {
+        let (status, _) = grant_access(
+            &app,
+            &org_slug,
+            "paged-repo",
+            &token,
+            "account",
+            *subject,
+            "read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let path = format!("/api/v1/organizations/{org_slug}/repositories/paged-repo/access");
+    let (status, body) = request(
+        &app,
+        "GET",
+        &format!("{path}?limit=2"),
+        Some(&token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first = body.as_array().unwrap();
+    assert_eq!(first.len(), 2);
+
+    let after = first[1]["id"].as_str().unwrap();
+    let (status, body) = request(
+        &app,
+        "GET",
+        &format!("{path}?limit=2&after={after}"),
+        Some(&token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn delete_revokes_active_grants() {
+    let (app, pool, storage_root, owner, org_slug, org_id) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    create_repository(&app, &org_slug, &token, "revoked-on-delete").await;
+
+    let member = fixture_account(&pool, &tag("del-member")).await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+    grant_access(
+        &app,
+        &org_slug,
+        "revoked-on-delete",
+        &token,
+        "account",
+        member,
+        "read",
+    )
+    .await;
+
+    let repo_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM repositories WHERE name = 'revoked-on-delete' AND organization_id = $1",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v1/organizations/{org_slug}/repositories/revoked-on-delete"),
+        Some(&token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM grants WHERE repository_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        active, 0,
+        "no grant for a deleted repository may stay active"
+    );
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resumed_delete_still_works_and_does_not_re_revoke() {
+    let (app, pool, storage_root, owner, org_slug, org_id) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    create_repository(&app, &org_slug, &token, "resume-delete").await;
+
+    let member = fixture_account(&pool, &tag("resume-member")).await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+    grant_access(
+        &app,
+        &org_slug,
+        "resume-delete",
+        &token,
+        "account",
+        member,
+        "read",
+    )
+    .await;
+
+    let repo_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM repositories WHERE name = 'resume-delete' AND organization_id = $1",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let key = tag("resume-del");
+    let (s1, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v1/organizations/{org_slug}/repositories/resume-delete"),
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s1, StatusCode::NO_CONTENT);
+
+    let (s2, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v1/organizations/{org_slug}/repositories/resume-delete"),
+        Some(&token),
+        Some(("Idempotency-Key", &key)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s2, StatusCode::NO_CONTENT);
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM grants WHERE repository_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active, 0);
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
