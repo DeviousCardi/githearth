@@ -196,7 +196,10 @@ pub(crate) struct ReviewJson {
     pub(crate) created_at: String,
 }
 
-async fn fetch_pull(conn: &mut PgConnection, id: Uuid) -> Result<Option<PullJson>, sqlx::Error> {
+pub(crate) async fn fetch_pull(
+    conn: &mut PgConnection,
+    id: Uuid,
+) -> Result<Option<PullJson>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {PULL_COLUMNS} FROM pull_requests WHERE id = $1"
     ))
