@@ -116,7 +116,7 @@ fn new_merge(body: &[u8]) -> Result<NewMerge, ApiError> {
 
 /// The reviewer ids whose latest non-comment review is at `source_oid`, sorted
 /// by id, so the digest is independent of insertion order.
-async fn latest_review_ids(
+pub(crate) async fn latest_review_ids(
     conn: &mut PgConnection,
     pull_request_id: Uuid,
     source_oid: &str,
@@ -138,7 +138,7 @@ async fn latest_review_ids(
 /// review at that oid, sorted. A new approval or change request (or a moved
 /// head) changes the digest, making the intent stale. Check results contribute
 /// nothing in M3 (no check system yet), so `require_checks` refuses every merge.
-fn checks_approvals_digest(source_oid: &str, review_ids: &[Uuid]) -> String {
+pub(crate) fn checks_approvals_digest(source_oid: &str, review_ids: &[Uuid]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(source_oid.as_bytes());
     for id in review_ids {
@@ -149,7 +149,7 @@ fn checks_approvals_digest(source_oid: &str, review_ids: &[Uuid]) -> String {
 
 /// The number of approvals at `source_oid`, using the same latest-verdict logic
 /// as the pull request detail.
-async fn approvals_at(
+pub(crate) async fn approvals_at(
     conn: &mut PgConnection,
     pull_request_id: Uuid,
     source_oid: &str,
@@ -167,6 +167,50 @@ async fn approvals_at(
     .await
 }
 
+/// Builds and evaluates the `pull_request.merge` request shared by the API
+/// handler and [`crate::merge::execute_intent`]. The merge facts are the
+/// approvals at the head and (in M3, always false) checks, with the matching
+/// target-branch protection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_allowed(
+    state: &AppState,
+    facts: &crate::facts::Facts,
+    repo: &repositories::RepositoryRow,
+    pull: &pulls::PullJson,
+    protection: Option<githearth_authz::Protection>,
+    approvals: u32,
+    checks_passed: bool,
+    auth_age: Option<Duration>,
+) -> bool {
+    let authz_repo = repositories::authz_repository(repo);
+    let entity = PullRequest {
+        id: pull.id,
+        repository: repo.id,
+        author: pull.author_id,
+        target: Ref {
+            repository: repo.id,
+            name: format!("refs/heads/{}", pull.target_branch),
+            protection,
+            exists: true,
+        },
+    };
+    let request = githearth_authz::Request {
+        principal: githearth_authz::Principal::Account(&facts.account),
+        teams: &facts.teams,
+        grants: &facts.grants,
+        action: Action::PullRequestMerge,
+        organization: &facts.organization,
+        resource: Resource::PullRequest(&authz_repo, &entity),
+        merge: Some(Merge {
+            approvals,
+            checks_passed,
+        }),
+        auth_age,
+        read_only: facts.read_only,
+    };
+    state.authz.authorize(&request).is_allowed()
+}
+
 /// Authorize the merge with the matching target-branch protection as merge
 /// facts: approvals at the head and (in M3, always false) checks.
 fn require_merge(
@@ -177,36 +221,19 @@ fn require_merge(
     approvals: u32,
     checks_passed: bool,
 ) -> Result<(), ApiError> {
-    let authz_repo = repositories::authz_repository(&loaded.repo);
-    let entity = PullRequest {
-        id: pull.id,
-        repository: loaded.repo.id,
-        author: pull.author_id,
-        target: Ref {
-            repository: loaded.repo.id,
-            name: format!("refs/heads/{}", pull.target_branch),
-            protection,
-            exists: true,
-        },
-    };
-    let request = githearth_authz::Request {
-        principal: githearth_authz::Principal::Account(&loaded.facts.account),
-        teams: &loaded.facts.teams,
-        grants: &loaded.facts.grants,
-        action: Action::PullRequestMerge,
-        organization: &loaded.facts.organization,
-        resource: Resource::PullRequest(&authz_repo, &entity),
-        merge: Some(Merge {
-            approvals,
-            checks_passed,
-        }),
-        auth_age: Some(Duration::from_secs(loaded.auth_age)),
-        read_only: loaded.facts.read_only,
-    };
-    let decision = state.authz.authorize(&request);
-    if decision.is_allowed() {
+    if merge_allowed(
+        state,
+        &loaded.facts,
+        &loaded.repo,
+        pull,
+        protection,
+        approvals,
+        checks_passed,
+        Some(Duration::from_secs(loaded.auth_age)),
+    ) {
         return Ok(());
     }
+    let authz_repo = repositories::authz_repository(&loaded.repo);
     let read_ok = state
         .authz
         .authorize(&loaded.facts.request(

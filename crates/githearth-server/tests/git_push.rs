@@ -2061,20 +2061,22 @@ async fn replay_skips_merge_record_and_applies_following_push() {
     let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
     assert_eq!(summary.committed, 2);
 
-    // Only the push created metadata.
+    // The merge record is replayed through `record_merge_result`, which writes
+    // its own `repository_pushes` row (the `ref_updates` foreign key needs
+    // one); it is never recorded as an ordinary push.
     let pc: i64 =
         sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
             .bind(fx.repo_id)
             .fetch_one(&fx.pool)
             .await
             .unwrap();
-    assert_eq!(pc, 1, "merge record must not create push metadata");
+    assert_eq!(pc, 2, "one repository_pushes row per applied record");
     let rc: i64 = sqlx::query_scalar("SELECT count(*) FROM ref_updates WHERE repository_id=$1")
         .bind(fx.repo_id)
         .fetch_one(&fx.pool)
         .await
         .unwrap();
-    assert_eq!(rc, 1);
+    assert_eq!(rc, 2);
     let feature_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ref_updates WHERE repository_id=$1 AND ref_name='refs/heads/feature'",
     )
@@ -2083,6 +2085,14 @@ async fn replay_skips_merge_record_and_applies_following_push() {
     .await
     .unwrap();
     assert_eq!(feature_rows, 1);
+    let main_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ref_updates WHERE repository_id=$1 AND ref_name='refs/heads/main'",
+    )
+    .bind(fx.repo_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(main_rows, 1);
 
     // The high-water mark passes both records.
     let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
@@ -2098,8 +2108,9 @@ async fn replay_skips_merge_record_and_applies_following_push() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn update_ref_expected_journals_merge_origin_and_replay_skips_it() {
+async fn update_ref_expected_journals_merge_origin_and_replay_records_merge_result() {
     let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
 
     // Build a child commit and bring its object into the bare repo without
     // moving any branch ref (objects only).
@@ -2136,7 +2147,39 @@ async fn update_ref_expected_journals_merge_origin_and_replay_skips_it() {
     let _ = std::fs::remove_dir_all(&work);
 
     let op = Uuid::new_v4();
-    let actor = Uuid::new_v4();
+    let actor = owner;
+    // The pull request and merge intent the journal record is replayed into
+    // (the actor must be a real account: `merge_intents.actor_id` references
+    // `accounts.id`).
+    let pull_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO pull_requests \
+         (id, repository_id, number, title, body, author_id, source_branch, target_branch) \
+         VALUES ($1, $2, 1, 'merge', '', $3, 'feature', 'main')",
+    )
+    .bind(pull_id)
+    .bind(fx.repo_id)
+    .bind(owner)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO merge_intents \
+         (operation_id, repository_id, pull_request_id, source_ref, source_oid, target_ref, \
+          expected_target_oid, method, policy_generation, checks_approvals_digest, actor_id, state) \
+         VALUES ($1, $2, $3, 'feature', $4, 'main', $5, 'merge', 0, $6, $7, 'executing')",
+    )
+    .bind(op)
+    .bind(fx.repo_id)
+    .bind(pull_id)
+    .bind(&child)
+    .bind(&fx.base_commit)
+    .bind(format!("digest-{}", Uuid::new_v4().simple()))
+    .bind(owner)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
     let repo_path = fx.repo_path.clone();
     let hooks_dir = fx.storage_root.join("hooks");
     let expected_old = fx.base_commit.clone();
@@ -2195,13 +2238,57 @@ async fn update_ref_expected_journals_merge_origin_and_replay_skips_it() {
 
     let summary = pushes::replay(&fx.state, fx.repo_id).await.unwrap();
     assert_eq!(summary.committed, 1);
+
+    // The merge record is replayed into the intent, not recorded as a push.
     let pc: i64 =
         sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
             .bind(fx.repo_id)
             .fetch_one(&fx.pool)
             .await
             .unwrap();
-    assert_eq!(pc, 0, "merge record must not be recorded as a push");
+    assert_eq!(
+        pc, 1,
+        "record_merge_result writes one repository_pushes row for the ref_updates foreign key"
+    );
+
+    let intent_state: String =
+        sqlx::query_scalar("SELECT state FROM merge_intents WHERE operation_id = $1")
+            .bind(op)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(intent_state, "merged");
+    let result_oid: String =
+        sqlx::query_scalar("SELECT result_oid FROM merge_intents WHERE operation_id = $1")
+            .bind(op)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(result_oid, child);
+    let journal_sequence: Option<i64> =
+        sqlx::query_scalar("SELECT journal_sequence FROM merge_intents WHERE operation_id = $1")
+            .bind(op)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    let sequence = journal_sequence.expect("merged intent records its journal sequence");
+
+    let pull_state: String = sqlx::query_scalar("SELECT state FROM pull_requests WHERE id = $1")
+        .bind(pull_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(pull_state, "merged");
+
+    let refs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ref_updates WHERE repository_id = $1 AND journal_sequence = $2",
+    )
+    .bind(fx.repo_id)
+    .bind(sequence)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(refs, 1, "exactly one ref update for the merge sequence");
 
     cleanup(&fx.storage_root);
     fx.pool.close().await;
