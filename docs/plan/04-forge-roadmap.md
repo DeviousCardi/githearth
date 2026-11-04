@@ -6,7 +6,7 @@ Baseline: 2026-10-27. This plan covers one freely usable forge, from personal ho
 
 The complete baseline supports planning, source hosting, review, safe merging, isolated automation, packages/releases/sites, deployment workflows, discovery, security, enterprise administration, integration, migration and recovery. Required capabilities are tracked in [the inventory](06-capability-inventory.md). Completion requires implementation and qualification evidence for every required row. Compatibility with other products uses explicit versioned matrices; exact parity with every changing vendor feature is not a finite acceptance criterion.
 
-AI, remote workspaces, federation, managed hosting and multi-region writes are optional/later modules. Self-hosting requires no vendor account, paid feature unlock or public runner fleet.
+AI, remote workspaces, federation, managed hosting and multi-region writes are optional/later modules. Self-hosting requires no vendor account, paid feature unlock or public runner fleet. Production use needs a commercial license under [the Business Source License](../../LICENSE), which unlocks no separate features.
 
 Architectural rules:
 

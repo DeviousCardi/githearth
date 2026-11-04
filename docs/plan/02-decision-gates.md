@@ -64,7 +64,6 @@ The next coding gate is specified in [M1](05-first-milestone.md). The full seque
 
 | Decision | Current position | When it must be resolved |
 | --- | --- | --- |
-| Product license | `MIT OR Apache-2.0` recommended; no license files adopted yet | Before external distribution/contributions |
 | Metadata engine | PostgreSQL provisionally selected for the first implementation; production qualification open | Before a production release or HA claim |
 | Git consensus/journal integration | No implementation selected | Before a replicated push service |
 | Exact revocation semantics | New admission must honor revocation; in-flight behavior needs a bounded contract | Before protected writes |

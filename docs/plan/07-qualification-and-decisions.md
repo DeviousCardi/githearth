@@ -58,7 +58,7 @@ Expansion gate: version/storage preflight, current backup, establish replicas, v
 | Decision | Current position | Required evidence / deadline |
 | --- | --- | --- |
 | Product name/visibility | GitHearth, private repo during development | Branding/domain checks before public launch |
-| License | MIT OR Apache-2.0 proposed, not adopted | Final files and dependency notices before external distribution |
+| License | Business Source License 1.1, no Additional Use Grant, changing to Apache-2.0 after four years (replaces the MIT OR Apache-2.0 proposal) | Dependency notices before distributing binaries or images |
 | Metadata | PostgreSQL provisional | Rust workload, restore, HA and sustained load before production |
 | Application | Rust, axum/Tokio, SQLx for M1 | Pinned compatible versions and tests; alternatives need evidence |
 | Authorization | Cedar PBAC engine ([ADR 0002](../decisions/0002-authorization.md)) | Grant/team/protection tables, anonymous principal and list-filter tests before M2 public access; revocation/cache contract before any decision cache or M5 local checks |
