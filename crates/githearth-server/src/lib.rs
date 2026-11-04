@@ -289,7 +289,7 @@ async fn enforce_read_only_boundary(
     if method == Method::GET || method == Method::HEAD {
         return next.run(request).await;
     }
-    // Only a valid `ghp_` access token is intercepted; anything else (no
+    // Only a valid `gth_` access token is intercepted; anything else (no
     // credential, a session token, or a malformed token) falls through to the
     // handler, which authenticates as it always has.
     let token_hash = match bearer_credential(request.headers()) {
@@ -549,7 +549,7 @@ pub(crate) fn bearer(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
 }
 
 /// A Bearer credential is either a 64-hex session token or a personal access
-/// token (`ghp_` followed by 64 hex). Both resolve to their SHA-256 for a
+/// token (`gth_` followed by 64 hex). Both resolve to their SHA-256 for a
 /// database lookup; the kind only changes which table the hash is matched in.
 pub(crate) enum Credential {
     Session { token_hash: Vec<u8> },
@@ -572,7 +572,7 @@ pub(crate) fn bearer_credential(headers: &HeaderMap) -> ApiResult<Credential> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(unauthorized)?;
-    if let Some(rest) = token.strip_prefix("ghp_") {
+    if let Some(rest) = token.strip_prefix("gth_") {
         if rest.len() == 64 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(Credential::AccessToken {
                 token_hash: Sha256::digest(token.as_bytes()).to_vec(),
@@ -685,13 +685,13 @@ pub(crate) async fn authenticate_access_token(
         u64::MAX,
     ))
 }
-/// Resolves an access token from its plaintext `ghp_` string, for transports
+/// Resolves an access token from its plaintext `gth_` string, for transports
 /// that receive the token directly (e.g. the Git Basic-auth path).
 pub(crate) async fn authenticate_access_token_plaintext(
     pool: &PgPool,
     token: &str,
 ) -> ApiResult<(Account, u64)> {
-    let rest = token.strip_prefix("ghp_").ok_or_else(unauthorized)?;
+    let rest = token.strip_prefix("gth_").ok_or_else(unauthorized)?;
     if rest.len() != 64 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(unauthorized());
     }

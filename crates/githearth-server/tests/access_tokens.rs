@@ -129,7 +129,7 @@ async fn create_token(
     assert_eq!(status, StatusCode::CREATED, "{value}");
     let id: Uuid = value["id"].as_str().unwrap().parse().unwrap();
     let token = value["token"].as_str().unwrap().to_owned();
-    assert!(token.starts_with("ghp_"));
+    assert!(token.starts_with("gth_"));
     assert_eq!(token.len(), 64 + 4);
     (id, token)
 }
