@@ -847,6 +847,39 @@ async fn review_resubmit_with_the_same_key_shows_the_422_notice() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn merged_pull_header_shows_the_badge_once_and_not_the_raw_state() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls", f.api_base),
+        &f.token,
+        json!({"title": "merged pull", "source_branch": "feature", "target_branch": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Scoped to this fixture's repository: tests share one database.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'merged' WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains("<span class=\"badge\">Merged</span>"),
+        "{page}"
+    );
+    assert!(!page.contains("Merged merged"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn unrelated_users_get_404() {
     let f = fixture().await;
     let (status, _) = api(
