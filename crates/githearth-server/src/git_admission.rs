@@ -99,10 +99,10 @@ pub async fn admit(
 ) -> Result<Admitted, AuthError> {
     let (username, password) = parse_basic(headers)?;
     // A personal access token may be supplied as the Basic password (or the
-    // username when only the token is embedded in the URL). Detect `ghp_` and
+    // username when only the token is embedded in the URL). Detect `gth_` and
     // short-circuit to the access-token path before password verification.
-    let (account_id, read_only) = if password.starts_with("ghp_") || username.starts_with("ghp_") {
-        let token = if password.starts_with("ghp_") {
+    let (account_id, read_only) = if password.starts_with("gth_") || username.starts_with("gth_") {
+        let token = if password.starts_with("gth_") {
             &password
         } else {
             &username

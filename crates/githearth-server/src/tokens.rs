@@ -105,7 +105,7 @@ async fn create(
 
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
-    let plaintext = format!("ghp_{}", hex::encode(bytes));
+    let plaintext = format!("gth_{}", hex::encode(bytes));
     let token_hash = Sha256::digest(plaintext.as_bytes()).to_vec();
     let id = Uuid::new_v4();
 
