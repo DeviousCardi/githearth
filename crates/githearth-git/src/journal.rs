@@ -80,10 +80,38 @@ pub struct Record {
     pub updates: Vec<Update>,
 }
 
+/// Read-only integrity check. Returns the last sequence (0 when absent)
+/// and does NOT create, write, or truncate the file.
+pub fn verify(repo_path: &Path) -> Result<u64, JournalError> {
+    let path = repo_path.join("githearth").join("journal");
+    let mut file = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(JournalError::Io(e)),
+    };
+    let (records, torn) = read_frames(&mut file)?;
+    if let Some(offset) = torn {
+        return Err(JournalError::TornTail { offset });
+    }
+    let mut prev = 0u64;
+    for r in &records {
+        if r.sequence <= prev {
+            return Err(JournalError::OutOfOrder {
+                sequence: r.sequence,
+                after: prev,
+            });
+        }
+        prev = r.sequence;
+    }
+    Ok(records.last().map(|r| r.sequence).unwrap_or(0))
+}
+
 #[derive(Debug)]
 pub enum JournalError {
     Io(io::Error),
     Corrupt { offset: u64 },
+    TornTail { offset: u64 },
+    OutOfOrder { sequence: u64, after: u64 },
     TooLarge { size: usize },
 }
 
@@ -92,6 +120,10 @@ impl fmt::Display for JournalError {
         match self {
             Self::Io(e) => write!(f, "journal i/o error: {e}"),
             Self::Corrupt { offset } => write!(f, "journal corrupt at byte offset {offset}"),
+            Self::TornTail { offset } => write!(f, "journal torn tail at byte offset {offset}"),
+            Self::OutOfOrder { sequence, after } => {
+                write!(f, "journal sequence {sequence} follows {after}")
+            }
             Self::TooLarge { size } => write!(
                 f,
                 "journal record is {size} bytes; limit is {MAX_RECORD_BYTES}"
@@ -104,6 +136,48 @@ impl From<io::Error> for JournalError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
     }
+}
+
+fn read_frames(file: &mut fs::File) -> Result<(Vec<Record>, Option<u64>), JournalError> {
+    let mut records = Vec::new();
+    let mut torn: Option<u64> = None;
+    loop {
+        let offset = file.stream_position()?;
+        let len_bytes = read_chunk(file, 4)?;
+        if len_bytes.is_empty() {
+            break;
+        }
+        if len_bytes.len() < 4 {
+            torn = Some(offset);
+            break;
+        }
+        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        if len > MAX_RECORD_BYTES {
+            return Err(JournalError::Corrupt { offset });
+        }
+        let crc_bytes = read_chunk(file, 4)?;
+        if crc_bytes.len() < 4 {
+            torn = Some(offset);
+            break;
+        }
+        let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        let payload = read_chunk(file, len)?;
+        if payload.len() < len {
+            torn = Some(offset);
+            break;
+        }
+        if crc32c(&payload) != crc {
+            if read_chunk(file, 1)?.is_empty() {
+                torn = Some(offset);
+                break;
+            }
+            return Err(JournalError::Corrupt { offset });
+        }
+        let record: Record =
+            serde_json::from_slice(&payload).map_err(|_| JournalError::Corrupt { offset })?;
+        records.push(record);
+    }
+    Ok((records, torn))
 }
 
 pub struct Journal {
@@ -150,50 +224,12 @@ impl Journal {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        let mut records = Vec::new();
-        let mut next_sequence = 1;
-        let mut truncated: Option<u64> = None;
-        loop {
-            let offset = file.stream_position()?;
-            let len_bytes = read_chunk(&mut file, 4)?;
-            if len_bytes.is_empty() {
-                break;
-            }
-            if len_bytes.len() < 4 {
-                truncated = Some(offset);
-                break;
-            }
-            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-            if len > MAX_RECORD_BYTES {
-                return Err(JournalError::Corrupt { offset });
-            }
-            let crc_bytes = read_chunk(&mut file, 4)?;
-            if crc_bytes.len() < 4 {
-                truncated = Some(offset);
-                break;
-            }
-            let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
-            let payload = read_chunk(&mut file, len)?;
-            if payload.len() < len {
-                truncated = Some(offset);
-                break;
-            }
-            if crc32c(&payload) != crc {
-                if read_chunk(&mut file, 1)?.is_empty() {
-                    truncated = Some(offset);
-                    break;
-                }
-                return Err(JournalError::Corrupt { offset });
-            }
-            let record: Record =
-                serde_json::from_slice(&payload).map_err(|_| JournalError::Corrupt { offset })?;
-            next_sequence = next_sequence.max(record.sequence + 1);
-            records.push(record);
-        }
-        if let Some(offset) = truncated {
+        let (records, torn) = read_frames(&mut file)?;
+        if let Some(offset) = torn {
             file.set_len(offset)?;
             file.sync_data()?;
         }
+        let next_sequence = records.iter().map(|r| r.sequence + 1).max().unwrap_or(1);
         Ok(Self {
             path,
             file,

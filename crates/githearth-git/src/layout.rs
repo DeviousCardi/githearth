@@ -1,6 +1,6 @@
 //! Durable repository storage layout and lifecycle (ADR 0003 "Storage layout").
 
-use crate::{StorageError, checked, git};
+use crate::{StorageError, checked, git, journal};
 use githearth_core::{GitRef, ObjectId, RepositoryId, RepositoryReader};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -841,4 +841,51 @@ impl RepositoryReader for Storage {
 pub struct Scan {
     pub repositories: Vec<Uuid>,
     pub malformed: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Problem {
+    pub subject: String,
+    pub message: String,
+}
+
+impl Storage {
+    pub fn check(&self) -> Result<(usize, Vec<Problem>), StorageError> {
+        let mut problems = Vec::new();
+        let scan = self.scan()?;
+        for m in &scan.malformed {
+            problems.push(Problem {
+                subject: m.clone(),
+                message: "malformed entry".to_owned(),
+            });
+        }
+        for repo_id in &scan.repositories {
+            let repo_path = self.repository_path(*repo_id);
+            let subject = repo_id.simple().to_string();
+            let output = git()
+                .arg("--git-dir")
+                .arg(&repo_path)
+                .args(["fsck", "--full", "--no-progress", "--no-dangling"])
+                .output()?;
+            if !output.status.success() {
+                let first_line = String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("git fsck failed")
+                    .to_owned();
+                problems.push(Problem {
+                    subject: subject.clone(),
+                    message: first_line,
+                });
+            }
+            match journal::verify(&repo_path) {
+                Ok(_) => {}
+                Err(e) => problems.push(Problem {
+                    subject: subject.clone(),
+                    message: format!("journal: {e}"),
+                }),
+            }
+        }
+        Ok((scan.repositories.len(), problems))
+    }
 }

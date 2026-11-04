@@ -8,10 +8,26 @@ use uuid::Uuid;
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Err(usage());
+    }
+    if args[0] == "check" {
+        if args.len() != 2 {
+            return Err(usage());
+        }
+        let storage = Storage::open(&args[1])?;
+        let (n, problems) = storage.check()?;
+        for p in &problems {
+            println!("{}: {}", p.subject, p.message);
+        }
+        println!("checked {n} repositories, {} problems", problems.len());
+        if !problems.is_empty() {
+            return Err(format!("{} problems found", problems.len()).into());
+        }
+        return Ok(());
+    }
     if args.len() < 3 {
-        return Err(
-            "usage: githearth <init|refs|blob> <storage-root> <repository-id> [object-id]".into(),
-        );
+        return Err(usage());
     }
     let expected = if args[0] == "blob" { 4 } else { 3 };
     if args.len() != expected {
@@ -41,9 +57,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .lock()
                 .write_all(&storage.read_blob(&id, &oid, 8 * 1024 * 1024)?)?;
         }
-        _ => return Err("unknown command; expected init, refs, or blob".into()),
+        _ => return Err("unknown command; expected init, refs, blob, check".into()),
     }
     Ok(())
+}
+
+fn usage() -> Box<dyn Error> {
+    "usage: githearth <init|refs|blob|check> <storage-root> <repository-id> [object-id]".into()
 }
 
 fn main() {

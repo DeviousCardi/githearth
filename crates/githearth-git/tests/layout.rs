@@ -597,3 +597,106 @@ fn repository_lock_held_in_thread_blocks_blocking_lock_owned() {
     handle.join().unwrap();
     assert!(done.load(std::sync::atomic::Ordering::SeqCst));
 }
+
+// ---------------------------------------------------------------------------
+// Storage::check tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_healthy_repository_passes() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::new_v4();
+    storage
+        .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+    let (n, problems) = storage.check().unwrap();
+    assert!(
+        problems.is_empty(),
+        "expected no problems, got {problems:?}"
+    );
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn check_corrupted_loose_object_fails_fsck() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::new_v4();
+    let repo = storage
+        .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+    // Create a minimal valid object and corrupt it.
+    let blob_content = b"check test blob\n";
+    let hash = {
+        let mut child = Command::new("git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("--git-dir")
+            .arg(&repo)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(blob_content).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    // Corrupt the object file.
+    let obj_path = repo.join("objects").join(&hash[..2]).join(&hash[2..]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&obj_path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let mut data = fs::read(&obj_path).unwrap();
+    data[0] ^= 0xFF;
+    fs::write(&obj_path, data).unwrap();
+
+    let (_n, problems) = storage.check().unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].subject, id.simple().to_string());
+}
+
+#[test]
+fn check_malformed_entry_is_reported() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+    fs::create_dir(root.join("repositories").join("zz")).unwrap();
+    let (_, problems) = storage.check().unwrap();
+    assert_eq!(problems.len(), 1);
+    assert!(problems[0].message.contains("malformed"));
+    assert_eq!(problems[0].subject, "repositories/zz");
+}
+
+#[test]
+fn check_reports_journal_problem() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    let storage = Storage::open(&root).unwrap();
+    let id = Uuid::new_v4();
+    let repo = storage
+        .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+    // Write a corrupt journal: oversize length field.
+    use std::io::Write;
+    let journal_path = repo.join("githearth").join("journal");
+    let mut file = fs::File::create(&journal_path).unwrap();
+    file.write_all(&((githearth_git::journal::MAX_RECORD_BYTES as u32) + 1).to_le_bytes())
+        .unwrap();
+    file.write_all(&[0u8; 4]).unwrap();
+    drop(file);
+
+    let (_, problems) = storage.check().unwrap();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].subject, id.simple().to_string());
+    assert!(problems[0].message.contains("journal:"));
+}

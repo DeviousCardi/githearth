@@ -73,7 +73,7 @@ fn usage_is_reported_without_arguments() {
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(
             stderr(&output),
-            "githearth: usage: githearth <init|refs|blob> <storage-root> <repository-id> [object-id]\n"
+            "githearth: usage: githearth <init|refs|blob|check> <storage-root> <repository-id> [object-id]\n"
         );
         assert!(output.stdout.is_empty());
     }
@@ -106,7 +106,7 @@ fn unknown_command_is_rejected() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         stderr(&output),
-        "githearth: unknown command; expected init, refs, or blob\n"
+        "githearth: unknown command; expected init, refs, blob, check\n"
     );
     assert!(output.stdout.is_empty());
 }
@@ -245,4 +245,94 @@ fn refs_and_blobs_are_read_from_a_real_repository() {
     assert_eq!(output.status.code(), Some(1));
     let message = stderr(&output);
     assert!(message.starts_with("githearth: Git failed:"), "{message}");
+}
+
+#[test]
+fn check_wrong_argument_count_errors() {
+    let temp = TempDir::new();
+    let storage = temp.path().join("storage");
+    let root = storage.to_str().unwrap();
+    // check with no root
+    let output = cli(&["check"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("githearth: usage:"),
+        "{}",
+        stderr(&output)
+    );
+    // check with extra args
+    let output = cli(&["check", root, "extra"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("githearth: usage:"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn check_healthy_root_exits_zero_with_summary() {
+    let temp = TempDir::new();
+    let storage = temp.path().join("storage");
+    let root = storage.to_str().unwrap();
+    // init a repo so there's something to check
+    let output = cli(&["init", root, ID]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let output = cli(&["check", root]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("checked 1 repositories, 0 problems"), "{out}");
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn check_corrupted_root_exits_one_and_prints_problem() {
+    let temp = TempDir::new();
+    let storage = temp.path().join("storage");
+    let root = storage.to_str().unwrap();
+    // init a repo
+    let init = cli(&["init", root, ID]);
+    assert!(init.status.success());
+    let bare = PathBuf::from(stdout(&init).trim());
+    // write an object and corrupt it
+    let blob_content = b"corrupted blob content\n";
+    let hash = {
+        let mut child = Command::new("git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(blob_content).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr_msg = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "hash-object failed: {stderr_msg}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    // Write blob as stdin to properly store it (hash-object -w needs stdin fed).
+    let obj = bare.join("objects").join(&hash[..2]).join(&hash[2..]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&obj, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let mut data = fs::read(&obj).unwrap();
+    data[0] ^= 0xFF;
+    fs::write(&obj, data).unwrap();
+
+    let output = cli(&["check", root]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(
+        err.contains("1 problems found") || err.contains("problem"),
+        "{err}"
+    );
 }
