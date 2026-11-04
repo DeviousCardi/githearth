@@ -7,6 +7,7 @@ RUN cargo build --locked --release -p githearth-server
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* && useradd --system --uid 10001 --create-home githearth
 COPY --from=build /build/target/release/githearth-server /usr/local/bin/githearth-server
+COPY LICENSE /usr/share/doc/githearth/LICENSE
 USER githearth
 EXPOSE 8080
 ENTRYPOINT ["githearth-server"]

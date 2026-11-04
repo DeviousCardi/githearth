@@ -1,8 +1,8 @@
 # GitHearth
 
-An open home for your code.
+A home for your code.
 
-GitHearth is a planned open-source development platform for repositories, code review, project planning, CI/CD, packages, security, and collaboration. The long-term goal is broad GitHub/GitLab-style capability with customer control over hosting and data.
+GitHearth is a planned source-available development platform for repositories, code review, project planning, CI/CD, packages, security, and collaboration. The long-term goal is broad GitHub/GitLab-style capability with customer control over hosting and data.
 
 **Current status: verified experimental application foundation.** The repository contains a Rust HTTP server with PostgreSQL migrations, administrator bootstrap, bearer sessions and membership-scoped organizations, alongside the local Git prototype and database comparison. Git HTTP/SSH hosting, issues/reviews, production installation, replication and CI remain planned. The repository remains private during initial development.
 
@@ -12,8 +12,18 @@ GitHearth is a planned open-source development platform for repositories, code r
 - The same APIs, permission rules, identifiers, and durable formats apply in both modes.
 - Rust is the primary implementation language; performance claims require measurements.
 - Users can self-host, export their data, and use standard Git clients.
-- The proposed licensing is `MIT OR Apache-2.0`; final license files are a release prerequisite.
-- Completed features are intended to be available without paid feature gates.
+- GitHearth is licensed under the Business Source License 1.1; see [Licensing](#licensing).
+- Completed features are intended to be available without feature tiers: one commercial license covers the whole product.
+
+## Licensing
+
+GitHearth is source-available under the [Business Source License 1.1](LICENSE). It is not open source.
+
+- **Free:** reading, copying and modifying the code, and any non-production use such as development, testing and evaluation.
+- **Needs a commercial license:** production use. [Contact the maintainers](https://github.com/DeviousCardi) to arrange one.
+- **Later:** each version becomes available under the Apache License 2.0 four years after it is published.
+
+Contributions are covered by [CONTRIBUTING.md](CONTRIBUTING.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Start here
 
