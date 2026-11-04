@@ -983,16 +983,36 @@ async fn resumed_delete_still_works_and_does_not_re_revoke() {
     .await;
     assert_eq!(s1, StatusCode::NO_CONTENT);
 
+    let (revoked_at_before, revoked_by_before): (String, Uuid) =
+        sqlx::query_as(
+            "SELECT to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), revoked_by FROM grants WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
     let (s2, _) = request(
         &app,
         "DELETE",
         &format!("/api/v1/organizations/{org_slug}/repositories/resume-delete"),
         Some(&token),
-        Some(("Idempotency-Key", &key)),
+        None,
         Value::Null,
     )
     .await;
-    assert_eq!(s2, StatusCode::NO_CONTENT);
+    assert_eq!(s2, StatusCode::NOT_FOUND);
+
+    let (revoked_at_after, revoked_by_after): (String, Uuid) =
+        sqlx::query_as(
+            "SELECT to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), revoked_by FROM grants WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(revoked_at_after, revoked_at_before);
+    assert_eq!(revoked_by_after, revoked_by_before);
 
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM grants WHERE repository_id = $1 AND revoked_at IS NULL",

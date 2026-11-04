@@ -718,25 +718,7 @@ pub(crate) async fn delete(
                 Ok(_) => {
                     // Store the response atomically with the mark-deleted step.
                     let mut tx = state.pool.begin().await?;
-                    repositories::set_status(
-                        &mut tx,
-                        repo_id,
-                        RepositoryStatus::Deleting,
-                        RepositoryStatus::Deleted,
-                    )
-                    .await?;
-                    // Revoke every still-active grant on this repository in the
-                    // same transaction as the final status change, so a retried or
-                    // resumed delete stays idempotent. Already-revoked grants are
-                    // left untouched (revoked_at stays NULL only while active).
-                    sqlx::query(
-                        "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 \
-                         WHERE repository_id = $2 AND revoked_at IS NULL",
-                    )
-                    .bind(loaded.actor_id)
-                    .bind(repo_id)
-                    .execute(&mut *tx)
-                    .await?;
+                    repositories::finish_delete(&mut tx, repo_id, loaded.actor_id).await?;
                     let status = StatusCode::NO_CONTENT;
                     let body = serde_json::Value::Null;
                     if !idem.store(&mut tx, status, &body).await? {
