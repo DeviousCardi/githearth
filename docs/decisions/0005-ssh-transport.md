@@ -2,7 +2,7 @@
 
 Date: 2026-11-07.
 
-Status: **proposed for phase 5**, pending Person A review. It sets the boundary between the two owners:
+Status: **accepted** for phase 5, after Person A's review on 2026-11-07 (PR #57). It sets the boundary between the two owners:
 
 - **Person A:** SSH key storage, the key API and UI, revocation, audit.
 - **Person B:** the SSH listener, command parsing, admission, process limits and routing into the existing Git pipeline.
@@ -50,7 +50,7 @@ struct SshIdentity { account: Uuid, key_id: Uuid, read_only: bool }
 ```
 
 **What `authenticate` does.**
-- `fingerprint` is the SHA-256 fingerprint of the public key the client proved it holds during the handshake.
+- `fingerprint` is the SHA-256 over the public key blob the client proved it holds during the handshake (see Settled with Person A).
 - It returns `None` for an unknown, revoked or expired key, or a suspended account.
 - `read_only` is `false` until A adds read-only keys. The field exists now so that adding them later changes no B code.
 
@@ -80,6 +80,15 @@ Both are accepted. The `.git` suffix is required, as over HTTP (`git_http::strip
 
 ## Admission and limits
 
+**Before authentication**, nothing else bounds a connection, because `git_slots` is taken only before Git is spawned. So:
+- **Timeouts.** The server sets a handshake and authentication timeout (`russh` `Config::inactivity_timeout`, 30 s) and an `auth_rejection_time` (1 s).
+- **Attempts.** A connection may make at most 6 authentication attempts; after that it is closed.
+- **Unauthenticated connections.** A semaphore caps concurrent unauthenticated connections at 64; further connections are closed immediately. A connection's permit is released when it authenticates or closes.
+- **Lookup only after proof.** `authenticate` is called only from `auth_publickey`, after the client's signature has been verified. `auth_publickey_offered` accepts every well-formed key without a database lookup, so an offered key can't be used to test whether a key is registered.
+- **Uniform rejections.** Every rejection waits the same `auth_rejection_time`, whether or not the key is registered.
+
+**After authentication:**
+
 SSH acquires a `git_slots` permit before spawning Git, applies the `git_timeout_seconds` deadline and the `git_push_limit_bytes` limit on receive-pack input, and uses the same hook token flow (`new_hook_token`, `HookTokenGuard`), so the hooks admit SSH pushes the same way they admit HTTP pushes.
 
 **Freshness.** Git admission already treats every credential as fresh (see Constraints), so an SSH key gets the same authentication age, 0. Force-push and ref deletion are therefore decided exactly as over HTTP: by the role and the branch protection rules. Freshness only becomes meaningful if HTTP Git admission changes, and then both transports change together.
@@ -106,6 +115,7 @@ One table-driven integration test starts one server with both transports. It run
 | Any | nonexistent path | clone | not found |
 | Read-only token over HTTP vs `read_only` key over SSH | private | push | not permitted (row added when A adds read-only keys) |
 | Revoked token vs revoked key | private | clone | authentication fails |
+| Member removed from the organization between connect and push (holds a write grant at connect) | private | push | not permitted (refused by `reload` under the lock) |
 | Suspended account | private | clone | authentication fails |
 
 The SSH side generates a key pair per actor and uses the system `ssh` client through `GIT_SSH_COMMAND`, so the test covers the same client real users run.
@@ -121,7 +131,7 @@ The SSH side generates a key pair per actor and uses the system `ssh` client thr
 **Host key.**
 - `githearth-server ssh-keygen --config …` creates the key if it is missing. `serve` refuses to start with SSH enabled and no readable key. It never generates one silently, because a regenerated key looks like an attack to every client.
 - The key belongs with configuration and secrets, not under `storage_root`. The backup runbook already says to back those up separately.
-- `doctor` gains an `ssh` check: skipped when disabled; otherwise it checks that the key exists and is readable but not by other users, and that the bind address is free.
+- `doctor` gains an `ssh` check: skipped when disabled; otherwise it checks that the host key exists, parses, and is not readable by other users, and that `ssh_bind` parses. It does not try to bind: on a live host `serve` already holds the port, and real bind failures are reported by `serve` at startup.
 
 ## Consequences
 
@@ -129,7 +139,7 @@ The SSH side generates a key pair per actor and uses the system `ssh` client thr
 - The split of `admit` is the only change to existing code. Its HTTP behaviour is pinned by the existing `git_http` tests.
 - Read-only keys, audit of the credential type per push, and per-key last-used timestamps are A's follow-ups. They need no change to this boundary.
 
-## Open items for Person A
+## Settled with Person A
 
-- Fingerprint format and the uniqueness rule. Recommended: SHA-256, unique across all accounts.
-- Whether to record the key ID on push audit events. That's an A migration; B can pass `key_id` through `SshIdentity` already.
+- **Fingerprint:** SHA-256 over the public key blob, unique across all accounts via a unique index on the fingerprint. One key maps to exactly one account. Adding a key that another account already holds returns 409.
+- **Audit:** push audit events record `credential_kind` (`password`, `token` or `ssh_key`) plus the key ID or token ID. That's A's migration. B passes `key_id` through from `SshIdentity`.
