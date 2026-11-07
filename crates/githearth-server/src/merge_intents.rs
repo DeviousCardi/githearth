@@ -89,12 +89,12 @@ pub(crate) struct MergeIntentJson {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NewMerge {
-    method: String,
-    expected_head_oid: String,
+pub(crate) struct NewMerge {
+    pub(crate) method: String,
+    pub(crate) expected_head_oid: String,
 }
 
-fn new_merge(body: &[u8]) -> Result<NewMerge, ApiError> {
+pub(crate) fn new_merge(body: &[u8]) -> Result<NewMerge, ApiError> {
     let input: NewMerge = serde_json::from_slice(body).map_err(|_| invalid())?;
     let valid_method = matches!(
         input.method.as_str(),
@@ -246,6 +246,55 @@ fn require_merge(
     }
 }
 
+/// Whether `actor_id` may merge this pull request right now, for the browser
+/// merge form: it reports false for a closed or merged pull request and for a
+/// viewer whose grant does not permit `pull_request.merge`. Branch protection
+/// merge facts are evaluated exactly as the create path does.
+pub(crate) async fn may_merge(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<bool, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    issues::require_readable_repo(&loaded)?;
+    let mut conn = state.pool.acquire().await?;
+    let pull = pulls::find_pull(&mut conn, loaded.repo.id, number)
+        .await?
+        .ok_or_else(not_found)?;
+    if pull.state != "open" {
+        return Ok(false);
+    }
+    let (rules, _generation) =
+        crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
+    drop(conn);
+
+    let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+    let approvals = match head.as_deref() {
+        Some(head) => {
+            let mut conn = state.pool.acquire().await?;
+            let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
+            drop(conn);
+            approvals
+        }
+        None => 0,
+    };
+    let protection =
+        crate::protection::matching(&rules, &format!("refs/heads/{}", pull.target_branch));
+    Ok(merge_allowed(
+        state,
+        &loaded.facts,
+        &loaded.repo,
+        &pull,
+        protection,
+        approvals,
+        false,
+        Some(Duration::from_secs(auth_age)),
+    ))
+}
+
 async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -254,21 +303,43 @@ async fn create(
 ) -> Result<(StatusCode, Json<MergeIntentJson>), ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let key = idempotency::extract_key(&headers).transpose()?;
+    let input = new_merge(&body)?;
+    let (status, intent) = create_intent(
+        &state, actor.id, auth_age, &org_slug, &repo_name, number, &body, key, &input,
+    )
+    .await?;
+    Ok((status, Json(intent)))
+}
+
+/// Creates (or replays, through the idempotency key) a merge intent, shared by
+/// the JSON handler and the browser merge form. Validation happens only in
+/// [`new_merge`]; behaviour is identical for both callers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_intent(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    body: &[u8],
+    key: Option<&str>,
+    input: &NewMerge,
+) -> Result<(StatusCode, MergeIntentJson), ApiError> {
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/pulls/{number}/merge");
     let state = &state;
     let body = &body;
     let (status, value) = idempotency::run(
         &state.pool,
-        actor.id,
+        actor_id,
         "POST",
         &path_str,
         body,
         key,
         |idem| async move {
-            let input = new_merge(body)?;
             let loaded =
-                repository_api::load_current(state, actor.id, auth_age, &org_slug, &repo_name)
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
                     .await?;
             issues::require_readable_repo(&loaded)?;
             if loaded.repo.status != RepositoryStatus::Active {
@@ -279,6 +350,11 @@ async fn create(
             let pull = pulls::find_pull(&mut conn, loaded.repo.id, number)
                 .await?
                 .ok_or_else(not_found)?;
+            // A closed or merged pull request must fail here, before branch
+            // lookups or merge authorization, with the shared "not open" error.
+            if pull.state != "open" {
+                return Err(pulls::not_open());
+            }
             // One snapshot, so the digest never pairs old rules with a new generation.
             let (rules, generation) =
                 crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
@@ -330,7 +406,7 @@ async fn create(
             .bind(&input.method)
             .bind(generation)
             .bind(&digest)
-            .bind(actor.id)
+            .bind(actor_id)
             .execute(&mut *tx)
             .await;
             if let Err(e) = inserted {
@@ -345,7 +421,7 @@ async fn create(
             crate::event(
                 &mut tx,
                 Some(loaded.org_id),
-                actor.id,
+                actor_id,
                 "pull_request.merge_intent_created",
             )
             .await?;
@@ -366,10 +442,10 @@ async fn create(
         },
     )
     .await?;
-    Ok((status, Json(serde_json::from_value(value).unwrap())))
+    Ok((status, serde_json::from_value(value).unwrap()))
 }
 
-async fn find_intent_json(
+pub(crate) async fn find_intent_json(
     conn: &mut PgConnection,
     pull_request_id: Uuid,
 ) -> Result<Option<MergeIntentJson>, sqlx::Error> {

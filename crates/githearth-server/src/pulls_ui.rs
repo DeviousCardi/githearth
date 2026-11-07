@@ -16,7 +16,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::{AppState, idempotency, pulls, ui};
+use crate::{AppState, idempotency, merge_intents, pulls, ui};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -40,6 +40,33 @@ pub(crate) fn router() -> Router<AppState> {
             "/organizations/{slug}/repositories/{name}/pulls/{number}/reviews",
             axum::routing::post(review_submit),
         )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/merge",
+            axum::routing::post(merge_submit),
+        )
+}
+
+/// The merge form's method labels and the select the pull page renders.
+const MERGE_METHODS: [(&str, &str); 4] = [
+    ("merge", "Merge commit"),
+    ("squash", "Squash and merge"),
+    ("rebase", "Rebase and merge"),
+    ("ff_only", "Fast-forward only"),
+];
+
+/// A merge intent state as a short, human-readable label.
+fn intent_state_label(state: &str) -> &str {
+    match state {
+        "queued" => "Queued",
+        "validating" => "Validating",
+        "executing" => "Executing",
+        "merged" => "Merged",
+        "conflicted" => "Conflicted",
+        "stale" => "Stale",
+        "failed" => "Failed",
+        "cancelled" => "Cancelled",
+        _ => state,
+    }
 }
 
 struct Session {
@@ -454,6 +481,11 @@ async fn pull_page(
         key: &new_key(),
         error: None,
     };
+    let merge = MergeDraft {
+        method: "merge",
+        key: &new_key(),
+        error: None,
+    };
     render_pull(
         &state,
         &s,
@@ -463,6 +495,7 @@ async fn pull_page(
         params.after,
         draft,
         review,
+        merge,
         StatusCode::OK,
     )
     .await
@@ -483,6 +516,13 @@ struct ReviewDraft<'a> {
     error: Option<&'a str>,
 }
 
+/// A merge form's contents when the page is shown again after a rejected submit.
+struct MergeDraft<'a> {
+    method: &'a str,
+    key: &'a str,
+    error: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_pull(
     state: &AppState,
@@ -493,6 +533,7 @@ async fn render_pull(
     after: Option<i64>,
     draft: Draft<'_>,
     review: ReviewDraft<'_>,
+    merge: MergeDraft<'_>,
     status: StatusCode,
 ) -> Result<Response, ui::UiError> {
     let detail = pulls::read_pull(state, s.account.id, s.auth_age, slug, name, number)
@@ -539,6 +580,19 @@ async fn render_pull(
     } else {
         ui::esc(&detail.pull.state)
     };
+
+    let intended: Option<merge_intents::MergeIntentJson> = match state.pool.acquire().await {
+        Ok(mut conn) => merge_intents::find_intent_json(&mut conn, detail.pull.id)
+            .await
+            .unwrap_or(None),
+        Err(_) => None,
+    };
+    let non_terminal = intended
+        .as_ref()
+        .is_some_and(|i| matches!(i.state.as_str(), "queued" | "validating" | "executing"));
+    let can_merge = merge_intents::may_merge(state, s.account.id, s.auth_age, slug, name, number)
+        .await
+        .unwrap_or(false);
 
     let mut review_list = String::new();
     for r in &reviews.items {
@@ -608,6 +662,54 @@ async fn render_pull(
             format!("<option value=\"{v}\"{sel}>{v}</option>")
         })
         .collect::<String>();
+    let merge_error = merge
+        .error
+        .map(|e| format!("<p class=\"error\" role=\"alert\">{}</p>", ui::esc(e)))
+        .unwrap_or_default();
+    // A merged pull request shows its badge instead; any other intent reports
+    // its state, plus the failure reason when that is what ended it.
+    let intent_section = match (&intended, detail.pull.state.as_str()) {
+        (Some(_intent), "merged") => String::new(),
+        (Some(intent), _) => {
+            let mut html = format!(
+                "<p class=\"muted\">Merge: {}</p>",
+                ui::esc(intent_state_label(&intent.state))
+            );
+            if let Some(reason) = intent.failure_reason.as_deref() {
+                html.push_str(&format!(
+                    "<p class=\"error\" role=\"alert\">{}</p>",
+                    ui::esc(reason)
+                ));
+            }
+            html
+        }
+        (None, _) => String::new(),
+    };
+    let merge_options = MERGE_METHODS
+        .iter()
+        .map(|(value, label)| {
+            let sel = if *value == merge.method {
+                " selected"
+            } else {
+                ""
+            };
+            format!("<option value=\"{value}\"{sel}>{label}</option>")
+        })
+        .collect::<String>();
+    let show_merge_form = detail.pull.state == "open" && !non_terminal && can_merge;
+    let merge_form = if show_merge_form {
+        format!(
+            "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/merge\">{}\
+<label for=\"method\">Merge method</label><select id=\"method\" name=\"method\">{}</select>\
+<input type=\"hidden\" name=\"expected_head_oid\" value=\"{}\">\
+<p><button type=\"submit\">Merge pull request</button></p></form>",
+            form_fields(s, merge.key),
+            merge_options,
+            ui::esc(head_id),
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
@@ -619,8 +721,10 @@ async fn render_pull(
 <dt>Changes requested</dt><dd>{}</dd>\
 </dl></div>\
 <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
+{intent_section}\
 <h2>Reviews</h2>{review_list} \
-<h2>Comments</h2>{comment_list}<p>{pager}</p>{error}{review_error}\
+<h2>Comments</h2>{comment_list}<p>{pager}</p>{error}{review_error}{merge_error}\
+{merge_form}\
 <form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/comments\">{}\
 <label for=\"comment\">Add a comment</label><textarea id=\"comment\" name=\"body\" rows=\"5\" required style=\"width:100%;box-sizing:border-box\">{}</textarea>\
 <p><button type=\"submit\">Comment</button></p></form>\
@@ -684,6 +788,11 @@ async fn comment_submit(
             key: &new_key(),
             error: None,
         };
+        let merge = MergeDraft {
+            method: "merge",
+            key: &new_key(),
+            error: None,
+        };
         return render_pull(
             &state,
             &s,
@@ -693,6 +802,7 @@ async fn comment_submit(
             None,
             draft,
             review,
+            merge,
             StatusCode::BAD_REQUEST,
         )
         .await;
@@ -722,6 +832,11 @@ async fn comment_submit(
                 key: &new_key(),
                 error: None,
             };
+            let merge = MergeDraft {
+                method: "merge",
+                key: &new_key(),
+                error: None,
+            };
             return render_pull(
                 &state,
                 &s,
@@ -731,6 +846,7 @@ async fn comment_submit(
                 None,
                 draft,
                 review,
+                merge,
                 e.status_code(),
             )
             .await;
@@ -782,6 +898,11 @@ async fn review_submit(
             key,
             error: Some("A reviewer verdict is required; the body is limited to 65536 characters."),
         };
+        let merge = MergeDraft {
+            method: "merge",
+            key: &new_key(),
+            error: None,
+        };
         return render_pull(
             &state,
             &s,
@@ -791,6 +912,7 @@ async fn review_submit(
             None,
             draft,
             review,
+            merge,
             StatusCode::BAD_REQUEST,
         )
         .await;
@@ -825,6 +947,11 @@ async fn review_submit(
                 key,
                 error: Some(message),
             };
+            let merge = MergeDraft {
+                method: "merge",
+                key: &new_key(),
+                error: None,
+            };
             return render_pull(
                 &state,
                 &s,
@@ -834,6 +961,7 @@ async fn review_submit(
                 None,
                 draft,
                 review,
+                merge,
                 e.status_code(),
             )
             .await;
@@ -841,4 +969,127 @@ async fn review_submit(
         return Err(api_error(&s, e));
     }
     Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
+}
+
+#[derive(Deserialize)]
+struct MergeForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    expected_head_oid: String,
+}
+
+async fn merge_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<MergeForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    let key = checked_key(&s, &form.idempotency_key)?;
+    let payload = serde_json::json!({
+        "method": &form.method,
+        "expected_head_oid": &form.expected_head_oid,
+    })
+    .to_string();
+    let input = match merge_intents::new_merge(payload.as_bytes()) {
+        Ok(input) => input,
+        Err(_) => {
+            let keep = MergeDraft {
+                method: &form.method,
+                key,
+                error: Some("Choose a merge method and reload the page if the branch has changed."),
+            };
+            return render_pull(
+                &state,
+                &s,
+                &slug,
+                &name,
+                number,
+                None,
+                Draft {
+                    text: "",
+                    key: &new_key(),
+                    error: None,
+                },
+                ReviewDraft {
+                    verdict: "approved",
+                    body: "",
+                    key: &new_key(),
+                    error: None,
+                },
+                keep,
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    };
+    let result = merge_intents::create_intent(
+        &state,
+        s.account.id,
+        s.auth_age,
+        &slug,
+        &name,
+        number,
+        payload.as_bytes(),
+        Some(key),
+        &input,
+    )
+    .await;
+    match result {
+        Ok((_, _)) => {}
+        Err(e) => {
+            let keep = MergeDraft {
+                method: &form.method,
+                key,
+                error: Some(merge_notice(&e)),
+            };
+            return render_pull(
+                &state,
+                &s,
+                &slug,
+                &name,
+                number,
+                None,
+                Draft {
+                    text: "",
+                    key: &new_key(),
+                    error: None,
+                },
+                ReviewDraft {
+                    verdict: "approved",
+                    body: "",
+                    key: &new_key(),
+                    error: None,
+                },
+                keep,
+                e.status_code(),
+            )
+            .await;
+        }
+    }
+    Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
+}
+
+/// The notice a rejected merge submit shows, keeping the chosen method. A 409
+/// or 403 from `create` becomes a readable message; an idempotency conflict has
+/// its own friendly text.
+fn merge_notice(error: &crate::ApiError) -> &'static str {
+    if let Some(message) = ui::idempotency_notice(error) {
+        return message;
+    }
+    match error.status_code() {
+        StatusCode::NOT_FOUND => "This pull request no longer exists.",
+        StatusCode::FORBIDDEN => "You may not merge this pull request.",
+        StatusCode::CONFLICT => "This pull request cannot be merged right now.",
+        StatusCode::UNPROCESSABLE_ENTITY => "One of the branches is missing.",
+        _ => "The merge could not be created. Try again.",
+    }
 }

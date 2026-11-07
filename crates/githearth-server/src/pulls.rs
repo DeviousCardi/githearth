@@ -65,7 +65,7 @@ fn not_text() -> ApiError {
 fn line_out_of_range() -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "line out of range")
 }
-fn not_open() -> ApiError {
+pub(crate) fn not_open() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is not open")
 }
 fn already_merged() -> ApiError {

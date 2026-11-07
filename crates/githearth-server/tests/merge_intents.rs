@@ -494,6 +494,60 @@ async fn create_refuses_a_closed_pull_request() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn create_reports_not_open_before_branch_lookup_on_a_closed_pull_with_no_source_branch() {
+    let f = build_fixture().await;
+    let pull_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM pull_requests WHERE number = $1 \
+         AND repository_id IN (SELECT id FROM repositories WHERE organization_id = $2)",
+    )
+    .bind(f.number as i32)
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+
+    // Delete the source branch, then close the pull request.
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        ":feature",
+    ]))
+    .await;
+    request(
+        &f.app,
+        "PATCH",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.token),
+        None,
+        json!({"state": "closed"}),
+    )
+    .await;
+
+    // The early open check must win over the missing-branch error, so the
+    // response is 409 "pull request is not open", not 422 "branch not found".
+    let (status, body) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "pull request is not open");
+
+    let intents: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE pull_request_id = $1")
+            .bind(pull_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(intents, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn idempotent_replay_returns_same_intent_once() {
     let f = build_fixture().await;
     let key = tag("idem");
