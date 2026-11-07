@@ -22,3 +22,7 @@ auth_concurrency = 2
 # ssh_enabled = false
 # ssh_bind = "127.0.0.1:2222"
 # ssh_host_key_path = "/etc/githearth/ssh_host_key"  # required when ssh_enabled; generate with `githearth-server ssh-keygen`
+# job_concurrency = 4
+# job_timeout_seconds = 60
+# job_poll_interval_ms = 500
+# job_retention_days = 7

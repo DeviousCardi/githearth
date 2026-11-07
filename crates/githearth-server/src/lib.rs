@@ -10,6 +10,7 @@ pub mod git_http;
 pub mod idempotency;
 pub mod issues;
 mod issues_ui;
+pub mod jobs;
 pub mod merge;
 pub mod merge_intents;
 pub mod merge_worker;
