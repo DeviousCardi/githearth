@@ -90,6 +90,7 @@ async fn run(args: Args) -> Result<()> {
                 .await
                 .context("cannot initialize authentication")?;
             let _reconciler = reconcile::spawn(state.clone());
+            let _merge_worker = githearth_server::merge_worker::spawn(state.clone());
             let listener = tokio::net::TcpListener::bind(config.bind)
                 .await
                 .context("cannot bind HTTP listener")?;

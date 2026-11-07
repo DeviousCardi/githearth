@@ -11,6 +11,7 @@ auth_concurrency = 2
 # storage_root = "data/repositories"
 # reconcile_interval_seconds = 60
 # reconcile_grace_seconds = 300
+# merge_worker_interval_seconds = 2
 # trash_retention_seconds = 604800
 # git_concurrency = 8
 # git_timeout_seconds = 600

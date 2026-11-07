@@ -20,6 +20,7 @@ pub struct Config {
     pub storage_root: PathBuf,
     pub reconcile_interval_seconds: u64,
     pub reconcile_grace_seconds: u64,
+    pub merge_worker_interval_seconds: u64,
     pub trash_retention_seconds: u64,
     pub git_concurrency: usize,
     pub git_timeout_seconds: u64,
@@ -45,6 +46,7 @@ impl Default for Config {
             storage_root: PathBuf::from("data/repositories"),
             reconcile_interval_seconds: 60,
             reconcile_grace_seconds: 300,
+            merge_worker_interval_seconds: 2,
             trash_retention_seconds: 604_800,
             git_concurrency: 8,
             git_timeout_seconds: 600,
@@ -118,6 +120,10 @@ impl Config {
         );
         env!(trash_retention_seconds, "GITHEARTH_TRASH_RETENTION_SECONDS");
         env!(reconcile_grace_seconds, "GITHEARTH_RECONCILE_GRACE_SECONDS");
+        env!(
+            merge_worker_interval_seconds,
+            "GITHEARTH_MERGE_WORKER_INTERVAL_SECONDS"
+        );
         c.validate()?;
         Ok(c)
     }
@@ -135,6 +141,7 @@ impl Config {
             || !(1..=16).contains(&self.auth_concurrency)
             || !(5..=3600).contains(&self.reconcile_interval_seconds)
             || !(30..=86400).contains(&self.reconcile_grace_seconds)
+            || !(1..=3600).contains(&self.merge_worker_interval_seconds)
             || !(3600..=31536000).contains(&self.trash_retention_seconds)
             || !(1..=256).contains(&self.git_concurrency)
             || !(10..=86400).contains(&self.git_timeout_seconds)
@@ -142,7 +149,7 @@ impl Config {
             || !(1024..=10737418240).contains(&self.git_push_limit_bytes)
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
