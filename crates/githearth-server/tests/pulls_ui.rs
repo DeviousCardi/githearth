@@ -900,3 +900,277 @@ async fn unrelated_users_get_404() {
     }
     finish(f).await;
 }
+
+async fn open_pull(f: &Fixture) {
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls", f.api_base),
+        &f.token,
+        json!({"title": "mergeable", "source_branch": "feature", "target_branch": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn merge_form_shows_only_for_permitted_viewers_on_an_open_pull_request() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // The owner (write) sees the merge form on the open pull request.
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("name=\"method\""), "{page}");
+    assert!(page.contains("Merge pull request"), "{page}");
+    assert!(page.contains("Fast-forward only"), "{page}");
+
+    // A read-only member sees no merge form.
+    let reader = member_cookie(&f, "read").await;
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("name=\"method\""), "{page}");
+    assert!(!page.contains("Merge pull request"), "{page}");
+
+    // A closed pull request shows no merge form, even to the owner.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'closed', closed_at = now() WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("name=\"method\""), "{page}");
+    assert!(!page.contains("Merge pull request"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn submitting_the_merge_form_queues_an_intent_and_redirects() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    let token = csrf(&page);
+    let expected_head_oid = hidden(&page, "expected_head_oid");
+    assert_eq!(expected_head_oid, f.feature_head);
+
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/merge", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", &key(&page)),
+            ("method", "squash"),
+            ("expected_head_oid", &expected_head_oid),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("{}/pulls/1", f.base).as_str())
+    );
+
+    // The page now shows the queued state and no merge form.
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Merge: Queued"), "{page}");
+    assert!(!page.contains("name=\"method\""), "{page}");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_wrong_merge_csrf_is_refused_and_queues_nothing() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/merge", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", "wrong"),
+            ("idempotency_key", &format!("{}", Uuid::new_v4().simple())),
+            ("method", "merge"),
+            ("expected_head_oid", &f.feature_head),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_failed_intent_reason_is_shown_escaped_and_the_form_returns() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // Queue an intent, then mark it failed with a reason carrying markup.
+    let (status, intent) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/merge", f.api_base),
+        &f.token,
+        json!({"method": "merge", "expected_head_oid": f.feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let operation_id = intent["operation_id"].as_str().unwrap().to_string();
+    sqlx::query(
+        "UPDATE merge_intents SET state = 'failed', failure_reason = $1 WHERE operation_id = $2",
+    )
+    .bind("<b>boom</b> & <script>x</script>")
+    .bind(Uuid::parse_str(&operation_id).unwrap())
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Merge: Failed"), "{page}");
+    assert!(
+        page.contains("&lt;b&gt;boom&lt;/b&gt; &amp; &lt;script&gt;x&lt;/script&gt;"),
+        "{page}"
+    );
+    assert!(!page.contains("<b>boom</b>"), "{page}");
+    // A failed intent is terminal, so the form returns.
+    assert!(page.contains("name=\"method\""), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_read_only_member_cannot_merge_through_the_form() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let reader = member_cookie(&f, "read").await;
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    let (status, _, body) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/merge", f.base),
+        &reader,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &format!("{}", Uuid::new_v4().simple())),
+            ("method", "merge"),
+            ("expected_head_oid", &f.feature_head),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body.contains("You may not merge this pull request."),
+        "{body}"
+    );
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn an_invalid_merge_method_re_renders_the_form_and_queues_nothing() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    let (status, _, body) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/merge", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("method", "not_a_method"),
+            ("expected_head_oid", &f.feature_head),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("Choose a merge method"), "{body}");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn merging_a_pull_with_an_open_intent_shows_a_conflict_notice() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // Queue an intent through the API, so a second merge attempt sees it.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/merge", f.api_base),
+        &f.token,
+        json!({"method": "merge", "expected_head_oid": f.feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    let (status, _, body) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/merge", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("method", "rebase"),
+            ("expected_head_oid", &f.feature_head),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        body.contains("This pull request cannot be merged right now."),
+        "{body}"
+    );
+
+    finish(f).await;
+}
