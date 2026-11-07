@@ -104,6 +104,9 @@ async fn run(args: Args) -> Result<()> {
         }
         Command::SshKeygen => unreachable!("handled above"),
         Command::Serve => {
+            if let Err(message) = doctor::schema_check(&pool).await {
+                bail!("database schema does not match this binary: {message}");
+            }
             let state = AppState::new(pool, config.clone())
                 .await
                 .context("cannot initialize authentication")?;

@@ -203,7 +203,7 @@ async fn db_connect(config: &Config) -> anyhow::Result<PgPool> {
     crate::connect(&c).await
 }
 
-async fn schema_check(pool: &PgPool) -> Result<String, String> {
+pub async fn schema_check(pool: &PgPool) -> Result<String, String> {
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations')",
     )
