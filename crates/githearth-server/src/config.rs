@@ -38,6 +38,18 @@ pub struct Config {
     pub ssh_bind: SocketAddr,
     #[serde(default)]
     pub ssh_host_key_path: PathBuf,
+    /// Number of concurrent job handlers (ADR 0006).
+    #[serde(default = "default_job_concurrency")]
+    pub job_concurrency: usize,
+    /// Per-job handler timeout in seconds (ADR 0006).
+    #[serde(default = "default_job_timeout_seconds")]
+    pub job_timeout_seconds: u64,
+    /// Poll interval in ms when no work is found (ADR 0006).
+    #[serde(default = "default_job_poll_interval_ms")]
+    pub job_poll_interval_ms: u64,
+    /// Completed jobs retention in days (ADR 0006).
+    #[serde(default = "default_job_retention_days")]
+    pub job_retention_days: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -65,6 +77,10 @@ impl Default for Config {
             ssh_enabled: false,
             ssh_bind: "127.0.0.1:2222".parse().unwrap(),
             ssh_host_key_path: PathBuf::new(),
+            job_concurrency: default_job_concurrency(),
+            job_timeout_seconds: default_job_timeout_seconds(),
+            job_poll_interval_ms: default_job_poll_interval_ms(),
+            job_retention_days: default_job_retention_days(),
         }
     }
 }
@@ -73,6 +89,18 @@ fn default_secure_cookies() -> bool {
 }
 fn default_ssh_bind() -> SocketAddr {
     "127.0.0.1:2222".parse().unwrap()
+}
+fn default_job_concurrency() -> usize {
+    4
+}
+fn default_job_timeout_seconds() -> u64 {
+    60
+}
+fn default_job_poll_interval_ms() -> u64 {
+    500
+}
+fn default_job_retention_days() -> u64 {
+    7
 }
 
 impl Config {
@@ -154,6 +182,10 @@ impl Config {
             merge_worker_interval_seconds,
             "GITHEARTH_MERGE_WORKER_INTERVAL_SECONDS"
         );
+        env!(job_concurrency, "GITHEARTH_JOB_CONCURRENCY");
+        env!(job_timeout_seconds, "GITHEARTH_JOB_TIMEOUT_SECONDS");
+        env!(job_poll_interval_ms, "GITHEARTH_JOB_POLL_INTERVAL_MS");
+        env!(job_retention_days, "GITHEARTH_JOB_RETENTION_DAYS");
         c.validate()?;
         Ok(c)
     }
@@ -179,9 +211,13 @@ impl Config {
             || !(1024..=10737418240).contains(&self.git_push_limit_bytes)
             || (self.repository_quota_bytes != 0
                 && !(1_048_576..=1_099_511_627_776).contains(&self.repository_quota_bytes))
+            || !(1..=64).contains(&self.job_concurrency)
+            || !(1..=3600).contains(&self.job_timeout_seconds)
+            || !(50..=60000).contains(&self.job_poll_interval_ms)
+            || !(1..=365).contains(&self.job_retention_days)
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d"
             );
         }
         if self.storage_root.as_os_str().is_empty() {

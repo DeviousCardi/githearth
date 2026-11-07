@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use githearth_server::{
-    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, reconcile, router, ssh,
+    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, jobs, reconcile, router,
+    ssh,
 };
 use std::{
     io::{self, Read},
@@ -112,6 +113,9 @@ async fn run(args: Args) -> Result<()> {
                 .context("cannot initialize authentication")?;
             let _reconciler = reconcile::spawn(state.clone());
             let _merge_worker = githearth_server::merge_worker::spawn(state.clone());
+            // Handlers are registered by their owners (ADR 0006).
+            let jobs_shutdown = tokio_util::sync::CancellationToken::new();
+            let jobs = jobs::spawn(state.clone(), jobs::Registry::new(), jobs_shutdown.clone());
             let _ssh = if config.ssh_enabled {
                 use std::sync::Arc;
                 ssh::load_host_key(&config.ssh_host_key_path)?;
@@ -131,6 +135,9 @@ async fn run(args: Args) -> Result<()> {
                 .with_graceful_shutdown(shutdown())
                 .await
                 .context("HTTP server failed")?;
+            // Let in-flight jobs finish and release their leases (ADR 0006).
+            jobs_shutdown.cancel();
+            let _ = jobs.await;
         }
         // Handled in `main` before any configuration is loaded.
         Command::GitHook { .. } => unreachable!("git-hook is dispatched in main"),

@@ -82,12 +82,14 @@ pub async fn report(config: &Config) -> Vec<Check> {
                     Err(d) => Check::fail("lifecycle", d),
                 },
             );
+            checks.push(jobs_check(&pool, config.job_timeout_seconds).await);
             pool.close().await;
         }
         Err(e) => {
             checks.push(Check::fail("database", e));
             checks.push(Check::skip("schema"));
             checks.push(Check::skip("lifecycle"));
+            checks.push(Check::skip("jobs"));
         }
     }
 
@@ -278,6 +280,33 @@ async fn lifecycle_check(pool: &PgPool, grace_seconds: u64) -> Result<i64, Strin
     .fetch_one(pool)
     .await
     .map_err(|_| "cannot query repositories".to_string())
+}
+
+/// Read-only: dead jobs and late pending jobs warn; a running job whose lease
+/// expired long ago fails, because recovery would have reset it (ADR 0006).
+async fn jobs_check(pool: &PgPool, timeout_seconds: u64) -> Check {
+    let counts: Result<(i64, i64, i64), _> = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE state = 'dead'), \
+         count(*) FILTER (WHERE state = 'pending' AND not_before < now() - interval '60 seconds'), \
+         count(*) FILTER (WHERE state = 'running' AND lease_expires_at < now() - make_interval(secs => $1)) \
+         FROM jobs",
+    )
+    .bind((2 * timeout_seconds) as f64)
+    .fetch_one(pool)
+    .await;
+    match counts {
+        Err(_) => Check::fail("jobs", "cannot query jobs"),
+        Ok((_, _, stuck)) if stuck > 0 => Check::fail(
+            "jobs",
+            format_args!("{stuck} running job(s) with an expired lease; the runner is not running"),
+        ),
+        Ok((dead, _, _)) if dead > 0 => Check::warn("jobs", format_args!("{dead} dead job(s)")),
+        Ok((_, late, _)) if late > 0 => Check::warn(
+            "jobs",
+            format_args!("{late} pending job(s) more than 60 s late"),
+        ),
+        Ok(_) => Check::ok("jobs", "no dead, late or stuck jobs"),
+    }
 }
 
 pub async fn run(config: &Config) -> i32 {
