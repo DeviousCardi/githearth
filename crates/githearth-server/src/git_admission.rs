@@ -142,6 +142,18 @@ pub async fn admit(
         (account_id, false)
     };
 
+    admit_account(state, account_id, read_only, org_slug, repo_name, want).await
+}
+
+/// Authorization after authentication, shared by HTTP and SSH transports (ADR 0005).
+pub async fn admit_account(
+    state: &AppState,
+    account_id: Uuid,
+    read_only: bool,
+    org_slug: &str,
+    repo_name: &str,
+    want: Want,
+) -> Result<Admitted, AuthError> {
     let mut conn = state
         .pool
         .acquire()
