@@ -32,6 +32,12 @@ pub struct Config {
     pub hook_program: PathBuf,
     #[serde(default = "default_secure_cookies")]
     pub secure_cookies: bool,
+    #[serde(default)]
+    pub ssh_enabled: bool,
+    #[serde(default = "default_ssh_bind")]
+    pub ssh_bind: SocketAddr,
+    #[serde(default)]
+    pub ssh_host_key_path: PathBuf,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -56,11 +62,17 @@ impl Default for Config {
             repository_quota_bytes: 0,
             hook_program: PathBuf::new(),
             secure_cookies: true,
+            ssh_enabled: false,
+            ssh_bind: "127.0.0.1:2222".parse().unwrap(),
+            ssh_host_key_path: PathBuf::new(),
         }
     }
 }
 fn default_secure_cookies() -> bool {
     true
+}
+fn default_ssh_bind() -> SocketAddr {
+    "127.0.0.1:2222".parse().unwrap()
 }
 
 impl Config {
@@ -103,6 +115,21 @@ impl Config {
         env!(git_request_limit_bytes, "GITHEARTH_GIT_REQUEST_LIMIT_BYTES");
         env!(git_push_limit_bytes, "GITHEARTH_GIT_PUSH_LIMIT_BYTES");
         env!(repository_quota_bytes, "GITHEARTH_REPOSITORY_QUOTA_BYTES");
+        env!(ssh_enabled, "GITHEARTH_SSH_ENABLED");
+        if std::env::var("GITHEARTH_SSH_BIND")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            env!(ssh_bind, "GITHEARTH_SSH_BIND");
+        }
+        if std::env::var("GITHEARTH_SSH_HOST_KEY_PATH")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            env!(ssh_host_key_path, "GITHEARTH_SSH_HOST_KEY_PATH");
+        }
         if std::env::var("GITHEARTH_HOOK_PROGRAM")
             .ok()
             .filter(|v| !v.is_empty())
@@ -160,6 +187,9 @@ impl Config {
         if self.storage_root.as_os_str().is_empty() {
             bail!("storage_root must not be empty");
         }
+        if self.ssh_enabled && self.ssh_host_key_path.as_os_str().is_empty() {
+            bail!("ssh_host_key_path must be set when ssh_enabled is true");
+        }
         Ok(())
     }
 }
@@ -204,5 +234,22 @@ mod tests {
         assert!(c.validate().is_ok());
         c.database_max_connections = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn ssh_enabled_requires_host_key_path() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            ssh_enabled: true,
+            ..Config::default()
+        };
+        assert!(
+            c.validate().is_err(),
+            "ssh_enabled without key path must fail"
+        );
+        c.ssh_host_key_path = PathBuf::from("/some/key");
+        assert!(c.validate().is_ok());
+        c.ssh_enabled = false;
+        assert!(c.validate().is_ok(), "ssh_disabled allows empty key path");
     }
 }
