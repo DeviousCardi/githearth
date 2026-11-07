@@ -301,9 +301,9 @@ async fn create(
     Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<MergeIntentJson>), ApiError> {
-    let input = new_merge(&body)?;
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let key = idempotency::extract_key(&headers).transpose()?;
+    let input = new_merge(&body)?;
     let (status, intent) = create_intent(
         &state, actor.id, auth_age, &org_slug, &repo_name, number, &body, key, &input,
     )
