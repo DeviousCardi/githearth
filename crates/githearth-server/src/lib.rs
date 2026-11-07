@@ -22,6 +22,7 @@ pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
 pub mod ssh;
+pub mod ssh_keys;
 mod tokens;
 pub mod ui;
 
@@ -235,6 +236,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ui::router())
         .merge(browse::router())
         .merge(tokens::router())
+        .merge(ssh_keys::router())
         .route(
             "/api/v1/organizations/{org}/repositories",
             post(repository_api::create).get(repository_api::list),

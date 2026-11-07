@@ -172,3 +172,20 @@ At push admission the server loads the repository's rules once and passes them t
 
 Protection applies to a branch only once it exists. Creating a branch (old value all zeros) that matches a rule is an ordinary `ref.push`, so `require_pull_request` does not block it; the rule applies to every later push. As a result, anyone who can push can create a protected name from any commit, for example `main` in an empty repository, or recreate it after a delete the rule allows. GitHub behaves the same way by default.
 
+## SSH keys
+
+Signed-in sessions manage SSH public keys for Git transport over the embedded SSH server ([ADR 0005](decisions/0005-ssh-transport.md)). The API is session-authenticated only; a personal access token can never create, list or revoke keys. The server is built without RSA, so only Ed25519 and ECDSA (nistp256/384/521) keys are accepted — RSA, DSA, `sk-*` and certificate lines are refused with 400.
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_githearth -N '' -C 'you@example.com'
+# POST /api/v1/user/ssh-keys  {"name": "laptop", "public_key": "...", "expires_in_days": 30}
+git clone ssh://githearth-host:2222/org/repo.git
+```
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /api/v1/user/ssh-keys` | Session bearer; JSON `name` (1–100 chars), `public_key` (OpenSSH line), optional `expires_in_days` (1–3650); 201 with metadata including the `SHA256:` fingerprint; 409 if the fingerprint is already registered to any account and not revoked; 400 for an unsupported or malformed key |
+| `GET /api/v1/user/ssh-keys` | Session bearer; lists the caller's keys, including `revoked_at` |
+| `DELETE /api/v1/user/ssh-keys/{id}` | Session bearer; revokes (sets `revoked_at`); 204; 404 for a missing or another account's key |
+
+A key's SHA-256 fingerprint is unique among non-revoked keys across all accounts, so one key maps to exactly one account; after revocation the same key can be added again. Revoked, expired, and suspended-account keys fail authentication on new connections exactly like unknown keys. `git clone ssh://host:port/org/repo.git` and the `host:org/repo.git` form both work, with Ed25519 or ECDSA client keys.

@@ -117,11 +117,8 @@ async fn run(args: Args) -> Result<()> {
             let jobs_shutdown = tokio_util::sync::CancellationToken::new();
             let jobs = jobs::spawn(state.clone(), jobs::Registry::new(), jobs_shutdown.clone());
             let _ssh = if config.ssh_enabled {
-                use std::sync::Arc;
                 ssh::load_host_key(&config.ssh_host_key_path)?;
-                // shortcut: no SSH keys until Person A's ssh_keys::authenticate lands (ADR 0005); swap this closure for it
-                let authenticate: ssh::Authenticate =
-                    Arc::new(|_fingerprint: String| Box::pin(async { Ok(None) }));
+                let authenticate = githearth_server::ssh_keys::authenticator(state.pool.clone());
                 let (handle, _port_rx) = ssh::spawn(state.clone(), authenticate);
                 Some(handle)
             } else {
