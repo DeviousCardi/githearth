@@ -2,7 +2,7 @@
 
 Date: 2026-11-07.
 
-Status: **proposed for phase 5**, pending Person A review. The [two-person roadmap](../plan/08-two-person-roadmap.md) phase 5 splits the work:
+Status: **accepted** for phase 5, after Person A's review on 2026-11-07 (PR #63). The [two-person roadmap](../plan/08-two-person-roadmap.md) phase 5 splits the work:
 
 - **Person A:** transactional job records and domain handlers.
 - **Person B:** claiming, retry and recovery execution.
@@ -34,9 +34,9 @@ The claim loop polls a new `jobs` table, not `outbox_events`.
 | Column | Meaning |
 | --- | --- |
 | `id` | Primary key |
-| `organization_id` | Scope, nullable |
+| `organization_id` | Scope, nullable; `REFERENCES organizations ON DELETE CASCADE`, so deleting an organization leaves no orphan jobs |
 | `kind` | Handler key, e.g. `notification.merged` |
-| `payload` | `jsonb` handler input |
+| `payload` | `jsonb` handler input: IDs only, never content (see the handler contract) |
 | `dedupe_key` | Unique per `kind` while `pending` or `running` |
 | `state` | `pending`, `running`, `done` or `dead` |
 | `not_before` | Earliest time the job may run |
@@ -54,10 +54,12 @@ The indexes:
 
 | Person A — application | Person B — infrastructure |
 | --- | --- |
-| `jobs` migration (columns and indexes above) | Claim loop, leases, fencing, recovery |
-| `jobs::enqueue` calls in domain transactions | Backoff, attempt cap, dead jobs |
-| Handlers per `kind`, idempotent (below) | Concurrency, per-job timeout, shutdown |
-| Choosing which domain events get jobs | `doctor` `jobs` check; retention sweep of `done` |
+| `jobs::enqueue` calls in domain transactions | `jobs` migration (columns and indexes above) and `jobs::enqueue` |
+| Real handlers per `kind`, idempotent (below) | Runner: claim loop, leases, fencing, recovery, backoff, dead jobs |
+| Choosing which domain events get jobs | Handler registry, concurrency, per-job timeout, shutdown |
+| | `doctor` `jobs` check; retention sweep of `done`; test handlers |
+
+B owns every statement against `jobs`, so B ships the table with them. A's handler PRs then depend only on B's merged runner.
 
 ## Narrow interface
 
@@ -104,6 +106,8 @@ RETURNING *
 
 **Recovery:** a `running` job whose lease expired goes back to `pending`, keeping its `attempt` count. That happens in a fenced update in the same poll, using `jobs_running_expiry`.
 
+**Poison pills:** the claim increments `attempt`, so a job that kills its process reaches `attempt = max_attempts` and then has its lease expire. Recovery therefore sends it to `dead` with `last_error = 'lease expired'` when `attempt >= max_attempts`. A crash loop ends after `max_attempts` claims instead of claiming forever.
+
 ## Retry and dead jobs
 
 | Event | Result |
@@ -111,15 +115,17 @@ RETURNING *
 | `Done` | `state = 'done'` |
 | `Retry`, panic or timeout, with `attempt < max_attempts` | `state = 'pending'`, `not_before = now() + delay` |
 | The same, with `attempt = max_attempts`, or `Failed` | `state = 'dead'`, `last_error` kept |
-| Lease expired (process died) | Back to `pending`, then as above |
+| Lease expired (process died), `attempt < max_attempts` | Back to `pending` |
+| Lease expired, `attempt >= max_attempts` | `state = 'dead'`, `last_error = 'lease expired'` |
 
 - **Delay:** `max(after, base × 2^(attempt−1))`, with ±25% jitter, capped at 10 minutes. `base` is 1 s.
 - **Dead jobs:** kept until an operator deletes them, and never claimed again.
 - **Dedupe after a job ends:** `done` and `dead` jobs are outside the dedupe index, so the same key can be enqueued again later.
 
-**At-least-once delivery.** A job can run more than once: after a crash, after a timeout whose handler had already done the work, or after a retry. **A's handlers must be idempotent**:
-- the effect of a second run with the same payload must equal the effect of one run;
-- they key any external side effect on a stable ID in the payload, such as the outbox event ID or the merge's `journal_sequence`.
+**Handler contract.**
+- **Idempotent, because delivery is at-least-once.** A job can run more than once: after a crash, after a timeout whose handler had already done the work, or after a retry. A second run with the same payload must have the same effect as one run.
+- **Stable keys.** Any side effect is keyed on a stable ID in the payload, such as the outbox event ID or the merge's `journal_sequence`.
+- **IDs, not content.** Payloads carry identifiers, for example the outbox event ID and the pull request ID, never content. `dead` jobs are kept indefinitely, so they mustn't retain private data. The handler loads current data when it runs.
 
 ## Bounds and shutdown
 
@@ -146,6 +152,7 @@ RETURNING *
 `tests/jobs.rs` runs against a real database with test handlers.
 - **Duplicate workers:** two concurrent loops run each of N jobs exactly once.
 - **Crash mid-job:** a process dies with a job running; after the lease expires, another loop runs it.
+- **Poison pill:** a job that crashes its runner every time ends `dead` with `last_error = 'lease expired'` after `max_attempts` claims.
 - **Stale completion:** a completion with the old attempt or holder after a reclaim changes nothing.
 - **Backoff:** `Retry` and timeouts advance `not_before` within the jitter bounds.
 - **Attempt cap and `Failed`:** the job ends `dead` with `last_error`, and isn't claimed again.
@@ -159,8 +166,8 @@ RETURNING *
 - Handlers carry the idempotence burden; this ADR states it as their contract.
 - Polling costs one indexed query per interval while idle.
 
-## Open items for Person A
+## Settled with Person A
 
-1. Which events get jobs first. Recommended: notifications for `pull_request.merged` and review requests.
-2. Per-kind `max_attempts`. Default 5; A can set it per `enqueue` later if needed.
-3. Confirm leaving `merge_worker.rs` on its own loop for phase 5.
+1. **First jobs:** `pull_request.merged` and review-requested notifications. A adds an in-app `notifications` table as the handler's idempotent target, keyed on (event ID, recipient).
+2. **`max_attempts`:** 5 for every kind for now. A per-`enqueue` parameter is added when a kind needs one.
+3. **Merge worker:** stays on its own loop for phase 5.
