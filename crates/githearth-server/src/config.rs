@@ -26,6 +26,7 @@ pub struct Config {
     pub git_timeout_seconds: u64,
     pub git_request_limit_bytes: usize,
     pub git_push_limit_bytes: usize,
+    pub repository_quota_bytes: u64,
     /// Path of the binary the Git hooks `exec`; empty means the current executable.
     #[serde(default)]
     pub hook_program: PathBuf,
@@ -52,6 +53,7 @@ impl Default for Config {
             git_timeout_seconds: 600,
             git_request_limit_bytes: 10_485_760,
             git_push_limit_bytes: 1_073_741_824,
+            repository_quota_bytes: 0,
             hook_program: PathBuf::new(),
             secure_cookies: true,
         }
@@ -100,6 +102,7 @@ impl Config {
         env!(git_timeout_seconds, "GITHEARTH_GIT_TIMEOUT_SECONDS");
         env!(git_request_limit_bytes, "GITHEARTH_GIT_REQUEST_LIMIT_BYTES");
         env!(git_push_limit_bytes, "GITHEARTH_GIT_PUSH_LIMIT_BYTES");
+        env!(repository_quota_bytes, "GITHEARTH_REPOSITORY_QUOTA_BYTES");
         if std::env::var("GITHEARTH_HOOK_PROGRAM")
             .ok()
             .filter(|v| !v.is_empty())
@@ -147,9 +150,11 @@ impl Config {
             || !(10..=86400).contains(&self.git_timeout_seconds)
             || !(1024..=1073741824).contains(&self.git_request_limit_bytes)
             || !(1024..=10737418240).contains(&self.git_push_limit_bytes)
+            || (self.repository_quota_bytes != 0
+                && !(1_048_576..=1_099_511_627_776).contains(&self.repository_quota_bytes))
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB"
             );
         }
         if self.storage_root.as_os_str().is_empty() {

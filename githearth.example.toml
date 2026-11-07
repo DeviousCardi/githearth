@@ -17,4 +17,5 @@ auth_concurrency = 2
 # git_timeout_seconds = 600
 # git_request_limit_bytes = 10485760
 # git_push_limit_bytes = 1073741824  # upload size and receive.maxInputSize
+# repository_quota_bytes = 1073741824  # total on-disk objects; 0 = unlimited
 # hook_program = "/path/to/githearth-server"  # default: the running executable

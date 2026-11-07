@@ -756,6 +756,29 @@ fn remove_lock_files_recursively(dir: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Sum of regular-file lengths in `dir`, recursing into subdirectories.
+/// Symlinks are not followed; `excluded_subdir` (if Some) is skipped entirely.
+pub fn dir_size(dir: &Path, excluded_subdir: Option<&Path>) -> io::Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let ft = metadata.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            if excluded_subdir.is_some_and(|ex| entry.path() == ex) {
+                continue;
+            }
+            total += dir_size(&entry.path(), None)?;
+        } else {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
 pub fn validate_git_protocol(value: &str) -> Result<(), StorageError> {
     if value.is_empty() || value.len() > 256 {
         return Err(StorageError::Invalid(
@@ -921,5 +944,50 @@ impl Storage {
             }
         }
         Ok((scan.repositories.len(), problems))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn dir_size_nested_files() {
+        let tmp = std::env::temp_dir().join(format!("githearth-dirsize-{}", Uuid::new_v4()));
+        fs::create_dir_all(tmp.join("a/b")).unwrap();
+        fs::write(tmp.join("a/b/c.txt"), [0u8; 100]).unwrap();
+        fs::write(tmp.join("a/b/d.txt"), [0u8; 50]).unwrap();
+        assert_eq!(dir_size(&tmp, None).unwrap(), 150);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dir_size_empty_dir() {
+        let tmp = std::env::temp_dir().join(format!("githearth-dirsize-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(dir_size(&tmp, None).unwrap(), 0);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dir_size_symlink_not_followed() {
+        let tmp = std::env::temp_dir().join(format!("githearth-dirsize-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("real.txt"), [0u8; 42]).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real.txt"), tmp.join("link.txt")).unwrap();
+        assert_eq!(dir_size(&tmp, None).unwrap(), 42);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dir_size_excluded_subdir() {
+        let tmp = std::env::temp_dir().join(format!("githearth-dirsize-{}", Uuid::new_v4()));
+        fs::create_dir_all(tmp.join("keep")).unwrap();
+        fs::create_dir_all(tmp.join("skip")).unwrap();
+        fs::write(tmp.join("keep/a.txt"), [0u8; 100]).unwrap();
+        fs::write(tmp.join("skip/b.txt"), [0u8; 999]).unwrap();
+        assert_eq!(dir_size(&tmp, Some(&tmp.join("skip"))).unwrap(), 100);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
