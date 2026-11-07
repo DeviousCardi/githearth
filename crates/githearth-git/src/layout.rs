@@ -1,6 +1,6 @@
 //! Durable repository storage layout and lifecycle (ADR 0003 "Storage layout").
 
-use crate::{StorageError, checked, git};
+use crate::{StorageError, checked, git, journal};
 use githearth_core::{GitRef, ObjectId, RepositoryId, RepositoryReader};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -208,6 +208,38 @@ impl Storage {
         Ok(Self {
             root,
             options,
+            locks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Read-only open: does not create, chmod, or modify anything on disk.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let root_ref = root.as_ref();
+        if !root_ref.is_dir() {
+            return Err(StorageError::Invalid(
+                "storage root does not exist or is not a directory".into(),
+            ));
+        }
+        if fs::symlink_metadata(root_ref)?.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "storage root must not be a symlink".into(),
+            ));
+        }
+        let root = fs::canonicalize(root_ref)?;
+        let repos = root.join("repositories");
+        if !repos.is_dir() {
+            return Err(StorageError::Invalid(
+                "storage root has no repositories/ directory".into(),
+            ));
+        }
+        if fs::symlink_metadata(&repos)?.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "repositories/ must not be a symlink".into(),
+            ));
+        }
+        Ok(Self {
+            root,
+            options: StorageOptions::default(),
             locks: Mutex::new(HashMap::new()),
         })
     }
@@ -544,11 +576,12 @@ impl Storage {
         let mut malformed = Vec::new();
         for pair in fs::read_dir(self.root.join("repositories"))? {
             let pair = pair?;
-            if !pair.file_type()?.is_dir() {
-                continue;
-            }
             let pair_name = pair.file_name();
             let pair_name = pair_name.to_string_lossy();
+            if !pair.file_type()?.is_dir() {
+                malformed.push(format!("repositories/{pair_name}"));
+                continue;
+            }
             if pair_name.len() != 2
                 || !pair_name
                     .bytes()
@@ -559,11 +592,12 @@ impl Storage {
             }
             for entry in fs::read_dir(pair.path())? {
                 let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
+                if !entry.file_type()?.is_dir() {
+                    malformed.push(format!("repositories/{pair_name}/{name}"));
+                    continue;
+                }
                 let stem = match name.strip_suffix(".git") {
                     Some(s) if s.len() == 32 && s.bytes().all(is_lower_hex) => s,
                     _ => {
@@ -841,4 +875,51 @@ impl RepositoryReader for Storage {
 pub struct Scan {
     pub repositories: Vec<Uuid>,
     pub malformed: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Problem {
+    pub subject: String,
+    pub message: String,
+}
+
+impl Storage {
+    pub fn check(&self) -> Result<(usize, Vec<Problem>), StorageError> {
+        let mut problems = Vec::new();
+        let scan = self.scan()?;
+        for m in &scan.malformed {
+            problems.push(Problem {
+                subject: m.clone(),
+                message: "malformed entry".to_owned(),
+            });
+        }
+        for repo_id in &scan.repositories {
+            let repo_path = self.repository_path(*repo_id);
+            let subject = repo_id.simple().to_string();
+            let output = git()
+                .arg("--git-dir")
+                .arg(&repo_path)
+                .args(["fsck", "--full", "--no-progress", "--no-dangling"])
+                .output()?;
+            if !output.status.success() {
+                let first_line = String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("git fsck failed")
+                    .to_owned();
+                problems.push(Problem {
+                    subject: subject.clone(),
+                    message: first_line,
+                });
+            }
+            match journal::verify(&repo_path) {
+                Ok(_) => {}
+                Err(e) => problems.push(Problem {
+                    subject: subject.clone(),
+                    message: format!("journal: {e}"),
+                }),
+            }
+        }
+        Ok((scan.repositories.len(), problems))
+    }
 }

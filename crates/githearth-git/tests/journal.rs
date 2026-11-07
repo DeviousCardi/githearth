@@ -1,7 +1,7 @@
 use githearth_core::ObjectId;
 use githearth_git::journal::{
     Journal, JournalError, Kind, MAX_RECORD_BYTES, Origin, Outcome, Record, Update, classify,
-    crc32c,
+    crc32c, verify,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -524,4 +524,203 @@ fn classify_covers_every_outcome() {
         classify(&creation, None, &now),
         Outcome::CommittedMarkerLost
     );
+}
+
+// ---------------------------------------------------------------------------
+// verify() tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verify_healthy_journal_passes() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let mut journal = Journal::open(&repo).unwrap();
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            None,
+            vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
+        )
+        .unwrap();
+    drop(journal);
+    assert_eq!(verify(&repo).unwrap(), 1);
+}
+
+#[test]
+fn verify_missing_journal_is_fine() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    assert_eq!(verify(&repo).unwrap(), 0);
+}
+
+#[test]
+fn verify_flipped_byte_fails_crc() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let mut journal = Journal::open(&repo).unwrap();
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            None,
+            vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
+        )
+        .unwrap();
+    drop(journal);
+
+    let mut bytes = journal_bytes(&repo);
+    let offsets = record_offsets(&bytes);
+    bytes[offsets[0] + 8 + 4] ^= 0xFF;
+    fs::write(repo.join("githearth").join("journal"), &bytes).unwrap();
+
+    assert!(matches!(verify(&repo), Err(JournalError::TornTail { .. })));
+}
+
+#[test]
+fn verify_torn_tail_is_reported() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let op = Uuid::new_v4();
+    let mut journal = Journal::open(&repo).unwrap();
+    journal
+        .append_prepared(
+            op,
+            None,
+            vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
+        )
+        .unwrap();
+    journal.append_marker(op, Kind::Committed).unwrap();
+    drop(journal);
+
+    let full = journal_bytes(&repo);
+    let cut = full.len() - 3;
+    let out = fs::OpenOptions::new()
+        .write(true)
+        .open(repo.join("githearth").join("journal"))
+        .unwrap();
+    out.set_len(cut as u64).unwrap();
+    drop(out);
+
+    assert!(matches!(verify(&repo), Err(JournalError::TornTail { .. })));
+}
+
+#[test]
+fn verify_torn_tail_preserves_file_unchanged() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let op = Uuid::new_v4();
+    let mut journal = Journal::open(&repo).unwrap();
+    journal
+        .append_prepared(
+            op,
+            None,
+            vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
+        )
+        .unwrap();
+    journal.append_marker(op, Kind::Committed).unwrap();
+    drop(journal);
+
+    let full = journal_bytes(&repo);
+    let cut = full.len() - 3;
+    let out = fs::OpenOptions::new()
+        .write(true)
+        .open(repo.join("githearth").join("journal"))
+        .unwrap();
+    out.set_len(cut as u64).unwrap();
+    drop(out);
+
+    let before = fs::read(repo.join("githearth").join("journal")).unwrap();
+    assert!(verify(&repo).is_err());
+    let after = fs::read(repo.join("githearth").join("journal")).unwrap();
+    assert_eq!(before, after, "verify must not modify the file");
+}
+
+#[test]
+fn verify_sequence_gap_is_corrupt() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let mut journal = Journal::open(&repo).unwrap();
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            None,
+            vec![update(&"0".repeat(40), &"a".repeat(40), "refs/heads/main")],
+            None,
+        )
+        .unwrap();
+    // Append a second record, then rewrite in the file to have duplicate sequence.
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            None,
+            vec![update(&"0".repeat(40), &"b".repeat(40), "refs/heads/other")],
+            None,
+        )
+        .unwrap();
+    drop(journal);
+
+    let mut bytes = journal_bytes(&repo);
+    let offsets = record_offsets(&bytes);
+    // The second record has sequence=2; change it to 1 (duplicate).
+    let second_offset = offsets[1];
+    let json_start = second_offset + 8;
+    let len =
+        u32::from_le_bytes(bytes[second_offset..second_offset + 4].try_into().unwrap()) as usize;
+    let payload = std::str::from_utf8(&bytes[json_start..json_start + len])
+        .unwrap()
+        .to_owned();
+    let patched = payload.replacen("\"sequence\":2", "\"sequence\":1", 1);
+    assert_ne!(patched, payload);
+    let new_payload = serde_json::from_str::<serde_json::Value>(&patched).unwrap();
+    let new_payload_bytes = serde_json::to_vec(&new_payload).unwrap();
+    let new_crc = crc32c(&new_payload_bytes);
+    bytes.splice(
+        second_offset..second_offset + 8 + len,
+        (new_payload_bytes.len() as u32)
+            .to_le_bytes()
+            .into_iter()
+            .chain(new_crc.to_le_bytes())
+            .chain(new_payload_bytes),
+    );
+    fs::write(repo.join("githearth").join("journal"), &bytes).unwrap();
+
+    assert!(matches!(
+        verify(&repo),
+        Err(JournalError::OutOfOrder {
+            sequence: 1,
+            after: 1
+        })
+    ));
+}
+
+#[test]
+fn verify_rotated_journal_passes() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let mut journal = Journal::open(&repo).unwrap();
+    for i in 0..4u64 {
+        journal
+            .append_prepared(
+                Uuid::new_v4(),
+                None,
+                vec![update(
+                    &"0".repeat(40),
+                    &format!("{i:040x}"),
+                    "refs/heads/main",
+                )],
+                None,
+            )
+            .unwrap();
+    }
+    // Rotate away records 1-2; live journal starts at sequence 3.
+    journal.rotate(0, 2).unwrap();
+    let remaining: Vec<u64> = journal.records_after(0).map(|r| r.sequence).collect();
+    assert_eq!(remaining, vec![3, 4]);
+    drop(journal);
+
+    let last = verify(&repo).unwrap();
+    assert_eq!(last, 4);
 }

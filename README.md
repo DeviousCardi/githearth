@@ -41,6 +41,7 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [Metadata contract](docs/plan/01-metadata-contract.md) | Data ownership, transactions, workload definitions, and account-scale profiles |
 | [Decision gates](docs/plan/02-decision-gates.md) | Agreed requirements, unresolved decisions, and the implementation sequence |
 | [Deployment contract](docs/plan/03-deployment-contract.md) | Single-node/cluster behavior, failure semantics, expansion, and merge requirements |
+| [Backup and restore](docs/operations/backup-restore.md) | Concrete backup/restore procedure and storage verification |
 | [Database experiment](experiments/metadata/README.md) | Reproducible lab setup, workload runner, and result interpretation |
 | [Database decision](docs/decisions/0001-metadata-database.md) | Provisional PostgreSQL selection, measured evidence, and remaining qualification gates |
 | [Authorization decision](docs/decisions/0002-authorization.md) | Cedar policy-based authorization: roles, built-in forbids, failing closed |
