@@ -764,3 +764,26 @@ fn check_empty_root_reports_warning_and_exits_nonzero() {
         "check itself reports no problems on empty root"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn open_existing_refuses_symlinked_root_and_repositories() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    Storage::open(&root).unwrap();
+
+    let link = fixture.0.join("link");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    let error = Storage::open_existing(&link).err().unwrap();
+    assert!(
+        error.to_string().contains("must not be a symlink"),
+        "{error}"
+    );
+
+    let outside = fixture.0.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::remove_dir(root.join("repositories")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("repositories")).unwrap();
+    let error = Storage::open_existing(&root).err().unwrap();
+    assert!(error.to_string().contains("repositories/"), "{error}");
+}
