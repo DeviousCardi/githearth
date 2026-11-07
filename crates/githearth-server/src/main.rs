@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use githearth_server::{
-    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, reconcile, router,
+    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, reconcile, router, ssh,
 };
 use std::{
     io::{self, Read},
@@ -33,6 +33,8 @@ enum Command {
         name: String,
         args: Vec<String>,
     },
+    /// Generate an Ed25519 host key for the embedded SSH server.
+    SshKeygen,
 }
 #[tokio::main]
 async fn main() {
@@ -58,6 +60,11 @@ async fn run(args: Args) -> Result<()> {
             anyhow::bail!("doctor reported failures; see output above");
         }
         return Ok(());
+    }
+    // Needs no database: an operator creates the key before the first serve.
+    if let Command::SshKeygen = args.command {
+        // Its errors already name the path and the reason.
+        return ssh::generate_host_key(&config.ssh_host_key_path);
     }
     let pool = connect(&config).await?;
     match args.command {
@@ -95,12 +102,24 @@ async fn run(args: Args) -> Result<()> {
                 }
             }
         }
+        Command::SshKeygen => unreachable!("handled above"),
         Command::Serve => {
             let state = AppState::new(pool, config.clone())
                 .await
                 .context("cannot initialize authentication")?;
             let _reconciler = reconcile::spawn(state.clone());
             let _merge_worker = githearth_server::merge_worker::spawn(state.clone());
+            let _ssh = if config.ssh_enabled {
+                use std::sync::Arc;
+                ssh::load_host_key(&config.ssh_host_key_path)?;
+                // shortcut: no SSH keys until Person A's ssh_keys::authenticate lands (ADR 0005); swap this closure for it
+                let authenticate: ssh::Authenticate =
+                    Arc::new(|_fingerprint: String| Box::pin(async { Ok(None) }));
+                let (handle, _port_rx) = ssh::spawn(state.clone(), authenticate);
+                Some(handle)
+            } else {
+                None
+            };
             let listener = tokio::net::TcpListener::bind(config.bind)
                 .await
                 .context("cannot bind HTTP listener")?;

@@ -19,3 +19,6 @@ auth_concurrency = 2
 # git_push_limit_bytes = 1073741824  # upload size and receive.maxInputSize
 # repository_quota_bytes = 1073741824  # total on-disk objects; 0 = unlimited
 # hook_program = "/path/to/githearth-server"  # default: the running executable
+# ssh_enabled = false
+# ssh_bind = "127.0.0.1:2222"
+# ssh_host_key_path = "/etc/githearth/ssh_host_key"  # required when ssh_enabled; generate with `githearth-server ssh-keygen`

@@ -38,7 +38,7 @@ pub fn router(_config: &Config) -> Router<AppState> {
 // Path helpers
 // ---------------------------------------------------------------------------
 
-fn strip_dot_git(raw: &str) -> Option<&str> {
+pub(crate) fn strip_dot_git(raw: &str) -> Option<&str> {
     raw.strip_suffix(".git").filter(|s| !s.is_empty())
 }
 
@@ -89,14 +89,16 @@ async fn info_refs(
     let git_protocol = extract_git_protocol(&headers);
 
     let cmd = if want == git_admission::Want::Fetch {
-        state
-            .storage
-            .upload_pack(admitted.repository.id, true, git_protocol.as_deref())
+        state.storage.upload_pack(
+            admitted.repository.id,
+            githearth_git::layout::PackMode::Advertise,
+            git_protocol.as_deref(),
+        )
     } else {
         let hooks_dir = state.config.storage_root.join("hooks");
         state.storage.receive_pack(
             admitted.repository.id,
-            true,
+            githearth_git::layout::PackMode::Advertise,
             git_protocol.as_deref(),
             &hooks_dir,
         )
@@ -210,7 +212,11 @@ async fn upload_pack(
 
     let cmd = state
         .storage
-        .upload_pack(admitted.repository.id, false, git_protocol.as_deref())
+        .upload_pack(
+            admitted.repository.id,
+            githearth_git::layout::PackMode::Rpc,
+            git_protocol.as_deref(),
+        )
         .map_err(|e| {
             tracing::error!(
                 category = "git",
@@ -371,7 +377,12 @@ async fn receive_pack(
 
     let cmd = state
         .storage
-        .receive_pack(repo_id, false, git_protocol.as_deref(), &hooks_dir)
+        .receive_pack(
+            repo_id,
+            githearth_git::layout::PackMode::Rpc,
+            git_protocol.as_deref(),
+            &hooks_dir,
+        )
         .map_err(|e| {
             tracing::error!(
                 category = "git",
@@ -514,7 +525,7 @@ async fn receive_pack(
 const HOOK_REQUEST_LIMIT: usize = 1024 * 1024;
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn new_hook_token() -> String {
+pub(crate) fn new_hook_token() -> String {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex::encode(bytes)
@@ -522,7 +533,7 @@ fn new_hook_token() -> String {
 
 /// Removes a one-use hook token when dropped, so a cancelled request or an
 /// aborted supervisor cannot leak the admitted principal.
-struct HookTokenGuard {
+pub(crate) struct HookTokenGuard {
     tokens: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, git_admission::Admitted>>,
     >,
@@ -530,7 +541,7 @@ struct HookTokenGuard {
 }
 
 impl HookTokenGuard {
-    fn new(
+    pub(crate) fn new(
         tokens: std::sync::Arc<
             std::sync::Mutex<std::collections::HashMap<String, git_admission::Admitted>>,
         >,

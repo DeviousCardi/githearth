@@ -514,17 +514,13 @@ impl Storage {
     pub fn upload_pack(
         &self,
         repository: Uuid,
-        advertise: bool,
+        mode: PackMode,
         protocol: Option<&str>,
     ) -> Result<std::process::Command, StorageError> {
         let path = self.verified_dir(&self.repository_path(repository))?;
         let mut cmd = crate::git();
-        cmd.arg("upload-pack")
-            .arg("--stateless-rpc")
-            .arg("--strict");
-        if advertise {
-            cmd.arg("--advertise-refs");
-        }
+        cmd.arg("upload-pack").arg("--strict");
+        mode.args(&mut cmd);
         cmd.arg(&path);
         if let Some(proto) = protocol {
             validate_git_protocol(proto)?;
@@ -536,7 +532,7 @@ impl Storage {
     pub fn receive_pack(
         &self,
         repository: Uuid,
-        advertise: bool,
+        mode: PackMode,
         protocol: Option<&str>,
         hooks_dir: &Path,
     ) -> Result<std::process::Command, StorageError> {
@@ -547,10 +543,8 @@ impl Storage {
             cmd.arg("-c")
                 .arg(format!("core.hooksPath={}", hooks_dir.display()));
         }
-        cmd.arg("receive-pack").arg("--stateless-rpc");
-        if advertise {
-            cmd.arg("--advertise-refs");
-        }
+        cmd.arg("receive-pack");
+        mode.args(&mut cmd);
         cmd.arg(&path);
         if let Some(proto) = protocol {
             validate_git_protocol(proto)?;
@@ -777,6 +771,27 @@ pub fn dir_size(dir: &Path, excluded_subdir: Option<&Path>) -> io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// How `upload-pack` / `receive-pack` talk to the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackMode {
+    /// Smart HTTP: the ref advertisement only.
+    Advertise,
+    /// Smart HTTP: one stateless request/response after the advertisement.
+    Rpc,
+    /// SSH: one bidirectional session, advertisement first.
+    Session,
+}
+
+impl PackMode {
+    fn args(self, cmd: &mut std::process::Command) {
+        match self {
+            PackMode::Advertise => cmd.args(["--stateless-rpc", "--advertise-refs"]),
+            PackMode::Rpc => cmd.arg("--stateless-rpc"),
+            PackMode::Session => cmd,
+        };
+    }
 }
 
 pub fn validate_git_protocol(value: &str) -> Result<(), StorageError> {
