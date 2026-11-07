@@ -344,7 +344,7 @@ async fn duplicate_fingerprint_is_409_across_accounts() {
     generate_key("ed25519", &key_path);
     let public_key = public_key_line(&key_path);
 
-    let (status, _) = request(
+    let (status, created) = request(
         &app,
         "POST",
         "/api/v1/user/ssh-keys",
@@ -359,10 +359,31 @@ async fn duplicate_fingerprint_is_409_across_accounts() {
         "POST",
         "/api/v1/user/ssh-keys",
         Some(&bob_session),
-        json!({"name": "bob key", "public_key": public_key}),
+        json!({"name": "bob key", "public_key": public_key.clone()}),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Once revoked, the same key can be registered again.
+    let id = created["id"].as_str().unwrap();
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v1/user/ssh-keys/{id}"),
+        Some(&alice_session),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v1/user/ssh-keys",
+        Some(&bob_session),
+        json!({"name": "bob key", "public_key": public_key}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let _ = std::fs::remove_dir_all(key_path.parent().unwrap());
     pool.close().await;

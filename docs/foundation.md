@@ -184,10 +184,8 @@ git clone ssh://githearth-host:2222/org/repo.git
 
 | Endpoint | Behavior |
 | --- | --- |
-| `POST /api/v1/user/ssh-keys` | Session bearer; JSON `name` (1–100 chars), `public_key` (OpenSSH line), optional `expires_in_days` (1–3650); 201 with metadata including the `SHA256:` fingerprint; 409 if the fingerprint is already registered to any account; 400 for an unsupported or malformed key |
+| `POST /api/v1/user/ssh-keys` | Session bearer; JSON `name` (1–100 chars), `public_key` (OpenSSH line), optional `expires_in_days` (1–3650); 201 with metadata including the `SHA256:` fingerprint; 409 if the fingerprint is already registered to any account and not revoked; 400 for an unsupported or malformed key |
 | `GET /api/v1/user/ssh-keys` | Session bearer; lists the caller's keys, including `revoked_at` |
 | `DELETE /api/v1/user/ssh-keys/{id}` | Session bearer; revokes (sets `revoked_at`); 204; 404 for a missing or another account's key |
 
-A key's SHA-256 fingerprint is unique across all accounts, including revoked rows, so one key maps to exactly one account; a key must be deleted before it can be re-added after revocation. Revoked, expired, and suspended-account keys fail authentication on new connections exactly like unknown keys. `git clone ssh://host:port/org/repo.git` and the `host:org/repo.git` form both work, with Ed25519 or ECDSA client keys.
-
-
+A key's SHA-256 fingerprint is unique among non-revoked keys across all accounts, so one key maps to exactly one account; after revocation the same key can be added again. Revoked, expired, and suspended-account keys fail authentication on new connections exactly like unknown keys. `git clone ssh://host:port/org/repo.git` and the `host:org/repo.git` form both work, with Ed25519 or ECDSA client keys.
