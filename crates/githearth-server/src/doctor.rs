@@ -1,43 +1,56 @@
 use crate::config::Config;
-use sqlx::{ConnectOptions, postgres::PgConnectOptions};
-use std::{path::Path, str::FromStr, time::Duration};
+use sqlx::PgPool;
+use std::path::Path;
 
-pub enum Line {
+pub enum Status {
     Ok,
     Warn,
     Fail,
+    Skip,
 }
 
 const OK: &str = "ok  ";
 const WARN: &str = "warn";
 const FAIL: &str = "fail";
+const SKIP: &str = "skip";
 
 pub struct Check {
-    pub header: Line,
+    pub status: Status,
     pub name: String,
     pub detail: String,
 }
 
 impl Check {
     fn ok(name: &str, detail: impl std::fmt::Display) -> Self {
+        let s = format!("{OK} {name}: {detail}");
         Self {
-            header: Line::Ok,
-            name: name.to_string(),
-            detail: format!("{OK} {name}: {detail}"),
+            status: Status::Ok,
+            name: name.into(),
+            detail: s,
         }
     }
     fn warn(name: &str, detail: impl std::fmt::Display) -> Self {
+        let s = format!("{WARN} {name}: {detail}");
         Self {
-            header: Line::Warn,
-            name: name.to_string(),
-            detail: format!("{WARN} {name}: {detail}"),
+            status: Status::Warn,
+            name: name.into(),
+            detail: s,
         }
     }
     fn fail(name: &str, detail: impl std::fmt::Display) -> Self {
+        let s = format!("{FAIL} {name}: {detail}");
         Self {
-            header: Line::Fail,
-            name: name.to_string(),
-            detail: format!("{FAIL} {name}: {detail}"),
+            status: Status::Fail,
+            name: name.into(),
+            detail: s,
+        }
+    }
+    fn skip(name: &str) -> Self {
+        let s = format!("{SKIP} {name}: database unavailable");
+        Self {
+            status: Status::Skip,
+            name: name.into(),
+            detail: s,
         }
     }
 }
@@ -45,15 +58,13 @@ impl Check {
 pub async fn report(config: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    check_config(config, &mut checks);
-
     check_git(&mut checks);
 
     check_storage(config, &mut checks);
 
     check_disk(config, &mut checks);
 
-    match connect_short_timeout(config).await {
+    match db_connect(config).await {
         Ok(pool) => {
             checks.push(Check::ok("database", "connected"));
             let schema = schema_check(&pool).await;
@@ -61,35 +72,26 @@ pub async fn report(config: &Config) -> Vec<Check> {
                 Ok(d) => Check::ok("schema", d),
                 Err(d) => Check::fail("schema", d),
             });
-            checks.push(match lifecycle_check(&pool, config.reconcile_grace_seconds).await {
-                Ok(0) => Check::ok("lifecycle", "no stuck repositories"),
-                Ok(n) => Check::warn(
-                    "lifecycle",
-                    format_args!("{n} repositories stuck in creating/deleting; the reconciler will retry them"),
-                ),
-                Err(d) => Check::fail("lifecycle", d),
-            });
+            checks.push(
+                match lifecycle_check(&pool, config.reconcile_grace_seconds).await {
+                    Ok(0) => Check::ok("lifecycle", "no stuck repositories"),
+                    Ok(n) => Check::warn(
+                        "lifecycle",
+                        format_args!("reconciler will retry {} repo(s)", n),
+                    ),
+                    Err(d) => Check::fail("lifecycle", d),
+                },
+            );
             pool.close().await;
         }
         Err(e) => {
             checks.push(Check::fail("database", e));
-            checks.push(Check::fail("schema", "skipped, database unavailable"));
-            checks.push(Check::fail("lifecycle", "skipped, database unavailable"));
+            checks.push(Check::skip("schema"));
+            checks.push(Check::skip("lifecycle"));
         }
     }
 
     checks
-}
-
-fn check_config(config: &Config, checks: &mut Vec<Check>) {
-    match config.validate() {
-        Ok(()) => {
-            checks.push(Check::ok("config", "valid"));
-        }
-        Err(e) => {
-            checks.push(Check::fail("config", &e));
-        }
-    }
 }
 
 fn check_git(checks: &mut Vec<Check>) {
@@ -131,10 +133,44 @@ fn check_storage(config: &Config, checks: &mut Vec<Check>) {
             ),
         },
     });
+
+    // serve creates these subdirectories; when the root exists, check each that also exists.
+    for sub in ["repositories", "tmp", "trash", "orphans"] {
+        let subpath = root.join(sub);
+        let shown = subpath.display();
+        let check = match std::fs::symlink_metadata(&subpath) {
+            // Missing subdirectories are created by serve.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => Check::fail("storage", format_args!("{shown}: {e}")),
+            Ok(m) if m.file_type().is_symlink() => {
+                Check::fail("storage", format_args!("{shown} is a symlink"))
+            }
+            Ok(m) if !m.is_dir() => {
+                Check::fail("storage", format_args!("{shown} is not a directory"))
+            }
+            Ok(_) => match rustix::fs::access(&subpath, rustix::fs::Access::WRITE_OK) {
+                Ok(()) => continue,
+                Err(_) => Check::fail(
+                    "storage",
+                    format_args!("{shown} not writable by this process"),
+                ),
+            },
+        };
+        checks.push(check);
+    }
+}
+
+/// Returns `(warn, free_bytes)`. Uses f_frsize as the unit; falls back to
+/// f_bsize only when f_frsize is 0.  `push_limit` is `git_push_limit_bytes`.
+fn disk_status(frsize: u64, bsize: u64, bavail: u64, blocks: u64, push_limit: u64) -> (bool, u64) {
+    let unit = if frsize == 0 { bsize } else { frsize };
+    let free = bavail * unit;
+    let total = blocks * unit;
+    let warn = free * 10 < total || free < 2 * push_limit;
+    (warn, free)
 }
 
 fn check_disk(config: &Config, checks: &mut Vec<Check>) {
-    // A missing root is reported by the storage check; measure the filesystem it will be created on.
     let path = config
         .storage_root
         .ancestors()
@@ -142,11 +178,15 @@ fn check_disk(config: &Config, checks: &mut Vec<Check>) {
         .unwrap_or(Path::new("."));
     checks.push(match rustix::fs::statvfs(path) {
         Ok(stat) => {
-            let block = stat.f_frsize.max(stat.f_bsize);
-            let free = stat.f_bavail * block;
-            let total = stat.f_blocks * block;
+            let (warn, free) = disk_status(
+                stat.f_frsize,
+                stat.f_bsize,
+                stat.f_bavail,
+                stat.f_blocks,
+                config.git_push_limit_bytes as u64,
+            );
             let free_gib = format!("{:.2} GiB free", free as f64 / f64::from(1u32 << 30));
-            if free * 10 < total || free < 2 * config.git_push_limit_bytes as u64 {
+            if warn {
                 Check::warn("disk", free_gib)
             } else {
                 Check::ok("disk", free_gib)
@@ -156,28 +196,14 @@ fn check_disk(config: &Config, checks: &mut Vec<Check>) {
     });
 }
 
-async fn connect_short_timeout(config: &Config) -> anyhow::Result<sqlx::PgPool> {
-    let options = PgConnectOptions::from_str(&config.database_url)
-        .map_err(|_| anyhow::anyhow!("invalid PostgreSQL connection URL"))?
-        .disable_statement_logging();
-    let timeout = if config.database_timeout_seconds > 5 {
-        5
-    } else {
-        config.database_timeout_seconds
-    };
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(timeout))
-        .connect_with(options)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "cannot connect to PostgreSQL; check database availability and credentials"
-            )
-        })
+async fn db_connect(config: &Config) -> anyhow::Result<PgPool> {
+    let mut c = config.clone();
+    c.database_max_connections = 1;
+    c.database_timeout_seconds = c.database_timeout_seconds.min(5);
+    crate::connect(&c).await
 }
 
-async fn schema_check(pool: &sqlx::PgPool) -> Result<String, String> {
+async fn schema_check(pool: &PgPool) -> Result<String, String> {
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations')",
     )
@@ -197,9 +223,9 @@ async fn schema_check(pool: &sqlx::PgPool) -> Result<String, String> {
 
     let migrations: Vec<_> = crate::MIGRATOR.iter().collect();
 
-    for (_version, success, _) in &rows {
+    for (version, success, _) in &rows {
         if !success {
-            return Err(format!("migration {} failed", _version));
+            return Err(format!("migration {version} failed"));
         }
     }
 
@@ -208,8 +234,7 @@ async fn schema_check(pool: &sqlx::PgPool) -> Result<String, String> {
     for (version, _, _) in &rows {
         if !binary_versions.contains(version) {
             return Err(format!(
-                "database schema is newer than this binary (version {})",
-                version
+                "database schema is newer than this binary (version {version})"
             ));
         }
     }
@@ -240,10 +265,10 @@ async fn schema_check(pool: &sqlx::PgPool) -> Result<String, String> {
     }
 
     let latest = applied_versions.last().copied().unwrap_or(0);
-    Ok(format!("latest v{}", latest))
+    Ok(format!("latest v{latest}"))
 }
 
-async fn lifecycle_check(pool: &sqlx::PgPool, grace_seconds: u64) -> Result<i64, String> {
+async fn lifecycle_check(pool: &PgPool, grace_seconds: u64) -> Result<i64, String> {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM repositories \
          WHERE status IN ('creating','deleting') \
@@ -259,19 +284,22 @@ pub async fn run(config: &Config) -> i32 {
     let checks = report(config).await;
     let mut failed = 0usize;
     let mut warnings = 0usize;
+    let mut skipped = 0usize;
     for check in &checks {
         println!("{}", check.detail);
-        match check.header {
-            Line::Fail => failed += 1,
-            Line::Warn => warnings += 1,
+        match check.status {
+            Status::Fail => failed += 1,
+            Status::Warn => warnings += 1,
+            Status::Skip => skipped += 1,
             _ => {}
         }
     }
     let summary = format!(
-        "{} checks, {} failed, {} warnings",
+        "{} checks, {} failed, {} warnings, {} skipped",
         checks.len(),
         failed,
-        warnings
+        warnings,
+        skipped
     );
     println!("{summary}");
     if failed > 0 { 1 } else { 0 }
@@ -297,42 +325,47 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
     }
 
+    // ---- disk_status pure-fn tests ----
+
     #[test]
-    fn config_valid() {
-        let dir = temp_dir("doctor-config-ok");
-        std::fs::create_dir_all(&dir).unwrap();
-        let config = test_config(&dir);
-        let mut checks = Vec::new();
-        check_config(&config, &mut checks);
-        assert!(checks.len() == 1);
-        assert!(matches!(checks[0].header, Line::Ok));
-        assert!(checks[0].detail.contains("ok   config: valid"));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn disk_status_normal() {
+        let (warn, free) = disk_status(4096, 0, 1_000_000, 1_000_000, 1_073_741_824);
+        assert!(!warn);
+        assert_eq!(free, 1_000_000 * 4096);
     }
 
     #[test]
-    fn config_invalid() {
-        let dir = temp_dir("doctor-config-bad");
-        let config = Config {
-            database_url: "".to_string(),
-            storage_root: dir,
-            ..Config::default()
-        };
-        let mut checks = Vec::new();
-        check_config(&config, &mut checks);
-        assert!(
-            matches!(checks[0].header, Line::Fail),
-            "{:?}",
-            checks[0].detail
-        );
-        assert!(
-            checks[0]
-                .detail
-                .contains("database_url must be a PostgreSQL URL"),
-            "actual detail: {}",
-            checks[0].detail
-        );
+    fn disk_status_frsize_zero_falls_back_to_bsize() {
+        let (warn, free) = disk_status(0, 4096, 1_000_000, 1_000_000, 0);
+        assert!(!warn);
+        assert_eq!(free, 1_000_000 * 4096);
     }
+
+    #[test]
+    fn disk_status_frsize_differs_from_bsize() {
+        let frsize = 1_048_576; // 1 MiB
+        let bsize = 4096;
+        let (warn, free) = disk_status(frsize, bsize, 10_000, 100_000, 1_073_741_824);
+        assert!(!warn);
+        assert_eq!(free, 10_000 * frsize);
+    }
+
+    #[test]
+    fn disk_status_below_10_percent_warns() {
+        // total=100*block, free=9*block → ~9.0% → warn
+        let (warn, _free) = disk_status(4096, 0, 9, 100, 0);
+        assert!(warn);
+    }
+
+    #[test]
+    fn disk_status_below_2x_push_limit_warns() {
+        // plenty of free percent, but free < 2 * push_limit
+        let push_limit = 100_000;
+        let (warn, _free) = disk_status(4096, 0, 20, 1, push_limit); // 20*4096 = 81920 < 200_000
+        assert!(warn);
+    }
+
+    // ---- storage tests ----
 
     #[test]
     fn storage_missing_warns() {
@@ -341,7 +374,7 @@ mod tests {
         let mut checks = Vec::new();
         check_storage(&config, &mut checks);
         assert!(
-            matches!(checks[0].header, Line::Warn),
+            matches!(checks[0].status, Status::Warn),
             "{:?}",
             checks[0].detail
         );
@@ -360,7 +393,7 @@ mod tests {
         let mut checks = Vec::new();
         check_storage(&config, &mut checks);
         assert!(
-            matches!(checks[0].header, Line::Fail),
+            matches!(checks[0].status, Status::Fail),
             "{:?}",
             checks[0].detail
         );
@@ -379,7 +412,7 @@ mod tests {
             let config = test_config(&dir);
             let mut checks = Vec::new();
             check_storage(&config, &mut checks);
-            assert!(matches!(checks[0].header, Line::Fail));
+            assert!(matches!(checks[0].status, Status::Fail));
             assert!(checks[0].detail.contains("is a symlink"));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -398,7 +431,7 @@ mod tests {
             let mut checks = Vec::new();
             check_storage(&config, &mut checks);
             assert!(
-                matches!(checks[0].header, Line::Fail),
+                matches!(checks[0].status, Status::Fail),
                 "{:?}",
                 checks[0].detail
             );
@@ -415,7 +448,7 @@ mod tests {
         let mut checks = Vec::new();
         check_storage(&config, &mut checks);
         assert!(
-            matches!(checks[0].header, Line::Ok),
+            matches!(checks[0].status, Status::Ok),
             "{:?}",
             checks[0].detail
         );
@@ -424,12 +457,101 @@ mod tests {
     }
 
     #[test]
+    fn storage_not_writable_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("doctor-storage-ro");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut checks = Vec::new();
+        check_storage(&test_config(&dir), &mut checks);
+        if !rustix::process::geteuid().is_root() {
+            assert!(
+                checks[0].detail.contains("not writable by this process"),
+                "{}",
+                checks[0].detail
+            );
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_subdir_symlink_fails() {
+        let dir = temp_dir("doctor-subdir-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sub = dir.join("repositories");
+        let target = temp_dir("doctor-subdir-symlink-target");
+        std::fs::create_dir_all(&target).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &sub).unwrap();
+            let mut checks = Vec::new();
+            check_storage(&test_config(&dir), &mut checks);
+            let fail = checks
+                .iter()
+                .find(|c| c.detail.contains("repositories") && c.detail.contains("symlink"));
+            assert!(
+                fail.is_some(),
+                "{:?}",
+                checks.iter().map(|c| &c.detail).collect::<Vec<_>>()
+            );
+            // A dangling symlink is still reported, not skipped as missing.
+            std::os::unix::fs::symlink(dir.join("gone"), dir.join("trash")).unwrap();
+            let mut checks = Vec::new();
+            check_storage(&test_config(&dir), &mut checks);
+            assert!(
+                checks
+                    .iter()
+                    .any(|c| c.detail.contains("trash is a symlink"))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn storage_subdir_missing_is_ok() {
+        let dir = temp_dir("doctor-subdir-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = test_config(&dir);
+        let mut checks = Vec::new();
+        check_storage(&config, &mut checks);
+        for c in &checks {
+            let d = &c.detail;
+            assert!(!d.contains("repositories") || d.contains("writable"), "{d}");
+            assert!(!d.contains("/tmp ") || d.contains("writable"), "{d}");
+            assert!(!d.contains("/trash ") || d.contains("writable"), "{d}");
+            assert!(!d.contains("/orphans ") || d.contains("writable"), "{d}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_subdir_good() {
+        let dir = temp_dir("doctor-subdir-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        for sub in ["repositories", "tmp", "trash", "orphans"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let mut checks = Vec::new();
+        check_storage(&test_config(&dir), &mut checks);
+        // root ok, no subdir fails
+        assert_eq!(checks.len(), 1);
+        assert!(matches!(checks[0].status, Status::Ok));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- git ----
+
+    #[test]
     fn git_version_check() {
         let mut checks = Vec::new();
         check_git(&mut checks);
-        assert!(matches!(checks[0].header, Line::Ok));
+        assert!(matches!(checks[0].status, Status::Ok));
         assert!(checks[0].detail.contains("ok   git: "));
     }
+
+    // ---- disk integration test ----
 
     #[test]
     fn disk_check_ok() {
@@ -438,32 +560,43 @@ mod tests {
         let config = test_config(&dir);
         let mut checks = Vec::new();
         check_disk(&config, &mut checks);
-        assert!(matches!(checks[0].header, Line::Ok) || matches!(checks[0].header, Line::Warn));
+        assert!(matches!(checks[0].status, Status::Ok) || matches!(checks[0].status, Status::Warn));
         assert!(checks[0].detail.contains("GiB free"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn report_with_invalid_config_skips_db() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let dir = temp_dir("doctor-report-invalid");
-            let config = Config {
-                database_url: "not-a-pg-url".to_string(),
-                storage_root: dir,
-                ..Config::default()
-            };
-            let checks = report(&config).await;
-            let has_config_fail = checks
-                .iter()
-                .any(|c| matches!(c.header, Line::Fail) && c.name == "config");
-            assert!(has_config_fail);
-            let schema_check = checks.iter().find(|c| c.name == "schema");
-            let lifecycle_check = checks.iter().find(|c| c.name == "lifecycle");
-            assert!(schema_check.is_some());
-            assert!(lifecycle_check.is_some());
-        });
+    fn disk_of_missing_root_uses_nearest_existing_ancestor() {
+        for root in [
+            temp_dir("doctor-disk-missing").join("a/b"),
+            "relative-missing/x".into(),
+        ] {
+            let mut checks = Vec::new();
+            check_disk(&test_config(&root), &mut checks);
+            assert!(
+                checks[0].detail.contains("GiB free"),
+                "{}",
+                checks[0].detail
+            );
+        }
     }
+
+    #[test]
+    fn disk_warns_when_push_limit_exceeds_free_space() {
+        let config = Config {
+            git_push_limit_bytes: usize::MAX / 4,
+            ..test_config(&std::env::temp_dir())
+        };
+        let mut checks = Vec::new();
+        check_disk(&config, &mut checks);
+        assert!(
+            matches!(checks[0].status, Status::Warn),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    // ---- DB tests ----
 
     async fn db_pool() -> (sqlx::PgPool, String) {
         let base =
@@ -558,13 +691,11 @@ mod tests {
     #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
     async fn schema_checksum_mismatch() {
         let (pool, _schema) = db_pool().await;
-        sqlx::query(
-            "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = (SELECT max(version) FROM _sqlx_migrations)",
-        )
-        .bind(vec![0u8; 32])
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = (SELECT max(version) FROM _sqlx_migrations)")
+            .bind(vec![0u8; 32])
+            .execute(&pool)
+            .await
+            .unwrap();
         let result = schema_check(&pool).await;
         assert!(result.is_err());
         assert!(
@@ -594,12 +725,10 @@ mod tests {
     #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
     async fn schema_pending_migrations() {
         let (pool, _schema) = db_pool().await;
-        sqlx::query(
-            "DELETE FROM _sqlx_migrations WHERE version = (SELECT max(version) FROM _sqlx_migrations)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = (SELECT max(version) FROM _sqlx_migrations)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let result = schema_check(&pool).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("pending migrations"));
@@ -652,7 +781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_unreachable_fails_sanitized_and_skips_schema() {
+    async fn database_unreachable_fails_and_skips_schema_lifecycle() {
         let dir = temp_dir("doctor-db-down");
         std::fs::create_dir_all(&dir).unwrap();
         let config = Config {
@@ -668,11 +797,11 @@ mod tests {
             .collect();
         assert!(lines.contains(&"fail database: cannot connect to PostgreSQL; check database availability and credentials".to_string()), "{lines:?}");
         assert!(
-            lines.contains(&"fail schema: skipped, database unavailable".to_string()),
+            lines.contains(&"skip schema: database unavailable".to_string()),
             "{lines:?}"
         );
         assert!(
-            lines.contains(&"fail lifecycle: skipped, database unavailable".to_string()),
+            lines.contains(&"skip lifecycle: database unavailable".to_string()),
             "{lines:?}"
         );
         assert!(
@@ -680,58 +809,11 @@ mod tests {
                 .iter()
                 .all(|l| !l.contains("supersecret") && !l.contains("127.0.0.1:1"))
         );
-        assert_eq!(run(&config).await, 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn storage_not_writable_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = temp_dir("doctor-storage-ro");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let mut checks = Vec::new();
-        check_storage(&test_config(&dir), &mut checks);
-        // root bypasses permission bits, so only assert when not running as root.
-        if !rustix::process::geteuid().is_root() {
-            assert!(
-                checks[0].detail.contains("not writable by this process"),
-                "{}",
-                checks[0].detail
-            );
-        }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn disk_of_missing_root_uses_nearest_existing_ancestor() {
-        for root in [
-            temp_dir("doctor-disk-missing").join("a/b"),
-            "relative-missing/x".into(),
-        ] {
-            let mut checks = Vec::new();
-            check_disk(&test_config(&root), &mut checks);
-            assert!(
-                checks[0].detail.contains("GiB free"),
-                "{}",
-                checks[0].detail
-            );
-        }
-    }
-
-    #[test]
-    fn disk_warns_when_push_limit_exceeds_free_space() {
-        let config = Config {
-            git_push_limit_bytes: usize::MAX / 4,
-            ..test_config(&std::env::temp_dir())
-        };
-        let mut checks = Vec::new();
-        check_disk(&config, &mut checks);
-        assert!(
-            matches!(checks[0].header, Line::Warn),
-            "{}",
-            checks[0].detail
+        let code = run(&config).await;
+        assert_eq!(
+            code, 1,
+            "exit code should be 1 for failed database; but database fails, schema/lifecycle skip, failed count = 1"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -67,7 +67,7 @@ fn doctor_help() {
 }
 
 #[test]
-fn doctor_with_missing_storage_root_warns_but_exits_zero() {
+fn doctor_with_missing_storage_root_warns_but_fails_from_unreachable_db() {
     let mut command = server();
     let root = self_storage_root();
     let path = temp_file("ok.toml");
@@ -78,14 +78,20 @@ fn doctor_with_missing_storage_root_warns_but_exits_zero() {
     );
     command.args(["--config", path.to_str().unwrap(), "doctor"]);
     let output = run(command);
-    // Storage root does not exist -> warn, but database is unreachable -> fail
     let out = stdout(&output);
     assert!(
         out.contains("does not exist; will be created by serve"),
         "{out}"
     );
-    // Database is unreachable, so exit code should be 1
+    // Database is unreachable -> fail database; schema/lifecycle skipped
     assert!(!output.status.success());
+    // Check for skip lines
+    assert!(out.contains("skip schema: database unavailable"), "{out}");
+    assert!(
+        out.contains("skip lifecycle: database unavailable"),
+        "{out}"
+    );
+    assert!(out.contains("skipped"), "{out}");
     // Summary must not leak password
     assert!(!out.contains("unused"));
     let _ = fs::remove_file(&path);
@@ -124,7 +130,6 @@ fn doctor_with_fresh_database_reports_all_ok() {
         "stdout: {out}\nstderr: {}",
         stderr(&output)
     );
-    assert!(out.contains("ok   config:"), "{out}");
     assert!(out.contains("ok   git:"), "{out}");
     assert!(out.contains("ok   storage:"), "{out}");
     assert!(out.contains("ok   database:"), "{out}");
