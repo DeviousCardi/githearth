@@ -2,6 +2,7 @@ pub mod audit;
 pub mod browse;
 mod browse_ui;
 pub mod config;
+pub mod doctor;
 pub mod facts;
 pub mod git_admission;
 pub mod git_hooks;

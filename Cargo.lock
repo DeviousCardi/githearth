@@ -983,6 +983,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "rand",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
