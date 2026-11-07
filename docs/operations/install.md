@@ -1,5 +1,7 @@
 # Installation
 
+See [upgrade.md](upgrade.md) for the upgrade runbook.
+
 ## Preflight check
 
 Before running `githearth-server serve`, validate your setup:
