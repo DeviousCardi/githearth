@@ -2433,3 +2433,243 @@ async fn push_and_merge_serialize_on_the_repository_lock() {
     cleanup(&fx.storage_root);
     fx.pool.close().await;
 }
+
+async fn setup_with_quota(repository_quota_bytes: u64) -> Fixture {
+    let storage_root = std::env::temp_dir().join(format!("githearth-push-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
+        git_push_limit_bytes: 1 << 30,
+        git_concurrency: 8,
+        repository_quota_bytes,
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let owner = fixture_account(&pool, &tag("owner")).await;
+    set_password(&pool, owner, "testpass").await;
+    let username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (org_id, org_slug) = fixture_organization(&pool, owner).await;
+    let repo_name = tag("repo");
+    let repo_id = create_active_repo(&pool, org_id, &repo_name, owner).await;
+
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let repo_path = state
+        .storage
+        .create(repo_id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+
+    let work = std::env::temp_dir().join(format!("githearth-push-seed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "init", "-b", "main"])).await;
+    std::fs::write(work.join("README.md"), "# Hello\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "README.md"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "initial",
+    ]))
+    .await;
+    let base_commit = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    seed_bare(repo_path.to_str().unwrap(), tw, "main:refs/heads/main").await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    let app = router(state.clone());
+    let port = find_port_and_serve(&app).await;
+
+    Fixture {
+        app,
+        state,
+        pool,
+        storage_root,
+        username,
+        org_slug,
+        repo_name,
+        repo_id,
+        repo_path,
+        base_commit,
+        port,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn storage_quota_refuses_large_push_ref_unchanged_no_journal() {
+    let fx = setup_with_quota(1_048_576).await; // 1 MiB quota
+
+    let clone = std::env::temp_dir().join(format!("git-push-quota-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    let baseline: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+
+    // Write a ~2 MiB file of non-compressible data and try to push
+    let mut blob = vec![0u8; 2 * 1024 * 1024];
+    let mut urandom = std::fs::File::open("/dev/urandom").unwrap();
+    std::io::Read::read_exact(&mut urandom, &mut blob).unwrap();
+    std::fs::write(clone.join("big.bin"), &blob).unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "big.bin"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "big",
+    ]))
+    .await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+    assert!(!out.status.success(), "push over quota must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("repository storage quota exceeded"),
+        "rejection reason: {stderr}"
+    );
+
+    // No journal records written
+    let records = journal_records(&fx.repo_path);
+    assert!(
+        !records.iter().any(|r| r.kind == Kind::Prepared),
+        "no prepared records should be written"
+    );
+
+    // Ref unchanged
+    assert_eq!(
+        git_output(git_cmd(&[
+            "--git-dir",
+            fx.repo_path_str(),
+            "rev-parse",
+            "main"
+        ]))
+        .await,
+        fx.base_commit
+    );
+
+    // No push metadata
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, baseline, "no push metadata should be recorded");
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn ref_delete_over_quota_succeeds() {
+    // Create a repo with quota, seed an extra branch via bypass, then delete it.
+    let fx = setup_with_quota(1_048_576).await;
+
+    let work = std::env::temp_dir().join(format!("git-push-quota-seed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    git_ok(git_cmd(&["-C", tw, "checkout", "-b", "extra"])).await;
+    std::fs::write(work.join("x.txt"), "x").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "x.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "extra",
+    ]))
+    .await;
+    seed_bare(fx.repo_path_str(), tw, "extra:refs/heads/extra").await;
+    let _ = std::fs::remove_dir_all(&work);
+
+    let clone = std::env::temp_dir().join(format!("git-push-quota-del-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // Delete the extra branch (ref-delete adds no new objects)
+    git_ok(git_cmd(&["-C", cd, "push", "origin", ":extra"])).await;
+
+    let refs_out = git_output(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads/",
+    ]))
+    .await;
+    assert!(
+        !refs_out.lines().any(|l| l == "refs/heads/extra"),
+        "extra branch must be deleted: {refs_out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn quota_zero_allows_large_push() {
+    let fx = setup_with_quota(0).await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-quota-zero-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // Write a ~2 MiB file of non-compressible data
+    let mut blob = vec![0u8; 2 * 1024 * 1024];
+    let mut urandom = std::fs::File::open("/dev/urandom").unwrap();
+    std::io::Read::read_exact(&mut urandom, &mut blob).unwrap();
+    std::fs::write(clone.join("big.bin"), &blob).unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "big.bin"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "big",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+
+    wait_for_journal_applied(&fx.pool, fx.repo_id, 1).await;
+    assert_push_metadata(&fx.pool, fx.repo_id, 1).await;
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}

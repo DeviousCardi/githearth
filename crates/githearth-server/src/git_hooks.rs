@@ -21,6 +21,7 @@ const HOOK_TOKEN: &str = "GITHEARTH_HOOK_TOKEN";
 const HOOK_OPERATION: &str = "GITHEARTH_OPERATION";
 const HOOK_ACTOR: &str = "GITHEARTH_ACTOR";
 const HOOK_MERGE: &str = "GITHEARTH_MERGE";
+const HOOK_QUOTA_BYTES: &str = "GITHEARTH_QUOTA_BYTES";
 const REFUSE: &str = "ref updates must go through GitHearth";
 const RESPONSE_LIMIT: u64 = 4096;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -90,6 +91,10 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
         let _ = writeln!(stderr, "{REFUSE}");
         return 1;
     }
+    if let Err(message) = check_quota(env) {
+        let _ = writeln!(stderr, "{message}");
+        return 1;
+    }
     let socket = env[HOOK_SOCKET].as_str();
     let token = env[HOOK_TOKEN].as_str();
     let mut input = String::new();
@@ -120,6 +125,43 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
             1
         }
     }
+}
+
+/// Refuses a push that brings new objects into a repository whose `objects/`
+/// plus the incoming quarantine exceed `GITHEARTH_QUOTA_BYTES` (0 or unset = unlimited).
+// shortcut: merge-created objects are not counted; upgrade with per-organization quotas.
+fn check_quota(env: &HashMap<String, String>) -> Result<(), String> {
+    let quota: u64 = env
+        .get(HOOK_QUOTA_BYTES)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let Some(quarantine) = env.get("GIT_QUARANTINE_PATH").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let brings_objects = std::fs::read_dir(&quarantine).is_ok_and(|mut d| d.next().is_some());
+    if quota == 0 || !brings_objects {
+        return Ok(());
+    }
+    // Git runs hooks with GIT_DIR="." and an absolute quarantine path inside objects/;
+    // canonicalize both so the quarantine is excluded from objects/ and counted once.
+    let size = |path: &Path, skip: Option<&Path>| {
+        githearth_git::layout::dir_size(path, skip)
+            .map_err(|e| format!("cannot measure repository size: {e}"))
+    };
+    let quarantine = quarantine
+        .canonicalize()
+        .map_err(|e| format!("cannot measure repository size: {e}"))?;
+    let objects = Path::new(env.get("GIT_DIR").map_or(".", String::as_str))
+        .join("objects")
+        .canonicalize()
+        .map_err(|e| format!("cannot measure repository size: {e}"))?;
+    let used = size(&objects, Some(&quarantine))? + size(&quarantine, None)?;
+    if used > quota {
+        return Err(format!(
+            "repository storage quota exceeded: {used} of {quota} bytes"
+        ));
+    }
+    Ok(())
 }
 
 fn query_policy(
@@ -752,5 +794,100 @@ mod tests {
         let updates = parse_updates(&mut stdin.as_bytes()).unwrap();
         assert_eq!(updates.len(), 1);
         assert!(parse_updates(&mut FailingReader).is_err());
+    }
+
+    #[test]
+    fn quota_unset_or_zero_allows_push() {
+        for quota in [None, Some("0")] {
+            let (path, server) = mock_server("OK\n");
+            let mut env = env_with(&[
+                ("GITHEARTH_HOOK_SOCKET", path.as_str()),
+                ("GIT_DIR", "/tmp/nonexistent-objects"),
+            ]);
+            if let Some(q) = quota {
+                env.insert(HOOK_QUOTA_BYTES.into(), q.to_string());
+            }
+            let (code, _err) = run_with(
+                "pre-receive",
+                &[],
+                &env,
+                &format!("{ZERO} {SHA} refs/heads/main\n"),
+            );
+            server.join().unwrap();
+            assert_eq!(code, 0, "quota={quota:?}");
+        }
+    }
+
+    /// A repository dir with `objects_bytes` in objects/ and a quarantine *inside*
+    /// objects/ (where git puts it) holding `incoming_bytes`.
+    fn quota_repo(objects_bytes: usize, incoming_bytes: usize) -> (PathBuf, PathBuf) {
+        let repo = std::env::temp_dir().join(format!("githearth-quota-{}", Uuid::new_v4()));
+        let quarantine = repo.join("objects/tmp_objdir-incoming-x");
+        std::fs::create_dir_all(repo.join("objects/ab")).unwrap();
+        std::fs::create_dir_all(&quarantine).unwrap();
+        std::fs::write(repo.join("objects/ab/obj"), vec![0u8; objects_bytes]).unwrap();
+        if incoming_bytes > 0 {
+            std::fs::write(quarantine.join("pack"), vec![0u8; incoming_bytes]).unwrap();
+        }
+        (repo, quarantine)
+    }
+
+    #[test]
+    fn quota_decisions() {
+        let mib = 1_048_576usize;
+        // (objects, incoming, GIT_DIR present, expected refusal substring)
+        let cases = [
+            (
+                900_000,
+                900_000,
+                true,
+                Some("repository storage quota exceeded: 1800000 of 1048576 bytes"),
+            ),
+            // The quarantine lives inside objects/ and must be counted once: 600k + 300k fits.
+            (600_000, 300_000, true, None),
+            (100_000, 50_000, true, None),
+            // Nothing incoming: allowed even when already over quota.
+            (2 * mib, 0, true, None),
+            (100, 100, false, Some("cannot measure repository size")),
+        ];
+        for (objects, incoming, with_dir, refused) in cases {
+            let (repo, quarantine) = quota_repo(objects, incoming);
+            let (path, server) = mock_server("OK\n");
+            // A relative GIT_DIR like git's "."; run_with does not chdir, so use the absolute path
+            // with a "./" component instead.
+            let git_dir = format!("{}/.", repo.display());
+            let mut pairs = vec![
+                ("GITHEARTH_HOOK_SOCKET", path.as_str()),
+                ("GIT_QUARANTINE_PATH", quarantine.to_str().unwrap()),
+                (HOOK_QUOTA_BYTES, "1048576"),
+            ];
+            let missing = repo.join("missing").display().to_string();
+            pairs.push((
+                "GIT_DIR",
+                if with_dir {
+                    git_dir.as_str()
+                } else {
+                    missing.as_str()
+                },
+            ));
+            let (code, err) = run_with(
+                "pre-receive",
+                &[],
+                &env_with(&pairs),
+                &format!("{ZERO} {SHA} refs/heads/main\n"),
+            );
+            match refused {
+                Some(message) => {
+                    assert_eq!(code, 1, "{objects}/{incoming}: {err}");
+                    assert!(err.contains(message), "{objects}/{incoming}: {err}");
+                    drop(server); // the policy socket was never contacted
+                }
+                None => {
+                    server.join().unwrap();
+                    assert_eq!(code, 0, "{objects}/{incoming}: {err}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&repo);
+        }
     }
 }

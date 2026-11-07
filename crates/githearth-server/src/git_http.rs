@@ -397,7 +397,11 @@ async fn receive_pack(
         .env("GITHEARTH_HOOK_SOCKET", &state.hook_socket_path)
         .env("GITHEARTH_HOOK_TOKEN", &hook_token)
         .env("GITHEARTH_OPERATION", operation.to_string())
-        .env("GITHEARTH_ACTOR", admitted.account.to_string());
+        .env("GITHEARTH_ACTOR", admitted.account.to_string())
+        .env(
+            "GITHEARTH_QUOTA_BYTES",
+            state.config.repository_quota_bytes.to_string(),
+        );
     // coverage: let the hook subprocess (the same instrumented binary) record
     // its own profile under the test harness.
     if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
