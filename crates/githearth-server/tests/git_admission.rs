@@ -663,3 +663,179 @@ async fn reload_sees_changes_made_after_admission() {
     assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     pool.close().await;
 }
+
+// ---- admit_account direct tests (ADR 0005) ----
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn admit_account_active_repo_member_read_only_carried_through() {
+    let (pool, owner, org_slug, _tmp) = setup().await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    create_active_repo(&pool, org_id, "repo", owner).await;
+    let state = app_state_for_test(pool.clone(), &_tmp).await;
+
+    let result = git_admission::admit_account(
+        &state,
+        owner,
+        true,
+        &org_slug,
+        "repo",
+        git_admission::Want::Fetch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.account, owner);
+    assert!(result.read_only);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn admit_account_unknown_org_not_found() {
+    let (pool, owner, _org_slug, _tmp) = setup().await;
+    let state = app_state_for_test(pool.clone(), &_tmp).await;
+
+    let err = git_admission::admit_account(
+        &state,
+        owner,
+        false,
+        "nonexistent-org",
+        "repo",
+        git_admission::Want::Fetch,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::NOT_FOUND);
+    assert_eq!(err.1, "not found");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn admit_account_unknown_repo_not_found() {
+    let (pool, owner, org_slug, _tmp) = setup().await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    create_active_repo(&pool, org_id, "exists", owner).await;
+    let state = app_state_for_test(pool.clone(), &_tmp).await;
+
+    let err = git_admission::admit_account(
+        &state,
+        owner,
+        false,
+        &org_slug,
+        "nope",
+        git_admission::Want::Fetch,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::NOT_FOUND);
+    assert_eq!(err.1, "not found");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn admit_account_non_member_of_private_repo_not_found() {
+    let (pool, _owner, org_slug, _tmp) = setup().await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let owner_id: Uuid = sqlx::query_scalar(
+        "SELECT account_id FROM memberships WHERE organization_id=$1 AND role='owner'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    create_active_repo(&pool, org_id, "private-repo", owner_id).await;
+
+    let outsider = fixture_account(&pool, &tag("outsider")).await;
+    set_password(&pool, outsider, "outsider").await;
+    let state = app_state_for_test(pool.clone(), &_tmp).await;
+
+    let err = git_admission::admit_account(
+        &state,
+        outsider,
+        false,
+        &org_slug,
+        "private-repo",
+        git_admission::Want::Fetch,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::NOT_FOUND);
+    assert_eq!(err.1, "not found");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn admit_account_read_grant_with_want_push_ok() {
+    let (pool, _owner, org_slug, _tmp) = setup().await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let owner_id: Uuid = sqlx::query_scalar(
+        "SELECT account_id FROM memberships WHERE organization_id=$1 AND role='owner'",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let repo_id = create_active_repo(&pool, org_id, "read-only-repo", owner_id).await;
+
+    let reader = fixture_account(&pool, &tag("reader")).await;
+    set_password(&pool, reader, "readerpass").await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(reader)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,repository_id,granted_by) VALUES ($1,'read','account',$2,'repository',$3,$4,$5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(reader)
+    .bind(org_id)
+    .bind(repo_id)
+    .bind(owner_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = app_state_for_test(pool.clone(), &_tmp).await;
+
+    let result = git_admission::admit_account(
+        &state,
+        reader,
+        false,
+        &org_slug,
+        "read-only-repo",
+        git_admission::Want::Push,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.account, reader);
+    assert_eq!(result.repository.id, repo_id);
+
+    pool.close().await;
+}
