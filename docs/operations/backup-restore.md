@@ -14,11 +14,13 @@ A backup is only proven by restoring it and verifying object integrity
 
 2. **Take a storage snapshot** — a tar of the storage root excluding `run/`
    (the server's PID and socket directory).  Run this after the dump completes.
+   The `--exclude` pattern is anchored with `./` so it matches only the
+   top-level `run/` directory and does not drop paths like `refs/heads/run`.
 
    ```sh
    tar -czf storage-$(date +%Y%m%d-%H%M).tgz \
      -C <storage-root> \
-     --exclude run \
+     --exclude ./run \
      .
    ```
 
@@ -45,7 +47,12 @@ A backup is only proven by restoring it and verifying object integrity
    newer than the metadata high-water mark (see ADR 0003 "Recovery").
    Repositories created after the backup will appear under `orphans/`.
 
-4. **Verify** the restored storage with the read-only check command:
+4. **Verify** the restored storage with the read-only check command.
+   Run this with no pushes in flight (ideally with the server stopped) so an
+   in-flight journal append is not reported as a torn tail.  If a torn tail is
+   reported after restore, it is harmless: every reconciler pass (including the one at
+   startup) opens each active repository's journal, and `Journal::open`
+   truncates a torn final frame.  Start the server once, then rerun `check`.
 
    ```sh
    githearth check <storage-root>
@@ -66,4 +73,6 @@ A backup is only proven by restoring it and verifying object integrity
   separate database-level restore test).
 - Whether the storage snapshot is consistent with the database dump — the
   journal reconciler handles that.
-- Search indexes (rebuilt after restore). Back up configuration and keys separately.
+- Rotated/archived journals (`journal.<first>`); `verify` reads only the live
+  `journal` file.
+- Search indexes (rebuilt after restore).  Back up configuration and keys separately.

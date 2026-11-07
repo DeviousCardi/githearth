@@ -212,6 +212,38 @@ impl Storage {
         })
     }
 
+    /// Read-only open: does not create, chmod, or modify anything on disk.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let root_ref = root.as_ref();
+        if !root_ref.is_dir() {
+            return Err(StorageError::Invalid(
+                "storage root does not exist or is not a directory".into(),
+            ));
+        }
+        if fs::symlink_metadata(root_ref)?.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "storage root must not be a symlink".into(),
+            ));
+        }
+        let root = fs::canonicalize(root_ref)?;
+        let repos = root.join("repositories");
+        if !repos.is_dir() {
+            return Err(StorageError::Invalid(
+                "storage root has no repositories/ directory".into(),
+            ));
+        }
+        if fs::symlink_metadata(&repos)?.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "repositories/ must not be a symlink".into(),
+            ));
+        }
+        Ok(Self {
+            root,
+            options: StorageOptions::default(),
+            locks: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// Return the per-repository lock for `repository`, creating it if the
     /// [`Weak`] is dead or missing.
     ///
@@ -544,11 +576,12 @@ impl Storage {
         let mut malformed = Vec::new();
         for pair in fs::read_dir(self.root.join("repositories"))? {
             let pair = pair?;
-            if !pair.file_type()?.is_dir() {
-                continue;
-            }
             let pair_name = pair.file_name();
             let pair_name = pair_name.to_string_lossy();
+            if !pair.file_type()?.is_dir() {
+                malformed.push(format!("repositories/{pair_name}"));
+                continue;
+            }
             if pair_name.len() != 2
                 || !pair_name
                     .bytes()
@@ -559,11 +592,12 @@ impl Storage {
             }
             for entry in fs::read_dir(pair.path())? {
                 let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
+                if !entry.file_type()?.is_dir() {
+                    malformed.push(format!("repositories/{pair_name}/{name}"));
+                    continue;
+                }
                 let stem = match name.strip_suffix(".git") {
                     Some(s) if s.len() == 32 && s.bytes().all(is_lower_hex) => s,
                     _ => {

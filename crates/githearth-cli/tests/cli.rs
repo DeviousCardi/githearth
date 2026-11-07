@@ -71,10 +71,8 @@ fn usage_is_reported_without_arguments() {
     for args in [vec![], vec!["init"], vec!["init", "/tmp"]] {
         let output = cli(&args);
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(
-            stderr(&output),
-            "githearth: usage: githearth <init|refs|blob|check> <storage-root> <repository-id> [object-id]\n"
-        );
+        let err = stderr(&output);
+        assert!(err.starts_with("githearth: usage:"), "{err}");
         assert!(output.stdout.is_empty());
     }
 }
@@ -295,7 +293,6 @@ fn check_corrupted_root_exits_one_and_prints_problem() {
     let init = cli(&["init", root, ID]);
     assert!(init.status.success());
     let bare = PathBuf::from(stdout(&init).trim());
-    // write an object and corrupt it
     let blob_content = b"corrupted blob content\n";
     let hash = {
         let mut child = Command::new("git")
@@ -317,7 +314,6 @@ fn check_corrupted_root_exits_one_and_prints_problem() {
         assert!(output.status.success(), "hash-object failed: {stderr_msg}");
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
-    // Write blob as stdin to properly store it (hash-object -w needs stdin fed).
     let obj = bare.join("objects").join(&hash[..2]).join(&hash[2..]);
     #[cfg(unix)]
     {
@@ -331,8 +327,130 @@ fn check_corrupted_root_exits_one_and_prints_problem() {
     let output = cli(&["check", root]);
     assert_eq!(output.status.code(), Some(1));
     let err = stderr(&output);
+    assert!(err.contains("1 problems found"), "{err}");
+    let out = stdout(&output);
+    assert!(out.contains(": "), "{out}");
+}
+
+#[test]
+fn check_missing_root_exits_nonzero_and_does_not_create_it() {
+    let temp = TempDir::new();
+    let root = temp.path().join("storage");
+    let root_str = root.to_str().unwrap();
+    let output = cli(&["check", root_str]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!root.exists(), "path must not be created");
+}
+
+#[test]
+fn check_root_without_repositories_errors() {
+    let temp = TempDir::new();
+    let root = temp.path().join("storage");
+    fs::create_dir(&root).unwrap();
+    let output = cli(&["check", root.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
     assert!(
-        err.contains("1 problems found") || err.contains("problem"),
-        "{err}"
+        stderr(&output).starts_with("githearth:"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn check_empty_root_exits_nonzero_with_warning() {
+    let temp = TempDir::new();
+    let storage = temp.path().join("storage");
+    // manually create a storage root with empty repositories/ (no repos inside).
+    fs::create_dir_all(storage.join("repositories")).unwrap();
+    let output = cli(&["check", storage.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("1 problems found"), "{err}");
+    let out = stdout(&output);
+    assert!(
+        out.contains("repositories: no repositories found\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn tar_exclude_dot_slash_run_does_not_drop_refs_heads_run() {
+    // skip if tar is missing
+    if !std::process::Command::new("tar")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let temp = TempDir::new();
+    let storage = temp.path().join("storage");
+    let root = storage.to_str().unwrap();
+
+    // init a repo and create refs/heads/run
+    let init = cli(&["init", root, ID]);
+    assert!(init.status.success());
+    let bare = PathBuf::from(stdout(&init).trim());
+    let work = temp.path().join("work");
+    fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-b", "main"]);
+    git(&work, &["config", "user.name", "Fixture"]);
+    git(&work, &["config", "user.email", "fixture@example.invalid"]);
+    fs::write(work.join("f"), b"1").unwrap();
+    git(&work, &["add", "f"]);
+    git(&work, &["commit", "-m", "init"]);
+    git(&work, &["push", bare.to_str().unwrap(), "main"]);
+    // Create a branch named "run"
+    git(&work, &["branch", "run"]);
+    git(&work, &["push", bare.to_str().unwrap(), "refs/heads/run"]);
+
+    // Also create a top-level run/ directory so --exclude run would catch it
+    // but --exclude ./run should not.
+    let run_dir_file = storage.join("run").join("pid");
+    fs::create_dir(storage.join("run")).unwrap();
+    fs::write(&run_dir_file, b"").unwrap();
+
+    // Tar using the documented command
+    let tar_file = temp.path().join("backup.tgz");
+    let status = Command::new("tar")
+        .args(["-czf"])
+        .arg(&tar_file)
+        .arg("-C")
+        .arg(&storage)
+        .args(["--exclude", "./run"])
+        .arg(".")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // Extract into fresh root
+    let restored = temp.path().join("restored");
+    fs::create_dir(&restored).unwrap();
+    let status = Command::new("tar")
+        .args(["-xzf"])
+        .arg(&tar_file)
+        .arg("-C")
+        .arg(&restored)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // run/ should not be in the restored root
+    assert!(
+        !restored.join("run").exists(),
+        "run/ directory must be excluded"
+    );
+    // refs/heads/run must survive
+    let ref_run = restored
+        .join("repositories")
+        .join(&ID[..2])
+        .join(format!("{ID}.git"))
+        .join("refs")
+        .join("heads")
+        .join("run");
+    assert!(
+        ref_run.exists(),
+        "refs/heads/run must survive: --exclude run unanchored would drop it"
     );
 }

@@ -15,8 +15,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         if args.len() != 2 {
             return Err(usage());
         }
-        let storage = Storage::open(&args[1])?;
-        let (n, problems) = storage.check()?;
+        let storage = Storage::open_existing(&args[1])?;
+        let (n, mut problems) = storage.check()?;
+        if n == 0 {
+            // An empty restore must not read as a clean pass.
+            problems.push(githearth_git::layout::Problem {
+                subject: "repositories".into(),
+                message: "no repositories found".into(),
+            });
+        }
         for p in &problems {
             println!("{}: {}", p.subject, p.message);
         }
@@ -63,7 +70,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn usage() -> Box<dyn Error> {
-    "usage: githearth <init|refs|blob|check> <storage-root> <repository-id> [object-id]".into()
+    "usage: githearth check <storage-root>\n       githearth <init|refs|blob> <storage-root> <repository-id> [object-id]".into()
 }
 
 fn main() {

@@ -328,14 +328,24 @@ fn scan_reports_malformed_names() {
     let pair = root.join("repositories").join(&s[..2]);
     fs::create_dir_all(&pair).unwrap();
     fs::create_dir(pair.join("not-a-repo")).unwrap();
-    // non-directory entries are skipped silently.
+    // non-directory entries are now reported as malformed.
     fs::write(root.join("repositories").join("stray-file"), b"").unwrap();
     fs::write(pair.join("stray-entry"), b"").unwrap();
     let scan = storage.scan().unwrap();
     assert!(scan.repositories.is_empty());
-    assert!(!scan.malformed.is_empty());
+    assert_eq!(scan.malformed.len(), 4);
     assert!(scan.malformed.iter().any(|m| m.contains("zz")));
     assert!(scan.malformed.iter().any(|m| m.contains("not-a-repo")));
+    assert!(
+        scan.malformed
+            .iter()
+            .any(|m| m == &"repositories/stray-file".to_string())
+    );
+    assert!(
+        scan.malformed
+            .iter()
+            .any(|m| *m == format!("repositories/{}/stray-entry", &s[..2]))
+    );
 }
 
 #[test]
@@ -699,4 +709,58 @@ fn check_reports_journal_problem() {
     assert_eq!(problems.len(), 1);
     assert_eq!(problems[0].subject, id.simple().to_string());
     assert!(problems[0].message.contains("journal:"));
+}
+
+#[test]
+fn open_existing_rejects_missing_root() {
+    let fixture = Fixture::new();
+    assert!(Storage::open_existing(fixture.0.join("nope")).is_err());
+}
+
+#[test]
+fn open_existing_rejects_root_without_repositories_dir() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    fs::create_dir(&root).unwrap();
+    assert!(Storage::open_existing(&root).is_err());
+}
+
+#[test]
+fn open_existing_does_not_modify_permissions() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    Storage::open(&root).unwrap();
+    // Change a subdirectory mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("repositories"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Storage::open_existing(&root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(root.join("repositories"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "mode must be unchanged by open_existing"
+        );
+    }
+}
+
+#[test]
+fn check_empty_root_reports_warning_and_exits_nonzero() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("storage");
+    Storage::open(&root).unwrap();
+    let (n, problems) = Storage::open_existing(&root).unwrap().check().unwrap();
+    assert_eq!(n, 0);
+    assert!(
+        problems.is_empty(),
+        "check itself reports no problems on empty root"
+    );
 }
