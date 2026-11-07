@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use githearth_server::{
-    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, reconcile, router,
+    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, reconcile, router,
 };
 use std::{
     io::{self, Read},
@@ -20,6 +20,8 @@ struct Args {
 enum Command {
     Serve,
     Migrate,
+    /// Run read-only preflight checks against configuration, storage, database, and Git.
+    Doctor,
     /// Create the first admin; password is read from stdin (never command arguments).
     BootstrapAdmin {
         #[arg(long)]
@@ -50,8 +52,16 @@ async fn main() {
 }
 async fn run(args: Args) -> Result<()> {
     let config = Config::load(args.config.as_deref())?;
+    if let Command::Doctor = args.command {
+        let exit_code = doctor::run(&config).await;
+        if exit_code != 0 {
+            anyhow::bail!("doctor reported failures; see output above");
+        }
+        return Ok(());
+    }
     let pool = connect(&config).await?;
     match args.command {
+        Command::Doctor => unreachable!("handled above"),
         Command::Migrate => {
             MIGRATOR.run(&pool).await.map_err(|_| {
                 anyhow::anyhow!(
