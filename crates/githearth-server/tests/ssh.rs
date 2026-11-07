@@ -650,6 +650,10 @@ struct Served {
 }
 
 async fn serve_with_repo(label: &str) -> Served {
+    serve_with_repo_deadline(label, ssh::AUTH_DEADLINE).await
+}
+
+async fn serve_with_repo_deadline(label: &str, auth_deadline: std::time::Duration) -> Served {
     let storage_root = temp_storage_root();
     let database_url = fresh_database(&format!(
         "githearth_tssh_{label}_{}",
@@ -704,7 +708,7 @@ async fn serve_with_repo(label: &str) -> Served {
         });
         Box::pin(async move { Ok(found) })
     });
-    let (_handle, port_rx) = ssh::spawn(state, authenticate);
+    let (_handle, port_rx) = ssh::spawn_with(state, authenticate, auth_deadline);
     Served {
         port: port_rx.await.unwrap().port(),
         client_key,
@@ -886,4 +890,54 @@ fn ssh_keygen_needs_no_database_and_never_overwrites() {
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains("refusing to overwrite"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn unauthenticated_connection_is_closed_at_the_deadline() {
+    use tokio::io::AsyncReadExt;
+    let s = serve_with_repo_deadline("idle", std::time::Duration::from_secs(1)).await;
+    // Connect and never send our version line: inactivity_timeout (30 s) would
+    // keep this open; the authentication deadline must close it.
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", s.port))
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut received),
+    )
+    .await;
+    assert!(closed.is_ok(), "connection still open after the deadline");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn second_session_on_one_connection_is_refused() {
+    if !has_ssh() {
+        return;
+    }
+    let s = serve_with_repo("mux").await;
+    let ctl = temp_dir("ssh-mux");
+    std::fs::create_dir_all(&ctl).unwrap();
+    let ctl = ctl.join("c").to_string_lossy().into_owned();
+    // One authenticated connection, multiplexed by OpenSSH.
+    let master = ssh_run_with(&s, &["-M", "-S", &ctl, "-N", "-f"], None).await;
+    assert!(
+        master.status.success(),
+        "{}",
+        String::from_utf8_lossy(&master.stderr)
+    );
+    let command = format!("git-upload-pack '/{}/testrepo.git'", s.org_slug);
+    let first = ssh_run_with(&s, &["-T", "-S", &ctl], Some(&command)).await;
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("refs/heads/main"),
+        "first session did not get the ref advertisement"
+    );
+    let second = ssh_run_with(&s, &["-T", "-S", &ctl], Some(&command)).await;
+    assert!(
+        !second.status.success(),
+        "a second session channel was accepted"
+    );
+    let _ = ssh_run_with(&s, &["-S", &ctl, "-O", "exit"], None).await;
 }

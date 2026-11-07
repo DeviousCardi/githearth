@@ -37,12 +37,8 @@ pub type Authenticate = Arc<
 // ------------------------------------------------------------------
 
 pub fn generate_host_key(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        bail!(
-            "host key already exists at {}; refusing to overwrite",
-            path.display()
-        );
-    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let key = russh::keys::PrivateKey::random(
         &mut russh::keys::key::safe_rng(),
         russh::keys::Algorithm::Ed25519,
@@ -51,12 +47,21 @@ pub fn generate_host_key(path: &Path) -> anyhow::Result<()> {
     let mut pem = Vec::new();
     key.write_openssh(&mut pem, russh::keys::ssh_key::LineEnding::LF)
         .context("cannot serialize host key")?;
-    std::fs::write(path, pem).context("cannot write host key")?;
-    #[cfg(unix)]
+    // create_new makes "never overwrite" atomic; the mode applies at creation,
+    // so the private key is never readable by others, even briefly.
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "host key already exists at {}; refusing to overwrite",
+            path.display()
+        ),
+        other => other.context("cannot write host key")?,
+    };
+    file.write_all(&pem).context("cannot write host key")?;
     tracing::info!(path = %path.display(), "SSH host key generated");
     Ok(())
 }
@@ -96,6 +101,10 @@ struct ConnectionState {
     unauthenticated_permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     /// Direct handle to git's stdin, used from the data() callback.
     git_stdin: Mutex<Option<tokio::process::ChildStdin>>,
+    /// Git uses one session channel and one exec per connection; a second
+    /// would share git_stdin and could block the session on the repository lock.
+    session_opened: std::sync::atomic::AtomicBool,
+    exec_started: std::sync::atomic::AtomicBool,
     _channel: Mutex<Option<russh::Channel<russh::server::Msg>>>,
 }
 
@@ -172,6 +181,13 @@ impl russh::server::Handler for SshHandler {
         reply: russh::server::ChannelOpenHandle,
         _session: &mut russh::server::Session,
     ) -> Result<(), Self::Error> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.conn.session_opened.swap(true, SeqCst) {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
         reply.accept().await;
         *self.conn._channel.lock().unwrap() = Some(channel);
         Ok(())
@@ -203,6 +219,13 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut russh::server::Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .conn
+            .exec_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return refuse(session, channel, b"githearth: one command per connection\n");
+        }
         let command = String::from_utf8_lossy(data).to_string();
 
         let identity = self.conn.identity.lock().unwrap().clone();
@@ -549,6 +572,9 @@ pub fn load_host_key(path: &Path) -> anyhow::Result<russh::keys::PrivateKey> {
     russh::keys::PrivateKey::from_openssh(&data).context("invalid SSH host key")
 }
 
+/// Connections that have not authenticated by then are closed (ADR 0005).
+pub const AUTH_DEADLINE: Duration = Duration::from_secs(30);
+
 pub fn spawn(
     state: AppState,
     authenticate: Authenticate,
@@ -556,9 +582,21 @@ pub fn spawn(
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Receiver<SocketAddr>,
 ) {
+    spawn_with(state, authenticate, AUTH_DEADLINE)
+}
+
+/// [`spawn`] with a custom authentication deadline (tests use a short one).
+pub fn spawn_with(
+    state: AppState,
+    authenticate: Authenticate,
+    auth_deadline: Duration,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<SocketAddr>,
+) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        if let Err(e) = run_server(state, authenticate, tx).await {
+        if let Err(e) = run_server(state, authenticate, auth_deadline, tx).await {
             tracing::error!(error = %e, "SSH server exited");
         }
     });
@@ -568,6 +606,7 @@ pub fn spawn(
 async fn run_server(
     state: AppState,
     authenticate: Authenticate,
+    auth_deadline: Duration,
     port_tx: tokio::sync::oneshot::Sender<SocketAddr>,
 ) -> anyhow::Result<()> {
     let bind = state.config.ssh_bind;
@@ -625,6 +664,8 @@ async fn run_server(
                 git_protocol: Mutex::new(None),
                 unauthenticated_permit: Mutex::new(Some(permit)),
                 git_stdin: Mutex::new(None),
+                session_opened: Default::default(),
+                exec_started: Default::default(),
                 _channel: Mutex::new(None),
             });
 
@@ -634,8 +675,39 @@ async fn run_server(
                 conn: conn.clone(),
             };
 
-            let _ = russh::server::run_stream(russh_config, stream, handler).await;
-
+            // run_stream returns once the session is set up and the session then runs
+            // on its own task, so await it; inactivity_timeout resets on every byte, so
+            // a separate deadline bounds the time to authenticate.
+            let handle = Mutex::new(None);
+            let run = async {
+                if let Ok(session) = russh::server::run_stream(russh_config, stream, handler).await
+                {
+                    *handle.lock().unwrap() = Some(session.handle());
+                    let _ = session.await;
+                }
+            };
+            let deadline = async {
+                tokio::time::sleep(auth_deadline).await;
+                // The permit is released on authentication.
+                if conn.unauthenticated_permit.lock().unwrap().is_none() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                _ = run => {}
+                _ = deadline => {
+                    let handle = handle.lock().unwrap().take();
+                    if let Some(handle) = handle {
+                        let _ = handle
+                            .disconnect(
+                                russh::Disconnect::ByApplication,
+                                "authentication timeout".into(),
+                                String::new(),
+                            )
+                            .await;
+                    }
+                }
+            }
             drop(conn.unauthenticated_permit.lock().unwrap().take());
         });
     }
