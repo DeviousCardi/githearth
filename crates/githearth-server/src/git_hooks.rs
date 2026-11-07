@@ -135,27 +135,26 @@ fn check_quota(env: &HashMap<String, String>) -> Result<(), String> {
         .get(HOOK_QUOTA_BYTES)
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let Some(quarantine) = env.get("GIT_QUARANTINE_PATH").map(PathBuf::from) else {
+    let Some(quarantine) = env.get("GIT_QUARANTINE_PATH").filter(|_| quota > 0) else {
         return Ok(());
     };
-    let brings_objects = std::fs::read_dir(&quarantine).is_ok_and(|mut d| d.next().is_some());
-    if quota == 0 || !brings_objects {
+    let measured = |e: std::io::Error| format!("cannot measure repository size: {e}");
+    // Git creates the quarantine (with an empty pack/) for every non-delete push,
+    // so "brings objects" is decided by bytes, not by entries.
+    let incoming =
+        githearth_git::layout::dir_size(Path::new(quarantine), None).map_err(measured)?;
+    if incoming == 0 {
         return Ok(());
     }
     // Git runs hooks with GIT_DIR="." and an absolute quarantine path inside objects/;
     // canonicalize both so the quarantine is excluded from objects/ and counted once.
-    let size = |path: &Path, skip: Option<&Path>| {
-        githearth_git::layout::dir_size(path, skip)
-            .map_err(|e| format!("cannot measure repository size: {e}"))
-    };
-    let quarantine = quarantine
-        .canonicalize()
-        .map_err(|e| format!("cannot measure repository size: {e}"))?;
+    let quarantine = Path::new(quarantine).canonicalize().map_err(measured)?;
     let objects = Path::new(env.get("GIT_DIR").map_or(".", String::as_str))
         .join("objects")
         .canonicalize()
-        .map_err(|e| format!("cannot measure repository size: {e}"))?;
-    let used = size(&objects, Some(&quarantine))? + size(&quarantine, None)?;
+        .map_err(measured)?;
+    let used =
+        githearth_git::layout::dir_size(&objects, Some(&quarantine)).map_err(measured)? + incoming;
     if used > quota {
         return Err(format!(
             "repository storage quota exceeded: {used} of {quota} bytes"
@@ -824,10 +823,15 @@ mod tests {
         let repo = std::env::temp_dir().join(format!("githearth-quota-{}", Uuid::new_v4()));
         let quarantine = repo.join("objects/tmp_objdir-incoming-x");
         std::fs::create_dir_all(repo.join("objects/ab")).unwrap();
-        std::fs::create_dir_all(&quarantine).unwrap();
+        // Git creates an empty pack/ in the quarantine for every non-delete push.
+        std::fs::create_dir_all(quarantine.join("pack")).unwrap();
         std::fs::write(repo.join("objects/ab/obj"), vec![0u8; objects_bytes]).unwrap();
         if incoming_bytes > 0 {
-            std::fs::write(quarantine.join("pack"), vec![0u8; incoming_bytes]).unwrap();
+            std::fs::write(
+                quarantine.join("pack/pack-x.pack"),
+                vec![0u8; incoming_bytes],
+            )
+            .unwrap();
         }
         (repo, quarantine)
     }

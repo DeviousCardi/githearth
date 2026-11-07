@@ -12,6 +12,9 @@ never followed.
 arriving via any path that does not go through a push (e.g. GC or
 server-initiated operations), and `refs/` / `packed-refs` / journal files.
 
+Only `objects/` is counted, so scheduled repacking can change the measured
+size; that matters only close to the limit.
+
 **How to raise it:** increase `repository_quota_bytes` in configuration or set
 `GITHEARTH_REPOSITORY_QUOTA_BYTES=0` to disable. Restart the server.
 Pushes that bring no new objects (deleting a branch, pointing a ref at an

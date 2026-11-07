@@ -2586,8 +2586,9 @@ async fn storage_quota_refuses_large_push_ref_unchanged_no_journal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn ref_delete_over_quota_succeeds() {
-    // Create a repo with quota, seed an extra branch via bypass, then delete it.
+async fn pushes_without_new_objects_succeed_over_quota() {
+    // Seed 2 MiB of incompressible data past the 1 MiB quota (bypassing the hook),
+    // then push a new ref at an existing commit and delete a branch.
     let fx = setup_with_quota(1_048_576).await;
 
     let work = std::env::temp_dir().join(format!("git-push-quota-seed-{}", Uuid::new_v4()));
@@ -2595,8 +2596,11 @@ async fn ref_delete_over_quota_succeeds() {
     let tw = work.to_str().unwrap();
     git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
     git_ok(git_cmd(&["-C", tw, "checkout", "-b", "extra"])).await;
-    std::fs::write(work.join("x.txt"), "x").unwrap();
-    git_ok(git_cmd(&["-C", tw, "add", "x.txt"])).await;
+    let mut blob = vec![0u8; 2 * 1024 * 1024];
+    let mut urandom = std::fs::File::open("/dev/urandom").unwrap();
+    std::io::Read::read_exact(&mut urandom, &mut blob).unwrap();
+    std::fs::write(work.join("x.bin"), &blob).unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "x.bin"])).await;
     git_ok(git_cmd(&[
         "-C",
         tw,
@@ -2616,7 +2620,16 @@ async fn ref_delete_over_quota_succeeds() {
     let cd = clone.to_str().unwrap();
     git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
 
-    // Delete the extra branch (ref-delete adds no new objects)
+    // Git still creates a quarantine (with an empty pack/) for this push.
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "push",
+        "origin",
+        "origin/extra:refs/heads/copy",
+    ]))
+    .await;
+    // A delete-only push sends no pack at all.
     git_ok(git_cmd(&["-C", cd, "push", "origin", ":extra"])).await;
 
     let refs_out = git_output(git_cmd(&[
@@ -2630,6 +2643,10 @@ async fn ref_delete_over_quota_succeeds() {
     assert!(
         !refs_out.lines().any(|l| l == "refs/heads/extra"),
         "extra branch must be deleted: {refs_out}"
+    );
+    assert!(
+        refs_out.lines().any(|l| l == "refs/heads/copy"),
+        "copy must be created: {refs_out}"
     );
 
     let _ = std::fs::remove_dir_all(&clone);
