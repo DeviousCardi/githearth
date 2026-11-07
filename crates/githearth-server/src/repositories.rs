@@ -80,6 +80,32 @@ pub async fn set_status(
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn finish_delete(
+    conn: &mut PgConnection,
+    id: Uuid,
+    actor: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let changed = set_status(
+        conn,
+        id,
+        RepositoryStatus::Deleting,
+        RepositoryStatus::Deleted,
+    )
+    .await?;
+    if !changed {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 \
+         WHERE repository_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(actor)
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(true)
+}
+
 /// Bump `updated_at` so the lifecycle reconciler (which only visits rows older
 /// than its grace) skips this row while a resumed create/delete is still doing
 /// its storage stage.

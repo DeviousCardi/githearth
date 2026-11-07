@@ -22,7 +22,7 @@ use crate::pushes;
 use crate::repositories;
 use githearth_core::RepositoryStatus;
 use githearth_git::layout::{ObjectFormat, TmpEntry};
-use sqlx::Row;
+use sqlx::{Connection, Row};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -461,12 +461,10 @@ async fn reconcile_deleting(
     // Re-read the row under the lock: a concurrent request may have already
     // changed the status, and the reconciler must not trash a directory that
     // is no longer deleting.
-    let still_deleting = repositories::get(&mut conn, repo_id)
-        .await?
-        .is_some_and(|r| r.status == RepositoryStatus::Deleting);
-    if !still_deleting {
+    let row = repositories::get(&mut conn, repo_id).await?;
+    let Some(row) = row.filter(|r| r.status == RepositoryStatus::Deleting) else {
         return Ok(None);
-    }
+    };
 
     if scanned.contains(&repo_id) {
         tokio::task::spawn_blocking(move || {
@@ -478,13 +476,11 @@ async fn reconcile_deleting(
     } else {
         drop(guard);
     }
-    let ok = repositories::set_status(
-        &mut conn,
-        repo_id,
-        RepositoryStatus::Deleting,
-        RepositoryStatus::Deleted,
-    )
-    .await?;
+
+    let mut tx = conn.begin().await?;
+    // shortcut: the deleting actor is not stored, so revoked_by names the creator; store the actor on the row if audits need it.
+    let ok = repositories::finish_delete(&mut tx, repo_id, row.created_by).await?;
+    tx.commit().await?;
     if ok {
         tracing::info!(repository_id = %repo_id, "reconciler deleted repository");
         Ok(Some(Change::Deleted))

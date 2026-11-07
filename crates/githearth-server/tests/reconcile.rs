@@ -380,6 +380,152 @@ async fn deleting_row_with_directory_trashed_and_deleted() {
     teardown(env).await;
 }
 
+/// A delete finished by the reconciler must revoke still-active grants, with
+/// `revoked_by` naming the repository creator (the deleting actor is not
+/// stored). Grants revoked before this run keep their original timestamps.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn deleting_row_with_active_grant_revoked_by_reconciler() {
+    let env = setup(30).await; // minimum valid grace; rows are backdated past it
+    let mut conn = env.pool.acquire().await.unwrap();
+
+    let op_id = Uuid::new_v4();
+    let row = repositories::insert_creating(
+        &mut conn,
+        env.org,
+        "reconcile-delete-grant",
+        env.owner,
+        op_id,
+        "private",
+        "",
+    )
+    .await
+    .unwrap();
+    let repo_id = row.id;
+
+    repositories::set_status(
+        &mut conn,
+        repo_id,
+        RepositoryStatus::Creating,
+        RepositoryStatus::Active,
+    )
+    .await
+    .unwrap();
+
+    // A subject the creator grants access to.
+    let member = Uuid::new_v4();
+    sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'hash')")
+        .bind(member)
+        .bind(tag("member"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(env.org)
+    .bind(member)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    // An active grant that the reconciler must revoke.
+    let active_grant = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,repository_id,granted_by) \
+         VALUES ($1,'read','account',$2,'repository',$3,$4,$5)",
+    )
+    .bind(active_grant)
+    .bind(member)
+    .bind(env.org)
+    .bind(repo_id)
+    .bind(env.owner)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    // A grant already revoked before this run: its timestamps must be untouched.
+    let revoked_grant = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,repository_id,granted_by,revoked_at,revoked_by) \
+         VALUES ($1,'read','account',$2,'repository',$3,$4,$5,clock_timestamp() - interval '1 hour',$6)",
+    )
+    .bind(revoked_grant)
+    .bind(member)
+    .bind(env.org)
+    .bind(repo_id)
+    .bind(env.owner)
+    .bind(env.owner)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let revoked_before: String = sqlx::query_scalar(
+        "SELECT to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM grants WHERE id = $1",
+    )
+    .bind(revoked_grant)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    let revoked_by_before = env.owner;
+
+    repositories::set_status(
+        &mut conn,
+        repo_id,
+        RepositoryStatus::Active,
+        RepositoryStatus::Deleting,
+    )
+    .await
+    .unwrap();
+    backdate(&env.pool, repo_id).await;
+    drop(conn);
+
+    let mut attempts = HashMap::new();
+    let summary = reconcile::reconcile_once(&env.state, &mut attempts)
+        .await
+        .unwrap();
+    assert_eq!(summary.deleted, 1);
+
+    let mut conn = env.pool.acquire().await.unwrap();
+    let updated = repositories::get(&mut conn, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.status, RepositoryStatus::Deleted);
+
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM grants WHERE repository_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(repo_id)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(active_count, 0, "no grant may stay active after deletion");
+
+    let revoker: Uuid = sqlx::query_scalar("SELECT revoked_by FROM grants WHERE id = $1")
+        .bind(active_grant)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(revoker, env.owner, "revoked_by must name the creator");
+
+    let revoked_at_now: String = sqlx::query_scalar(
+        "SELECT to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM grants WHERE id = $1",
+    )
+    .bind(revoked_grant)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    let revoked_by_now: Uuid = sqlx::query_scalar("SELECT revoked_by FROM grants WHERE id = $1")
+        .bind(revoked_grant)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(revoked_at_now, revoked_before);
+    assert_eq!(revoked_by_now, revoked_by_before);
+
+    teardown(env).await;
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn deleting_row_without_directory_becomes_deleted() {

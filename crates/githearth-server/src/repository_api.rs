@@ -718,13 +718,7 @@ pub(crate) async fn delete(
                 Ok(_) => {
                     // Store the response atomically with the mark-deleted step.
                     let mut tx = state.pool.begin().await?;
-                    repositories::set_status(
-                        &mut tx,
-                        repo_id,
-                        RepositoryStatus::Deleting,
-                        RepositoryStatus::Deleted,
-                    )
-                    .await?;
+                    repositories::finish_delete(&mut tx, repo_id, loaded.actor_id).await?;
                     let status = StatusCode::NO_CONTENT;
                     let body = serde_json::Value::Null;
                     if !idem.store(&mut tx, status, &body).await? {
@@ -787,17 +781,26 @@ pub(crate) async fn list_access(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((org_slug, name)): Path<(String, String)>,
+    Query(page): Query<Page>,
 ) -> Result<Json<Vec<AccessGrant>>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
     require(&state, &loaded, Action::RepositoryManageAccess)?;
 
+    let limit = page.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(invalid());
+    }
+
     let rows = sqlx::query::<sqlx::Postgres>(&format!(
         "SELECT {GRANT_COLUMNS} FROM grants \
          WHERE repository_id = $1 AND revoked_at IS NULL \
-         AND (expires_at IS NULL OR expires_at > clock_timestamp())"
+         AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
+         AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3"
     ))
     .bind(loaded.repo.id)
+    .bind(page.after)
+    .bind(limit)
     .fetch_all(&state.pool)
     .await?;
 
