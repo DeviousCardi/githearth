@@ -113,11 +113,8 @@ async fn run(args: Args) -> Result<()> {
             let _reconciler = reconcile::spawn(state.clone());
             let _merge_worker = githearth_server::merge_worker::spawn(state.clone());
             let _ssh = if config.ssh_enabled {
-                use std::sync::Arc;
                 ssh::load_host_key(&config.ssh_host_key_path)?;
-                // shortcut: no SSH keys until Person A's ssh_keys::authenticate lands (ADR 0005); swap this closure for it
-                let authenticate: ssh::Authenticate =
-                    Arc::new(|_fingerprint: String| Box::pin(async { Ok(None) }));
+                let authenticate = githearth_server::ssh_keys::authenticator(state.pool.clone());
                 let (handle, _port_rx) = ssh::spawn(state.clone(), authenticate);
                 Some(handle)
             } else {

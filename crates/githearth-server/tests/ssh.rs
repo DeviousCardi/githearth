@@ -7,7 +7,7 @@
 //! All tests are `#[ignore]` — they require a real PostgreSQL database via
 //! `GITHEARTH_TEST_DATABASE_URL` and a system `ssh` client.
 
-use githearth_server::{AppState, MIGRATOR, config::Config, connect, ssh};
+use githearth_server::{AppState, MIGRATOR, config::Config, connect, router, ssh, ssh_keys};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -940,4 +940,184 @@ async fn second_session_on_one_connection_is_refused() {
         "a second session channel was accepted"
     );
     let _ = ssh_run_with(&s, &["-S", &ctl, "-O", "exit"], None).await;
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: a real key registered through the API, then admitted by
+// ssh_keys::authenticate over the system ssh client (ADR 0005, Person A).
+// ---------------------------------------------------------------------------
+
+fn public_key_line(key_path: &Path) -> String {
+    let pub_path = key_path.with_extension("pub");
+    std::fs::read_to_string(&pub_path).unwrap()
+}
+
+async fn ssh_register_key(app: &axum::Router, session: &str, key_path: &Path) -> Uuid {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let body = serde_json::json!({
+        "name": "e2e",
+        "public_key": public_key_line(key_path),
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/api/v1/user/ssh-keys")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {session}"))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn ssh_login(app: &axum::Router, username: &str, password: &str) -> String {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let body = serde_json::json!({"username": username, "password": password});
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/api/v1/login")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["token"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn ssh_key_registered_via_api_then_revoked_stops_authentication() {
+    if !has_ssh() {
+        eprintln!("SKIP: ssh binary not found");
+        return;
+    }
+
+    let storage_root = temp_storage_root();
+    let db_name = format!(
+        "githearth_tssh_e2e_{}",
+        Uuid::new_v4().to_string().replace('-', "_")
+    );
+    let database_url = fresh_database(&db_name).await;
+    let key_dir = temp_dir("ssh-key-e2e");
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    let host_key = storage_root.join("ssh_host_key");
+    ssh::generate_host_key(&host_key).unwrap();
+    let client_key = key_dir.join("id_ed25519");
+    ssh_keygen_generate(&client_key);
+
+    let config = Config {
+        database_url: database_url.clone(),
+        storage_root: storage_root.clone(),
+        ssh_enabled: true,
+        hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
+        ssh_bind: "127.0.0.1:0".parse().unwrap(),
+        ssh_host_key_path: host_key,
+        git_timeout_seconds: 120,
+        ..Config::default()
+    };
+
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+
+    // An account with a real password so the session API can log in.
+    let account_id = fixture_account(&pool, "sshe2e").await;
+    let password_hash = githearth_server::hash_password("correct horse battery staple").unwrap();
+    sqlx::query("UPDATE accounts SET password_hash = $1 WHERE id = $2")
+        .bind(password_hash)
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (org_id, org_slug) = fixture_organization(&pool, account_id).await;
+    let repo_id = create_active_repo(&pool, org_id, "testrepo", account_id).await;
+
+    let repo_path = githearth_git::layout::Storage::open(&storage_root)
+        .unwrap()
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha1,
+        )
+        .unwrap();
+
+    let work_dir = temp_dir("ssh-e2e-w");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    git_ok(git_cmd(&["init", &work_dir.to_string_lossy()])).await;
+    std::fs::write(work_dir.join("README.md"), "# test\n").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        &work_dir.to_string_lossy(),
+        "add",
+        "README.md",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        &work_dir.to_string_lossy(),
+        "commit",
+        "-m",
+        "init",
+    ]))
+    .await;
+    seed_bare(&repo_path.to_string_lossy(), &work_dir.to_string_lossy()).await;
+
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let app = router(state.clone());
+
+    let session = ssh_login(&app, "sshe2e", "correct horse battery staple").await;
+    let key_id = ssh_register_key(&app, &session, &client_key).await;
+
+    let (_ssh_handle, port_rx) = ssh::spawn(state.clone(), ssh_keys::authenticator(pool.clone()));
+    let ssh_port = port_rx.await.unwrap().port();
+
+    let ssh_cmd_env = git_ssh_key_env(&client_key, ssh_port);
+    let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{org_slug}/testrepo.git");
+    let clone_dir = temp_dir("ssh-e2e-clone");
+    let _ = std::fs::remove_dir_all(&clone_dir);
+    let mut cmd = git_cmd(&["clone", &ssh_url, &clone_dir.to_string_lossy()]);
+    cmd.env("GIT_SSH_COMMAND", &ssh_cmd_env);
+    git_ok(cmd).await;
+    assert!(clone_dir.join("README.md").exists());
+
+    // Revoke through the API, then a fresh clone must fail authentication.
+    use axum::body::Body;
+    use tower::ServiceExt;
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::delete(format!("/api/v1/user/ssh-keys/{key_id}"))
+                .header("authorization", format!("Bearer {session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+
+    let clone2_dir = temp_dir("ssh-e2e-clone2");
+    let _ = std::fs::remove_dir_all(&clone2_dir);
+    let mut cmd = git_cmd(&["clone", &ssh_url, &clone2_dir.to_string_lossy()]);
+    cmd.env("GIT_SSH_COMMAND", &ssh_cmd_env);
+    let out = git_run(cmd).await;
+    assert!(!out.status.success(), "clone must fail after revocation");
+
+    let _ = std::fs::remove_dir_all(&clone_dir);
+    let _ = std::fs::remove_dir_all(&clone2_dir);
+    let _ = std::fs::remove_dir_all(&storage_root);
+    pool.close().await;
 }
