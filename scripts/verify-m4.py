@@ -177,7 +177,8 @@ class M4Harness(_m2.Harness):
 
     def _ssh_key_env(self, key_path):
         return (
-            f"ssh -i {key_path} -p {self.ssh_port} "
+            # No -p: it would override the port in each ssh:// URL (every server has its own).
+            f"ssh -i {key_path} "
             f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
             f"-o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR")
 
@@ -584,7 +585,7 @@ class M4Harness(_m2.Harness):
 
         p = subprocess.run([self.cli_binary, "check", str(ns)], capture_output=True, text=True)
         if p.returncode != 0:
-            print(f"    githearth check exited {p.returncode} ({p.stderr[:200]})")
+            raise HarnessError(f"restore: githearth check exited {p.returncode}: {p.stderr[:300]}")
 
         self.generate_ssh_host_key()
         self.start_server(RESTORE_DB, ns, "restored")
