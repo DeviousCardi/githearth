@@ -11,7 +11,9 @@ githearth-server doctor --config /path/to/config.toml
 ```
 
 An invalid configuration file makes the command exit 1 with the validation error
-before any check runs. The checks below are only reached when the configuration
+before any check runs. One such error: `storage_root` must be short enough (at most
+84 bytes) for the hook socket `<storage_root>/run/hook-XXXXXXXX.sock` to fit the
+107-byte Unix socket path limit. The checks below are only reached when the configuration
 is valid.
 
 This runs seven read-only checks:
