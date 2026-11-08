@@ -40,6 +40,15 @@ def _load_m2():
     return mod
 
 _m2 = _load_m2()
+
+# s2: (actor, repository state, operation) -> allowed. Anything absent is denied
+# (the non-member and the suspended account are denied everywhere).
+EXPECTED_ACCESS = {
+    ("owner", "active", "clone"): True, ("owner", "active", "push"): True,
+    ("owner", "archived", "clone"): True, ("owner", "archived", "push"): False,
+    ("reader", "active", "clone"): True, ("reader", "active", "push"): False,
+    ("reader", "archived", "clone"): True, ("reader", "archived", "push"): False,
+}
 HarnessError = _m2.HarnessError
 
 
@@ -436,6 +445,13 @@ class M4Harness(_m2.Harness):
                     sr_norm = "ALLOWED" if "ALLOWED" in sr else "DENIED"
                     if hr_norm != sr_norm:
                         raise HarnessError(f"{an}/{state}/{op}: HTTP={hr} SSH={sr} DISAGREE")
+                    # Agreement is not enough: both transports must give the right answer.
+                    want = "ALLOWED" if EXPECTED_ACCESS.get((an, state, op), False) else "DENIED"
+                    if hr_norm != want:
+                        raise HarnessError(f"{an}/{state}/{op}: expected {want}, HTTP={hr} SSH={sr}")
+                    # A non-member must not learn that the repository exists.
+                    if an == "nonmember" and not (hr == sr == "DENIED (not-found)"):
+                        raise HarnessError(f"nonmember/{state}/{op}: expected not-found, HTTP={hr} SSH={sr}")
                     self.auth_matrix.append(
                         {"actor": an, "repo_state": state, "operation": op,
                          "http_result": hr, "ssh_result": sr, "agree": hr_norm == sr_norm})
@@ -474,6 +490,15 @@ class M4Harness(_m2.Harness):
         if st != 200: raise HarnessError(f"unarchive status {st}")
 
     # ================================================================== S3
+    def _ls_remote(self, url, env):
+        """Remote refs; fails unless ls-remote works and lists main, so an absent ref proves something."""
+        out = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", url],
+            env=env, capture_output=True, text=True, timeout=120)
+        if out.returncode != 0 or "refs/heads/main" not in out.stdout:
+            raise HarnessError(f"ls-remote {url} failed or lacks main: rc={out.returncode} {out.stderr[:200]}")
+        return out.stdout
+
     def s3_quota(self):
         self.stop_server()
         self.generate_ssh_host_key()
@@ -539,10 +564,7 @@ class M4Harness(_m2.Harness):
             env=penv, capture_output=True, text=True, timeout=120)
         if p.returncode == 0:
             raise HarnessError("quota: HTTP push above limit should be refused")
-        out = subprocess.run(
-            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", qurl],
-            env=penv, capture_output=True, text=True)
-        if "refs/heads/quota-test" in out.stdout:
+        if "refs/heads/quota-test" in self._ls_remote(qurl, penv):
             raise HarnessError("quota: ref moved despite HTTP push refusal")
 
         # SSH
@@ -552,10 +574,9 @@ class M4Harness(_m2.Harness):
             capture_output=True, text=True, timeout=120)
         if ssp.returncode == 0:
             raise HarnessError("quota: SSH push above limit should be refused")
-        out = subprocess.run(
-            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", qurl],
-            env=penv, capture_output=True, text=True)
-        if "refs/heads/quota-ssh" in out.stdout:
+        if any(m in ssp.stderr for m in ("Connection refused", "Permission denied (publickey")):
+            raise HarnessError(f"quota: SSH push never reached the server: {ssp.stderr[:300]}")
+        if "refs/heads/quota-ssh" in self._ls_remote(qurl, penv):
             raise HarnessError("quota: ref moved despite SSH push refusal")
 
         shutil.rmtree(str(qw), ignore_errors=True)
