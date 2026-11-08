@@ -223,12 +223,26 @@ impl Config {
         if self.storage_root.as_os_str().is_empty() {
             bail!("storage_root must not be empty");
         }
+        // The hook admission socket is <storage_root>/run/hook-XXXXXXXX.sock, and a
+        // Unix socket path must fit sun_path (108 bytes with its NUL on Linux).
+        let socket_len = self.storage_root.as_os_str().len() + HOOK_SOCKET_SUFFIX_LEN;
+        if socket_len > MAX_SOCKET_PATH_LEN {
+            bail!(
+                "storage_root is too long: the hook socket path would be {socket_len} bytes, \
+                 the Unix limit is {MAX_SOCKET_PATH_LEN}; use a shorter storage_root"
+            );
+        }
         if self.ssh_enabled && self.ssh_host_key_path.as_os_str().is_empty() {
             bail!("ssh_host_key_path must be set when ssh_enabled is true");
         }
         Ok(())
     }
 }
+
+/// Length of `/run/hook-XXXXXXXX.sock` appended to the storage root.
+const HOOK_SOCKET_SUFFIX_LEN: usize = "/run/hook-00000000.sock".len();
+/// Longest Unix socket path: `sun_path` is 108 bytes including the NUL.
+const MAX_SOCKET_PATH_LEN: usize = 107;
 
 #[cfg(test)]
 mod tests {
@@ -270,6 +284,20 @@ mod tests {
         assert!(c.validate().is_ok());
         c.database_max_connections = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn storage_root_must_leave_room_for_the_hook_socket() {
+        let fits = "/".to_owned() + &"a".repeat(MAX_SOCKET_PATH_LEN - HOOK_SOCKET_SUFFIX_LEN - 1);
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            storage_root: PathBuf::from(&fits),
+            ..Config::default()
+        };
+        assert!(c.validate().is_ok(), "a root that just fits is accepted");
+        c.storage_root = PathBuf::from(fits + "a");
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("storage_root is too long"), "{error}");
     }
 
     #[test]
