@@ -21,7 +21,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, browse, event, idempotency, invalid,
+    ApiError, AppState, authenticate, browse, event, event_with, facts, idempotency, invalid,
     issues::{allocate_number, not_active, require_readable_repo},
     repositories,
     repository_api::{self, Loaded},
@@ -44,6 +44,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/reviews",
             axum::routing::post(create_review).get(list_reviews),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/requested_reviewers",
+            axum::routing::post(add_review_request).get(list_review_requests),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/requested_reviewers/{username}",
+            axum::routing::delete(remove_review_request),
         )
 }
 
@@ -1067,6 +1075,15 @@ pub(crate) async fn create_pull_review(
             .bind(&input.body)
             .fetch_one(&mut *tx)
             .await?;
+            // Any verdict satisfies a pending review request for this reviewer.
+            sqlx::query(
+                "DELETE FROM pull_request_review_requests \
+                 WHERE pull_request_id = $1 AND reviewer_id = $2",
+            )
+            .bind(pull.id)
+            .bind(actor_id)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query("UPDATE pull_requests SET updated_at = now() WHERE id = $1")
                 .bind(pull.id)
                 .execute(&mut *tx)
@@ -1140,6 +1157,257 @@ pub(crate) async fn list_pull_reviews(
     .fetch_all(&mut *conn)
     .await?;
     Ok(page(rows, limit, |r| r.seq))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewReviewRequest {
+    reviewer: String,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ReviewRequestJson {
+    reviewer_id: Uuid,
+    username: String,
+    requested_by: Option<Uuid>,
+    created_at: String,
+}
+
+const REVIEW_REQUEST_COLUMNS: &str = "rr.reviewer_id, a.username, rr.requested_by, \
+ to_char(rr.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at";
+
+/// The current requested reviewers, oldest first.
+async fn list_review_requests_query(
+    conn: &mut PgConnection,
+    pull_id: Uuid,
+) -> Result<Vec<ReviewRequestJson>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {REVIEW_REQUEST_COLUMNS} FROM pull_request_review_requests rr \
+         JOIN accounts a ON a.id = rr.reviewer_id \
+         WHERE rr.pull_request_id = $1 ORDER BY rr.created_at"
+    ))
+    .bind(pull_id)
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// Whether `facts` allow `action` on the pull request built exactly as
+/// `require_pull` builds it. `None` facts mean the account is not resolvable in
+/// the organization, so it is not allowed.
+fn reviewer_allowed(
+    action: Action,
+    state: &AppState,
+    loaded: &Loaded,
+    pull: &PullJson,
+    facts: Option<&facts::Facts>,
+) -> bool {
+    let Some(facts) = facts else {
+        return false;
+    };
+    let authz_repo = repositories::authz_repository(&loaded.repo);
+    let entity = PullRequest {
+        id: pull.id,
+        repository: loaded.repo.id,
+        author: pull.author_id,
+        target: Ref {
+            repository: loaded.repo.id,
+            name: format!("refs/heads/{}", pull.target_branch),
+            protection: None,
+            exists: true,
+        },
+    };
+    state
+        .authz
+        .authorize(&facts.request(action, Resource::PullRequest(&authz_repo, &entity), None))
+        .is_allowed()
+}
+
+async fn list_review_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
+) -> Result<Json<Vec<ReviewRequestJson>>, ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let loaded =
+        repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    // Read access alone suffices, matching list_reviews.
+    require_readable_repo(&loaded)?;
+    let pull = load_pull(&state, &loaded, number, Action::PullRequestRead).await?;
+    let mut conn = state.pool.acquire().await?;
+    Ok(Json(list_review_requests_query(&mut conn, pull.id).await?))
+}
+
+/// Permission shared by POST and DELETE: the caller must be allowed
+/// `PullRequestComment` on the pull, and be either the author or allowed
+/// `PullRequestApprove`.
+fn require_request_permission(
+    state: &AppState,
+    loaded: &Loaded,
+    pull: &PullJson,
+) -> Result<(), ApiError> {
+    require_pull(state, loaded, pull, Action::PullRequestComment)?;
+    let is_author = loaded.actor_id == pull.author_id;
+    // Approve is a routine action, so the auth age does not change the decision.
+    let can_approve = reviewer_allowed(
+        Action::PullRequestApprove,
+        state,
+        loaded,
+        pull,
+        Some(&loaded.facts),
+    );
+    if !is_author && !can_approve {
+        return Err(ApiError(StatusCode::FORBIDDEN, "not permitted"));
+    }
+    Ok(())
+}
+
+async fn add_review_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
+    body: Bytes,
+) -> Result<Json<Vec<ReviewRequestJson>>, ApiError> {
+    let input: NewReviewRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+
+    let loaded =
+        repository_api::load_current(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    let pull = load_pull(&state, &loaded, number, Action::PullRequestComment).await?;
+    require_request_permission(&state, &loaded, &pull)?;
+    if loaded.repo.status != RepositoryStatus::Active {
+        return Err(not_active());
+    }
+    if pull.state != "open" {
+        return Err(not_open());
+    }
+
+    // Resolve the reviewer by username.
+    let mut conn = state.pool.acquire().await?;
+    let reviewer_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+            .bind(&input.reviewer)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(reviewer_id) = reviewer_id else {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reviewer not found",
+        ));
+    };
+    if reviewer_id == pull.author_id {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the author cannot review their own pull request",
+        ));
+    }
+    drop(conn);
+
+    let mut conn = state.pool.acquire().await?;
+    let reviewer_facts = facts::load(&mut conn, reviewer_id, loaded.org_id).await?;
+    drop(conn);
+    if !reviewer_allowed(
+        Action::PullRequestApprove,
+        &state,
+        &loaded,
+        &pull,
+        reviewer_facts.as_ref(),
+    ) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reviewer cannot approve this pull request",
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
+        return Err(not_active());
+    }
+    require_open(&mut tx, pull.id).await?;
+
+    let request_id = Uuid::new_v4();
+    let inserted = sqlx::query(
+        "INSERT INTO pull_request_review_requests (pull_request_id, reviewer_id, requested_by) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(pull.id)
+    .bind(reviewer_id)
+    .bind(actor.id)
+    .execute(&mut *tx)
+    .await?;
+
+    if inserted.rows_affected() > 0 {
+        event_with(
+            &mut tx,
+            Some(loaded.org_id),
+            actor.id,
+            "pull_request.review_requested",
+            serde_json::json!({ "pull_request_id": pull.id, "reviewer_id": reviewer_id }),
+        )
+        .await?;
+        crate::jobs::enqueue(
+            &mut tx,
+            Some(loaded.org_id),
+            "notification.pull_request_review_requested",
+            serde_json::json!({
+                "request_id": request_id,
+                "pull_request_id": pull.id,
+                "reviewer_id": reviewer_id,
+                "requested_by": actor.id,
+            }),
+            &request_id.to_string(),
+            None,
+        )
+        .await?;
+    }
+
+    let list = list_review_requests_query(&mut tx, pull.id).await?;
+    tx.commit().await?;
+    Ok(Json(list))
+}
+
+async fn remove_review_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, repo_name, number, username)): Path<(String, String, i32, String)>,
+) -> Result<StatusCode, ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+
+    let loaded =
+        repository_api::load_current(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    let pull = load_pull(&state, &loaded, number, Action::PullRequestComment).await?;
+    require_request_permission(&state, &loaded, &pull)?;
+
+    let mut tx = state.pool.begin().await?;
+    let reviewer_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+            .bind(&username)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(reviewer_id) = reviewer_id else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "review request not found"));
+    };
+
+    let deleted = sqlx::query(
+        "DELETE FROM pull_request_review_requests WHERE pull_request_id = $1 AND reviewer_id = $2",
+    )
+    .bind(pull.id)
+    .bind(reviewer_id)
+    .execute(&mut *tx)
+    .await?;
+    if deleted.rows_affected() == 0 {
+        return Err(ApiError(StatusCode::NOT_FOUND, "review request not found"));
+    }
+
+    event_with(
+        &mut tx,
+        Some(loaded.org_id),
+        actor.id,
+        "pull_request.review_request_removed",
+        serde_json::json!({ "pull_request_id": pull.id, "reviewer_id": reviewer_id }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
