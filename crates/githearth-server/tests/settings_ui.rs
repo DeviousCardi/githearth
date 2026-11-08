@@ -337,6 +337,49 @@ async fn creating_a_token_shows_its_plaintext_exactly_once() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn double_submitting_the_same_token_form_creates_one_token() {
+    let f = fixture().await;
+
+    let (_, page) = get(&f.app, "/settings", Some(&f.cookie)).await;
+    let csrf = csrf(&page);
+    let key = key(&page);
+    let form = [
+        ("csrf_token", csrf.as_str()),
+        ("idempotency_key", key.as_str()),
+        ("name", "dedupe token"),
+        ("scope_read", "repo:read"),
+    ];
+
+    let (status, _, body) = post_form(&f.app, "/settings/tokens", &f.cookie, &form).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Copy it now; it won't be shown again."),
+        "{body}"
+    );
+    assert!(body.contains("gth_"), "{body}");
+
+    let (status, _, body) = post_form(&f.app, "/settings/tokens", &f.cookie, &form).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(
+            "This token was already created. Its value was shown once and cannot be shown again."
+        ),
+        "{body}"
+    );
+    assert!(!body.contains("gth_"), "{body}");
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM access_tokens WHERE account_id = $1")
+        .bind(f.account_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn a_bad_token_name_or_scope_re_renders_with_a_notice() {
     let f = fixture().await;
 

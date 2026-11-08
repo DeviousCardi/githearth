@@ -100,21 +100,29 @@ async fn create(
         &input.name,
         &input.scopes,
         input.expires_in_days,
+        None,
     )
     .await?;
+    let created = created.ok_or(ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal error",
+    ))?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
 /// Shared by the JSON handler and the settings page's "Create token" form.
 /// Validation stays here: a bad name, scope set or expiry fails both callers
-/// identically. Returns the plaintext exactly once.
+/// identically. Returns the plaintext exactly once. A non-`None` idempotency
+/// key makes creation safe against replays: a replayed key returns `Ok(None)`
+/// with no new row, no `token.created` event and no plaintext.
 pub(crate) async fn create_token(
     state: &AppState,
     account_id: Uuid,
     name: &str,
     scopes: &[String],
     expires_in_days: Option<i64>,
-) -> ApiResult<CreatedToken> {
+    idempotency_key: Option<&str>,
+) -> ApiResult<Option<CreatedToken>> {
     if !name_ok(name) || !scope_ok(scopes) {
         return Err(invalid());
     }
@@ -131,10 +139,11 @@ pub(crate) async fn create_token(
     let id = Uuid::new_v4();
 
     let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO access_tokens (id, account_id, name, token_hash, scopes, expires_at) \
+    let inserted = sqlx::query(
+        "INSERT INTO access_tokens (id, account_id, name, token_hash, scopes, expires_at, idempotency_key) \
          VALUES ($1, $2, $3, $4, $5, CASE WHEN $6::bigint IS NULL THEN NULL \
-         ELSE clock_timestamp() + $6 * interval '1 day' END)",
+         ELSE clock_timestamp() + $6 * interval '1 day' END, $7) \
+         ON CONFLICT (account_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING",
     )
     .bind(id)
     .bind(account_id)
@@ -142,8 +151,13 @@ pub(crate) async fn create_token(
     .bind(token_hash)
     .bind(scopes)
     .bind(expires_in_days)
+    .bind(idempotency_key)
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() == 0 {
+        tx.commit().await?;
+        return Ok(None);
+    }
     event_with(
         &mut tx,
         None,
@@ -160,14 +174,14 @@ pub(crate) async fn create_token(
     .await?;
     tx.commit().await?;
 
-    Ok(CreatedToken {
+    Ok(Some(CreatedToken {
         id,
         name: name.to_owned(),
         scopes: scopes.to_vec(),
         created_at: row.get("created_at"),
         expires_at: row.get("expires_at"),
         token: plaintext,
-    })
+    }))
 }
 
 async fn list(

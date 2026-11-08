@@ -405,8 +405,17 @@ async fn create_token_submit(
             .await;
         }
     };
-    match tokens::create_token(&state, s.account.id, &form.name, &form.scopes(), expiry).await {
-        Ok(created) => {
+    match tokens::create_token(
+        &state,
+        s.account.id,
+        &form.name,
+        &form.scopes(),
+        expiry,
+        Some(key),
+    )
+    .await
+    {
+        Ok(Some(created)) => {
             let notice = "Token created.";
             return render_page(
                 &state,
@@ -414,6 +423,26 @@ async fn create_token_submit(
                 StatusCode::OK,
                 Some(notice),
                 Some(&created.token),
+                TokenDraft {
+                    name: "",
+                    repo_read: true,
+                    repo_write: false,
+                    expiry: "",
+                    key: &new_key(),
+                    error: None,
+                },
+                empty_key_draft(),
+            )
+            .await;
+        }
+        Ok(None) => {
+            let notice = "This token was already created. Its value was shown once and cannot be shown again.";
+            return render_page(
+                &state,
+                &s,
+                StatusCode::OK,
+                Some(notice),
+                None,
                 TokenDraft {
                     name: "",
                     repo_read: true,
