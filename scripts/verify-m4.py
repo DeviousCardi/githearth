@@ -834,6 +834,491 @@ class M4Harness(_m2.Harness):
         if "fail jobs" in (p.stdout + p.stderr).lower():
             raise HarnessError("doctor jobs check shows failure")
 
+    # ================================================================== S7
+    def s7_container_install(self):
+        self.stop_server()
+        # Build the Docker image
+        img = "githearth-m4-test:" + uuid.uuid4().hex[:8]
+        subprocess.run(
+            ["docker", "build", "-t", img, "-f", str(ROOT / "Dockerfile"), str(ROOT)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+
+        net = "githearth-m4-net-" + uuid.uuid4().hex[:8]
+        self._s7_net = net
+        subprocess.run(["docker", "network", "create", net], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        pg_name = "githearth-m4-pg-" + uuid.uuid4().hex[:8]
+        vol_name = "githearth-m4-repos-" + uuid.uuid4().hex[:8]
+        self._s7_pg = pg_name
+        self._s7_vol = vol_name
+        self._s7_img = img
+
+        subprocess.run([
+            "docker", "run", "--detach", "--rm", "--name", pg_name,
+            "--network", net,
+            "-e", "POSTGRES_DB=githearth",
+            "-e", "POSTGRES_USER=githearth",
+            "-e", "POSTGRES_PASSWORD=" + self.db_password,
+            IMAGE,
+        ], check=True, stdout=subprocess.DEVNULL)
+        for _ in range(120):
+            if subprocess.run(
+                ["docker", "exec", pg_name, "pg_isready", "-h", "127.0.0.1",
+                 "-U", "githearth", "-d", "githearth"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0:
+                break
+            time.sleep(0.5)
+        else:
+            raise HarnessError("s7 postgres startup timed out")
+
+        db_url = "postgres://githearth:" + self.db_password + "@" + pg_name + ":5432/githearth"
+        # migrate
+        subprocess.run([
+            "docker", "run", "--rm", "--network", net,
+            "-v", vol_name + ":/var/lib/githearth",
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            img, "migrate",
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+
+        # bootstrap-admin
+        subprocess.run([
+            "docker", "run", "--rm", "--network", net, "-i",
+            "-v", vol_name + ":/var/lib/githearth",
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            img, "bootstrap-admin", "--username", self.admin_username,
+        ], input=self.admin_password, text=True, check=True,
+           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+        # The server's own ssh-keygen; the image sets GITHEARTH_SSH_HOST_KEY_PATH.
+        subprocess.run([
+            "docker", "run", "--rm",
+            "-v", vol_name + ":/var/lib/githearth",
+            # Config validation needs a database URL even though ssh-keygen never connects.
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            img, "ssh-keygen",
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+        # serve in background
+        hp = self.free_port()
+        sp = self.free_port()
+        srv_name = "githearth-m4-srv-" + uuid.uuid4().hex[:8]
+        self._s7_srv = srv_name
+        subprocess.run([
+            "docker", "run", "--detach", "--name", srv_name,  # no --rm: keep logs for failures
+            "--network", net,
+            "-v", vol_name + ":/var/lib/githearth",
+            "-p", f"127.0.0.1:{hp}:8080",
+            "-p", f"127.0.0.1:{sp}:2222",
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            "-e", "GITHEARTH_SSH_ENABLED=true",
+            "-e", "GITHEARTH_SSH_HOST_KEY_PATH=/var/lib/githearth/ssh_host_key",
+            "-e", "GITHEARTH_BIND=0.0.0.0:8080",
+            "-e", "GITHEARTH_SSH_BIND=0.0.0.0:2222",
+            "-e", "GITHEARTH_SECURE_COOKIES=false",
+            img, "serve",
+        ], check=True, stdout=subprocess.DEVNULL, timeout=30)
+
+        base = f"http://127.0.0.1:{hp}"
+        # Wait ready
+        for _ in range(300):
+            try:
+                st, _ = self.api_json("GET", "/health/ready", base=base)
+                if st == 200:
+                    break
+            except (OSError, urllib.error.URLError):
+                pass
+            if subprocess.run(
+                ["docker", "inspect", srv_name, "--format", "{{.State.Status}}"],
+                capture_output=True, text=True
+            ).stdout.strip() != "running":
+                raise HarnessError("s7 server stopped during startup")
+            time.sleep(0.1)
+        else:
+            raise HarnessError("s7 server readiness timed out")
+
+        # Wait for SSH to be reachable
+        for _ in range(100):
+            try:
+                s = socket.create_connection(("127.0.0.1", sp), timeout=1)
+                s.close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise HarnessError(f"s7 SSH port {sp} never became reachable")
+
+        # login, create org, create private repo
+        tok = self.api_session(self.admin_username, self.admin_password, base=base)
+        st, org = self.api_json(
+            "POST", "/api/v1/organizations",
+            {"slug": "s7-org", "name": "S7 Org"}, token=tok, base=base)
+        if st != 201:
+            raise HarnessError(f"s7 create org status {st}")
+        org_slug = org["slug"]
+        st, repo = self.api_json(
+            "POST", f"/api/v1/organizations/{org_slug}/repositories",
+            {"name": "s7-repo", "visibility": "private"}, token=tok, base=base)
+        if st != 201:
+            raise HarnessError(f"s7 create repo status {st}")
+        repo_name = repo["name"]
+        http_url = f"http://127.0.0.1:{hp}/{org_slug}/{repo_name}.git"
+
+        # Push over HTTP
+        w = self.tmp / "s7-work"; w.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(w),
+                       env=self.git_env(), capture_output=True, check=True)
+        (w / "README.md").write_text("# S7\n")
+        subprocess.run(["git", "-C", str(w), "config", "user.name", "S7"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "config", "user.email", "s7@t"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "commit", "-m", "init"], capture_output=True)
+        penv = self.git_env(self.admin_username, self.admin_password)
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}",
+             "-C", str(w), "push", http_url, "main"],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+
+        # Register SSH key
+        skey = self.tmp / "s7_ssh_key"
+        _, spub = self.ssh_keygen(skey)
+        self.api_register_ssh_key(tok, spub, base=base)
+
+        # Push over SSH
+        s7_ssh = f"ssh://git@127.0.0.1:{sp}/{org_slug}/{repo_name}.git"
+        subprocess.run(["git", "-C", str(w), "-c", "user.name=S7", "-c", "user.email=s7@t",
+                         "commit", "--allow-empty", "-m", "ssh"], capture_output=True)
+        ssh_e = self.ssh_git_env(skey)
+        sproc = subprocess.run(
+            ["git", "-C", str(w), "push", s7_ssh, "main"],
+            env=ssh_e, capture_output=True, text=True, timeout=120)
+        if sproc.returncode != 0:
+            raise HarnessError(f"s7 SSH push failed: {sproc.stderr.strip()[:400]}\n"
+                               + _container_tail(srv_name))
+
+        # Clone over HTTP
+        ch = self.tmp / "s7-clone-http"; ch.mkdir()
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "clone", http_url, str(ch)],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+        http_refs = subprocess.run(
+            ["git", "-C", str(ch), "show-ref", "--heads"],
+            capture_output=True, text=True, check=True).stdout.strip()
+
+        # Clone over SSH
+        cs = self.tmp / "s7-clone-ssh"; cs.mkdir()
+        subprocess.run(
+            ["git", "clone", s7_ssh, str(cs)],
+            env=ssh_e, capture_output=True, text=True, check=True, timeout=120)
+        ssh_refs = subprocess.run(
+            ["git", "-C", str(cs), "show-ref", "--heads"],
+            capture_output=True, text=True, check=True).stdout.strip()
+
+        if http_refs != ssh_refs:
+            raise HarnessError(f"s7: HTTP and SSH refs differ\nHTTP:{http_refs}\nSSH:{ssh_refs}")
+
+        # doctor inside container
+        p = subprocess.run(
+            ["docker", "exec", "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+             srv_name, "githearth-server", "doctor"],
+            capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            raise HarnessError(f"s7: doctor exited {p.returncode}: {(p.stdout+p.stderr)[:300]}")
+
+        # Restart
+        subprocess.run(["docker", "stop", srv_name], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        subprocess.run(["docker", "rm", "--volumes", srv_name], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+        srv_name2 = "githearth-m4-srv2-" + uuid.uuid4().hex[:8]
+        self._s7_srv2 = srv_name2
+        subprocess.run([
+            "docker", "run", "--detach", "--rm", "--name", srv_name2,
+            "--network", net,
+            "-v", vol_name + ":/var/lib/githearth",
+            "-p", f"127.0.0.1:{hp}:8080",
+            "-p", f"127.0.0.1:{sp}:2222",
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            "-e", "GITHEARTH_SSH_ENABLED=true",
+            "-e", "GITHEARTH_SSH_HOST_KEY_PATH=/var/lib/githearth/ssh_host_key",
+            "-e", "GITHEARTH_BIND=0.0.0.0:8080",
+            "-e", "GITHEARTH_SSH_BIND=0.0.0.0:2222",
+            "-e", "GITHEARTH_SECURE_COOKIES=false",
+            img, "serve",
+        ], check=True, stdout=subprocess.DEVNULL, timeout=30)
+
+        # Wait ready
+        base2 = f"http://127.0.0.1:{hp}"
+        for _ in range(300):
+            try:
+                st, _ = self.api_json("GET", "/health/ready", base=base2)
+                if st == 200:
+                    break
+            except (OSError, urllib.error.URLError):
+                pass
+            time.sleep(0.1)
+        else:
+            raise HarnessError("s7 restarted server readiness timed out")
+
+        # Clone after restart still works
+        cr = self.tmp / "s7-clone-restart"; cr.mkdir()
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "clone", http_url, str(cr)],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+        rest_refs = subprocess.run(
+            ["git", "-C", str(cr), "show-ref", "--heads"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        if rest_refs != http_refs:
+            raise HarnessError("s7: restart clone refs mismatch")
+
+        shutil.rmtree(str(w), ignore_errors=True)
+        shutil.rmtree(str(ch), ignore_errors=True)
+        shutil.rmtree(str(cs), ignore_errors=True)
+        shutil.rmtree(str(cr), ignore_errors=True)
+
+    # ================================================================== S8
+    def s8_disk_full(self):
+        self.stop_server()
+        img = getattr(self, "_s7_img", None)
+        if not img:
+            img = "githearth-m4-test:" + uuid.uuid4().hex[:8]
+            subprocess.run(
+                ["docker", "build", "-t", img, "-f", str(ROOT / "Dockerfile"), str(ROOT)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+            self._s7_img = img
+
+        pg_name = "githearth-m4-pgdf-" + uuid.uuid4().hex[:8]
+        srv_name = "githearth-m4-srvdf-" + uuid.uuid4().hex[:8]
+        vol_name = "githearth-m4-dfvol-" + uuid.uuid4().hex[:8]
+        self._s8_pg = pg_name
+        self._s8_srv = srv_name
+        self._s8_vol = vol_name
+
+        net = getattr(self, "_s7_net", None)
+        if net is None:
+            net = "githearth-m4-net-" + uuid.uuid4().hex[:8]
+            subprocess.run(["docker", "network", "create", net], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._s8_net = net
+        else:
+            self._s8_net = None
+
+        subprocess.run([
+            "docker", "run", "--detach", "--rm", "--name", pg_name,
+            "--network", net,
+            "-e", "POSTGRES_DB=githearth",
+            "-e", "POSTGRES_USER=githearth",
+            "-e", "POSTGRES_PASSWORD=" + self.db_password,
+            IMAGE,
+        ], check=True, stdout=subprocess.DEVNULL)
+        for _ in range(120):
+            if subprocess.run(
+                ["docker", "exec", pg_name, "pg_isready", "-h", "127.0.0.1",
+                 "-U", "githearth", "-d", "githearth"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0:
+                break
+            time.sleep(0.5)
+        else:
+            raise HarnessError("s8 postgres startup timed out")
+
+        hp = self.free_port()
+        sp = self.free_port()
+        db_url = "postgres://githearth:" + self.db_password + "@" + pg_name + ":5432/githearth"
+
+        # migrate and bootstrap-admin need only the database. Storage is a small tmpfs
+        # inside the server container: never fill a docker volume, which lives on the host disk.
+        subprocess.run([
+            "docker", "run", "--rm", "--network", net,
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            img, "migrate",
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        subprocess.run([
+            "docker", "run", "--rm", "--network", net, "-i",
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            img, "bootstrap-admin", "--username", self.admin_username,
+        ], input=self.admin_password, text=True,
+           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        # Start serve
+        subprocess.run([
+            "docker", "run", "--detach", "--rm", "--name", srv_name,
+            "--network", net,
+            "--tmpfs", "/var/lib/githearth:size=32m,uid=10001,gid=10001,mode=0700",
+            "--entrypoint", "sh",
+            "-p", f"127.0.0.1:{hp}:8080",
+            "-p", f"127.0.0.1:{sp}:2222",
+            "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+            "-e", "GITHEARTH_SSH_ENABLED=true",
+            "-e", "GITHEARTH_BIND=0.0.0.0:8080",
+            "-e", "GITHEARTH_SSH_BIND=0.0.0.0:2222",
+            "-e", "GITHEARTH_RECONCILE_INTERVAL_SECONDS=5",
+            "-e", "GITHEARTH_RECONCILE_GRACE_SECONDS=30",
+            "-e", "GITHEARTH_SECURE_COOKIES=false",
+            img, "-c", "githearth-server ssh-keygen && exec githearth-server serve",
+        ], check=True, stdout=subprocess.DEVNULL, timeout=30)
+
+        base = f"http://127.0.0.1:{hp}"
+        for _ in range(300):
+            try:
+                st, _ = self.api_json("GET", "/health/ready", base=base)
+                if st == 200:
+                    break
+            except (OSError, urllib.error.URLError):
+                pass
+            time.sleep(0.1)
+        else:
+            raise HarnessError("s8 server readiness timed out")
+
+        tok = self.api_session(self.admin_username, self.admin_password, base=base)
+        st, org = self.api_json(
+            "POST", "/api/v1/organizations",
+            {"slug": "s8-org", "name": "S8 Org"}, token=tok, base=base)
+        if st != 201:
+            raise HarnessError(f"s8 create org status {st}")
+        org_slug = org["slug"]
+        st, repo = self.api_json(
+            "POST", f"/api/v1/organizations/{org_slug}/repositories",
+            {"name": "s8-repo", "visibility": "private"}, token=tok, base=base)
+        if st != 201:
+            raise HarnessError(f"s8 create repo status {st}")
+        repo_name = repo["name"]
+        http_url = f"http://127.0.0.1:{hp}/{org_slug}/{repo_name}.git"
+        s8_ssh = f"ssh://git@127.0.0.1:{sp}/{org_slug}/{repo_name}.git"
+
+        # Register SSH key
+        skey = self.tmp / "s8_ssh_key"
+        _, spub = self.ssh_keygen(skey)
+        self.api_register_ssh_key(tok, spub, base=base)
+
+        # Seed push over HTTP
+        w = self.tmp / "s8-work"; w.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(w),
+                       env=self.git_env(), capture_output=True, check=True)
+        (w / "seed.txt").write_text("s8\n")
+        subprocess.run(["git", "-C", str(w), "config", "user.name", "S8"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "config", "user.email", "s8@t"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "commit", "-m", "seed"], capture_output=True)
+        penv = self.git_env(self.admin_username, self.admin_password)
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}",
+             "-C", str(w), "push", http_url, "main"],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+
+        # Remember pre-fill refs
+        pre_ref = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", http_url],
+            env=penv, capture_output=True, text=True, check=True).stdout.strip()
+
+        # Fill the volume to near-full (leave ~100KB free)
+        subprocess.run(
+            ["docker", "exec", srv_name, "sh", "-c",
+             # Guard: refuse to fill anything but the small tmpfs (64 MiB max).
+             "total=$(df --output=size /var/lib/githearth | tail -1); "
+             "[ \"$total\" -le 65536 ] || { echo refusing to fill $total KiB >&2; exit 3; }; "
+             "avail=$(df --output=avail /var/lib/githearth | tail -1); "
+             "target=$((avail > 100 ? avail - 100 : 0)); "
+             "dd if=/dev/zero of=/var/lib/githearth/filler bs=1K count=$target 2>/dev/null"],
+            check=True, capture_output=True, text=True, timeout=300)
+
+        # Push large file over HTTP — must fail
+        data = os.urandom(5 * 1024 * 1024)  # 5 MiB
+        (w / "big.bin").write_bytes(data)
+        subprocess.run(["git", "-C", str(w), "add", "big.bin"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "-c", "user.name=T", "-c", "user.email=t@t",
+                         "commit", "-m", "big disk"], capture_output=True)
+        hp_proc = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}",
+             "-C", str(w), "push", http_url, "HEAD:refs/heads/big-http"],
+            env=penv, capture_output=True, text=True, timeout=120)
+        if hp_proc.returncode == 0:
+            raise HarnessError(f"s8: HTTP push on full disk should fail: rc=0, stderr={hp_proc.stderr[:200]}")
+        post_ref = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", http_url],
+            env=penv, capture_output=True, text=True, check=True).stdout.strip()
+        if pre_ref != post_ref:
+            raise HarnessError("s8: ref moved during HTTP disk-full push")
+
+        # Push large file over SSH — must fail
+        (w / "big2.bin").write_bytes(data)
+        subprocess.run(["git", "-C", str(w), "add", "big2.bin"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "-c", "user.name=T", "-c", "user.email=t@t",
+                         "commit", "-m", "big disk ssh"], capture_output=True)
+        ssh_e = self.ssh_git_env(skey)
+        ss_proc = subprocess.run(
+            ["git", "-C", str(w), "push", s8_ssh, "HEAD:refs/heads/big-ssh"],
+            env=ssh_e, capture_output=True, text=True, timeout=120)
+        if ss_proc.returncode == 0:
+            raise HarnessError("s8: SSH push on full disk should fail")
+        # The refusal must come from the server, not from never reaching it.
+        if any(m in ss_proc.stderr for m in ("Connection refused", "Permission denied (publickey")):
+            raise HarnessError(f"s8: SSH push never reached the server: {ss_proc.stderr[:300]}")
+        post_ref2 = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", http_url],
+            env=penv, capture_output=True, text=True, check=True).stdout.strip()
+        if pre_ref != post_ref2:
+            raise HarnessError("s8: ref moved during SSH disk-full push")
+
+        # Server still alive
+        st, _ = self.api_json("GET", "/health/ready", base=base)
+        if st != 200:
+            raise HarnessError(f"s8: server not healthy after disk full: {st}")
+
+        # doctor reports disk warn/fail
+        p = subprocess.run(
+            ["docker", "exec", "-e", "GITHEARTH_DATABASE_URL=" + db_url,
+             srv_name, "githearth-server", "doctor"],
+            capture_output=True, text=True, timeout=30)
+        out = p.stdout + p.stderr
+        if "ok   disk" in out:
+            raise HarnessError(f"s8: doctor disk check should warn/fail, not ok: {out[:300]}")
+
+        # Integrity check: copy storage out and run CLI check
+        stg = self.tmp / "s8-storage-copy"; stg.mkdir()
+        # docker cp cannot see into a tmpfs mount; stream it out with tar instead.
+        tar_out = subprocess.run(
+            ["docker", "exec", srv_name, "tar", "-C", "/var/lib/githearth", "-cf", "-", "."],
+            check=True, capture_output=True, timeout=60).stdout
+        subprocess.run(["tar", "-C", str(stg), "-xf", "-"], input=tar_out, check=True)
+        p = subprocess.run([self.cli_binary, "check", str(stg)], capture_output=True, text=True)
+        if p.returncode != 0:
+            raise HarnessError(f"s8: githearth check exited {p.returncode}: {p.stderr[:300]}")
+
+        # Delete filler, push succeeds
+        subprocess.run(
+            ["docker", "exec", srv_name, "rm", "/var/lib/githearth/filler"],
+            check=True, capture_output=True, text=True, timeout=10)
+
+        # Small push over HTTP
+        (w / "recovered.txt").write_text("recovered\n")
+        subprocess.run(["git", "-C", str(w), "add", "recovered.txt"], capture_output=True)
+        subprocess.run(["git", "-C", str(w), "-c", "user.name=T", "-c", "user.email=t@t",
+                         "commit", "-m", "recovered"], capture_output=True)
+        r_proc = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}",
+             "-C", str(w), "push", http_url, "HEAD:refs/heads/recovered"],
+            env=penv, capture_output=True, text=True, timeout=120)
+        if r_proc.returncode != 0:
+            raise HarnessError(f"s8: push after filler removal failed: {r_proc.stderr[:300]}")
+
+        # Clone and check refs
+        cf = self.tmp / "s8-clone-final"; cf.mkdir()
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "clone", http_url, str(cf)],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+        # A fresh clone has only main as a local branch; recovered is a remote-tracking ref.
+        final_refs = subprocess.run(
+            ["git", "-C", str(cf), "show-ref"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        if "refs/remotes/origin/recovered" not in final_refs:
+            raise HarnessError("s8: recovered ref not in clone")
+
+        shutil.rmtree(str(w), ignore_errors=True)
+        shutil.rmtree(str(stg), ignore_errors=True)
+        shutil.rmtree(str(cf), ignore_errors=True)
+
     # ================================================================== runner
 
     def run(self):
@@ -847,6 +1332,8 @@ class M4Harness(_m2.Harness):
             self.scenario("s4_backup_restore", self.s4_backup_restore)
             self.scenario("s5_upgrade_drill", self.s5_upgrade_drill)
             self.scenario("s6_restart_jobs", self.s6_restart_jobs)
+            self.scenario("s7_container_install", self.s7_container_install)
+            self.scenario("s8_disk_full", self.s8_disk_full)
         finally:
             self.cleanup()
         self.write_report()
@@ -881,6 +1368,20 @@ class M4Harness(_m2.Harness):
                 cwd=ROOT, capture_output=True)
         if self._old_target_dir and Path(self._old_target_dir).exists():
             shutil.rmtree(self._old_target_dir, ignore_errors=True)
+        # s7/s8 docker resources: containers (with anonymous volumes) first, since a
+        # network or image in use cannot be removed; then volumes, networks, the image.
+        steps = [
+            (("_s7_pg", "_s7_srv", "_s7_srv2", "_s8_pg", "_s8_srv"), ["rm", "--force", "--volumes"]),
+            (("_s7_vol",), ["volume", "rm", "--force"]),
+            (("_s7_net", "_s8_net"), ["network", "rm"]),
+            (("_s7_img",), ["rmi", "--force"]),
+        ]
+        for names, cmd in steps:
+            for name in names:
+                val = getattr(self, name, None)
+                if val:
+                    subprocess.run(["docker"] + cmd + [val],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ---- module-level helpers (not on the class, shared by upgrade) -----------
@@ -966,6 +1467,15 @@ def _wait_http(proc, harness, base, label, timeout=120):
         except (OSError, urllib.error.URLError): pass
         time.sleep(0.1)
     raise HarnessError(f"{label} server readiness timed out")
+
+
+def _container_tail(name):
+    """Container state and last log lines, for a failure message."""
+    st = subprocess.run(["docker", "inspect", name, "--format", "{{.State.Status}}"],
+                        capture_output=True, text=True).stdout.strip()
+    logs = subprocess.run(["docker", "logs", "--tail", "15", name],
+                          capture_output=True, text=True)
+    return f"container {name} {st or 'gone'}:\n{(logs.stdout + logs.stderr)[-2500:]}"
 
 
 def _kill_proc(proc):
