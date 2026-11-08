@@ -492,7 +492,7 @@ async fn receive_pack(
         })
     };
 
-    let body = Body::from_stream(stream_git_output(
+    let mut output = Box::pin(futures_util::StreamExt::peekable(stream_git_output(
         child,
         stdout,
         stderr,
@@ -505,7 +505,14 @@ async fn receive_pack(
         token,
         Some(after_exit),
         false,
-    ));
+    )));
+    // Half-duplex proxies (nginx) stop forwarding the request body once response
+    // headers arrive. receive-pack writes nothing until it has read the whole pack,
+    // so wait for its first output (or end, or the deadline) before responding.
+    // The supervisor already owns git and the post-push replay, so a client that
+    // disconnects here still gets its push applied.
+    output.as_mut().peek().await;
+    let body = Body::from_stream(output);
 
     let mut response = Response::new(body);
     response.headers_mut().insert(
