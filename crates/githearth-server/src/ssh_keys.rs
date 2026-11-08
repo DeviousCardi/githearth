@@ -81,26 +81,26 @@ const SSH_KEY_COLUMNS: &str = "id, name, algorithm, fingerprint, \
   to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS revoked_at";
 
 #[derive(Serialize, FromRow)]
-struct SshKeyMeta {
-    id: Uuid,
-    name: String,
-    algorithm: String,
-    fingerprint: String,
-    created_at: String,
-    expires_at: Option<String>,
-    last_used_at: Option<String>,
-    revoked_at: Option<String>,
+pub(crate) struct SshKeyMeta {
+    pub(crate) id: Uuid,
+    pub(crate) name: String,
+    pub(crate) algorithm: String,
+    pub(crate) fingerprint: String,
+    pub(crate) created_at: String,
+    pub(crate) expires_at: Option<String>,
+    pub(crate) last_used_at: Option<String>,
+    pub(crate) revoked_at: Option<String>,
 }
 
 #[derive(Serialize)]
-struct CreatedSshKey {
-    id: Uuid,
-    name: String,
-    algorithm: String,
-    fingerprint: String,
-    public_key: String,
-    created_at: String,
-    expires_at: Option<String>,
+pub(crate) struct CreatedSshKey {
+    pub(crate) id: Uuid,
+    pub(crate) name: String,
+    pub(crate) algorithm: String,
+    pub(crate) fingerprint: String,
+    pub(crate) public_key: String,
+    pub(crate) created_at: String,
+    pub(crate) expires_at: Option<String>,
 }
 
 async fn create(
@@ -109,15 +109,36 @@ async fn create(
     Json(input): Json<NewSshKey>,
 ) -> ApiResult<(StatusCode, Json<CreatedSshKey>)> {
     let (account, _) = session_auth(&state.pool, &headers).await?;
-    if !name_ok(&input.name) {
+    let created = create_ssh_key(
+        &state,
+        account.id,
+        &input.name,
+        &input.public_key,
+        input.expires_in_days,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Shared by the JSON handler and the settings page's "Add SSH key" form.
+/// Validation (name, expiry, key parsing and the Ed25519/ECDSA-only rule) stays
+/// here, so both callers fail identically.
+pub(crate) async fn create_ssh_key(
+    state: &AppState,
+    account_id: Uuid,
+    name: &str,
+    public_key: &str,
+    expires_in_days: Option<i64>,
+) -> ApiResult<CreatedSshKey> {
+    if !name_ok(name) {
         return Err(invalid());
     }
-    if let Some(days) = input.expires_in_days
+    if let Some(days) = expires_in_days
         && !(1..=3650).contains(&days)
     {
         return Err(invalid());
     }
-    if input.public_key.len() > MAX_PUBLIC_KEY_LEN {
+    if public_key.len() > MAX_PUBLIC_KEY_LEN {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "public key input too long",
@@ -126,7 +147,7 @@ async fn create(
 
     // Parse first: the server is built without RSA, and only Ed25519/ECDSA are
     // accepted. Certificate lines fail to parse, so they become a 400 too.
-    let key = PublicKey::from_openssh(&input.public_key).map_err(|_| {
+    let key = PublicKey::from_openssh(public_key).map_err(|_| {
         ApiError(
             StatusCode::BAD_REQUEST,
             "must be an Ed25519 or ECDSA (nistp256/384/521) public key; RSA and DSA are not supported",
@@ -147,7 +168,7 @@ async fn create(
         },
         _ => unreachable!("algorithm_ok rejected everything else"),
     };
-    let public_key = {
+    let canonical_key = {
         let mut canonical = key.clone();
         canonical.set_comment("");
         canonical
@@ -166,12 +187,12 @@ async fn create(
          ELSE clock_timestamp() + $7 * interval '1 day' END)",
     )
     .bind(id)
-    .bind(account.id)
-    .bind(&input.name)
+    .bind(account_id)
+    .bind(name)
     .bind(&algorithm)
-    .bind(&public_key)
+    .bind(&canonical_key)
     .bind(&fingerprint)
-    .bind(input.expires_in_days)
+    .bind(expires_in_days)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -185,7 +206,7 @@ async fn create(
         }
         ApiError::from(e)
     })?;
-    event(&mut tx, None, account.id, "ssh_key.created").await?;
+    event(&mut tx, None, account_id, "ssh_key.created").await?;
     let row = sqlx::query(&format!(
         "SELECT {SSH_KEY_COLUMNS} FROM ssh_keys WHERE id = $1"
     ))
@@ -194,18 +215,15 @@ async fn create(
     .await?;
     tx.commit().await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(CreatedSshKey {
-            id,
-            name: input.name,
-            algorithm,
-            fingerprint,
-            public_key,
-            created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
-        }),
-    ))
+    Ok(CreatedSshKey {
+        id,
+        name: name.to_owned(),
+        algorithm,
+        fingerprint,
+        public_key: canonical_key,
+        created_at: row.get("created_at"),
+        expires_at: row.get("expires_at"),
+    })
 }
 
 async fn list(
@@ -213,13 +231,22 @@ async fn list(
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Json<Vec<SshKeyMeta>>> {
     let (account, _) = session_auth(&state.pool, &headers).await?;
+    Ok(Json(list_ssh_keys(&state, account.id).await?))
+}
+
+/// Shared by the JSON handler and the settings page: the account's keys in a
+/// stable order.
+pub(crate) async fn list_ssh_keys(
+    state: &AppState,
+    account_id: Uuid,
+) -> ApiResult<Vec<SshKeyMeta>> {
     let rows = sqlx::query_as::<_, SshKeyMeta>(&format!(
         "SELECT {SSH_KEY_COLUMNS} FROM ssh_keys WHERE account_id = $1 ORDER BY created_at, id"
     ))
-    .bind(account.id)
+    .bind(account_id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(rows))
+    Ok(rows)
 }
 
 async fn revoke(
@@ -228,21 +255,28 @@ async fn revoke(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     let (account, _) = session_auth(&state.pool, &headers).await?;
+    revoke_ssh_key(&state, account.id, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Shared by the JSON handler and the settings page's "Revoke" button. A
+/// missing id or another account's key is a 404 for both callers.
+pub(crate) async fn revoke_ssh_key(state: &AppState, account_id: Uuid, id: Uuid) -> ApiResult<()> {
     let mut tx = state.pool.begin().await?;
     let result = sqlx::query(
         "UPDATE ssh_keys SET revoked_at = clock_timestamp() \
          WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
     )
     .bind(id)
-    .bind(account.id)
+    .bind(account_id)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError(StatusCode::NOT_FOUND, "ssh key not found"));
     }
-    event(&mut tx, None, account.id, "ssh_key.revoked").await?;
+    event(&mut tx, None, account_id, "ssh_key.revoked").await?;
     tx.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// Authenticates an SSH connection by fingerprint (ADR 0005). Returns `None`

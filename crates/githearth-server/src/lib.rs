@@ -22,6 +22,7 @@ pub mod pushes;
 pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
+mod settings_ui;
 pub mod ssh;
 pub mod ssh_keys;
 mod tokens;
