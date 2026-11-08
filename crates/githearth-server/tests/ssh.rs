@@ -442,13 +442,19 @@ async fn ssh_push_works() {
     cmd.env("GIT_SSH_COMMAND", &ssh_cmd_env);
     git_ok(cmd).await;
 
-    // Make a change and push
+    // Make a change and push. The 2 MiB of incompressible data spans well over
+    // 100 SSH data packets: the session once stalled after ~1 MiB because an
+    // unread russh Channel buffered every packet.
     std::fs::write(clone_dir.join("new.txt"), "pushed via SSH\n").unwrap();
+    let mut big = vec![0u8; 2 << 20];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut big).unwrap();
+    std::fs::write(clone_dir.join("big.bin"), big).unwrap();
     git_ok(git_cmd(&[
         "-C",
         &clone_dir.to_string_lossy(),
         "add",
         "new.txt",
+        "big.bin",
     ]))
     .await;
     git_ok(git_cmd(&[
