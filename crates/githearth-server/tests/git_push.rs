@@ -1580,6 +1580,95 @@ async fn stale_ref_locks_cleaned_before_push() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn receive_pack_answers_only_after_the_whole_pack() {
+    // A half-duplex proxy (nginx with proxy_request_buffering off) stops sending
+    // the request body once response headers arrive, so receive-pack must not
+    // answer before it has read the pack. A raw HTTP/1.1 client over TCP sees
+    // exactly what such a proxy sees.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fx = setup(1 << 30).await;
+    let work = std::env::temp_dir().join(format!("git-push-half-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "clone", "--", fx.repo_path_str(), "."])).await;
+    // Incompressible and larger than socket and pipe buffers, like a real push.
+    let mut big = vec![0u8; 8 << 20];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").unwrap(), &mut big).unwrap();
+    std::fs::write(work.join("f"), big).unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "f"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "m",
+    ]))
+    .await;
+    let new_sha = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    let request = receive_pack_request_body(&fx, tw, "refs/heads/main").await;
+    let (first, rest) = request.split_at(request.len() / 2);
+    let chunk = |data: &[u8]| {
+        let mut c = format!("{:x}\r\n", data.len()).into_bytes();
+        c.extend_from_slice(data);
+        c.extend_from_slice(b"\r\n");
+        c
+    };
+
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", fx.port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST /{}/{}.git/git-receive-pack HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Authorization: {}\r\nContent-Type: application/x-git-receive-pack-request\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        fx.org_slug,
+        fx.repo_name,
+        basic_auth(&fx.username, "testpass")
+    );
+    conn.write_all(head.as_bytes()).await.unwrap();
+    conn.write_all(&chunk(first)).await.unwrap();
+
+    let mut buf = [0u8; 1];
+    let early = tokio::time::timeout(Duration::from_millis(500), conn.read(&mut buf)).await;
+    assert!(
+        early.is_err(),
+        "the server answered before the pack was fully received"
+    );
+
+    conn.write_all(&chunk(rest)).await.unwrap();
+    conn.write_all(b"0\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), conn.read_to_end(&mut response))
+        .await
+        .expect("no response after the full pack")
+        .unwrap();
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 200"), "response: {text}");
+    assert!(text.contains("unpack ok"), "response: {text}");
+    wait_for_journal_applied(&fx.pool, fx.repo_id, 1).await;
+    assert_eq!(
+        git_output(git_cmd(&[
+            "--git-dir",
+            fx.repo_path_str(),
+            "rev-parse",
+            "main"
+        ]))
+        .await,
+        new_sha
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn disconnect_after_full_pack_applies_and_cleans_token() {
     use axum::{body::Body, http::Request};
 
