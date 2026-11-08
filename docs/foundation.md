@@ -4,7 +4,7 @@ The `githearth-server` binary runs independently of the existing local `githeart
 
 ## Local Docker Compose
 
-Requirements: Docker Engine with Compose, Python 3, and a terminal. Ports 8080 and 54329 must be available. Run from the repository root. The database is a separate process with a persistent Docker volume. These commands generate a unique local password; the ignored `.env` file is a secret.
+Requirements: Docker Engine with Compose, Python 3, and a terminal. Ports 8080, 2222 and 54329 must be available. Run from the repository root. The database and repository storage are persistent Docker volumes. These commands generate a unique local password; the ignored `.env` file is a secret.
 
 ```bash
 umask 077
@@ -21,9 +21,11 @@ printf '%s' "$ADMIN_PASSWORD" | docker compose exec -T app githearth-server boot
 unset ADMIN_PASSWORD
 ```
 
+Repositories, their journals and the SSH host key live in the `repositories` volume, mounted at the storage root `/var/lib/githearth`. Back it up together with a database dump as described in [backup-restore.md](operations/backup-restore.md): copy the whole storage root (for example `docker compose stop app` and then `docker compose cp app:/var/lib/githearth backup/`), not only `repositories/`.
+
 Bootstrap succeeds once. Repeating it fails with an explicit message and never updates an existing administrator or password. It takes a transaction-scoped database lock, creates the account and audit/outbox records atomically, and requires schema migration first. There is no password reset or account provisioning command in M1. Bootstrap is an operator command, never an HTTP route. Passwords are accepted only on stdin, never as CLI options.
 
-Compose starts PostgreSQL, runs a one-shot migration service, then starts the app. A failed migration prevents app startup. Application serving itself does not apply migrations, keeping schema changes an explicit operator action. The image runs as an unprivileged user and handles SIGINT/SIGTERM. Shutdown drains admitted requests; HTTP and SQL work have separate deadlines.
+Compose starts PostgreSQL, runs a one-shot migration service, generates an SSH host key, then starts the app. A failed migration or host-key generation prevents app startup. Application serving itself does not apply migrations, keeping schema changes an explicit operator action. The image runs as an unprivileged user and handles SIGINT/SIGTERM. Shutdown drains admitted requests; HTTP and SQL work have separate deadlines.
 
 Plain HTTP is for loopback development only. Compose publishes both ports on `127.0.0.1`; the app binds all interfaces inside its container. Before remote use, install a trusted TLS reverse proxy, restrict the backend network to that proxy, and use TLS for any nonlocal database connection (`sslmode=verify-full` and an appropriate CA). M1 is experimental, without a production deployment or availability claim.
 

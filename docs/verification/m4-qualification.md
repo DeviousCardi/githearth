@@ -15,7 +15,7 @@ The harness [`scripts/verify-m4.py`](../../scripts/verify-m4.py) subclasses the 
 
 | Item | Value |
 | --- | --- |
-| Source revision | `66c0684` (main plus the SSH fix in #74) |
+| Source revision | `aea70e3` plus this branch (main, the SSH fix in #74, and #75) |
 | Upgrade from revision | `9b4a372` (the merge of PR #62, the first release with the startup schema check) |
 | Host toolchain | rustc 1.99.1; server and CLI built in release mode by the harness |
 | Git client and server-side Git | git 2.43.0 |
@@ -28,7 +28,7 @@ The harness [`scripts/verify-m4.py`](../../scripts/verify-m4.py) subclasses the 
 
 | Command | Result |
 | --- | --- |
-| `python3 scripts/verify-m4.py --report <path>` | **Passed, 6/6 scenarios**. Afterwards no `githearth-server` process and no harness container remained. |
+| `python3 scripts/verify-m4.py --report <path>` | **Passed, 8/8 scenarios**. Afterwards no `githearth-server` process and no harness container remained. |
 | `scripts/ci.sh` | Passed |
 
 ## Scenario results
@@ -41,6 +41,8 @@ The harness [`scripts/verify-m4.py`](../../scripts/verify-m4.py) subclasses the 
 | 4 | Backup and fresh restore | Follows [backup-restore.md](../operations/backup-restore.md).<ul><li>Takes a `pg_dump -Fc` and a storage tarball.</li><li>Restores them into a new database and a new storage root; `githearth check` exits 0.</li><li>Clones over HTTP and SSH match the refs from before the backup.</li><li>Spot checks still hold: the owner is allowed, and the non-member is denied on both transports.</li></ul> | PASS | 3.7 s |
 | 5 | Upgrade drill | Follows [upgrade.md](../operations/upgrade.md).<ul><li>Builds `9b4a372` in a temporary worktree with its own target directory.</li><li>Installs, migrates and serves that old binary, then creates a repository, a push and an issue.</li><li>New binary: `doctor` reports pending migrations and `serve` refuses to start; after `migrate`, `doctor` exits 0.</li><li>The old data is intact, and new pushes work over HTTP and SSH.</li><li>Afterwards the old binary refuses the newer schema, so upgrades are forward-only.</li></ul> | PASS | 167.8 s (mostly the old release build) |
 | 6 | Restart and jobs | Restarts the upgraded server. The `doctor` jobs check is `ok`, and no running job has an expired lease. | PASS | 0.3 s |
+| 7 | Container install | Builds the `Dockerfile` image, which now includes `git`, a storage volume at `/var/lib/githearth`, and SSH on 2222.<ul><li>On a private Docker network with a disposable PostgreSQL and a fresh named volume, it runs `migrate`, `bootstrap-admin` (password on stdin) and `ssh-keygen`, then `serve`, all from the image.</li><li>From the host: login and repository creation through the API; push and clone over HTTP and SSH, with matching refs; `doctor` inside the container exits 0.</li><li>After a container restart, the data in the volume persists and clones still work.</li></ul> | PASS | 7.7 s (image build cached) |
+| 8 | Disk full | Runs the image with its storage root on a 32 MiB **tmpfs**. The harness refuses to fill any filesystem larger than 64 MiB, so the host disk is never filled.<ul><li>After a seed push, it fills the tmpfs to about 100 KiB free.</li><li>A 5 MiB push fails cleanly over HTTP and over SSH. The SSH refusal must come from the server, not from a failed connection. No ref moves.</li><li>The server stays ready, `doctor` reports `disk` as not `ok`, and `githearth check` on a copy of the storage exits 0.</li><li>Once the filler is deleted, a new push succeeds and appears in a fresh clone.</li></ul> | PASS | 6.8 s |
 
 ## Authorization matrix
 
@@ -64,7 +66,8 @@ The harness does **not** cover the following M4 exit items:
 
 - **Independent installation.** The harness automates the runbook. An install by a person who has not seen the code, on a clean Linux host, is still to be done.
 - **TLS ingress and session/TLS defaults.** The harness uses plain HTTP on loopback.
-- **Disk-full behaviour.** Not simulated.
+- **Disk-full on the host filesystem.** s8 fills a tmpfs inside the container; a full host disk under PostgreSQL is not exercised.
+- **The `compose.yaml` file itself.** s7 runs the same image and steps with `docker run` (Compose's fixed host ports would clash with other services). The compose file is checked only with `docker compose config`.
 - **Off-host backup.** The backup and restore run on the same host.
 - **Controlled uninstall.** No runbook or drill yet.
 - **Bounded resources and published hardware minimums.** The M2 harness measured memory; this run did not.
