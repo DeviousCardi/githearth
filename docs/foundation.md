@@ -189,3 +189,14 @@ git clone ssh://githearth-host:2222/org/repo.git
 | `DELETE /api/v1/user/ssh-keys/{id}` | Session bearer; revokes (sets `revoked_at`); 204; 404 for a missing or another account's key |
 
 A key's SHA-256 fingerprint is unique among non-revoked keys across all accounts, so one key maps to exactly one account; after revocation the same key can be added again. Revoked, expired, and suspended-account keys fail authentication on new connections exactly like unknown keys. `git clone ssh://host:port/org/repo.git` and the `host:org/repo.git` form both work, with Ed25519 or ECDSA client keys.
+
+## Notifications
+
+In-app notifications are the first real handlers on the [ADR 0006](decisions/0006-durable-jobs.md) job runner. A merge that a pull request author did not perform themselves, and a review submitted by someone else, each enqueue a job inside the domain transaction; the handler loads the current rows by ID, skips self-notifications, and inserts one `notifications` row keyed idempotently on `(event_id, account_id)`. Job payloads carry IDs only (the audit event id or review id and the pull request id), never titles or bodies, so retained `dead` jobs keep no private data.
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /api/v1/user/notifications` | Session bearer only (an access token gets 403); lists up to 50, newest first; optional `?unread=true`; each item has `id, kind, pull_request_id, actor_username (nullable), created_at, read_at`. No titles or repository names are returned — the client fetches those through the pull request API, which enforces read access, so a notification never leaks a repository the user lost access to |
+| `POST /api/v1/user/notifications/{id}/read` | Session bearer only; sets `read_at` and returns 204; idempotent; 404 for an unknown id or another account's notification |
+
+The two kinds are `pull_request.merged` and `pull_request.reviewed`. The recipient is always the pull request author, and a notification is skipped when the author is the one who merged or reviewed. The `notifications` table's `actor_id` set to null when the acting account is deleted, `pull_request_id` cascades on pull request deletion, and `account_id` cascades on account deletion.

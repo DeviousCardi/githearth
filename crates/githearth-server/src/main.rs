@@ -115,7 +115,9 @@ async fn run(args: Args) -> Result<()> {
             let _merge_worker = githearth_server::merge_worker::spawn(state.clone());
             // Handlers are registered by their owners (ADR 0006).
             let jobs_shutdown = tokio_util::sync::CancellationToken::new();
-            let jobs = jobs::spawn(state.clone(), jobs::Registry::new(), jobs_shutdown.clone());
+            let mut registry = jobs::Registry::new();
+            githearth_server::notifications::register(&mut registry);
+            let jobs = jobs::spawn(state.clone(), registry, jobs_shutdown.clone());
             let _ssh = if config.ssh_enabled {
                 ssh::load_host_key(&config.ssh_host_key_path)?;
                 let authenticate = githearth_server::ssh_keys::authenticator(state.pool.clone());

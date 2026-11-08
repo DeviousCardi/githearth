@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod merge;
 pub mod merge_intents;
 pub mod merge_worker;
+pub mod notifications;
 pub mod protection;
 pub mod pulls;
 mod pulls_ui;
@@ -237,6 +238,7 @@ pub fn router(state: AppState) -> Router {
         .merge(browse::router())
         .merge(tokens::router())
         .merge(ssh_keys::router())
+        .merge(notifications::router())
         .route(
             "/api/v1/organizations/{org}/repositories",
             post(repository_api::create).get(repository_api::list),

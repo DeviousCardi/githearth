@@ -617,15 +617,23 @@ pub async fn record_merge_result(
 
         // The ref has moved, so Git won: a close that committed after
         // execute_intent revalidated still ends with the pull request merged.
-        sqlx::query(
+        // Capture the pull request id and whether it actually transitioned to
+        // `merged`, so the notification job is enqueued only on a real merge.
+        let merged_pr: Option<Uuid> = sqlx::query_scalar(
             "UPDATE pull_requests SET state = 'merged', merged_at = now(), merged_by = $1, \
              updated_at = now() WHERE id = (SELECT pull_request_id FROM merge_intents \
-             WHERE operation_id = $2) AND state IN ('open', 'closed')",
+             WHERE operation_id = $2) AND state IN ('open', 'closed') RETURNING id",
         )
         .bind(actor)
         .bind(operation_id)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        let organization_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id = $1")
+                .bind(repository_id)
+                .fetch_one(&mut *tx)
+                .await?;
 
         let audit_id = Uuid::new_v4();
         sqlx::query(
@@ -656,6 +664,23 @@ pub async fn record_merge_result(
         .bind(repository_id)
         .execute(&mut *tx)
         .await?;
+
+        // Notification: only when this transaction actually merged the pull
+        // request, and only for a pull request that exists at this point.
+        if let (Some(org_id), Some(pull_request_id)) = (organization_id, merged_pr) {
+            crate::jobs::enqueue(
+                &mut tx,
+                Some(org_id),
+                "notification.pull_request_merged",
+                serde_json::json!({
+                    "event_id": audit_id,
+                    "pull_request_id": pull_request_id,
+                }),
+                &audit_id.to_string(),
+                None,
+            )
+            .await?;
+        }
     }
 
     tx.commit().await?;

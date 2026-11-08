@@ -1078,6 +1078,16 @@ pub(crate) async fn create_pull_review(
             };
             event(&mut tx, Some(loaded.org_id), actor_id, kind).await?;
 
+            crate::jobs::enqueue(
+                &mut tx,
+                Some(loaded.org_id),
+                "notification.pull_request_reviewed",
+                serde_json::json!({ "review_id": id }),
+                &id.to_string(),
+                None,
+            )
+            .await?;
+
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&review).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
