@@ -202,6 +202,21 @@ async fn token_create_list_revoke() {
         StatusCode::UNAUTHORIZED
     );
 
+    // Both outbox events name the token, and never carry the secret (issue #67).
+    let events: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT kind, payload FROM outbox_events WHERE payload->>'token_id' = $1 ORDER BY created_at",
+    )
+    .bind(id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(kinds, ["token.created", "token.revoked"]);
+    for (_, payload) in &events {
+        assert_eq!(payload["actor_id"], owner.to_string());
+        assert!(!payload.to_string().contains(&plaintext));
+    }
+
     pool.close().await;
 }
 

@@ -14,7 +14,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, Credential, authenticate_token_hash, bearer_credential, event, invalid,
+    ApiError, AppState, Credential, authenticate_token_hash, bearer_credential, event_with, invalid,
 };
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -144,7 +144,14 @@ pub(crate) async fn create_token(
     .bind(expires_in_days)
     .execute(&mut *tx)
     .await?;
-    event(&mut tx, None, account_id, "token.created").await?;
+    event_with(
+        &mut tx,
+        None,
+        account_id,
+        "token.created",
+        serde_json::json!({"token_id": id}),
+    )
+    .await?;
     let row = sqlx::query(&format!(
         "SELECT {TOKEN_COLUMNS} FROM access_tokens WHERE id = $1"
     ))
@@ -208,7 +215,14 @@ pub(crate) async fn revoke_token(state: &AppState, account_id: Uuid, id: Uuid) -
     if result.rows_affected() == 0 {
         return Err(ApiError(StatusCode::NOT_FOUND, "token not found"));
     }
-    event(&mut tx, None, account_id, "token.revoked").await?;
+    event_with(
+        &mut tx,
+        None,
+        account_id,
+        "token.revoked",
+        serde_json::json!({"token_id": id}),
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }

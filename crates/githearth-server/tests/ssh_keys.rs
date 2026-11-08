@@ -251,6 +251,21 @@ async fn list_revoke_and_list_shows_revocation() {
     assert_eq!(list.len(), 1);
     assert!(list[0].get("revoked_at").unwrap().is_string());
 
+    // Both outbox events carry the key id and fingerprint (issue #67).
+    let events: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT kind, payload FROM outbox_events WHERE payload->>'key_id' = $1 ORDER BY created_at",
+    )
+    .bind(&key_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(kinds, ["ssh_key.created", "ssh_key.revoked"]);
+    for (_, payload) in &events {
+        assert_eq!(payload["fingerprint"], list[0]["fingerprint"]);
+        assert!(payload["actor_id"].is_string());
+    }
+
     let _ = std::fs::remove_dir_all(key_path.parent().unwrap());
     pool.close().await;
 }
