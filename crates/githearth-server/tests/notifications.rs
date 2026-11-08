@@ -911,6 +911,24 @@ async fn notifications_api_listing_and_mark_read() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 0);
 
+    // unread=false is no filter: the read notification is still listed.
+    let (status, list) = request(
+        &app,
+        "GET",
+        "/api/v1/user/notifications?unread=false",
+        Some(&session),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == unread_id.to_string()),
+        "{list}"
+    );
+
     let (status, _) = request(
         &app,
         "POST",

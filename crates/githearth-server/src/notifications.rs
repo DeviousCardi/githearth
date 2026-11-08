@@ -231,7 +231,7 @@ async fn list(
     let sql = format!(
         "SELECT {NOTIFICATION_COLUMNS} FROM notifications n \
          LEFT JOIN accounts a ON a.id = n.actor_id \
-         WHERE n.account_id = $1 AND ($2::boolean IS NULL OR n.read_at IS NULL) \
+         WHERE n.account_id = $1 AND ($2::boolean IS NOT TRUE OR n.read_at IS NULL) \
          ORDER BY n.created_at DESC, n.id DESC LIMIT 50"
     );
     let rows = sqlx::query_as::<_, NotificationJson>(&sql)
