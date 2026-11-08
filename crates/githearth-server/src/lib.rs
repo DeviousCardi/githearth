@@ -56,6 +56,10 @@ use uuid::Uuid;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+tokio::task_local! {
+    static ADMITTED_TOKEN: (Vec<u8>, Account, u64);
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -305,9 +309,20 @@ async fn enforce_read_only_boundary(
         Ok(Credential::AccessToken { token_hash }) => token_hash,
         _ => return next.run(request).await,
     };
-    match authenticate_credential(&state.pool, Credential::AccessToken { token_hash }).await {
+    match authenticate_credential(
+        &state.pool,
+        Credential::AccessToken {
+            token_hash: token_hash.clone(),
+        },
+    )
+    .await
+    {
         Ok((account, _)) if account.is_read_only() => read_only_denied().into_response(),
-        Ok((_account, _)) => next.run(request).await,
+        Ok((account, age)) => {
+            ADMITTED_TOKEN
+                .scope((token_hash, account, age), next.run(request))
+                .await
+        }
         // An invalid or expired token: the handler refuses it the same way.
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => next.run(request).await,
         // Any other lookup failure (pool timeout, dropped database, a failed
@@ -618,7 +633,7 @@ pub(crate) async fn authenticate_token_hash(
         row.3.max(0) as u64,
     ))
 }
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Clone, Serialize, sqlx::FromRow)]
 pub(crate) struct Account {
     id: Uuid,
     username: String,
@@ -646,7 +661,16 @@ pub(crate) async fn authenticate_credential(
 ) -> ApiResult<(Account, u64)> {
     match credential {
         Credential::Session { token_hash } => authenticate_token_hash(pool, token_hash).await,
-        Credential::AccessToken { token_hash } => authenticate_access_token(pool, token_hash).await,
+        Credential::AccessToken { token_hash } => {
+            // The read-only boundary middleware already authenticated this exact
+            // token for this request, so the handler reuses that single lookup.
+            if let Ok(Some(admitted)) = ADMITTED_TOKEN
+                .try_with(|(h, account, age)| (h == &token_hash).then(|| (account.clone(), *age)))
+            {
+                return Ok(admitted);
+            }
+            authenticate_access_token(pool, token_hash).await
+        }
     }
 }
 

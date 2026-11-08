@@ -484,6 +484,120 @@ async fn token_fails_recent_auth_gated_action() {
     pool.close().await;
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn write_token_is_looked_up_once_per_request() {
+    let (pool, app) = api_pool().await;
+    let username = tag("user");
+    fixture_account(&pool, &username, "correct horse battery staple").await;
+    let session = login(&app, &username, "correct horse battery staple").await;
+
+    let (token_id, token) = create_token(&app, &session, &["repo:write"], None).await;
+
+    // Revoke the token from a trigger that fires on the first `last_used_at`
+    // refresh. The middleware's single lookup refreshes it and, via this
+    // trigger, revokes it; a second lookup in the handler would then observe
+    // `revoked_at` and refuse the write. The write succeeding proves the
+    // handler reused the middleware's lookup instead of querying again.
+    sqlx::query(
+        "CREATE FUNCTION revoke_on_use() RETURNS trigger AS $$
+         BEGIN
+           UPDATE access_tokens SET revoked_at = clock_timestamp() WHERE id = NEW.id;
+           RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER revoke_on_use_trg
+         AFTER UPDATE OF last_used_at ON access_tokens
+         FOR EACH ROW WHEN (NEW.id = '{token_id}') EXECUTE FUNCTION revoke_on_use()"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The trigger has not fired yet: the token starts with no last_used_at.
+    let initial: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM access_tokens WHERE id = $1")
+            .bind(token_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!initial);
+
+    // A write with the repo:write token still succeeds.
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v1/organizations",
+        Some(&token),
+        json!({"slug": tag("org"), "name": "Once"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Exactly one lookup: that lookup refreshed `last_used_at`, which fired the
+    // trigger and revoked the token. A second lookup would have seen the
+    // revocation and refused the write, so the successful write means the
+    // handler never queried the token again.
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM access_tokens WHERE id = $1")
+            .bind(token_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(revoked, "token should be revoked by the trigger");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn read_only_token_write_is_still_refused() {
+    let (pool, app) = api_pool().await;
+    let username = tag("user");
+    fixture_account(&pool, &username, "correct horse battery staple").await;
+    let session = login(&app, &username, "correct horse battery staple").await;
+
+    let (_id, token) = create_token(&app, &session, &["repo:read"], None).await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v1/organizations",
+        Some(&token),
+        json!({"slug": tag("blocked-org"), "name": "Blocked"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, json!({"error": "read-only token"}));
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn session_write_is_unchanged() {
+    let (pool, app) = api_pool().await;
+    let username = tag("user");
+    fixture_account(&pool, &username, "correct horse battery staple").await;
+    let session = login(&app, &username, "correct horse battery staple").await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v1/organizations",
+        Some(&session),
+        json!({"slug": tag("org"), "name": "Session Org"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    pool.close().await;
+}
+
 // ---------------------------------------------------------------------------
 // Git Smart HTTP tests
 // ---------------------------------------------------------------------------
