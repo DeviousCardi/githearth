@@ -48,6 +48,10 @@ async fn session_auth(pool: &PgPool, headers: &HeaderMap) -> ApiResult<(crate::A
 pub fn register(registry: &mut jobs::Registry) {
     registry.register("notification.pull_request_merged", merged_handler());
     registry.register("notification.pull_request_reviewed", reviewed_handler());
+    registry.register(
+        "notification.pull_request_review_requested",
+        review_requested_handler(),
+    );
 }
 
 fn merged_handler() -> jobs::Handler {
@@ -59,6 +63,12 @@ fn merged_handler() -> jobs::Handler {
 fn reviewed_handler() -> jobs::Handler {
     std::sync::Arc::new(|state: AppState, job: Job| {
         Box::pin(async move { reviewed(&state, &job).await })
+    })
+}
+
+fn review_requested_handler() -> jobs::Handler {
+    std::sync::Arc::new(|state: AppState, job: Job| {
+        Box::pin(async move { review_requested(&state, &job).await })
     })
 }
 
@@ -162,6 +172,55 @@ async fn reviewed(state: &AppState, job: &Job) -> JobOutcome {
         pull_request_id,
         author,
         Some(reviewer),
+    )
+    .await
+}
+
+/// Recipient: the requested reviewer, unless the request has since gone away
+/// (removed manually, or satisfied by a submitted review).
+async fn review_requested(state: &AppState, job: &Job) -> JobOutcome {
+    let request_id = match payload_uuid(&job.payload, "request_id") {
+        Ok(id) => id,
+        Err(failed) => return failed,
+    };
+    let pull_request_id = match payload_uuid(&job.payload, "pull_request_id") {
+        Ok(id) => id,
+        Err(failed) => return failed,
+    };
+    let reviewer_id = match payload_uuid(&job.payload, "reviewer_id") {
+        Ok(id) => id,
+        Err(failed) => return failed,
+    };
+
+    let still_exists: bool = match sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pull_request_review_requests \
+         WHERE pull_request_id = $1 AND reviewer_id = $2)",
+    )
+    .bind(pull_request_id)
+    .bind(reviewer_id)
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(exists) => exists,
+        Err(_) => return db_retry(),
+    };
+    if !still_exists {
+        // The request was removed or the reviewer already submitted a review.
+        return JobOutcome::Done;
+    }
+
+    let requested_by = match payload_uuid(&job.payload, "requested_by") {
+        Ok(id) => id,
+        Err(failed) => return failed,
+    };
+
+    insert_notification(
+        state,
+        request_id,
+        "pull_request.review_requested",
+        pull_request_id,
+        reviewer_id,
+        Some(requested_by),
     )
     .await
 }
