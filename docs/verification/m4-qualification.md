@@ -28,7 +28,7 @@ The harness [`scripts/verify-m4.py`](../../scripts/verify-m4.py) subclasses the 
 
 | Command | Result |
 | --- | --- |
-| `python3 scripts/verify-m4.py --report <path>` | **Passed, 8/8 scenarios**. Afterwards no `githearth-server` process and no harness container remained. |
+| `python3 scripts/verify-m4.py --report <path>` | **Passed, 9/9 scenarios**. Afterwards no `githearth-server` process and no harness container remained. |
 | `scripts/ci.sh` | Passed |
 
 ## Scenario results
@@ -43,6 +43,7 @@ The harness [`scripts/verify-m4.py`](../../scripts/verify-m4.py) subclasses the 
 | 6 | Restart and jobs | Restarts the upgraded server. The `doctor` jobs check is `ok`, and no running job has an expired lease. | PASS | 0.3 s |
 | 7 | Container install | Builds the `Dockerfile` image, which now includes `git`, a storage volume at `/var/lib/githearth`, and SSH on 2222.<ul><li>On a private Docker network with a disposable PostgreSQL and a fresh named volume, it runs `migrate`, `bootstrap-admin` (password on stdin) and `ssh-keygen`, then `serve`, all from the image.</li><li>From the host: login and repository creation through the API; push and clone over HTTP and SSH, with matching refs; `doctor` inside the container exits 0.</li><li>After a container restart, the data in the volume persists and clones still work.</li></ul> | PASS | 7.7 s (image build cached) |
 | 8 | Disk full | Runs the image with its storage root on a 32 MiB **tmpfs**. The harness refuses to fill any filesystem larger than 64 MiB, so the host disk is never filled.<ul><li>After a seed push, it fills the tmpfs to about 100 KiB free.</li><li>A 5 MiB push fails cleanly over HTTP and over SSH. The SSH refusal must come from the server, not from a failed connection. No ref moves.</li><li>The server stays ready, `doctor` reports `disk` as not `ok`, and `githearth check` on a copy of the storage exits 0.</li><li>Once the filler is deleted, a new push succeeds and appears in a fresh clone.</li></ul> | PASS | 6.8 s |
+| 9 | Uninstall drill | Follows [uninstall.md](../operations/uninstall.md) on the native binary.<ul><li>**Keep-data**: stops the server, replaces the binary and configuration, runs `migrate` then `doctor` (exits 0), and starts the server — all clone refs match the pre-reinstall mirrors and an issue is readable.</li><li>**Full removal**: exports every repository as `git clone --mirror` via the API, verifies mirror refs; stops the server, removes the storage root and drops the database. Asserts storage root is empty, database is gone, and HTTP/SSH ports refuse connections. Mirror exports still clone fine.</li></ul> | PASS | 1.6 s |
 
 ## Authorization matrix
 
@@ -69,7 +70,6 @@ The harness does **not** cover the following M4 exit items:
 - **Disk-full on the host filesystem.** s8 fills a tmpfs inside the container; a full host disk under PostgreSQL is not exercised.
 - **The `compose.yaml` file itself.** s7 runs the same image and steps with `docker run` (Compose's fixed host ports would clash with other services). The compose file is checked only with `docker compose config`.
 - **Off-host backup.** The backup and restore run on the same host.
-- **Controlled uninstall.** No runbook or drill yet.
 - **Bounded resources and published hardware minimums.** The M2 harness measured memory; this run did not.
 - **License files and notices, and accessibility review.** Not part of this harness.
 - **SHA-256 repositories, public/internal visibility, and online (non-maintenance-window) backup.** Not exercised.

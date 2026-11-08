@@ -1,6 +1,7 @@
 # Installation
 
-See [upgrade.md](upgrade.md) for the upgrade runbook.
+See [upgrade.md](upgrade.md) for the upgrade runbook and
+[uninstall.md](uninstall.md) for removal.
 
 ## Preflight check
 
