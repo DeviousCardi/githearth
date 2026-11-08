@@ -1,7 +1,7 @@
 # Installation
 
-See [upgrade.md](upgrade.md) for the upgrade runbook and
-[uninstall.md](uninstall.md) for removal.
+See [upgrade.md](upgrade.md) for the upgrade runbook,
+[uninstall.md](uninstall.md) for removal and [tls.md](tls.md) for TLS setup.
 
 ## Preflight check
 
