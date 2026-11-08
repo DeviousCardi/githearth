@@ -6,6 +6,7 @@ use githearth_server::{
 };
 use std::{
     io::{self, Read},
+    net::SocketAddr,
     path::PathBuf,
 };
 
@@ -130,10 +131,13 @@ async fn run(args: Args) -> Result<()> {
                 .await
                 .context("cannot bind HTTP listener")?;
             tracing::info!(bind = %config.bind, "HTTP server listening; use loopback or a trusted TLS proxy");
-            axum::serve(listener, router(state))
-                .with_graceful_shutdown(shutdown())
-                .await
-                .context("HTTP server failed")?;
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await
+            .context("HTTP server failed")?;
             // Let in-flight jobs finish and release their leases (ADR 0006).
             jobs_shutdown.cancel();
             let _ = jobs.await;

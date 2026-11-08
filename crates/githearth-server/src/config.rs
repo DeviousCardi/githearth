@@ -50,6 +50,10 @@ pub struct Config {
     /// Completed jobs retention in days (ADR 0006).
     #[serde(default = "default_job_retention_days")]
     pub job_retention_days: u64,
+    /// IPs or CIDRs that are trusted to set `X-Forwarded-For` (TASK #88).
+    /// Empty by default; every entry is validated at load.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -81,6 +85,7 @@ impl Default for Config {
             job_timeout_seconds: default_job_timeout_seconds(),
             job_poll_interval_ms: default_job_poll_interval_ms(),
             job_retention_days: default_job_retention_days(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -186,6 +191,13 @@ impl Config {
         env!(job_timeout_seconds, "GITHEARTH_JOB_TIMEOUT_SECONDS");
         env!(job_poll_interval_ms, "GITHEARTH_JOB_POLL_INTERVAL_MS");
         env!(job_retention_days, "GITHEARTH_JOB_RETENTION_DAYS");
+        if let Ok(value) = std::env::var("GITHEARTH_TRUSTED_PROXIES") {
+            c.trusted_proxies = value
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         c.validate()?;
         Ok(c)
     }
@@ -234,6 +246,13 @@ impl Config {
         }
         if self.ssh_enabled && self.ssh_host_key_path.as_os_str().is_empty() {
             bail!("ssh_host_key_path must be set when ssh_enabled is true");
+        }
+        for entry in &self.trusted_proxies {
+            if crate::client_ip::parse_trusted_proxy(entry).is_err() {
+                bail!(
+                    "trusted_proxies: invalid entry \"{entry}\"; expected IP address or CIDR range"
+                );
+            }
         }
         Ok(())
     }

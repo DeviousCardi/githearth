@@ -170,6 +170,10 @@ impl russh::server::Handler for SshHandler {
         &mut self,
         _session: &mut russh::server::Session,
     ) -> Result<(), Self::Error> {
+        let identity = self.conn.identity.lock().unwrap().clone();
+        if let Some(id) = &identity {
+            tracing::info!(account_id = %id.account, key_id = %id.key_id, "ssh authentication succeeded");
+        }
         drop(self.conn.unauthenticated_permit.lock().unwrap().take());
         Ok(())
     }
@@ -637,7 +641,7 @@ async fn run_server(
     tracing::info!(bind = %bound_addr, "SSH server listening");
 
     loop {
-        let (stream, _peer_addr) = match listener.accept().await {
+        let (stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "SSH accept failed");
@@ -645,6 +649,7 @@ async fn run_server(
                 continue;
             }
         };
+        tracing::info!(client_ip = %peer_addr.ip(), "ssh connection accepted");
 
         let state = state.clone();
         let authenticate = authenticate.clone();
