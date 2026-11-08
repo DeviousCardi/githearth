@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod browse;
 mod browse_ui;
+pub mod client_ip;
 pub mod config;
 pub mod doctor;
 pub mod facts;
@@ -35,11 +36,12 @@ use argon2::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
+use client_ip::{ClientIp, TrustedProxy, client_ip, parse_trusted_proxy};
 use config::Config;
 use githearth_authz::{Engine, Resource};
 use rand::RngCore;
@@ -49,7 +51,7 @@ use sqlx::{
     ConnectOptions, PgPool, Row,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 use uuid::Uuid;
@@ -73,6 +75,7 @@ pub struct AppState {
     // pub so the disconnect integration test can assert the token is released.
     pub hook_tokens: Arc<std::sync::Mutex<HashMap<String, git_admission::Admitted>>>,
     pub(crate) hook_socket_path: std::path::PathBuf,
+    pub(crate) trusted_proxies: Vec<TrustedProxy>,
 }
 impl AppState {
     pub async fn new(pool: PgPool, config: Config) -> anyhow::Result<Self> {
@@ -124,6 +127,12 @@ impl AppState {
         let listener = tokio::net::UnixListener::bind(&socket_path)
             .with_context(|| format!("cannot bind hook socket {}", socket_path.display()))?;
 
+        let trusted_proxies = config
+            .trusted_proxies
+            .iter()
+            .map(|e| parse_trusted_proxy(e))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| anyhow::anyhow!("trusted_proxies: invalid entry"))?;
         let state = Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
@@ -134,6 +143,7 @@ impl AppState {
             storage: Arc::new(storage),
             hook_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hook_socket_path: socket_path,
+            trusted_proxies,
         };
         tokio::spawn(crate::git_http::hook_accept_loop(listener, state.clone()));
         Ok(state)
@@ -282,8 +292,13 @@ pub fn router(state: AppState) -> Router {
 
     let git = git_http::router(&state.config);
 
+    // The last layer runs first: resolve the client IP before observe logs it.
     json.merge(git)
         .layer(axum::middleware::from_fn(observe))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            client_ip_middleware,
+        ))
         .with_state(state)
 }
 
@@ -332,6 +347,30 @@ async fn enforce_read_only_boundary(
     }
 }
 
+async fn client_ip_middleware(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .copied()
+        .map(|c| c.0);
+    if let Some(addr) = peer {
+        let fwd: Vec<String> = request
+            .headers()
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+            .collect();
+        let ip = client_ip(addr, &fwd, &state.trusted_proxies);
+        request.extensions_mut().insert(ClientIp(ip));
+    }
+    next.run(request).await
+}
+
 async fn observe(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let start = std::time::Instant::now();
     let method = request.method().clone();
@@ -341,11 +380,16 @@ async fn observe(request: axum::extract::Request, next: axum::middleware::Next) 
         .get::<axum::extract::MatchedPath>()
         .map(|p| p.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".into());
+    let client_ip = request
+        .extensions()
+        .get::<ClientIp>()
+        .map(|c| c.0.to_string())
+        .unwrap_or_else(|| "unknown".into());
     let mut response = next.run(request).await;
     response
         .headers_mut()
         .insert("cache-control", "no-store".parse().unwrap());
-    tracing::info!(%method, route, status = response.status().as_u16(), elapsed_ms = start.elapsed().as_millis() as u64, "http request");
+    tracing::info!(%method, route, status = response.status().as_u16(), elapsed_ms = start.elapsed().as_millis() as u64, client_ip, "http request");
     response
 }
 

@@ -26,3 +26,5 @@ auth_concurrency = 2
 # job_timeout_seconds = 60
 # job_poll_interval_ms = 500
 # job_retention_days = 7
+# WARNING: listing an untrusted address here lets clients spoof their IP.
+# trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
