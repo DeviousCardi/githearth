@@ -500,7 +500,7 @@ async fn write_token_is_looked_up_once_per_request() {
     // `revoked_at` and refuse the write. The write succeeding proves the
     // handler reused the middleware's lookup instead of querying again.
     sqlx::query(
-        "CREATE FUNCTION revoke_on_use() RETURNS trigger AS $$
+        "CREATE OR REPLACE FUNCTION revoke_on_use() RETURNS trigger AS $$
          BEGIN
            UPDATE access_tokens SET revoked_at = clock_timestamp() WHERE id = NEW.id;
            RETURN NEW;
@@ -510,9 +510,10 @@ async fn write_token_is_looked_up_once_per_request() {
     .await
     .unwrap();
     sqlx::query(&format!(
-        "CREATE TRIGGER revoke_on_use_trg
-         AFTER UPDATE OF last_used_at ON access_tokens
-         FOR EACH ROW WHEN (NEW.id = '{token_id}') EXECUTE FUNCTION revoke_on_use()"
+        "CREATE TRIGGER revoke_on_use_{} \
+         AFTER UPDATE OF last_used_at ON access_tokens \
+         FOR EACH ROW WHEN (NEW.id = '{token_id}') EXECUTE FUNCTION revoke_on_use()",
+        token_id.simple()
     ))
     .execute(&pool)
     .await
@@ -550,6 +551,14 @@ async fn write_token_is_looked_up_once_per_request() {
             .unwrap();
     assert!(revoked, "token should be revoked by the trigger");
 
+    // The test database is shared: leave no trigger behind.
+    sqlx::query(&format!(
+        "DROP TRIGGER revoke_on_use_{} ON access_tokens",
+        token_id.simple()
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     pool.close().await;
 }
 
