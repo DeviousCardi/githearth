@@ -5,7 +5,10 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -25,7 +28,13 @@ fn server() -> Command {
     command
 }
 
+/// One short-lived command at a time. `migrate` (sqlx's migration advisory lock)
+/// and `bootstrap-admin` take database-wide locks under the server's 3 s
+/// `lock_timeout`; run in parallel on a loaded machine, waiters time out spuriously.
+static RUN: Mutex<()> = Mutex::new(());
+
 fn run(mut command: Command) -> Output {
+    let _one = RUN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -34,6 +43,7 @@ fn run(mut command: Command) -> Output {
 }
 
 fn run_with_stdin(mut command: Command, input: &[u8]) -> Output {
+    let _one = RUN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
