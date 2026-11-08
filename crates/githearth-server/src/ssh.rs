@@ -105,7 +105,6 @@ struct ConnectionState {
     /// would share git_stdin and could block the session on the repository lock.
     session_opened: std::sync::atomic::AtomicBool,
     exec_started: std::sync::atomic::AtomicBool,
-    _channel: Mutex<Option<russh::Channel<russh::server::Msg>>>,
 }
 
 // ------------------------------------------------------------------
@@ -189,7 +188,9 @@ impl russh::server::Handler for SshHandler {
             return Ok(());
         }
         reply.accept().await;
-        *self.conn._channel.lock().unwrap() = Some(channel);
+        // I/O goes through data() and the Handle; drop the Channel, or russh queues
+        // every data packet into its bounded buffer and the session stalls at ~100.
+        drop(channel);
         Ok(())
     }
 
@@ -666,7 +667,6 @@ async fn run_server(
                 git_stdin: Mutex::new(None),
                 session_opened: Default::default(),
                 exec_started: Default::default(),
-                _channel: Mutex::new(None),
             });
 
             let handler = SshHandler {
