@@ -190,6 +190,8 @@ git clone ssh://githearth-host:2222/org/repo.git
 
 A key's SHA-256 fingerprint is unique among non-revoked keys across all accounts, so one key maps to exactly one account; after revocation the same key can be added again. Revoked, expired, and suspended-account keys fail authentication on new connections exactly like unknown keys. `git clone ssh://host:port/org/repo.git` and the `host:org/repo.git` form both work, with Ed25519 or ECDSA client keys.
 
+Registration does not require proof that the caller holds the private key, as on most forges (issue #66). Someone who registers another person's public key first makes that person's own registration fail with 409 until the key is revoked. This fails safe: a connection with that key authenticates as the registrant, so it reaches only repositories the registrant can already access, never the key owner's. A key owner who gets an unexpected 409 should generate a new key; a signature-challenge step before activating a key would close the gap and is not implemented.
+
 ## Notifications
 
 In-app notifications are the first real handlers on the [ADR 0006](decisions/0006-durable-jobs.md) job runner. A merge that a pull request author did not perform themselves, and a review submitted by someone else, each enqueue a job inside the domain transaction; the handler loads the current rows by ID, skips self-notifications, and inserts one `notifications` row keyed idempotently on `(event_id, account_id)`. Job payloads carry IDs only (the audit event id or review id and the pull request id), never titles or bodies, so retained `dead` jobs keep no private data.
