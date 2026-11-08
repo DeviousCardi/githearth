@@ -20,7 +20,7 @@ This runs seven read-only checks:
 
 - **git** — verifies Git ≥ 2.38 is available
 - **storage** — checks the storage root exists, is a writable directory, is not a symlink, is not world-writable, and every subdirectory (`repositories/`, `tmp/`, `trash/`, `orphans/`) that already exists is a real writable directory
-- **disk** — reports free space on the filesystem holding the storage root; warns below 10% free or below twice `git_push_limit_bytes`
+- **disk** — reports free space on the filesystem holding the storage root; warns below 10% free or below twice `git_push_limit_bytes`. It does not see PostgreSQL's disk: monitor that separately, because a full database disk leaves `doctor` and `/health/ready` reporting ok while writes fail (see [db-disk-full](../verification/db-disk-full.md))
 - **database** — connects to PostgreSQL and verifies connectivity
 - **schema** — compares applied migrations against the binary; detects pending, failed, or tampered migrations
 - **lifecycle** — warns about repositories stuck in `creating` or `deleting` past the reconcile grace period (the reconciler retries them)
