@@ -929,6 +929,12 @@ async fn notifications_api_listing_and_mark_read() {
         "{list}"
     );
 
+    let read_at = || {
+        sqlx::query_scalar::<_, String>("SELECT read_at::text FROM notifications WHERE id = $1")
+            .bind(unread_id)
+            .fetch_one(&pool)
+    };
+    let first_read_at = read_at().await.unwrap();
     let (status, _) = request(
         &app,
         "POST",
@@ -938,6 +944,11 @@ async fn notifications_api_listing_and_mark_read() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "mark-read is idempotent");
+    assert_eq!(
+        read_at().await.unwrap(),
+        first_read_at,
+        "the first read time is kept"
+    );
 
     // Another account's notification id is 404 for B.
     let b_session = fixture_session(&pool, _b).await;

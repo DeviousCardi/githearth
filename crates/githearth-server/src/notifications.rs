@@ -249,7 +249,8 @@ async fn mark_read(
 ) -> ApiResult<StatusCode> {
     let (account, _) = session_auth(&state.pool, &headers).await?;
     let result = sqlx::query(
-        "UPDATE notifications SET read_at = clock_timestamp() \
+        // The first read time wins; re-marking a read notification keeps it (#70).
+        "UPDATE notifications SET read_at = COALESCE(read_at, clock_timestamp()) \
          WHERE id = $1 AND account_id = $2",
     )
     .bind(id)
