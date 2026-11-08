@@ -40,7 +40,7 @@ server {
     ssl_ciphers         HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
 
-    # HSTS (start with a short max-age, then increase to 63072000)
+    # HSTS: browsers use HTTPS only, for one year (31536000 s).
     add_header Strict-Transport-Security "max-age=31536000" always;
 
     # Body size must at least match GITHEARTH_GIT_PUSH_LIMIT_BYTES (default 1 GiB)
