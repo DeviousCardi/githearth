@@ -61,25 +61,25 @@ struct NewToken {
 }
 
 #[derive(Serialize, sqlx::FromRow)]
-struct TokenMeta {
-    id: Uuid,
-    name: String,
-    scopes: Vec<String>,
-    created_at: String,
-    expires_at: Option<String>,
-    last_used_at: Option<String>,
-    revoked_at: Option<String>,
+pub(crate) struct TokenMeta {
+    pub(crate) id: Uuid,
+    pub(crate) name: String,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) created_at: String,
+    pub(crate) expires_at: Option<String>,
+    pub(crate) last_used_at: Option<String>,
+    pub(crate) revoked_at: Option<String>,
 }
 
 #[derive(Serialize)]
-struct CreatedToken {
-    id: Uuid,
-    name: String,
-    scopes: Vec<String>,
-    created_at: String,
-    expires_at: Option<String>,
+pub(crate) struct CreatedToken {
+    pub(crate) id: Uuid,
+    pub(crate) name: String,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) created_at: String,
+    pub(crate) expires_at: Option<String>,
     /// Shown once: the plaintext token string.
-    token: String,
+    pub(crate) token: String,
 }
 
 const TOKEN_COLUMNS: &str = "id, name, scopes, \
@@ -94,10 +94,31 @@ async fn create(
     Json(input): Json<NewToken>,
 ) -> ApiResult<(StatusCode, Json<CreatedToken>)> {
     let (account, _) = session_auth(&state.pool, &headers).await?;
-    if !name_ok(&input.name) || !scope_ok(&input.scopes) {
+    let created = create_token(
+        &state,
+        account.id,
+        &input.name,
+        &input.scopes,
+        input.expires_in_days,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Shared by the JSON handler and the settings page's "Create token" form.
+/// Validation stays here: a bad name, scope set or expiry fails both callers
+/// identically. Returns the plaintext exactly once.
+pub(crate) async fn create_token(
+    state: &AppState,
+    account_id: Uuid,
+    name: &str,
+    scopes: &[String],
+    expires_in_days: Option<i64>,
+) -> ApiResult<CreatedToken> {
+    if !name_ok(name) || !scope_ok(scopes) {
         return Err(invalid());
     }
-    if let Some(days) = input.expires_in_days
+    if let Some(days) = expires_in_days
         && !(1..=3650).contains(&days)
     {
         return Err(invalid());
@@ -116,14 +137,14 @@ async fn create(
          ELSE clock_timestamp() + $6 * interval '1 day' END)",
     )
     .bind(id)
-    .bind(account.id)
-    .bind(&input.name)
+    .bind(account_id)
+    .bind(name)
     .bind(token_hash)
-    .bind(&input.scopes)
-    .bind(input.expires_in_days)
+    .bind(scopes)
+    .bind(expires_in_days)
     .execute(&mut *tx)
     .await?;
-    event(&mut tx, None, account.id, "token.created").await?;
+    event(&mut tx, None, account_id, "token.created").await?;
     let row = sqlx::query(&format!(
         "SELECT {TOKEN_COLUMNS} FROM access_tokens WHERE id = $1"
     ))
@@ -132,17 +153,14 @@ async fn create(
     .await?;
     tx.commit().await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(CreatedToken {
-            id,
-            name: input.name,
-            scopes: input.scopes,
-            created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
-            token: plaintext,
-        }),
-    ))
+    Ok(CreatedToken {
+        id,
+        name: name.to_owned(),
+        scopes: scopes.to_vec(),
+        created_at: row.get("created_at"),
+        expires_at: row.get("expires_at"),
+        token: plaintext,
+    })
 }
 
 async fn list(
@@ -150,13 +168,19 @@ async fn list(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<TokenMeta>>> {
     let (account, _) = session_auth(&state.pool, &headers).await?;
+    Ok(Json(list_tokens(&state, account.id).await?))
+}
+
+/// Shared by the JSON handler and the settings page: the account's tokens in
+/// a stable order.
+pub(crate) async fn list_tokens(state: &AppState, account_id: Uuid) -> ApiResult<Vec<TokenMeta>> {
     let rows = sqlx::query_as::<_, TokenMeta>(&format!(
         "SELECT {TOKEN_COLUMNS} FROM access_tokens WHERE account_id = $1 ORDER BY created_at, id"
     ))
-    .bind(account.id)
+    .bind(account_id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(rows))
+    Ok(rows)
 }
 
 async fn revoke(
@@ -165,19 +189,26 @@ async fn revoke(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     let (account, _) = session_auth(&state.pool, &headers).await?;
+    revoke_token(&state, account.id, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Shared by the JSON handler and the settings page's "Revoke" button. A
+/// missing id or another account's token is a 404 for both callers.
+pub(crate) async fn revoke_token(state: &AppState, account_id: Uuid, id: Uuid) -> ApiResult<()> {
     let mut tx = state.pool.begin().await?;
     let result = sqlx::query(
         "UPDATE access_tokens SET revoked_at = clock_timestamp() \
          WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
     )
     .bind(id)
-    .bind(account.id)
+    .bind(account_id)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError(StatusCode::NOT_FOUND, "token not found"));
     }
-    event(&mut tx, None, account.id, "token.revoked").await?;
+    event(&mut tx, None, account_id, "token.revoked").await?;
     tx.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }

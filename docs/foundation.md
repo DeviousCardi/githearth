@@ -202,3 +202,7 @@ In-app notifications are the first real handlers on the [ADR 0006](decisions/000
 | `POST /api/v1/user/notifications/{id}/read` | Session bearer only; sets `read_at` and returns 204; idempotent; 404 for an unknown id or another account's notification |
 
 The two kinds are `pull_request.merged` and `pull_request.reviewed`. The recipient is always the pull request author, and a notification is skipped when the author is the one who merged or reviewed. The `notifications` table's `actor_id` set to null when the acting account is deleted, `pull_request_id` cascades on pull request deletion, and `account_id` cascades on account deletion.
+
+## Settings
+
+Signed-in sessions manage personal access tokens and SSH keys from the browser at `/settings` (create with a one-time plaintext-token display, list, and revoke), using the same CSRF-protected forms and shared API functions as the JSON endpoints.

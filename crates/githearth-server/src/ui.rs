@@ -152,7 +152,8 @@ pub(crate) fn render_page(
         if let Some(token) = csrf {
             format!(
                 "<nav><a href=\"/\">GitHearth</a><span class=\"muted\" style=\"color:#ccc\">{}</span>\
-<form method=\"post\" action=\"/logout\" style=\"margin-left:auto;display:inline\">\
+<a href=\"/settings\" style=\"margin-left:auto\">Settings</a>\
+<form method=\"post\" action=\"/logout\" style=\"display:inline\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
 <button type=\"submit\">Sign out</button></form></nav>",
                 esc(name),
@@ -699,5 +700,6 @@ pub fn router() -> Router<AppState> {
         .merge(crate::issues_ui::router())
         .merge(crate::pulls_ui::router())
         .merge(crate::browse_ui::router())
+        .merge(crate::settings_ui::router())
         .layer(axum::middleware::map_response(page_headers))
 }
