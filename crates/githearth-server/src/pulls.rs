@@ -1247,27 +1247,14 @@ fn require_request_permission(
 ) -> Result<(), ApiError> {
     require_pull(state, loaded, pull, Action::PullRequestComment)?;
     let is_author = loaded.actor_id == pull.author_id;
-    let can_approve = state
-        .authz
-        .authorize(&loaded.facts.request(
-            Action::PullRequestApprove,
-            Resource::PullRequest(
-                &repositories::authz_repository(&loaded.repo),
-                &PullRequest {
-                    id: pull.id,
-                    repository: loaded.repo.id,
-                    author: pull.author_id,
-                    target: Ref {
-                        repository: loaded.repo.id,
-                        name: format!("refs/heads/{}", pull.target_branch),
-                        protection: None,
-                        exists: true,
-                    },
-                },
-            ),
-            Some(Duration::from_secs(loaded.auth_age)),
-        ))
-        .is_allowed();
+    // Approve is a routine action, so the auth age does not change the decision.
+    let can_approve = reviewer_allowed(
+        Action::PullRequestApprove,
+        state,
+        loaded,
+        pull,
+        Some(&loaded.facts),
+    );
     if !is_author && !can_approve {
         return Err(ApiError(StatusCode::FORBIDDEN, "not permitted"));
     }
