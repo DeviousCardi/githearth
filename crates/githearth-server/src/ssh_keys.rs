@@ -18,8 +18,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    Account, ApiError, AppState, Credential, authenticate_token_hash, bearer_credential, event,
-    invalid, ssh,
+    Account, ApiError, AppState, Credential, authenticate_token_hash, bearer_credential,
+    event_with, invalid, ssh,
 };
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -206,7 +206,14 @@ pub(crate) async fn create_ssh_key(
         }
         ApiError::from(e)
     })?;
-    event(&mut tx, None, account_id, "ssh_key.created").await?;
+    event_with(
+        &mut tx,
+        None,
+        account_id,
+        "ssh_key.created",
+        serde_json::json!({"key_id": id, "fingerprint": fingerprint}),
+    )
+    .await?;
     let row = sqlx::query(&format!(
         "SELECT {SSH_KEY_COLUMNS} FROM ssh_keys WHERE id = $1"
     ))
@@ -263,18 +270,23 @@ async fn revoke(
 /// missing id or another account's key is a 404 for both callers.
 pub(crate) async fn revoke_ssh_key(state: &AppState, account_id: Uuid, id: Uuid) -> ApiResult<()> {
     let mut tx = state.pool.begin().await?;
-    let result = sqlx::query(
+    let fingerprint: String = sqlx::query_scalar(
         "UPDATE ssh_keys SET revoked_at = clock_timestamp() \
-         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
+         WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL RETURNING fingerprint",
     )
     .bind(id)
     .bind(account_id)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "ssh key not found"))?;
+    event_with(
+        &mut tx,
+        None,
+        account_id,
+        "ssh_key.revoked",
+        serde_json::json!({"key_id": id, "fingerprint": fingerprint}),
+    )
     .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError(StatusCode::NOT_FOUND, "ssh key not found"));
-    }
-    event(&mut tx, None, account_id, "ssh_key.revoked").await?;
     tx.commit().await?;
     Ok(())
 }

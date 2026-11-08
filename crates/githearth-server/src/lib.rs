@@ -833,6 +833,18 @@ pub(crate) async fn event(
     actor: Uuid,
     kind: &str,
 ) -> Result<(), sqlx::Error> {
+    event_with(tx, organization, actor, kind, serde_json::json!({})).await
+}
+
+/// `event` with `extra` fields merged into the outbox payload (IDs only, never
+/// secrets); the audit row keeps its fixed columns and shares the event id.
+pub(crate) async fn event_with(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    organization: Option<Uuid>,
+    actor: Uuid,
+    kind: &str,
+    extra: serde_json::Value,
+) -> Result<(), sqlx::Error> {
     // At most one audit chain per transaction, or the site chain last (lock order).
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO audit_events (id,organization_id,actor_id,kind) VALUES ($1,$2,$3,$4)")
@@ -846,7 +858,12 @@ pub(crate) async fn event(
         .bind(id)
         .bind(organization)
         .bind(kind)
-        .bind(serde_json::json!({"actor_id": actor, "organization_id": organization}))
+        .bind({
+            let mut payload = extra;
+            payload["actor_id"] = serde_json::json!(actor);
+            payload["organization_id"] = serde_json::json!(organization);
+            payload
+        })
         .execute(&mut **tx)
         .await?;
     Ok(())
