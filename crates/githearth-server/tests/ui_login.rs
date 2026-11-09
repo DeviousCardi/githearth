@@ -603,8 +603,40 @@ async fn login_page_reuses_csrf_cookie_and_sets_page_headers() {
         .unwrap();
     assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
     assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
+    assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert_eq!(resp.headers()[header::REFERRER_POLICY], "same-origin");
+    let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for directive in [
+        "default-src 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'",
+    ] {
+        assert!(csp.contains(directive), "CSP {csp:?} lacks {directive}");
+    }
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert!(String::from_utf8_lossy(&bytes).contains(&format!("value=\"{csrf_token}\"")));
+
+    // Non-page responses get nosniff and Referrer-Policy too, without the page CSP.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert_eq!(resp.headers()[header::REFERRER_POLICY], "same-origin");
+    assert!(
+        resp.headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .is_none()
+    );
     pool.close().await;
 }
 

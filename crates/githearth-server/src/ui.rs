@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, SET_COOKIE, X_FRAME_OPTIONS},
+        header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, SET_COOKIE, X_FRAME_OPTIONS},
     },
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
@@ -682,10 +682,15 @@ async fn repository(
 }
 
 /// Pages carry account data and a sign-out form: keep them out of shared caches and frames.
+pub(crate) const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; \
+     form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
 async fn page_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // Pages use no JavaScript and only inline style attributes (#87).
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(PAGE_CSP));
     response
 }
 

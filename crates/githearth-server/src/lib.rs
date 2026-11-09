@@ -386,9 +386,12 @@ async fn observe(request: axum::extract::Request, next: axum::middleware::Next) 
         .map(|c| c.0.to_string())
         .unwrap_or_else(|| "unknown".into());
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert("cache-control", "no-store".parse().unwrap());
+    let headers = response.headers_mut();
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    // Every response: no MIME sniffing (raw file views serve user content), and
+    // no URL paths leaked to other sites in Referer (#87).
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("referrer-policy", "same-origin".parse().unwrap());
     tracing::info!(%method, route, status = response.status().as_u16(), elapsed_ms = start.elapsed().as_millis() as u64, client_ip, "http request");
     response
 }
