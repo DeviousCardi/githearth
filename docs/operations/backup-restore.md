@@ -67,6 +67,113 @@ A backup is only proven by restoring it and verifying object integrity
    git clone https://<host>/<org>/<repo>.git
    ```
 
+## Off-host copy
+
+A backup stored on the same host does not help when the host fails.
+Copy the artifacts to a separate host, verify them there, and restore
+from that copy at least once to prove the round-trip works.
+
+### How it works
+
+Three files must leave the primary host:
+
+1. the database dump (see *Procedure* above),
+2. the storage tarball, and
+3. a `SHA256SUMS` manifest of both so integrity can be verified at the
+   far end without trusting the network.
+
+### Copy to the backup host
+
+On the backup host, create a dedicated unprivileged user (for example
+`githearth-backup`, not Debian's built-in `backup` system account) that owns
+only the backup directory, such as `/srv/backups/githearth/`. On the primary
+host, generate a key for it:
+
+```sh
+ssh-keygen -t ed25519 -N '' -f /etc/githearth/backup-key   # private key, mode 0600
+```
+
+Add `/etc/githearth/backup-key.pub` to that user's `authorized_keys`. Prefix
+the line with `restrict` to disable forwarding and PTYs:
+
+```
+restrict ssh-ed25519 AAAA... githearth-backup
+```
+
+The key must still be able to run commands, because the upload uses `rsync`
+and the check runs `sha256sum -c` on the backup host. Don't use a
+`command="rsync --server --sender"` restriction: that only permits downloads.
+
+Generate the checksum manifest alongside the dump and the tarball:
+
+```sh
+sha256sum githearth-YYYYMMDD-HHMM.dump storage-YYYYMMDD-HHMM.tgz > SHA256SUMS
+```
+
+Push all three with `rsync` (or `scp`):
+
+```sh
+rsync -e "ssh -i /etc/githearth/backup-key -o StrictHostKeyChecking=yes" \
+  githearth-YYYYMMDD-HHMM.dump \
+  storage-YYYYMMDD-HHMM.tgz \
+  SHA256SUMS \
+  githearth-backup@backuphost.example.com:/srv/backups/githearth/
+```
+
+Verify the manifest on the remote side:
+
+```sh
+ssh -i /etc/githearth/backup-key \
+  githearth-backup@backuphost.example.com \
+  "cd /srv/backups/githearth && sha256sum -c SHA256SUMS"
+```
+
+An `OK` line is printed for every file.  If any file says `FAILED`,
+delete the remote copy, recheck the dump/tarball on the source, and
+repeat the upload.
+
+### What else must be kept off-host
+
+Secrets that are not inside the dump or storage tarball:
+
+- **Configuration file** — the TOML file at the path passed to `--config`
+  (or the environment variables).  It often contains database credentials
+  and host-key paths.  Treat it as a secret and copy it to a safe off-host
+  location.
+- **SSH host key**: the file at `GITHEARTH_SSH_HOST_KEY_PATH` (there is no
+  default). If it lies inside the storage root, as in the container image
+  (`/var/lib/githearth/ssh_host_key`), the storage tarball already contains
+  it. Otherwise copy it separately. Without it, every client sees a new host
+  key after a restore, and `StrictHostKeyChecking` blocks their connections.
+  It is a private key: store it encrypted.
+
+### Retention
+
+Keep N most-recent generations (e.g. `N=7` for a daily backup — one
+week).  Prune: keep the backup directory sorted by date, delete anything
+past the N-th most recent generation.
+
+### Restoring from the off-host copy
+
+1. Fetch the three files back to the (new) primary host:
+
+   ```sh
+   rsync -e "ssh -i /etc/githearth/backup-key" \
+     githearth-backup@backuphost.example.com:/srv/backups/githearth/SHA256SUMS \
+     githearth-backup@backuphost.example.com:/srv/backups/githearth/githearth-YYYYMMDD-HHMM.dump \
+     githearth-backup@backuphost.example.com:/srv/backups/githearth/storage-YYYYMMDD-HHMM.tgz \
+     /tmp/githearth-restore/
+   ```
+
+2. Verify the manifest locally:
+
+   ```sh
+   cd /tmp/githearth-restore && sha256sum -c SHA256SUMS
+   ```
+
+3. Follow the *Restore* section above, starting from step 1
+   (`createdb` / `pg_restore`).
+
 ## What `check` does NOT verify
 
 - Database relationships, permissions, or metadata consistency (that is a
