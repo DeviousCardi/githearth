@@ -1326,12 +1326,13 @@ async fn add_review_request(
 
     let request_id = Uuid::new_v4();
     let inserted = sqlx::query(
-        "INSERT INTO pull_request_review_requests (pull_request_id, reviewer_id, requested_by) \
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        "INSERT INTO pull_request_review_requests (pull_request_id, reviewer_id, requested_by, id) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (pull_request_id, reviewer_id) DO NOTHING",
     )
     .bind(pull.id)
     .bind(reviewer_id)
     .bind(actor.id)
+    .bind(request_id)
     .execute(&mut *tx)
     .await?;
 
