@@ -585,6 +585,57 @@ async fn remove_request_and_remove_again() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn remove_then_re_request_notifies_once() {
+    let f = build_fixture().await;
+
+    let (reviewer_id, reviewer_username) = add_member(&f.pool, f.org_id, "write").await;
+    let href = review_requests_href(&f.org_slug, &f.repo_name, f.number);
+    let item_href = format!("{href}/{reviewer_username}");
+    let add = json!({"reviewer": reviewer_username});
+
+    // Request, remove, request again, all before any job runs (#86).
+    let (status, _) = request(&f.app, "POST", &href, Some(&f.author_token), add.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &f.app,
+        "DELETE",
+        &item_href,
+        Some(&f.author_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = request(&f.app, "POST", &href, Some(&f.author_token), add).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = 'notification.pull_request_review_requested' \
+         AND payload->>'pull_request_id' = $1",
+    )
+    .bind(f.pull_id.to_string())
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 2, "one job per request");
+
+    // Only the job for the live request notifies.
+    run_jobs(&f.state).await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM notifications WHERE account_id = $1 \
+         AND kind = 'pull_request.review_requested' AND pull_request_id = $2",
+    )
+    .bind(reviewer_id)
+    .bind(f.pull_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn closed_pull_request_refuses_a_request() {
     let f = build_fixture().await;
 

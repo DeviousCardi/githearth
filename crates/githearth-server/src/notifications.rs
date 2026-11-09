@@ -193,11 +193,10 @@ async fn review_requested(state: &AppState, job: &Job) -> JobOutcome {
     };
 
     let still_exists: bool = match sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pull_request_review_requests \
-         WHERE pull_request_id = $1 AND reviewer_id = $2)",
+        // This exact request, not merely one for the same reviewer (#86).
+        "SELECT EXISTS(SELECT 1 FROM pull_request_review_requests WHERE id = $1)",
     )
-    .bind(pull_request_id)
-    .bind(reviewer_id)
+    .bind(request_id)
     .fetch_one(&state.pool)
     .await
     {
