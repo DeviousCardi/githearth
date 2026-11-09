@@ -1451,6 +1451,309 @@ class M4Harness(_m2.Harness):
     def _repo_http_url(self, repo_name):
         return f"http://127.0.0.1:{self.server.http_port}/{self.org_slug}/{repo_name}.git"
 
+    # ================================================================== S10
+    def s10_resource_bounds(self):
+        """Measure resource bounds: git concurrency, memory, request limits, auth concurrency."""
+        self.stop_server()
+        self.generate_ssh_host_key()
+
+        GIT_CONCURRENCY = 8   # default git_concurrency
+        BODY_LIMIT = 524_288  # default body_limit_bytes
+        # Fixed ceilings set from measurement with headroom (docs/verification/m4-qualification.md):
+        # the server process alone, and the server plus its git children.
+        SERVER_RSS_CEILING_KIB = 256 * 1024
+        TREE_RSS_CEILING_KIB = 768 * 1024
+
+        # ---- Phase 1: default config for burst/memory/auth tests ----
+        self.start_server(MAIN_DB, self.storage_root, "s10-default")
+        tok = self.api_session(self.admin_username, self.admin_password)
+        self.admin_token = tok
+
+        st, repo = self.api_json(
+            "POST", f"/api/v1/organizations/{self.org_slug}/repositories",
+            {"name": "s10-repo", "visibility": "private"}, token=tok)
+        if st != 201: raise HarnessError(f"s10 create repo status {st}")
+        s10_url = f"http://127.0.0.1:{self.server.http_port}/{self.org_slug}/s10-repo.git"
+        s10_ssh = self.ssh_repo_url(org=self.org_slug, repo="s10-repo")
+
+        try: self.api_register_ssh_key(tok, self.admin_ssh_key.with_suffix(".pub"))
+        except HarnessError as e:
+            if "already registered" not in str(e) and "409" not in str(e): raise
+
+        # Seed the repo with a few MiB of history
+        sw = self.tmp / "s10-work"; sw.mkdir()
+        self.git("init", "-b", "main", cwd=str(sw))
+        self.git("config", "user.name", "S10", cwd=str(sw))
+        self.git("config", "user.email", "s10@t", cwd=str(sw))
+        (sw / "data.bin").write_bytes(os.urandom(10 * 1024 * 1024))  # 10 MiB for slower clones
+        self.git("add", "-A", cwd=str(sw)); self.git("commit", "-m", "seed", cwd=str(sw))
+        self.git("push", s10_url, "main", user=self.admin_username, password=self.admin_password, cwd=str(sw))
+
+        # ---- concurrency bound, 3x git_concurrency simultaneous clones ----
+        N = 3 * GIT_CONCURRENCY
+        server_pid = self.server.proc.pid
+        max_children = 0
+        peak_burst_tree_kib = 0
+        busy_count = 0
+        success_count = 0
+        completion_errors = 0
+
+        procs = []
+        clone_dirs = [self.tmp / f"s10-cc-{i}" for i in range(N)]
+        for i in range(N):
+            cd = clone_dirs[i]
+            proc = subprocess.Popen(
+                ["git", "-c", f"credential.helper={self.cred_helper}", "clone", s10_url, str(cd)],
+                env=self.git_env(self.admin_username, self.admin_password),
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            procs.append((proc, cd))
+
+        # Sample aggressively for the first few seconds while clones start up,
+        # then back off. The try_acquire semaphore means at most git_concurrency
+        # children can exist simultaneously.
+        for _ in range(3000):  # ~30s at 10ms
+            running = [p for p, _ in procs if p.poll() is None]
+            if not running:
+                break
+            gchildren = _count_git_children(server_pid)
+            if gchildren > max_children:
+                max_children = gchildren
+            tree = _proc_rss_kib(server_pid) + sum(_proc_rss_kib(c) for c in _all_children(server_pid))
+            peak_burst_tree_kib = max(peak_burst_tree_kib, tree)
+            time.sleep(0.01)
+
+        burst_deadline = time.time() + 600
+        while time.time() < burst_deadline:
+            running = [p for p, _ in procs if p.poll() is None]
+            if not running:
+                break
+            time.sleep(0.5)
+
+        for proc, cd in procs:
+            try: proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill(); proc.wait()
+            stderr = proc.stderr.read()
+            shutil.rmtree(str(cd), ignore_errors=True)
+            if proc.returncode == 0:
+                success_count += 1
+            elif "busy" in stderr.lower() or "unavailable" in stderr.lower() or "503" in stderr:
+                busy_count += 1
+            else:
+                completion_errors += 1
+
+        if max_children > GIT_CONCURRENCY:
+            raise HarnessError(
+                f"s10 concurrency: {max_children} git children > limit {GIT_CONCURRENCY}")
+        if success_count + busy_count != N:
+            raise HarnessError(
+                f"s10 concurrency: {success_count} ok + {busy_count} busy + {completion_errors} errors != {N}")
+        st, _ = self.api_json("GET", "/health/ready")
+        if st != 200:
+            raise HarnessError(f"s10: server not ready after concurrency burst: {st}")
+
+        # ---- memory bound during burst ----
+        peak_rss_kib = self.server.rss_kib()  # server high-water mark (VmHWM)
+        rss_ceiling = SERVER_RSS_CEILING_KIB
+        if (peak_rss_kib or 0) > SERVER_RSS_CEILING_KIB:
+            raise HarnessError(f"s10: server peak RSS {peak_rss_kib} KiB > {SERVER_RSS_CEILING_KIB} KiB")
+        if peak_burst_tree_kib > TREE_RSS_CEILING_KIB:
+            raise HarnessError(f"s10: burst server+git RSS {peak_burst_tree_kib} KiB > {TREE_RSS_CEILING_KIB} KiB")
+
+        # ---- memory bound during 20 MiB push over HTTP ----
+        (sw / "big20.bin").write_bytes(os.urandom(20 * 1024 * 1024))
+        self.git("add", "big20.bin", cwd=str(sw))
+        self.git("-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "20 MiB push", cwd=str(sw))
+        srv_pid = self.server.proc.pid
+        peak_during_push = [0]
+
+        push_proc = subprocess.Popen(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "push", s10_url, "main"],
+            env=self.git_env(self.admin_username, self.admin_password),
+            cwd=str(sw),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        while push_proc.poll() is None:
+            r = _proc_rss_kib(srv_pid) + sum(_proc_rss_kib(c) for c in _all_children(srv_pid))
+            if r > peak_during_push[0]: peak_during_push[0] = r
+            time.sleep(0.1)
+        push_stderr = push_proc.stderr.read()
+        if push_proc.returncode != 0:
+            raise HarnessError(f"s10: 20 MiB HTTP push failed: {push_stderr[:400]}")
+        peak_push_rss_kib = peak_during_push[0]
+        push_rss_ceiling = TREE_RSS_CEILING_KIB
+        if peak_push_rss_kib > TREE_RSS_CEILING_KIB:
+            raise HarnessError(f"s10: HTTP push server+git RSS {peak_push_rss_kib} KiB > {TREE_RSS_CEILING_KIB} KiB")
+
+        # ---- memory bound during 20 MiB push over SSH ----
+        (sw / "big20-ssh.bin").write_bytes(os.urandom(20 * 1024 * 1024))
+        self.git("add", "big20-ssh.bin", cwd=str(sw))
+        self.git("-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "20 MiB SSH push", cwd=str(sw))
+        peak_during_ssh_push = [0]
+        ssh_proc = subprocess.Popen(
+            ["git", "push", s10_ssh, "main"],
+            env=self.ssh_git_env(self.admin_ssh_key),
+            cwd=str(sw),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        while ssh_proc.poll() is None:
+            r = _proc_rss_kib(srv_pid) + sum(_proc_rss_kib(c) for c in _all_children(srv_pid))
+            if r > peak_during_ssh_push[0]: peak_during_ssh_push[0] = r
+            time.sleep(0.1)
+        ssh_stderr = ssh_proc.stderr.read()
+        if ssh_proc.returncode != 0:
+            raise HarnessError(f"s10: 20 MiB SSH push failed: {ssh_stderr[:400]}")
+        peak_ssh_rss_kib = peak_during_ssh_push[0]
+        ssh_rss_ceiling = TREE_RSS_CEILING_KIB
+        if peak_ssh_rss_kib > TREE_RSS_CEILING_KIB:
+            raise HarnessError(f"s10: SSH push server+git RSS {peak_ssh_rss_kib} KiB > {TREE_RSS_CEILING_KIB} KiB")
+
+        shutil.rmtree(str(sw), ignore_errors=True)
+
+        # ---- request body limit ----
+        big_body = json.dumps({"username": self.admin_username, "password": "x" * (BODY_LIMIT + 100)}).encode()
+        st, _, _ = self.api("POST", "/api/v1/login", body=big_body,
+                            headers={"Content-Type": "application/json"})
+        if st not in (413, 400):
+            raise HarnessError(f"s10: oversized body status {st} (expected 413 or 400)")
+        body_limit_status = st
+
+        # Record idle RSS before auth test
+        time.sleep(2)
+        idle_rss_kib = self.server.rss_kib()
+
+        # ---- auth concurrency bound ----
+        AUTH_BURST = 10  # > auth_concurrency (2)
+        login_start = time.time()
+        login_procs = []
+        for _ in range(AUTH_BURST):
+            data = json.dumps({"username": self.admin_username, "password": self.admin_password}).encode()
+            proc = subprocess.Popen(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-X", "POST", f"{self.http_base}/api/v1/login",
+                 "-H", "Content-Type: application/json", "-d", "@/dev/stdin"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc.stdin.write(data); proc.stdin.close()
+            login_procs.append(proc)
+        results = []
+        for proc in login_procs:
+            try: proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill(); proc.wait()
+            out = proc.stdout.read().decode(errors="replace").strip()
+            results.append(out)
+        login_elapsed = time.time() - login_start
+        ok_logins = sum(1 for r in results if r == "200")
+        throttled = sum(1 for r in results if r == "429")
+        if ok_logins + throttled != AUTH_BURST:
+            raise HarnessError(f"s10 auth: {ok_logins} ok + {throttled} throttled != {AUTH_BURST}")
+        auth_latency_s = round(login_elapsed, 3)
+
+        self.stop_server()
+
+        # ---- Phase 2: lowered git_push_limit_bytes server for push-limit drill ----
+        push_limit = 2 * 1024 * 1024  # 2 MiB
+        self.generate_ssh_host_key()
+        self.start_server(MAIN_DB, self.storage_root, "s10-pushlimit",
+                          extra={"GITHEARTH_GIT_PUSH_LIMIT_BYTES": str(push_limit)})
+        tok2 = self.api_session(self.admin_username, self.admin_password)
+
+        st, repo2 = self.api_json(
+            "POST", f"/api/v1/organizations/{self.org_slug}/repositories",
+            {"name": "s10-pushlimit", "visibility": "private"}, token=tok2)
+        if st != 201: raise HarnessError(f"s10: create pushlimit repo status {st}")
+        pl_url = f"http://127.0.0.1:{self.server.http_port}/{self.org_slug}/s10-pushlimit.git"
+        pl_ssh = self.ssh_repo_url(org=self.org_slug, repo="s10-pushlimit")
+
+        try: self.api_register_ssh_key(tok2, self.admin_ssh_key.with_suffix(".pub"))
+        except HarnessError as e:
+            if "already registered" not in str(e) and "409" not in str(e): raise
+
+        plw = self.tmp / "s10-plw"; plw.mkdir()
+        self.git("init", "-b", "main", cwd=str(plw))
+        self.git("config", "user.name", "PL", cwd=str(plw))
+        self.git("config", "user.email", "pl@t", cwd=str(plw))
+        (plw / "seed.txt").write_text("pushlimit\n")
+        self.git("add", "-A", cwd=str(plw)); self.git("commit", "-m", "seed", cwd=str(plw))
+        self.git("push", pl_url, "main", user=self.admin_username, password=self.admin_password, cwd=str(plw))
+
+        big_data = os.urandom(push_limit + 1024)
+        (plw / "big.bin").write_bytes(big_data)
+        self.git("add", "big.bin", cwd=str(plw))
+        self.git("-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "oversized", cwd=str(plw))
+        hp_proc = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}",
+             "push", pl_url, "HEAD:refs/heads/oversized"],
+            env=self.git_env(self.admin_username, self.admin_password),
+            cwd=str(plw), capture_output=True, text=True, timeout=600)
+        if hp_proc.returncode == 0:
+            raise HarnessError("s10: HTTP push above git_push_limit should be refused")
+        ls_out = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", pl_url],
+            env=self.git_env(self.admin_username, self.admin_password),
+            capture_output=True, text=True).stdout
+        if "refs/heads/oversized" in ls_out:
+            raise HarnessError("s10: ref moved despite HTTP push refusal over git_push_limit")
+
+        (plw / "big2.bin").write_bytes(big_data)
+        self.git("add", "big2.bin", cwd=str(plw))
+        self.git("-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "oversized ssh", cwd=str(plw))
+        ss_proc = subprocess.run(
+            ["git", "push", pl_ssh, "HEAD:refs/heads/oversized-ssh"],
+            env=self.ssh_git_env(self.admin_ssh_key),
+            cwd=str(plw), capture_output=True, text=True, timeout=600)
+        if ss_proc.returncode == 0:
+            raise HarnessError("s10: SSH push above git_push_limit should be refused")
+        ls_out2 = subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "ls-remote", pl_url],
+            env=self.git_env(self.admin_username, self.admin_password),
+            capture_output=True, text=True).stdout
+        if "refs/heads/oversized-ssh" in ls_out2:
+            raise HarnessError("s10: ref moved despite SSH push refusal over git_push_limit")
+
+        shutil.rmtree(str(plw), ignore_errors=True)
+
+        # ---- PostgreSQL measurements ----
+        pg_stats = self.docker_stats()
+        db_size = None
+        try: db_size = int(self.sql(MAIN_DB, "SELECT pg_database_size('" + MAIN_DB + "')"))
+        except Exception: db_size = None
+        storage_size = self.dir_size(self.storage_root)
+
+        self._s10_measurements = {
+            "git_concurrency_limit": GIT_CONCURRENCY,
+            "concurrency_burst_clones": N,
+            "max_concurrent_git_children": max_children,
+            "successful_clones": success_count,
+            "busy_responses": busy_count,
+            "peak_server_rss_kib_burst": peak_rss_kib,
+            "peak_tree_rss_kib_burst": peak_burst_tree_kib,
+            "server_rss_ceiling_kib": rss_ceiling,
+            "tree_rss_ceiling_kib": TREE_RSS_CEILING_KIB,
+            "idle_rss_kib": idle_rss_kib,
+            "peak_rss_kib_20mib_http_push": peak_push_rss_kib,
+            "rss_ceiling_kib_20mib_http_push": push_rss_ceiling,
+            "peak_rss_kib_20mib_ssh_push": peak_ssh_rss_kib,
+            "rss_ceiling_kib_20mib_ssh_push": ssh_rss_ceiling,
+            "body_limit_bytes": BODY_LIMIT,
+            "body_over_limit_status": body_limit_status,
+            "git_push_limit_bytes_test": push_limit,
+            "http_push_refused": hp_proc.returncode != 0,
+            "ssh_push_refused": ss_proc.returncode != 0,
+            "auth_concurrency_limit": 2,
+            "auth_burst_requests": AUTH_BURST,
+            "auth_ok_logins": ok_logins,
+            "auth_throttled": throttled,
+            "auth_total_latency_s": auth_latency_s,
+            "postgresql_memory": pg_stats,
+            "database_size_bytes": db_size,
+            "storage_size_bytes": storage_size,
+        }
+        print(f"    concurrency: max {max_children}/{GIT_CONCURRENCY}, "
+              f"{success_count} ok + {busy_count} busy")
+        print(f"    memory: idle {idle_rss_kib} KiB, server peak {peak_rss_kib} KiB, "
+              f"burst server+git {peak_burst_tree_kib} KiB, "
+              f"HTTP push {peak_push_rss_kib} KiB, SSH push {peak_ssh_rss_kib} KiB")
+        print(f"    auth: {ok_logins} ok + {throttled} throttled in {auth_latency_s}s")
+
     # ================================================================== runner
 
     def run(self):
@@ -1466,6 +1769,7 @@ class M4Harness(_m2.Harness):
             self.scenario("s6_restart_jobs", self.s6_restart_jobs)
             self.scenario("s7_container_install", self.s7_container_install)
             self.scenario("s8_disk_full", self.s8_disk_full)
+            self.scenario("s10_resource_bounds", self.s10_resource_bounds)
             self.scenario("s9_uninstall_drill", self.s9_uninstall_drill)
         finally:
             self.cleanup()
@@ -1485,7 +1789,8 @@ class M4Harness(_m2.Harness):
         info["upgrade_from_rev"] = self._from_rev
         report = {"environment": info, "scenarios": self.scenarios,
                   "git_operations": self.git_ops, "server_lifetimes": self.lifetimes,
-                  "authorization_matrix": self.auth_matrix, "measurements": {}}
+                  "authorization_matrix": self.auth_matrix,
+                  "measurements": getattr(self, "_s10_measurements", {})}
         with open(self.report_path, "w") as f:
             json.dump(report, f, indent=2, sort_keys=True)
 
@@ -1633,6 +1938,74 @@ def _classify(proc):
 
 def _sq(s):
     return "'" + s.replace("'", "''") + "'"
+
+
+def _proc_rss_kib(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        return 0
+    return 0
+
+
+def _all_children(root_pid):
+    """Return all descendant PIDs of root_pid (iterative walk)."""
+    seen = set()
+    todo = [root_pid]
+    result = []
+    while todo:
+        pid = todo.pop()
+        if pid in seen: continue
+        seen.add(pid)
+        # Every thread's children file: tokio spawns git from worker threads, which
+        # /proc/<pid>/task/<pid>/children (main thread only) would miss.
+        try: tids = os.listdir(f"/proc/{pid}/task")
+        except OSError: continue
+        for tid in tids:
+            try:
+                with open(f"/proc/{pid}/task/{tid}/children") as f:
+                    children = [int(x) for x in f.read().split()]
+            except OSError: continue
+            todo.extend(children)
+            result.extend(children)
+    return result
+
+
+def _count_git_children(pid):
+    """Count git upload-pack/receive-pack children of pid by scanning /proc for PPID ancestry."""
+    try:
+        git_pids = set()
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit(): continue
+            cp = int(entry)
+            # Trace lineage: is this process a descendant of pid?
+            current = cp
+            for _ in range(10):  # max depth
+                try:
+                    with open(f"/proc/{current}/stat") as f:
+                        ppid = int(f.read().split()[3])
+                except (OSError, ValueError, IndexError):
+                    break
+                if ppid <= 1: break
+                if ppid == pid:
+                    git_pids.add(cp)
+                    break
+                current = ppid
+                if current <= 1: break
+        count = 0
+        for cp in git_pids:
+            try:
+                with open(f"/proc/{cp}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError: continue
+            if "upload-pack" in cmd or "receive-pack" in cmd:
+                count += 1
+        return count
+    except Exception:
+        return 0
 
 
 def main():
