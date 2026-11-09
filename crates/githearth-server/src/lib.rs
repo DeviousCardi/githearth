@@ -16,6 +16,7 @@ pub mod merge;
 pub mod merge_intents;
 pub mod merge_worker;
 pub mod notifications;
+mod notifications_ui;
 pub mod protection;
 pub mod pulls;
 mod pulls_ui;
