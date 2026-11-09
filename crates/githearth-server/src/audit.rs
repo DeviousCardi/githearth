@@ -116,7 +116,8 @@ pub async fn verify(
     };
     let sql = format!(
         "SELECT seq, id, organization_id, actor_id, kind, \
-         (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS micros, prev_hash, hash \
+         (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS micros, prev_hash, hash, \
+         host(client_ip) AS client_ip \
          FROM audit_events WHERE {chain_filter} AND seq IS NOT NULL AND seq <= $2 ORDER BY seq"
     );
     let mut rows = sqlx::query(&sql)
@@ -174,13 +175,16 @@ pub async fn verify(
 
 /// The canonical encoding from the migration, mirrored byte-for-byte:
 /// id || organization_id (nil when NULL) || actor_id || len(kind) || kind
-/// || seq || created_at microseconds, all big-endian.
+/// || seq || created_at microseconds, all big-endian, and finally (V2) the
+/// optional client IP as len(host(client_ip)) || host(client_ip); the trailing
+/// field is omitted entirely when client_ip is NULL, preserving the V1 hash.
 fn hash_row(row: &sqlx::postgres::PgRow, seq: i64, prev: &[u8; 32]) -> Vec<u8> {
     let id: Uuid = row.get("id");
     let org: Option<Uuid> = row.get("organization_id");
     let actor: Uuid = row.get("actor_id");
     let kind: String = row.get("kind");
     let micros: i64 = row.get("micros");
+    let client_ip: Option<String> = row.get("client_ip");
     let mut hasher = Sha256::new();
     hasher.update(prev);
     hasher.update(id.as_bytes());
@@ -190,6 +194,10 @@ fn hash_row(row: &sqlx::postgres::PgRow, seq: i64, prev: &[u8; 32]) -> Vec<u8> {
     hasher.update(kind.as_bytes());
     hasher.update(seq.to_be_bytes());
     hasher.update(micros.to_be_bytes());
+    if let Some(ip) = client_ip {
+        hasher.update((ip.len() as i64).to_be_bytes());
+        hasher.update(ip.as_bytes());
+    }
     hasher.finalize().to_vec()
 }
 
@@ -209,11 +217,13 @@ struct AuditItem {
     actor_id: Uuid,
     created_at: String,
     hash: String,
+    client_ip: Option<String>,
 }
 
 const AUDIT_ITEM_COLUMNS: &str = "seq, kind, actor_id, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
- encode(hash, 'hex') AS hash";
+ encode(hash, 'hex') AS hash, \
+ host(client_ip) AS client_ip";
 
 #[derive(Serialize)]
 struct AuditPage {

@@ -363,6 +363,11 @@ async fn backfilled_rows_verify() {
     // Apply migration 0007 (adds columns, trigger, backfill).
     let m7 = migrations.iter().find(|m| m.version == 7).unwrap();
     sqlx::raw_sql(&m7.sql).execute(&pool).await.unwrap();
+    // Apply 0019 (adds client_ip and the v2 trigger) so the schema matches what
+    // verify() expects; v2 hashes byte-identically to 0007 when client_ip is
+    // NULL, so these backfilled rows keep their 0007-computed hashes.
+    let m19 = migrations.iter().find(|m| m.version == 19).unwrap();
+    sqlx::raw_sql(&m19.sql).execute(&pool).await.unwrap();
     let (org_rows, org_ok, bad1) = verify_chain(&pool, Some(org_id)).await;
     assert_eq!(
         (org_rows, org_ok, bad1),

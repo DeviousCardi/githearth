@@ -60,6 +60,9 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 tokio::task_local! {
     static ADMITTED_TOKEN: (Vec<u8>, Account, u64);
+    // Work spawned onto other tasks (tokio::spawn, job runner, push replay)
+    // runs outside this scope, so its audit rows record client_ip NULL.
+    static CLIENT_IP: std::net::IpAddr;
 }
 
 #[derive(Clone)]
@@ -367,6 +370,7 @@ async fn client_ip_middleware(
             .collect();
         let ip = client_ip(addr, &fwd, &state.trusted_proxies);
         request.extensions_mut().insert(ClientIp(ip));
+        return CLIENT_IP.scope(ip, next.run(request)).await;
     }
     next.run(request).await
 }
@@ -915,13 +919,17 @@ pub(crate) async fn event_with(
 ) -> Result<(), sqlx::Error> {
     // At most one audit chain per transaction, or the site chain last (lock order).
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO audit_events (id,organization_id,actor_id,kind) VALUES ($1,$2,$3,$4)")
-        .bind(id)
-        .bind(organization)
-        .bind(actor)
-        .bind(kind)
-        .execute(&mut **tx)
-        .await?;
+    let client_ip = CLIENT_IP.try_with(|ip| ip.to_string()).ok();
+    sqlx::query(
+        "INSERT INTO audit_events (id,organization_id,actor_id,kind,client_ip) VALUES ($1,$2,$3,$4,$5::inet)",
+    )
+    .bind(id)
+    .bind(organization)
+    .bind(actor)
+    .bind(kind)
+    .bind(client_ip)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query("INSERT INTO outbox_events (id,organization_id,kind,payload) VALUES ($1,$2,$3,$4)")
         .bind(id)
         .bind(organization)
