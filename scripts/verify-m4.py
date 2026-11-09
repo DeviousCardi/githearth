@@ -1319,6 +1319,138 @@ class M4Harness(_m2.Harness):
         shutil.rmtree(str(stg), ignore_errors=True)
         shutil.rmtree(str(cf), ignore_errors=True)
 
+    # ================================================================== S9
+    def s9_uninstall_drill(self):
+        self.stop_server()
+        if self._old_db:
+            self.docker(["exec", self.name, "dropdb", "-U", "githearth", "--if-exists", self._old_db],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._old_db = None
+        self.generate_ssh_host_key()
+        self.start_server(MAIN_DB, self.storage_root, "pre-s9")
+        tok = self.api_session(self.admin_username, self.admin_password)
+        st, raw = self.api_json(
+            "GET", f"/api/v1/organizations/{self.org_slug}/repositories", token=tok)
+        if st != 200:
+            raise HarnessError(f"s9: list repos status {st}")
+        repo_entries = raw if isinstance(raw, list) else raw.get("items", [])
+        st, issue = self.api_json(
+            "POST",
+            f"/api/v1/organizations/{self.org_slug}/repositories/{self.repo_name}/issues",
+            {"title": "S9 Uninstall Test", "body": "created before uninstall drill"},
+            token=tok)
+        if st != 201:
+            raise HarnessError(f"s9: create issue status {st}")
+        self._s9_issue_number = issue["number"]
+        mirror_dir = self.tmp / "mirrors"; mirror_dir.mkdir()
+        mir_refs = {}
+        for r in repo_entries:
+            rname = r["name"]
+            md = mirror_dir / f"{rname}.git"
+            self.git("clone", "--mirror", self._repo_http_url(rname), str(md),
+                     user=self.admin_username, password=self.admin_password, label=f"s9-mirror-{rname}")
+            refs_out = subprocess.run(
+                ["git", "-C", str(md), "ls-remote", "--heads", "--tags", "."],
+                capture_output=True, text=True, check=True).stdout.strip()
+            mir_refs[rname] = refs_out
+        hp_before = self.server.http_port
+        sp_before = self.ssh_port
+        self.stop_server()
+        # keep-data variant: delete binary copy and config, then reinstall
+        config_env = self.server_env(MAIN_DB, self.storage_root)
+        binary_copy = self.tmp / "githearth-server-copy"
+        shutil.copy2(self.binary, binary_copy)
+        self.binary = str(binary_copy)
+        subprocess.run([self.binary, "migrate"], env=config_env,
+                       check=True, capture_output=True, text=True)
+        subprocess.run([self.binary, "doctor"], env=config_env,
+                       check=True, capture_output=True, text=True)
+        self.generate_ssh_host_key()
+        self.start_server(MAIN_DB, self.storage_root, "keep-data-reinstall")
+        for rname, expected_refs in mir_refs.items():
+            actual = self.git("ls-remote", "--heads", "--tags", self._repo_http_url(rname),
+                              user=self.admin_username, password=self.admin_password,
+                              label=f"s9-ls-{rname}").stdout.strip()
+            if not actual:
+                raise HarnessError(f"s9 keep-data: ls-remote empty for {rname}")
+            actual_refs = "\n".join(sorted(actual.splitlines()))
+            expected_sorted = "\n".join(sorted(expected_refs.splitlines()))
+            if actual_refs != expected_sorted:
+                raise HarnessError(f"s9 keep-data: refs mismatch for {rname}\nexpected:{expected_refs[:200]}\nactual:{actual[:200]}")
+        st, iss = self.api_json(
+            "GET",
+            f"/api/v1/organizations/{self.org_slug}/repositories/{self.repo_name}/issues/{self._s9_issue_number}",
+            token=self.api_session(self.admin_username, self.admin_password))
+        if st != 200 or iss.get("title") != "S9 Uninstall Test":
+            raise HarnessError(f"s9: keep-data issues not readable: {st}")
+        self.stop_server()
+        # full removal
+        for rname, expected_refs in mir_refs.items():
+            md = mirror_dir / f"{rname}.git"
+            refs_now = subprocess.run(
+                ["git", "-C", str(md), "ls-remote", "--heads", "--tags", "."],
+                capture_output=True, text=True, check=True).stdout.strip()
+            if refs_now != expected_refs:
+                raise HarnessError(f"s9: mirror refs changed after keep-data for {rname}")
+            fresh = self.tmp / f"s9-fresh-{uuid.uuid4().hex[:6]}"
+            subprocess.run(
+                ["git", "clone", str(md), str(fresh)],
+                capture_output=True, text=True, check=True)
+            fresh_refs = subprocess.run(
+                ["git", "-C", str(fresh), "ls-remote", "--heads", "--tags", "origin"],
+                capture_output=True, text=True, check=True).stdout.strip()
+            if fresh_refs != expected_refs:
+                raise HarnessError(f"s9: fresh mirror clone refs mismatch for {rname}")
+            shutil.rmtree(str(fresh), ignore_errors=True)
+        shutil.rmtree(str(self.storage_root), ignore_errors=True)
+        self.storage_root.mkdir()
+        remaining = list(self.storage_root.iterdir())
+        if remaining:
+            raise HarnessError(f"s9: storage root not empty: {[p.name for p in remaining]}")
+        self.docker(["exec", self.name, "dropdb", "-U", "githearth", MAIN_DB],
+                    capture_output=True, text=True)
+        db_gone = subprocess.run(
+            ["docker", "exec", self.name, "psql",
+             "-U", "githearth", "-d", "template1", "-t", "-A", "-v", "ON_ERROR_STOP=1"],
+            input="SELECT 1 FROM pg_database WHERE datname='" + MAIN_DB + "'",
+            text=True, capture_output=True).stdout.strip()
+        if db_gone.strip():
+            raise HarnessError(f"s9: database {MAIN_DB} still present after drop")
+        try:
+            s = socket.create_connection(("127.0.0.1", hp_before), timeout=1)
+            s.close()
+            raise HarnessError("s9: HTTP port still accepting after full removal")
+        except (ConnectionRefusedError, OSError):
+            pass
+        if sp_before is not None:
+            try:
+                s = socket.create_connection(("127.0.0.1", sp_before), timeout=1)
+                s.close()
+                raise HarnessError("s9: SSH port still accepting after full removal")
+            except (ConnectionRefusedError, OSError):
+                pass
+        server_procs = subprocess.run(
+            ["pgrep", "-f", "githearth-server serve"],
+            capture_output=True, text=True).stdout.strip()
+        if server_procs:
+            leftover = []
+            for pid_str in server_procs.splitlines():
+                try:
+                    exe = os.readlink(f"/proc/{pid_str}/exe")
+                except OSError:
+                    exe = ""
+                if self.binary in exe or "githearth-server" in exe:
+                    ns_check = subprocess.run(
+                        ["cat", f"/proc/{pid_str}/cgroup"],
+                        capture_output=True, text=True).stdout.strip()
+                    if "/docker/" not in ns_check:
+                        leftover.append(pid_str)
+            if leftover:
+                raise HarnessError(f"s9: server processes still running: {','.join(leftover)}")
+
+    def _repo_http_url(self, repo_name):
+        return f"http://127.0.0.1:{self.server.http_port}/{self.org_slug}/{repo_name}.git"
+
     # ================================================================== runner
 
     def run(self):
@@ -1334,6 +1466,7 @@ class M4Harness(_m2.Harness):
             self.scenario("s6_restart_jobs", self.s6_restart_jobs)
             self.scenario("s7_container_install", self.s7_container_install)
             self.scenario("s8_disk_full", self.s8_disk_full)
+            self.scenario("s9_uninstall_drill", self.s9_uninstall_drill)
         finally:
             self.cleanup()
         self.write_report()
