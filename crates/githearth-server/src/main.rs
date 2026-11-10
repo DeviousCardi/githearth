@@ -211,12 +211,6 @@ async fn run(args: Args) -> Result<()> {
                 } else {
                     println!("dropped:");
                 }
-                for id in &result.dropped {
-                    println!("  {id}");
-                }
-                if let Some(ref id) = result.skipped_newest {
-                    println!("skipped newest key (id: {id})");
-                }
                 for id in &result.skipped_in_use {
                     println!("skipped key still in use (id: {id})");
                 }

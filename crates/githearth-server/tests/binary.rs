@@ -84,6 +84,15 @@ fn execute(url: &str, statement: &str) {
     });
 }
 
+fn execute_scalar(url: &str, statement: &str) -> String {
+    runtime().block_on(async {
+        let pool = sqlx::PgPool::connect(url).await.unwrap();
+        let row: (i64,) = sqlx::query_as(statement).fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        format!("{}", row.0)
+    })
+}
+
 fn schema_url(base: &str, schema: &str) -> String {
     let separator = if base.contains('?') { '&' } else { '?' };
     format!("{base}{separator}options=-c%20search_path%3D{schema}")
@@ -590,10 +599,19 @@ fn audit_drop_ip_keys_dry_run_counts_keys() {
     cmd0.args(["audit", "rotate-ip-key"]);
     assert!(run(cmd0).status.success());
 
+    let pre_count: i64 = execute_scalar(schema.url(), "SELECT COUNT(*) FROM audit_ip_keys")
+        .parse()
+        .unwrap();
+
     let mut command = server();
     command.env("GITHEARTH_DATABASE_URL", schema.url());
     command.args(["audit", "drop-ip-keys", "--older-than", "1", "--dry-run"]);
     let output = run(command);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("DRY RUN:"), "{}", stdout(&output));
+
+    let post_count: i64 = execute_scalar(schema.url(), "SELECT COUNT(*) FROM audit_ip_keys")
+        .parse()
+        .unwrap();
+    assert_eq!(post_count, pre_count, "dry-run must not delete keys");
 }

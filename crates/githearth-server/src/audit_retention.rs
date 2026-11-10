@@ -107,7 +107,6 @@ pub async fn rotate_ip_key(pool: &PgPool, dry_run: bool) -> anyhow::Result<Uuid>
 #[derive(Debug)]
 pub struct DropKeysResult {
     pub dropped: Vec<Uuid>,
-    pub skipped_newest: Option<Uuid>,
     pub skipped_in_use: Vec<Uuid>,
 }
 
@@ -162,15 +161,7 @@ pub async fn drop_ip_keys(
             if deleted.is_some() {
                 dropped.push(key_id);
             } else {
-                let still_exists: bool =
-                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM audit_ip_keys WHERE id = $1)")
-                        .bind(key_id)
-                        .fetch_one(pool)
-                        .await
-                        .context("check key existence")?;
-                if still_exists {
-                    skipped_in_use.push(key_id);
-                }
+                skipped_in_use.push(key_id);
             }
         } else {
             let in_use: bool = sqlx::query_scalar(
@@ -192,7 +183,6 @@ pub async fn drop_ip_keys(
 
     Ok(DropKeysResult {
         dropped,
-        skipped_newest: None,
         skipped_in_use,
     })
 }
@@ -449,8 +439,15 @@ mod tests {
             assert_eq!(post_key_count, pre_key_count, "dry-run rotate must not create a key");
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_ip_keys WHERE id = $1").bind(new_id).fetch_one(&pool).await.unwrap();
             assert_eq!(exists, 0, "dry-run rotate key must not exist");
-            // dry-run drop may error (newest key) or succeed on a fresh DB
-            let _ = drop_ip_keys(&pool, 365, true).await;
+            // dry-run drop: keys must be unchanged afterwards.
+            let pre_keys: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM audit_ip_keys ORDER BY id")
+                .fetch_all(&pool).await.unwrap();
+            match drop_ip_keys(&pool, 365, true).await {
+                Ok(_) | Err(_) => {} // on a fresh DB with only one old key it will be refused (newest)
+            }
+            let post_keys: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM audit_ip_keys ORDER BY id")
+                .fetch_all(&pool).await.unwrap();
+            assert_eq!(post_keys, pre_keys, "dry-run drop must not delete keys");
             drop(pool); drop_database(&db_name).await;
         }).await.expect("test timed out");
     }
