@@ -45,6 +45,7 @@ use axum::{
 use client_ip::{ClientIp, TrustedProxy, client_ip, parse_trusted_proxy};
 use config::Config;
 use githearth_authz::{Engine, Resource};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -929,14 +930,31 @@ pub(crate) async fn event_with(
     // At most one audit chain per transaction, or the site chain last (lock order).
     let id = Uuid::new_v4();
     let client_ip = CLIENT_IP.try_with(|ip| ip.to_string()).ok();
+    // The digest only hides the IP once its key is deleted: IPv4 is
+    // brute-forceable while the key exists, and any backup that still contains
+    // a deleted key or the raw IP bounds how long the IP is retained.
+    let (client_ip, client_ip_key_id, client_ip_digest) = match client_ip {
+        Some(ip) => {
+            let (key_id, key) = current_or_new_ip_key(tx).await?;
+            let ip_text: String = sqlx::query_scalar("SELECT host($1::inet)")
+                .bind(&ip)
+                .fetch_one(&mut **tx)
+                .await?;
+            let digest = hmac_sha256(&key, ip_text.as_bytes());
+            (Some(ip), Some(key_id), Some(digest))
+        }
+        None => (None, None, None),
+    };
     sqlx::query(
-        "INSERT INTO audit_events (id,organization_id,actor_id,kind,client_ip) VALUES ($1,$2,$3,$4,$5::inet)",
+        "INSERT INTO audit_events (id,organization_id,actor_id,kind,client_ip,client_ip_key_id,client_ip_digest) VALUES ($1,$2,$3,$4,$5::inet,$6,$7)",
     )
     .bind(id)
     .bind(organization)
     .bind(actor)
     .bind(kind)
     .bind(client_ip)
+    .bind(client_ip_key_id)
+    .bind(client_ip_digest)
     .execute(&mut **tx)
     .await?;
     sqlx::query("INSERT INTO outbox_events (id,organization_id,kind,payload) VALUES ($1,$2,$3,$4)")
@@ -952,6 +970,46 @@ pub(crate) async fn event_with(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// The most recent IP-key row, or a freshly created one when none exists. The
+/// insert is guarded by `WHERE NOT EXISTS`, but under READ COMMITTED two
+/// concurrent first writers may both see no rows and each insert a key. That is
+/// harmless because each event stores its own key_id and digest, so both keys
+/// remain equally valid.
+async fn current_or_new_ip_key(
+    conn: &mut sqlx::PgConnection,
+) -> Result<(Uuid, Vec<u8>), sqlx::Error> {
+    if let Some(key) = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+        "SELECT id, key FROM audit_ip_keys ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    {
+        return Ok(key);
+    }
+    let id = Uuid::new_v4();
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    sqlx::query(
+        "INSERT INTO audit_ip_keys (id, key) \
+         SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM audit_ip_keys)",
+    )
+    .bind(id)
+    .bind(key.to_vec())
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+        "SELECT id, key FROM audit_ip_keys ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&mut *conn)
+    .await
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
 }
 
 #[cfg(test)]
