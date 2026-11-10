@@ -117,7 +117,7 @@ pub async fn verify(
     let sql = format!(
         "SELECT seq, id, organization_id, actor_id, kind, \
          (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS micros, prev_hash, hash, \
-         host(client_ip) AS client_ip \
+         host(client_ip) AS client_ip, client_ip_key_id, client_ip_digest \
          FROM audit_events WHERE {chain_filter} AND seq IS NOT NULL AND seq <= $2 ORDER BY seq"
     );
     let mut rows = sqlx::query(&sql)
@@ -175,9 +175,12 @@ pub async fn verify(
 
 /// The canonical encoding from the migration, mirrored byte-for-byte:
 /// id || organization_id (nil when NULL) || actor_id || len(kind) || kind
-/// || seq || created_at microseconds, all big-endian, and finally (V2) the
-/// optional client IP as len(host(client_ip)) || host(client_ip); the trailing
-/// field is omitted entirely when client_ip is NULL, preserving the V1 hash.
+/// || seq || created_at microseconds, all big-endian, followed by exactly one
+/// trailing form:
+///   V3 — key_id (16 bytes) || digest (32 bytes) when a digest is present
+///   (the raw IP is NOT part of the hash, so it can be pruned later);
+///   V2 — len(host(client_ip)) || host(client_ip) when the IP is present;
+///   V1 — nothing extra when both are absent.
 fn hash_row(row: &sqlx::postgres::PgRow, seq: i64, prev: &[u8; 32]) -> Vec<u8> {
     let id: Uuid = row.get("id");
     let org: Option<Uuid> = row.get("organization_id");
@@ -185,6 +188,8 @@ fn hash_row(row: &sqlx::postgres::PgRow, seq: i64, prev: &[u8; 32]) -> Vec<u8> {
     let kind: String = row.get("kind");
     let micros: i64 = row.get("micros");
     let client_ip: Option<String> = row.get("client_ip");
+    let key_id: Option<Uuid> = row.get("client_ip_key_id");
+    let digest: Option<Vec<u8>> = row.get("client_ip_digest");
     let mut hasher = Sha256::new();
     hasher.update(prev);
     hasher.update(id.as_bytes());
@@ -194,7 +199,10 @@ fn hash_row(row: &sqlx::postgres::PgRow, seq: i64, prev: &[u8; 32]) -> Vec<u8> {
     hasher.update(kind.as_bytes());
     hasher.update(seq.to_be_bytes());
     hasher.update(micros.to_be_bytes());
-    if let Some(ip) = client_ip {
+    if let Some(digest) = digest {
+        hasher.update(key_id.expect("a digest implies a key id").as_bytes());
+        hasher.update(&digest);
+    } else if let Some(ip) = client_ip {
         hasher.update((ip.len() as i64).to_be_bytes());
         hasher.update(ip.as_bytes());
     }
