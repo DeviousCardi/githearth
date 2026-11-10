@@ -2994,3 +2994,145 @@ async fn fetch_inserts_no_push_credentials_row() {
     cleanup(&fx.storage_root);
     fx.pool.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn push_credentials_insert_failure_http_refused() {
+    let fx = setup(1 << 30).await;
+    let owner: Uuid = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT organization_id FROM repositories WHERE id=$1) AND role='owner'")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE accounts SET password_hash=$1 WHERE id=$2")
+        .bind(githearth_server::hash_password("testpass").unwrap())
+        .bind(owner)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let mut session_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut session_bytes);
+    let session = hex::encode(session_bytes);
+    sqlx::query("INSERT INTO sessions (token_hash,account_id,expires_at) VALUES (sha256($1::bytea),$2,clock_timestamp() + interval '1 hour')")
+        .bind(session.as_bytes())
+        .bind(owner)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let token_name = format!("tok-{}", Uuid::new_v4().simple());
+    let (status, body) = request(
+        &fx.app,
+        "POST",
+        "/api/v1/user/tokens",
+        Some(&session),
+        serde_json::json!({"name": token_name, "scopes": ["repo:write"]}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let token_plaintext = body["token"].as_str().unwrap().to_owned();
+    let token_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    let clone = std::env::temp_dir().join(format!("git-push-pcs-fail-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    let token_url = format!(
+        "http://any:{}@127.0.0.1:{}/{}/{}.git",
+        token_plaintext, fx.port, fx.org_slug, fx.repo_name
+    );
+
+    // Clean up any leftover trigger from a previous aborted run.
+    let drop_sql = format!(
+        "DROP TRIGGER IF EXISTS pcrej_http_{} ON push_credentials",
+        token_id.simple()
+    );
+    sqlx::query(&drop_sql).execute(&fx.pool).await.ok();
+
+    sqlx::query(&format!(
+        "CREATE OR REPLACE FUNCTION pcrej_http_fn_{}() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'injected push_credentials insert failure for test';
+         END $$ LANGUAGE plpgsql",
+        token_id.simple()
+    ))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER pcrej_http_{} BEFORE INSERT ON push_credentials FOR EACH ROW \
+         WHEN (NEW.credential_id = '{}') EXECUTE FUNCTION pcrej_http_fn_{}()",
+        token_id.simple(),
+        token_id,
+        token_id.simple()
+    ))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    git_ok(git_cmd(&["clone", "--", &token_url, cd])).await;
+    std::fs::write(clone.join("fail.txt"), "insert failure test\n").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "fail.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "fail",
+    ]))
+    .await;
+
+    let push_out = git_run(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+    let stderr = String::from_utf8_lossy(&push_out.stderr);
+    assert!(
+        !push_out.status.success(),
+        "push must be refused when push_credentials insert fails"
+    );
+    assert!(
+        stderr.contains("HTTP 500") || stderr.contains("internal server error"),
+        "expected HTTP 500 error in stderr, got: {stderr}"
+    );
+
+    let pushes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pushes, 0, "no repository_pushes row must exist");
+
+    let remote_head = git_output(git_cmd(&[
+        "--git-dir",
+        fx.repo_path_str(),
+        "rev-parse",
+        "refs/heads/main",
+    ]))
+    .await;
+    assert_eq!(
+        remote_head.trim(),
+        fx.base_commit.trim(),
+        "remote ref must not have changed"
+    );
+
+    sqlx::query(&format!(
+        "DROP TRIGGER pcrej_http_{} ON push_credentials",
+        token_id.simple()
+    ))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "DROP FUNCTION pcrej_http_fn_{}",
+        token_id.simple()
+    ))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
