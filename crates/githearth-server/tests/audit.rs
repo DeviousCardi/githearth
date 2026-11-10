@@ -368,11 +368,11 @@ async fn backfilled_rows_verify() {
     // NULL, so these backfilled rows keep their 0007-computed hashes.
     let m19 = migrations.iter().find(|m| m.version == 19).unwrap();
     sqlx::raw_sql(&m19.sql).execute(&pool).await.unwrap();
-    // Apply 0021 (adds the IP key/digest columns and the v3 trigger) so the
+    // Apply 0022 (adds the IP key/digest columns and the v3 trigger) so the
     // schema matches what verify() selects; the backfilled rows have no digest,
     // so they keep their 0019-computed hashes.
-    let m21 = migrations.iter().find(|m| m.version == 21).unwrap();
-    sqlx::raw_sql(&m21.sql).execute(&pool).await.unwrap();
+    let m22 = migrations.iter().find(|m| m.version == 22).unwrap();
+    sqlx::raw_sql(&m22.sql).execute(&pool).await.unwrap();
     let (org_rows, org_ok, bad1) = verify_chain(&pool, Some(org_id)).await;
     assert_eq!(
         (org_rows, org_ok, bad1),
