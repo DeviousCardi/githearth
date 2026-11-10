@@ -11,6 +11,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -593,22 +594,35 @@ fn audit_drop_ip_keys_dry_run_counts_keys() {
     let migrated = migrate(&schema);
     assert!(migrated.status.success(), "{}", stderr(&migrated));
 
-    // Create a key first so there's something to drop
-    let mut cmd0 = server();
-    cmd0.env("GITHEARTH_DATABASE_URL", schema.url());
-    cmd0.args(["audit", "rotate-ip-key"]);
-    assert!(run(cmd0).status.success());
+    // Insert two keys: a newer one (not a candidate) and an old one.
+    let old_key_id = Uuid::new_v4();
+    schema.execute(&format!(
+        "INSERT INTO audit_ip_keys (id, key, created_at) \
+         VALUES ('{old_key_id}', decode(repeat('01',32),'hex'), \
+         clock_timestamp() - '3 years'::interval)"
+    ));
+    // A newer key so the old one isn't the newest.
+    schema.execute(
+        "INSERT INTO audit_ip_keys (id, key) \
+         VALUES (gen_random_uuid(), decode(repeat('02',32),'hex'))",
+    );
 
     let pre_count: i64 = execute_scalar(schema.url(), "SELECT COUNT(*) FROM audit_ip_keys")
         .parse()
         .unwrap();
+    assert_eq!(pre_count, 2);
 
     let mut command = server();
     command.env("GITHEARTH_DATABASE_URL", schema.url());
     command.args(["audit", "drop-ip-keys", "--older-than", "1", "--dry-run"]);
     let output = run(command);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("DRY RUN:"), "{}", stdout(&output));
+    let out = stdout(&output);
+    assert!(out.contains("DRY RUN:"), "{out}");
+    assert!(
+        out.contains(&format!("{old_key_id}")),
+        "output must list the old key id: {out}"
+    );
 
     let post_count: i64 = execute_scalar(schema.url(), "SELECT COUNT(*) FROM audit_ip_keys")
         .parse()

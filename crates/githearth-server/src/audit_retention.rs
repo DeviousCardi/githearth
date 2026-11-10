@@ -439,12 +439,15 @@ mod tests {
             assert_eq!(post_key_count, pre_key_count, "dry-run rotate must not create a key");
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_ip_keys WHERE id = $1").bind(new_id).fetch_one(&pool).await.unwrap();
             assert_eq!(exists, 0, "dry-run rotate key must not exist");
-            // dry-run drop: keys must be unchanged afterwards.
+            // dry-run drop: on a fresh DB the only key is old AND the newest,
+            // so it must be refused with the specific error.
             let pre_keys: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM audit_ip_keys ORDER BY id")
                 .fetch_all(&pool).await.unwrap();
-            match drop_ip_keys(&pool, 365, true).await {
-                Ok(_) | Err(_) => {} // on a fresh DB with only one old key it will be refused (newest)
-            }
+            let err = drop_ip_keys(&pool, 365, true).await.unwrap_err();
+            assert!(
+                err.to_string().contains("cannot drop the newest key"),
+                "must refuse newest key: {err}"
+            );
             let post_keys: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM audit_ip_keys ORDER BY id")
                 .fetch_all(&pool).await.unwrap();
             assert_eq!(post_keys, pre_keys, "dry-run drop must not delete keys");
