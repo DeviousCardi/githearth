@@ -263,6 +263,7 @@ impl russh::server::Handler for SshHandler {
             &state,
             identity.account,
             identity.read_only,
+            git_admission::CredentialRef::SshKey(identity.key_id),
             &org,
             &repo,
             want,
@@ -357,6 +358,30 @@ impl russh::server::Handler for SshHandler {
         }
 
         let kill_on_drop = want != Want::Push;
+
+        if let Some(op_id) = operation {
+            let (kind, cred_id) = match &admitted.credential {
+                crate::git_admission::CredentialRef::Password => ("password", None),
+                crate::git_admission::CredentialRef::Token(id) => ("token", Some(*id)),
+                crate::git_admission::CredentialRef::SshKey(id) => ("ssh_key", Some(*id)),
+            };
+            if let Err(e) = sqlx::query(
+                "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, $2, $3)",
+            )
+            .bind(op_id)
+            .bind(kind)
+            .bind(cred_id)
+            .execute(&state.pool)
+            .await
+            {
+                tracing::error!(category = "database", operation_id = %op_id, error = %e, "cannot insert push credential");
+                return refuse(
+                    session,
+                    channel,
+                    "githearth: repository not found\n".as_bytes(),
+                );
+            }
+        }
 
         let mut child = match hook_cmd
             .kill_on_drop(kill_on_drop)
