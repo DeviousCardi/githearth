@@ -91,7 +91,7 @@ pub(crate) fn client_ip(
 ) -> IpAddr {
     let peer_ip = peer.ip();
     if trusted.is_empty() || !is_trusted(peer_ip, trusted) {
-        return peer_ip;
+        return normalise(peer_ip);
     }
     let mut candidates: Vec<IpAddr> = Vec::new();
     for header_value in forwarded {
@@ -100,16 +100,29 @@ pub(crate) fn client_ip(
             if let Ok(ip) = part.parse::<IpAddr>() {
                 candidates.push(ip);
             } else {
-                return peer_ip; // malformed entry → fall back
+                return normalise(peer_ip); // malformed entry → fall back
             }
         }
     }
     for ip in candidates.into_iter().rev() {
         if !is_trusted(ip, trusted) {
-            return ip;
+            return normalise(ip);
         }
     }
-    peer_ip // all-trusted chain → fall back
+    normalise(peer_ip) // all-trusted chain → fall back
+}
+
+/// Collapse an IPv4-mapped IPv6 address (`::ffff:203.0.113.7`) to its IPv4 form
+/// (`203.0.113.7`) so the audit digest is identical for both (TASK #105). Any
+/// other address is returned unchanged.
+fn normalise(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +288,37 @@ mod tests {
         assert_eq!(
             client_ip(peer, &fwd, &trusted),
             "203.0.113.5".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn normalise_mapped_to_ipv4() {
+        assert_eq!(
+            normalise("::ffff:203.0.113.7".parse().unwrap()),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn normalise_plain_ipv6_unchanged() {
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(normalise(v6), v6);
+    }
+
+    #[test]
+    fn normalise_ipv4_unchanged() {
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(normalise(v4), v4);
+    }
+
+    #[test]
+    fn mapped_header_normalises_to_ipv4() {
+        let peer = p("10.0.0.1");
+        let fwd = vec!["::ffff:203.0.113.7".into()];
+        let trusted = trusted_list(&["10.0.0.1"]);
+        assert_eq!(
+            client_ip(peer, &fwd, &trusted),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
         );
     }
 }
