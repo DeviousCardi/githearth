@@ -967,8 +967,10 @@ pub(crate) async fn event_with(
 }
 
 /// The most recent IP-key row, or a freshly created one when none exists. The
-/// insert is guarded by `WHERE NOT EXISTS` so two concurrent first writers share
-/// one key; whoever loses the race re-selects the winner's row.
+/// insert is guarded by `WHERE NOT EXISTS`, but under READ COMMITTED two
+/// concurrent first writers may both see no rows and each insert a key. That is
+/// harmless because each event stores its own key_id and digest, so both keys
+/// remain equally valid.
 async fn current_or_new_ip_key(
     conn: &mut sqlx::PgConnection,
 ) -> Result<(Uuid, Vec<u8>), sqlx::Error> {

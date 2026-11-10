@@ -38,8 +38,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 flate2 = "1"
-hmac = "0.12"
-sha2 = "0.10"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

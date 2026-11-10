@@ -255,33 +255,39 @@ async fn pruning_client_ip_keeps_chain_verifiable() {
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn deleting_key_keeps_chain_verifiable() {
-    let (app, pool, storage_root, username, account) = setup().await;
-
-    // This test's own key, newest by created_at so event_with picks it.
-    let key_id = Uuid::new_v4();
-    let key = [0x33u8; 32];
+    let (pool, storage_root) = plain_pool().await;
+    let owner = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO audit_ip_keys (id, key, created_at) \
-         VALUES ($1, $2, clock_timestamp() + interval '1000 years')",
+        "INSERT INTO accounts (id,username,password_hash,is_admin) VALUES ($1,$2,'unused',false)",
     )
-    .bind(key_id)
-    .bind(key.to_vec())
+    .bind(owner)
+    .bind(tag("owner"))
     .execute(&pool)
     .await
     .unwrap();
 
-    let status = login_request(
-        &app,
-        &username,
-        Some(SocketAddr::from(([203, 0, 113, 7], 4242))),
+    // A key with a normal created_at, and its event inserted directly under it,
+    // so no other test's `current_or_new_ip_key` can rely on this key being the
+    // newest and then have it deleted out from under them.
+    let key_id = Uuid::new_v4();
+    let key = [0x33u8; 32];
+    sqlx::query("INSERT INTO audit_ip_keys (id, key) VALUES ($1, $2)")
+        .bind(key_id)
+        .bind(key.to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let digest = hmac(&key, b"203.0.113.7");
+    insert_digest_event(
+        &pool,
+        None,
+        owner,
+        "key.shredded",
+        "203.0.113.7",
+        key_id,
+        &digest,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (ip, row_key_id, digest) = ip_row_for_actor(&pool, account).await;
-    assert_eq!(ip, Some("203.0.113.7".to_string()));
-    assert_eq!(row_key_id, Some(key_id));
-    assert_eq!(digest, Some(hmac(&key, b"203.0.113.7")));
 
     let (_rows, ok, _bad) = verify_chain(&pool, None).await;
     assert!(ok, "site chain must verify before key deletion");
