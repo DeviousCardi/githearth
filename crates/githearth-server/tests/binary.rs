@@ -514,3 +514,86 @@ fn serve_reports_bind_failure() {
     drop(listener);
     drop(storage);
 }
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_prune_ips_rejects_invalid_days() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "prune-ips", "--older-than", "0"]);
+    let output = run(command);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("invalid value '0'"),
+        "{}",
+        stderr(&output)
+    );
+
+    let mut command2 = server();
+    command2.env("GITHEARTH_DATABASE_URL", schema.url());
+    command2.args(["audit", "prune-ips", "--older-than", "-5"]);
+    let output2 = run(command2);
+    assert_eq!(output2.status.code(), Some(2), "{}", stderr(&output2));
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_prune_ips_dry_run_counts_rows() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "prune-ips", "--older-than", "1", "--dry-run"]);
+    let output = run(command);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("DRY RUN:"), "{out}");
+    assert!(out.contains("clear"), "{out}");
+    assert!(out.contains("legacy"), "{out}");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_rotate_ip_key_creates_key() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "rotate-ip-key"]);
+    let output = run(command);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("created new key"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_drop_ip_keys_dry_run_counts_keys() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    // Create a key first so there's something to drop
+    let mut cmd0 = server();
+    cmd0.env("GITHEARTH_DATABASE_URL", schema.url());
+    cmd0.args(["audit", "rotate-ip-key"]);
+    assert!(run(cmd0).status.success());
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "drop-ip-keys", "--older-than", "1", "--dry-run"]);
+    let output = run(command);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("DRY RUN:"), "{}", stdout(&output));
+}

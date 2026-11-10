@@ -990,14 +990,13 @@ async fn current_or_new_ip_key(
         return Ok(key);
     }
     let id = Uuid::new_v4();
-    let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    let key = audit_retention::new_ip_key_bytes();
     sqlx::query(
         "INSERT INTO audit_ip_keys (id, key) \
          SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM audit_ip_keys)",
     )
     .bind(id)
-    .bind(key.to_vec())
+    .bind(&key)
     .execute(&mut *conn)
     .await?;
     sqlx::query_as::<_, (Uuid, Vec<u8>)>(
