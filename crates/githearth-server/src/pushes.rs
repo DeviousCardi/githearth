@@ -123,6 +123,16 @@ pub async fn apply_committed(
         .bind(repository_id)
         .execute(&mut *tx)
         .await?;
+        let credential: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT credential_kind, credential_id FROM push_credentials WHERE operation_id = $1",
+        )
+        .bind(prepared.operation)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (credential_kind, credential_id) = match credential {
+            Some((kind, id)) => (Some(kind), id),
+            None => (None, None),
+        };
         sqlx::query(
             "INSERT INTO outbox_events (id, organization_id, kind, payload)
              SELECT $1, r.organization_id, 'repository.pushed', $2
@@ -134,6 +144,8 @@ pub async fn apply_committed(
             "journal_sequence": prepared.sequence,
             "operation_id": prepared.operation,
             "actor_id": actor,
+            "credential_kind": credential_kind,
+            "credential_id": credential_id,
             "updates": prepared.updates.iter().map(|u| serde_json::json!({
                 "ref": u.reference,
                 "old": u.old,
@@ -174,6 +186,17 @@ pub async fn applied_through(
         .fetch_one(conn)
         .await?;
     Ok(val as u64)
+}
+
+/// Deletes `push_credentials` rows older than one day. A push is committed long
+/// before the credential record reaches this age, so any replay that needs the
+/// credential has already read it; afterwards the event degrades to null fields.
+pub async fn sweep_credentials(conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+    let result =
+        sqlx::query("DELETE FROM push_credentials WHERE created_at < now() - interval '1 day'")
+            .execute(conn)
+            .await?;
+    Ok(result.rows_affected())
 }
 
 // ---------------------------------------------------------------------------

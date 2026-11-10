@@ -218,6 +218,14 @@ pub async fn reconcile_once(
     // ---- push journal replay ----------------------------------------------
     push_replay(state).await?;
 
+    // ---- push credential retention -----------------------------------------
+    let mut conn = state.pool.acquire().await?;
+    let purged = pushes::sweep_credentials(&mut conn).await?;
+    drop(conn);
+    if purged > 0 {
+        tracing::info!(purged, "push credential retention swept rows");
+    }
+
     Ok(summary)
 }
 
