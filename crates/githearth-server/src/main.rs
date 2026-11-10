@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use githearth_server::audit_retention::{self, DEFAULT_BATCH_SIZE};
 use githearth_server::{
     AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, jobs, reconcile, router,
     ssh,
@@ -37,6 +38,34 @@ enum Command {
     },
     /// Generate an Ed25519 host key for the embedded SSH server.
     SshKeygen,
+    /// Audit log IP retention management.
+    Audit {
+        #[command(subcommand)]
+        action: AuditCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommand {
+    /// Set client_ip=NULL on old rows that carry a digest.
+    PruneIps {
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        older_than: i64,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Insert a new per-row HMAC key.
+    RotateIpKey {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete keys older than DAYS (skips newest and keys still in use).
+    DropIpKeys {
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        older_than: i64,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 #[tokio::main]
 async fn main() {
@@ -144,6 +173,55 @@ async fn run(args: Args) -> Result<()> {
         }
         // Handled in `main` before any configuration is loaded.
         Command::GitHook { .. } => unreachable!("git-hook is dispatched in main"),
+        Command::Audit { action } => match action {
+            AuditCommand::PruneIps {
+                older_than,
+                dry_run,
+            } => {
+                let result =
+                    audit_retention::prune_ips(&pool, older_than, dry_run, DEFAULT_BATCH_SIZE)
+                        .await?;
+                if dry_run {
+                    println!(
+                        "DRY RUN: would clear {} row(s), {} legacy row(s) still have raw IPs without digests",
+                        result.cleared, result.legacy_remaining
+                    );
+                } else {
+                    println!(
+                        "cleared {} row(s), {} legacy row(s) still have raw IPs without digests",
+                        result.cleared, result.legacy_remaining
+                    );
+                }
+            }
+            AuditCommand::RotateIpKey { dry_run } => {
+                let id = audit_retention::rotate_ip_key(&pool, dry_run).await?;
+                if dry_run {
+                    println!("DRY RUN: would create new key (id: {id})");
+                } else {
+                    println!("created new key (id: {id})");
+                }
+            }
+            AuditCommand::DropIpKeys {
+                older_than,
+                dry_run,
+            } => {
+                let result = audit_retention::drop_ip_keys(&pool, older_than, dry_run).await?;
+                if dry_run {
+                    println!("DRY RUN: would drop:");
+                } else {
+                    println!("dropped:");
+                }
+                for id in &result.dropped {
+                    println!("  {id}");
+                }
+                if let Some(ref id) = result.skipped_newest {
+                    println!("skipped newest key (id: {id})");
+                }
+                for id in &result.skipped_in_use {
+                    println!("skipped key still in use (id: {id})");
+                }
+            }
+        },
     }
     Ok(())
 }

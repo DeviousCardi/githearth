@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod audit_retention;
 pub mod browse;
 mod browse_ui;
 pub mod client_ip;
@@ -1006,7 +1007,7 @@ async fn current_or_new_ip_key(
     .await
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
