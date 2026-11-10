@@ -17,6 +17,13 @@ pub enum Want {
 }
 
 #[derive(Clone)]
+pub enum CredentialRef {
+    Password,
+    Token(Uuid),
+    SshKey(Uuid),
+}
+
+#[derive(Clone)]
 pub struct Admitted {
     pub account: Uuid,
     pub organization: Uuid,
@@ -25,6 +32,7 @@ pub struct Admitted {
     pub rules: Vec<crate::protection::ProtectionRule>,
     /// True when the credential was a read-only scoped access token.
     pub read_only: bool,
+    pub credential: CredentialRef,
 }
 
 impl std::fmt::Debug for Admitted {
@@ -101,48 +109,56 @@ pub async fn admit(
     // A personal access token may be supplied as the Basic password (or the
     // username when only the token is embedded in the URL). Detect `gth_` and
     // short-circuit to the access-token path before password verification.
-    let (account_id, read_only) = if password.starts_with("gth_") || username.starts_with("gth_") {
-        let token = if password.starts_with("gth_") {
-            &password
+    let (account_id, read_only, credential) =
+        if password.starts_with("gth_") || username.starts_with("gth_") {
+            let token = if password.starts_with("gth_") {
+                &password
+            } else {
+                &username
+            };
+            match crate::authenticate_access_token_plaintext(&state.pool, token).await {
+                Ok(((account, _), token_id)) => (
+                    account.id,
+                    account.is_read_only(),
+                    CredentialRef::Token(token_id),
+                ),
+                Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
+                    return Err(AuthError(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid or expired credentials",
+                    ));
+                }
+                Err(_) => {
+                    return Err(AuthError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authentication unavailable",
+                    ));
+                }
+            }
         } else {
-            &username
-        };
-        match crate::authenticate_access_token_plaintext(&state.pool, token).await {
-            Ok((account, _)) => (account.id, account.is_read_only()),
-            Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
+            let Some(account_id) = crate::verify_password(state, &username, &password)
+                .await
+                // Busy or unavailable is not a bad password: the client must not re-prompt.
+                .map_err(|e| match e.0 {
+                    StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, "authentication busy"),
+                    _ => AuthError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authentication unavailable",
+                    ),
+                })?
+            else {
                 return Err(AuthError(
                     StatusCode::UNAUTHORIZED,
                     "invalid or expired credentials",
                 ));
-            }
-            Err(_) => {
-                return Err(AuthError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "authentication unavailable",
-                ));
-            }
-        }
-    } else {
-        let Some(account_id) = crate::verify_password(state, &username, &password)
-            .await
-            // Busy or unavailable is not a bad password: the client must not re-prompt.
-            .map_err(|e| match e.0 {
-                StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, "authentication busy"),
-                _ => AuthError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "authentication unavailable",
-                ),
-            })?
-        else {
-            return Err(AuthError(
-                StatusCode::UNAUTHORIZED,
-                "invalid or expired credentials",
-            ));
+            };
+            (account_id, false, CredentialRef::Password)
         };
-        (account_id, false)
-    };
 
-    admit_account(state, account_id, read_only, org_slug, repo_name, want).await
+    admit_account(
+        state, account_id, read_only, credential, org_slug, repo_name, want,
+    )
+    .await
 }
 
 /// Authorization after authentication, shared by HTTP and SSH transports (ADR 0005).
@@ -150,6 +166,7 @@ pub async fn admit_account(
     state: &AppState,
     account_id: Uuid,
     read_only: bool,
+    credential: CredentialRef,
     org_slug: &str,
     repo_name: &str,
     want: Want,
@@ -215,6 +232,7 @@ pub async fn admit_account(
         facts,
         rules,
         read_only,
+        credential,
     })
 }
 
@@ -247,6 +265,7 @@ pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, A
         facts,
         rules,
         read_only: admitted.read_only,
+        credential: admitted.credential.clone(),
     })
 }
 
@@ -399,6 +418,7 @@ mod tests {
             },
             rules: vec![],
             read_only: false,
+            credential: CredentialRef::Password,
         }
     }
 

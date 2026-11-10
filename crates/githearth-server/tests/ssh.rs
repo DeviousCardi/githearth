@@ -506,6 +506,25 @@ async fn ssh_push_works() {
         applied >= 1,
         "journal record was not replayed into PostgreSQL"
     );
+    // SSH push must record an ssh_key credential with the key id.
+    let key_id: Uuid = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT credential_id FROM push_credentials ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .expect("credential_id must be set for ssh_key");
+    assert!(
+        key_id != Uuid::nil(),
+        "ssh_key credential must record a non-nil key id"
+    );
+    let kind: String = sqlx::query_scalar(
+        "SELECT credential_kind FROM push_credentials ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "ssh_key");
 }
 
 #[tokio::test]

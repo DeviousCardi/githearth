@@ -8,6 +8,7 @@ use githearth_authz::{Action, BuiltinRole, Engine, Resource, Role, Scope, Subjec
 use githearth_server::{AppState, MIGRATOR, bootstrap_admin, config::Config, connect, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use sha2::Digest;
 use sqlx::{Connection, PgPool, Row};
 use std::time::Duration;
 use tower::ServiceExt;
@@ -1245,5 +1246,126 @@ async fn suspended_account_cannot_sign_in_or_create_organizations() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(count(&pool, "organizations").await, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn push_credentials_check_rejects_invalid_rows() {
+    let config = Config {
+        database_url: fresh_database("githearth_pc_check").await,
+        database_timeout_seconds: 1,
+        storage_root: temp_storage_root(),
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+
+    // (password, some id) must fail.
+    let res = sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, 'password', $2)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(res.is_err(), "password+bogus id must fail CHECK");
+
+    // (token, NULL) must fail.
+    let res = sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, 'token', NULL)",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(res.is_err(), "token+NULL must fail CHECK");
+
+    // (ssh_key, NULL) must fail.
+    let res = sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, 'ssh_key', NULL)",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(res.is_err(), "ssh_key+NULL must fail CHECK");
+
+    // (password, NULL) must succeed.
+    let op_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, 'password', NULL)",
+    )
+    .bind(op_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // (token, some id) must succeed.
+    let op_id2 = Uuid::new_v4();
+    let tid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, 'token', $2)",
+    )
+    .bind(op_id2)
+    .bind(tid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // (ssh_key, some id) must succeed.
+    let op_id3 = Uuid::new_v4();
+    let kid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, 'ssh_key', $2)",
+    )
+    .bind(op_id3)
+    .bind(kid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn authenticate_access_token_returns_token_id() {
+    let config = Config {
+        database_url: fresh_database("githearth_aattid").await,
+        database_timeout_seconds: 1,
+        storage_root: temp_storage_root(),
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let app = router(AppState::new(pool.clone(), config).await.unwrap());
+    let pwd = "testpassword";
+    let admin = bootstrap_admin(&pool, "tidtest", pwd.into()).await.unwrap();
+    let (status, ses) = login(&app, "tidtest", pwd).await;
+    assert_eq!(status, StatusCode::OK);
+    let session = ses["token"].as_str().unwrap();
+
+    // Create a token.
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v1/user/tokens",
+        Some(session),
+        json!({"name": "tid-token", "scopes": ["repo:write"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token_plaintext = body["token"].as_str().unwrap();
+    let created_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    // Authenticate and verify the returned id matches.
+    let token_hash = sha2::Sha256::digest(token_plaintext.as_bytes()).to_vec();
+    let result = githearth_server::authenticate_access_token(&pool, token_hash)
+        .await
+        .unwrap();
+    let ((account, auth_age), returned_id) = result;
+    assert_eq!(account.id, admin);
+    assert_eq!(auth_age, u64::MAX);
+    assert_eq!(returned_id, created_id);
+
     pool.close().await;
 }
