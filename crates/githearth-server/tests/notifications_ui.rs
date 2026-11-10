@@ -295,7 +295,7 @@ async fn an_accessible_notification_shows_actor_target_and_escaped_title() {
 async fn a_notification_on_an_unreadable_repository_shows_no_details() {
     let f = fixture().await;
     let (pr_id, _number) = pull_request(&f, "secret title", 1).await;
-    notification(&f, f.account_id, "pull_request.merged", pr_id, None).await;
+    let notif_id = notification(&f, f.account_id, "pull_request.merged", pr_id, None).await;
 
     // Remove the viewer's membership and revoke their grant so the repository
     // becomes unreadable.
@@ -324,6 +324,12 @@ async fn a_notification_on_an_unreadable_repository_shows_no_details() {
     );
     assert!(!page.contains("secret title"), "{page}");
     assert!(!page.contains(&f.repo_name), "{page}");
+    // It can still be marked read: its form carries the CSRF token.
+    let form = format!(
+        "action=\"/notifications/{notif_id}/read\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"csrf_token\""
+    );
+    assert!(page.contains(&form), "{page}");
 
     finish(f).await;
 }

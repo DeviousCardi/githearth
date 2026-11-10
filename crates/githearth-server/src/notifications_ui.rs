@@ -183,6 +183,19 @@ async fn notifications_page(
             any_unread = true;
         }
 
+        // Every row can be marked read, accessible or not, so the form always carries the token.
+        let muted = if read { " class=\"muted\"" } else { "" };
+        let mark_button = if read {
+            String::new()
+        } else {
+            format!(
+                "<form method=\"post\" action=\"/notifications/{}/read\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<button type=\"submit\">Mark read</button></form>",
+                row.id,
+                ui::esc(&s.csrf)
+            )
+        };
         if !can_read(
             &state,
             s.account.id,
@@ -192,16 +205,6 @@ async fn notifications_page(
         )
         .await
         {
-            let muted = if read { " class=\"muted\"" } else { "" };
-            let mark_button = if read {
-                String::new()
-            } else {
-                format!(
-                    "<form method=\"post\" action=\"/notifications/{}/read\" style=\"display:inline\">\
-<button type=\"submit\">Mark read</button></form>",
-                    row.id
-                )
-            };
             items.push_str(&format!(
                 "<li{}><p>A pull request you can no longer access <span class=\"muted\">{}</span></p>{}</li>",
                 muted,
@@ -225,18 +228,6 @@ async fn notifications_page(
             row.number,
             ui::esc(&row.title)
         );
-        let muted = if read { " class=\"muted\"" } else { "" };
-        let mark_button = if read {
-            String::new()
-        } else {
-            format!(
-                "<form method=\"post\" action=\"/notifications/{}/read\" style=\"display:inline\">\
-<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
-<button type=\"submit\">Mark read</button></form>",
-                row.id,
-                ui::esc(&s.csrf)
-            )
-        };
         items.push_str(&format!(
             "<li{}><p>{} {}</p><p class=\"muted\">{}</p>{}</li>",
             muted,
