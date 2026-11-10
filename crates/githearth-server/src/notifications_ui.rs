@@ -161,7 +161,7 @@ fn kind_sentence(kind: &str, actor: &str) -> String {
         "pull_request.review_requested" => {
             format!("<strong>{actor}</strong> requested your review on")
         }
-        _ => format!("<strong>{actor}</strong>"),
+        _ => format!("<strong>{actor}</strong> sent you a notification"),
     }
 }
 
@@ -301,4 +301,17 @@ async fn mark_all_read_submit(
     .await
     .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
     Ok(Redirect::to("/notifications").into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kind_sentence;
+
+    #[test]
+    fn unknown_kind_renders_generic_sentence() {
+        assert_eq!(
+            kind_sentence("pull_request.unknown", "<alice>"),
+            "<strong>&lt;alice&gt;</strong> sent you a notification"
+        );
+    }
 }
