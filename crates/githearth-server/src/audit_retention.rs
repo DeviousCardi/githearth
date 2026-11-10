@@ -502,6 +502,28 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn drop_dry_run_old_non_newest_appears_in_dropped() {
+        use std::time::Duration;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (pool, db_name) = test_pool("drprunold").await;
+            // Insert an old key first, then a newer key so the old one is not the newest.
+            let old_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO audit_ip_keys (id, key, created_at) VALUES ($1, $2, clock_timestamp() - '3 years'::interval)")
+                .bind(old_id).bind(vec![0x11u8; 32]).execute(&pool).await.unwrap();
+            rotate_ip_key(&pool, false).await.unwrap();
+            let result = drop_ip_keys(&pool, 365, true).await.unwrap();
+            assert!(result.dropped.contains(&old_id), "old key must be in dropped: {:?}", result.dropped);
+            assert_eq!(result.skipped_in_use.len(), 0);
+            // Both keys still exist (dry run)
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_ip_keys WHERE id = $1")
+                .bind(old_id).fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 1, "old key must still exist after dry run");
+            drop(pool); drop_database(&db_name).await;
+        }).await.expect("test timed out");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
     async fn drop_skips_keys_still_in_use() {
         use std::time::Duration;
         tokio::time::timeout(Duration::from_secs(60), async {
