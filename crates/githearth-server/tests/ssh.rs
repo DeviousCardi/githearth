@@ -1146,3 +1146,218 @@ async fn ssh_key_registered_via_api_then_revoked_stops_authentication() {
     let _ = std::fs::remove_dir_all(&storage_root);
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn ssh_push_credentials_insert_failure_refused() {
+    if !has_ssh() {
+        eprintln!("SKIP: ssh binary not found");
+        return;
+    }
+
+    let storage_root = temp_storage_root();
+    let db_name = format!(
+        "githearth_tssh_icf_{}",
+        Uuid::new_v4().to_string().replace('-', "_")
+    );
+    let database_url = fresh_database(&db_name).await;
+    let key_dir = temp_dir("ssh-key-icf");
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    let host_key = storage_root.join("ssh_host_key");
+    ssh::generate_host_key(&host_key).unwrap();
+    let client_key = key_dir.join("id_ed25519");
+    ssh_keygen_generate(&client_key);
+    let fp = sha256_fingerprint(&client_key);
+
+    let config = Config {
+        database_url: database_url.clone(),
+        storage_root: storage_root.clone(),
+        ssh_enabled: true,
+        hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
+        ssh_bind: "127.0.0.1:0".parse().unwrap(),
+        ssh_host_key_path: host_key,
+        git_timeout_seconds: 120,
+        ..Config::default()
+    };
+
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let account_id = fixture_account(&pool, "sshicf").await;
+    let (org_id, org_slug) = fixture_organization(&pool, account_id).await;
+    let repo_id = create_active_repo(&pool, org_id, "pushrepo", account_id).await;
+
+    let repo_path = githearth_git::layout::Storage::open(&storage_root)
+        .unwrap()
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha1,
+        )
+        .unwrap();
+
+    let work_dir = temp_dir("ssh-icf-w");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    git_ok(git_cmd(&["init", &work_dir.to_string_lossy()])).await;
+    std::fs::write(work_dir.join("seed.txt"), "seed\n").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        &work_dir.to_string_lossy(),
+        "add",
+        "seed.txt",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        &work_dir.to_string_lossy(),
+        "commit",
+        "-m",
+        "seed",
+    ]))
+    .await;
+    seed_bare(&repo_path.to_string_lossy(), &work_dir.to_string_lossy()).await;
+
+    let key_id = Uuid::new_v4();
+
+    // Clean up any leftover trigger from a previous aborted run.
+    let drop_sql = format!(
+        "DROP TRIGGER IF EXISTS pcrej_ssh_{} ON push_credentials",
+        key_id.simple()
+    );
+    sqlx::query(&drop_sql).execute(&pool).await.ok();
+
+    sqlx::query(&format!(
+        "CREATE OR REPLACE FUNCTION pcrej_ssh_fn_{}() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'injected push_credentials insert failure for test';
+         END $$ LANGUAGE plpgsql",
+        key_id.simple()
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER pcrej_ssh_{} BEFORE INSERT ON push_credentials FOR EACH ROW \
+         WHEN (NEW.credential_id = '{}') EXECUTE FUNCTION pcrej_ssh_fn_{}()",
+        key_id.simple(),
+        key_id,
+        key_id.simple()
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool.clone(), config.clone()).await.unwrap();
+
+    let authenticate: ssh::Authenticate = Arc::new({
+        let fid = fp.clone();
+        let kid = key_id;
+        move |f: String| {
+            let result = if f == fid {
+                Ok(Some(ssh::SshIdentity {
+                    account: account_id,
+                    key_id: kid,
+                    read_only: false,
+                }))
+            } else {
+                Ok(None)
+            };
+            Box::pin(async move { result })
+        }
+    });
+
+    let (_ssh_handle, port_rx) = ssh::spawn(state.clone(), authenticate);
+    let ssh_port = port_rx.await.unwrap().port();
+
+    let clone_dir = temp_dir("ssh-icf-clone");
+    let _ = std::fs::remove_dir_all(&clone_dir);
+
+    let ssh_cmd_env = git_ssh_key_env(&client_key, ssh_port);
+    let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{org_slug}/pushrepo.git");
+    let mut cmd = git_cmd(&["clone", &ssh_url, &clone_dir.to_string_lossy()]);
+    cmd.env("GIT_SSH_COMMAND", &ssh_cmd_env);
+    git_ok(cmd).await;
+
+    std::fs::write(clone_dir.join("new.txt"), "push via SSH\n").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        &clone_dir.to_string_lossy(),
+        "add",
+        "new.txt",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        &clone_dir.to_string_lossy(),
+        "commit",
+        "-m",
+        "ssh push fail",
+    ]))
+    .await;
+
+    let base_head = git_output(git_cmd(&[
+        "--git-dir",
+        &repo_path.to_string_lossy(),
+        "rev-parse",
+        "refs/heads/main",
+    ]))
+    .await;
+
+    let mut push_cmd = git_cmd(&[
+        "-C",
+        &clone_dir.to_string_lossy(),
+        "push",
+        "origin",
+        "HEAD:refs/heads/main",
+    ]);
+    push_cmd.env("GIT_SSH_COMMAND", &ssh_cmd_env);
+    let push_out = git_run(push_cmd).await;
+    let stderr = String::from_utf8_lossy(&push_out.stderr);
+    assert!(
+        !push_out.status.success(),
+        "push must be refused when push_credentials insert fails"
+    );
+    assert!(
+        stderr.contains("repository not found"),
+        "expected 'repository not found' in stderr, got: {stderr}"
+    );
+
+    // No push recorded.
+    let pushes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pushes, 0, "no repository_pushes row must exist");
+
+    // No ref updated.
+    let remote_head = git_output(git_cmd(&[
+        "--git-dir",
+        &repo_path.to_string_lossy(),
+        "rev-parse",
+        "refs/heads/main",
+    ]))
+    .await;
+    assert_eq!(
+        remote_head.trim(),
+        base_head.trim(),
+        "remote ref must not have changed"
+    );
+
+    sqlx::query(&format!(
+        "DROP TRIGGER pcrej_ssh_{} ON push_credentials",
+        key_id.simple()
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!("DROP FUNCTION pcrej_ssh_fn_{}", key_id.simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&clone_dir);
+    let _ = std::fs::remove_dir_all(&storage_root);
+    pool.close().await;
+}
