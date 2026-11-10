@@ -685,12 +685,12 @@ pub(crate) async fn authenticate_token_hash(
     ))
 }
 #[derive(Clone, Serialize, sqlx::FromRow)]
-pub(crate) struct Account {
-    id: Uuid,
-    username: String,
-    is_admin: bool,
+pub struct Account {
+    pub id: Uuid,
+    pub username: String,
+    pub is_admin: bool,
     #[serde(skip)]
-    read_only: bool,
+    pub read_only: bool,
 }
 impl Account {
     /// `repo:read`-only access tokens may never perform writes.
@@ -720,7 +720,9 @@ pub(crate) async fn authenticate_credential(
             {
                 return Ok(admitted);
             }
-            authenticate_access_token(pool, token_hash).await
+            authenticate_access_token(pool, token_hash)
+                .await
+                .map(|(result, _token_id)| result)
         }
     }
 }
@@ -730,12 +732,12 @@ pub(crate) async fn authenticate_credential(
 /// the token lacks `repo:write`, and `auth_age` large enough that sensitive
 /// actions keep requiring a fresh session. `last_used_at` is refreshed, at a
 /// throttled rate so a burst of Git requests does not write per-request.
-pub(crate) async fn authenticate_access_token(
+pub async fn authenticate_access_token(
     pool: &PgPool,
     token_hash: Vec<u8>,
-) -> ApiResult<(Account, u64)> {
-    let row = sqlx::query_as::<_, (Uuid, String, bool, Vec<String>, Option<bool>)>(
-        "SELECT a.id, a.username, a.is_admin, t.scopes, (t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp()) AS expired \
+) -> ApiResult<((Account, u64), Uuid)> {
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, bool, Vec<String>, Option<bool>)>(
+        "SELECT a.id, t.id, a.username, a.is_admin, t.scopes, (t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp()) AS expired \
          FROM accounts a JOIN access_tokens t ON t.account_id = a.id \
          WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND NOT a.suspended",
     )
@@ -743,10 +745,10 @@ pub(crate) async fn authenticate_access_token(
     .fetch_optional(pool)
     .await?
     .ok_or_else(unauthorized)?;
-    if row.4.unwrap_or(false) {
+    if row.5.unwrap_or(false) {
         return Err(unauthorized());
     }
-    let (account_id, username, is_admin, scopes, _) = row;
+    let (account_id, token_id, username, is_admin, scopes, _) = row;
     // shortcut: scopes collapse to read-only vs read-write here. `repo:write`
     // (which implies repo:read) is the only capability beyond reading, so a
     // token without it is treated as read-only for every scope check.
@@ -760,13 +762,16 @@ pub(crate) async fn authenticate_access_token(
     .execute(pool)
     .await?;
     Ok((
-        Account {
-            id: account_id,
-            username,
-            is_admin,
-            read_only,
-        },
-        u64::MAX,
+        (
+            Account {
+                id: account_id,
+                username,
+                is_admin,
+                read_only,
+            },
+            u64::MAX,
+        ),
+        token_id,
     ))
 }
 /// Resolves an access token from its plaintext `gth_` string, for transports
@@ -774,7 +779,7 @@ pub(crate) async fn authenticate_access_token(
 pub(crate) async fn authenticate_access_token_plaintext(
     pool: &PgPool,
     token: &str,
-) -> ApiResult<(Account, u64)> {
+) -> ApiResult<((Account, u64), Uuid)> {
     let rest = token.strip_prefix("gth_").ok_or_else(unauthorized)?;
     if rest.len() != 64 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(unauthorized());

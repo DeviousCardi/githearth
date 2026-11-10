@@ -12,6 +12,39 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// JSON API helpers (for token creation in push_credentials tests)
+// ---------------------------------------------------------------------------
+
+async fn request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    let mut builder = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Git helpers
 // ---------------------------------------------------------------------------
 
@@ -415,6 +448,53 @@ async fn assert_push_metadata(pool: &PgPool, repo_id: Uuid, expected_pushes: i64
     assert!(ja > 0, "journal_applied must advance");
 }
 
+async fn assert_push_credentials(
+    pool: &PgPool,
+    repo_id: Uuid,
+    expected_kind: &str,
+    expected_id: Option<Uuid>,
+) {
+    let ops: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT operation_id FROM repository_pushes WHERE repository_id=$1")
+            .bind(repo_id)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let creds: Vec<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT pc.operation_id, pc.credential_kind, pc.credential_id \
+         FROM push_credentials pc \
+         JOIN repository_pushes rp ON rp.operation_id = pc.operation_id \
+         WHERE rp.repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    for (op_id,) in &ops {
+        let found = creds.iter().find(|(o, _, _)| o == op_id);
+        assert!(
+            found.is_some(),
+            "no push_credentials row for operation {op_id}"
+        );
+        let (_, kind, cred_id) = found.unwrap();
+        assert_eq!(
+            kind, expected_kind,
+            "credential_kind for {op_id}: expected {expected_kind}, got {kind}"
+        );
+        assert_eq!(
+            cred_id, &expected_id,
+            "credential_id for {op_id}: expected {expected_id:?}, got {cred_id:?}"
+        );
+    }
+    assert_eq!(
+        creds.len(),
+        ops.len(),
+        "push_credentials rows ({}) != push operations ({})",
+        creds.len(),
+        ops.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -489,6 +569,8 @@ async fn push_new_branch_fast_forward_tag_and_clone_back() {
     );
 
     assert_push_metadata(&fx.pool, fx.repo_id, 3).await;
+    // Password auth: every push records a password credential with null id.
+    assert_push_credentials(&fx.pool, fx.repo_id, "password", None).await;
 
     // Journal has prepared+committed pairs.
     let records = journal_records(&fx.repo_path);
@@ -2774,6 +2856,139 @@ async fn quota_zero_allows_large_push() {
 
     wait_for_journal_applied(&fx.pool, fx.repo_id, 1).await;
     assert_push_metadata(&fx.pool, fx.repo_id, 1).await;
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn push_credentials_password() {
+    let fx = setup(1 << 30).await;
+
+    let clone = std::env::temp_dir().join(format!("git-push-pw-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    std::fs::write(clone.join("pw.txt"), "password auth\n").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "pw.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "pw",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+
+    wait_for_journal_applied(&fx.pool, fx.repo_id, 1).await;
+    assert_push_credentials(&fx.pool, fx.repo_id, "password", None).await;
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn push_credentials_token() {
+    let fx = setup(1 << 30).await;
+    let owner: Uuid = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT organization_id FROM repositories WHERE id=$1) AND role='owner'")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE accounts SET password_hash=$1 WHERE id=$2")
+        .bind(githearth_server::hash_password("testpass").unwrap())
+        .bind(owner)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    // Generate a 64-char hex session token.
+    let mut session_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut session_bytes);
+    let session = hex::encode(session_bytes);
+    sqlx::query("INSERT INTO sessions (token_hash,account_id,expires_at) VALUES (sha256($1::bytea),$2,clock_timestamp() + interval '1 hour')")
+        .bind(session.as_bytes())
+        .bind(owner)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let token_name = format!("tok-{}", Uuid::new_v4().simple());
+    let (status, body) = request(
+        &fx.app,
+        "POST",
+        "/api/v1/user/tokens",
+        Some(&session),
+        serde_json::json!({"name": token_name, "scopes": ["repo:write"]}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let token_plaintext = body["token"].as_str().unwrap().to_owned();
+    let token_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    // Push using the token. Embed the token in the URL as Basic auth password.
+    let clone = std::env::temp_dir().join(format!("git-push-tok-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    let token_url = format!(
+        "http://any:{}@127.0.0.1:{}/{}/{}.git",
+        token_plaintext, fx.port, fx.org_slug, fx.repo_name
+    );
+
+    git_ok(git_cmd(&["clone", "--", &token_url, cd])).await;
+
+    std::fs::write(clone.join("tok.txt"), "token auth\n").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "tok.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "tok",
+    ]))
+    .await;
+
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+
+    wait_for_journal_applied(&fx.pool, fx.repo_id, 1).await;
+    assert_push_credentials(&fx.pool, fx.repo_id, "token", Some(token_id)).await;
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fetch_inserts_no_push_credentials_row() {
+    let fx = setup(1 << 30).await;
+
+    let clone = std::env::temp_dir().join(format!("git-fetch-nop-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    let pc: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM push_credentials pc \
+         JOIN repository_pushes rp ON rp.operation_id = pc.operation_id \
+         WHERE rp.repository_id = $1",
+    )
+    .bind(fx.repo_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(pc, 0, "fetch must not insert push_credentials");
 
     let _ = std::fs::remove_dir_all(&clone);
     cleanup(&fx.storage_root);

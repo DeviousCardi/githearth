@@ -418,6 +418,28 @@ async fn receive_pack(
     if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
         hook_cmd.env("LLVM_PROFILE_FILE", profile);
     }
+    // Record the credential before spawning git: if this insert fails the push
+    // is refused, never leaving an untraced push. Fetches insert nothing.
+    {
+        let (kind, cred_id) = match &admitted.credential {
+            git_admission::CredentialRef::Password => ("password", None),
+            git_admission::CredentialRef::Token(id) => ("token", Some(*id)),
+            git_admission::CredentialRef::SshKey(id) => ("ssh_key", Some(*id)),
+        };
+        sqlx::query(
+            "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) VALUES ($1, $2, $3)",
+        )
+        .bind(operation)
+        .bind(kind)
+        .bind(cred_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(category = "database", operation_id = %operation, error = %e, "cannot insert push credential");
+            GitHttpError::ServerError
+        })?;
+    }
+
     // Once the pack is fully fed, a client that went away must not kill
     // receive-pack mid-ref-update (that would leave stale lock files); the
     // deadline still bounds it.  So: no kill on drop, no kill on disconnect.
