@@ -99,7 +99,7 @@ def third_party_dependencies(meta: dict) -> list[tuple[str, str, str]]:
         adjacency[node["id"]] = []
         for dep in node["deps"]:
             kinds = [k.get("kind") for k in dep.get("dep_kinds", [])]
-            if any(kind != "dev" for kind in kinds):
+            if not kinds or any(kind != "dev" for kind in kinds):
                 adjacency[node["id"]].append(dep["pkg"])
 
     roots = [p["id"] for p in meta["packages"] if p["name"] in BINARY_CRATES]

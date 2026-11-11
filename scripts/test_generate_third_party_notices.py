@@ -78,6 +78,31 @@ class ThirdPartyDependenciesTests(unittest.TestCase):
         deps = _generate.third_party_dependencies(_meta(packages, nodes))
         self.assertEqual(deps, [("allowlisted", "1.0.0", "MIT OR Apache-2.0")])
 
+    def test_dep_with_empty_dep_kinds_is_treated_as_normal(self):
+        packages = [
+            {
+                "id": "githearth-server 0.0.1",
+                "name": "githearth-server",
+                "version": "0.0.1",
+                "license": "BUSL-1.1",
+            },
+            {
+                "id": "dep 1.0.0",
+                "name": "dep",
+                "version": "1.0.0",
+                "license": "MIT",
+            },
+        ]
+        nodes = [
+            {
+                "id": "githearth-server 0.0.1",
+                "deps": [{"pkg": "dep 1.0.0", "dep_kinds": []}],
+            },
+            {"id": "dep 1.0.0", "deps": []},
+        ]
+        deps = _generate.third_party_dependencies(_meta(packages, nodes))
+        self.assertEqual(deps, [("dep", "1.0.0", "MIT")])
+
 
 if __name__ == "__main__":
     unittest.main()
