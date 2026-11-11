@@ -145,11 +145,11 @@ async fn create(
     Path((org_slug, repo_name, sha)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<StatusJson>), ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     if !valid_commit_id(&sha) {
         return Err(invalid());
     }
     let input = new_status(&body)?;
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let key = idempotency::extract_key(&headers).transpose()?;
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/commits/{sha}/statuses");

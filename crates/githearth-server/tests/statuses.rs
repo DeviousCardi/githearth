@@ -432,6 +432,30 @@ async fn invalid_statuses_are_rejected() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn unauthenticated_post_with_malformed_input_returns_unauthorized() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    fixture_repository(&pool, org_id, "r", owner).await;
+
+    // A missing token must be reported as 401 before any validation, so a
+    // malformed commit id and body still yield 401 rather than 400/422.
+    let base = statuses_path(&slug, "r", "not-a-commit");
+    let (status, _) = request(
+        &app,
+        "POST",
+        &base,
+        None,
+        None,
+        json!({"context": "", "state": "nope"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn read_only_token_cannot_post_status() {
     let (app, pool, storage, owner, org_id, slug) = setup().await;
     fixture_repository(&pool, org_id, "ro", owner).await;
