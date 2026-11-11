@@ -1283,6 +1283,50 @@ async fn auto_merge_button_enables_and_cancels_through_the_form() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn disable_auto_merge_form_is_only_shown_to_closers() {
+    let f = fixture().await;
+    open_pull(&f).await;
+    // Require an approval so enabling auto-merge does not immediately raise a
+    // merge intent, keeping the auto-merge pending for the page.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/protection", f.api_base),
+        &f.token,
+        json!({"pattern": "main", "required_approvals": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The owner enables auto-merge.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/auto_merge", f.api_base),
+        &f.token,
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The owner (who may close) sees the disable form.
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Auto-merge enabled"), "{page}");
+    assert!(page.contains("Disable auto-merge"), "{page}");
+
+    // A read-only member sees auto-merge is on, but no disable form.
+    let reader = member_cookie(&f, "read").await;
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Auto-merge enabled"), "{page}");
+    assert!(!page.contains("Disable auto-merge"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn queue_position_is_shown_on_the_pull_request_page() {
     let f = fixture().await;
     open_pull(&f).await;

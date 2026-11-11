@@ -612,6 +612,9 @@ async fn render_pull(
         auto_merge::may_enable(state, s.account.id, s.auth_age, slug, name, number)
             .await
             .unwrap_or(false);
+    let can_close = pulls::may_close(state, s.account.id, s.auth_age, slug, name, number)
+        .await
+        .unwrap_or(false);
     let queue_position = if intended.as_ref().is_some_and(|i| {
         i.in_queue && matches!(i.state.as_str(), "queued" | "validating" | "executing")
     }) {
@@ -777,13 +780,23 @@ async fn render_pull(
         None => String::new(),
     };
     let auto_merge_section = match (&auto_merge_row, detail.pull.state.as_str()) {
-        (Some(am), "open") => format!(
-            "<div class=\"card\"><p>Auto-merge enabled ({})</p>\
-<form method=\"post\" action=\"{base}/pulls/{number}/auto_merge/cancel\">{}\
-<p><button type=\"submit\">Disable auto-merge</button></p></form></div>",
-            ui::esc(&am.method),
-            form_fields(s, &new_key()),
-        ),
+        (Some(am), "open") => {
+            // The cancel submit checks `PullRequestClose`, so only closers see
+            // the disable form; everyone else just sees that it is enabled.
+            let disable = if can_close {
+                format!(
+                    "<form method=\"post\" action=\"{base}/pulls/{number}/auto_merge/cancel\">{}\
+<p><button type=\"submit\">Disable auto-merge</button></p></form>",
+                    form_fields(s, &new_key()),
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "<div class=\"card\"><p>Auto-merge enabled ({})</p>{disable}</div>",
+                ui::esc(&am.method),
+            )
+        }
         (None, "open") if can_auto_merge && !non_terminal => format!(
             "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/auto_merge\">{}\
 <label for=\"auto_method\">Auto-merge method</label><select id=\"auto_method\" name=\"method\">{}</select>\

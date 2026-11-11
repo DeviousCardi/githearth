@@ -624,6 +624,7 @@ async fn cancel(
 /// changes nothing and returns Ok. In one transaction it:
 ///  - marks the intent `merged` with its result oid and journal sequence;
 ///  - marks the pull request `merged` with `merged_at`/`merged_by`;
+///  - consumes any pending auto-merge, recording its completion audit event;
 ///  - writes the ref-update, audit and outbox rows in the same style as pushes.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_merge_result(
@@ -690,20 +691,33 @@ pub async fn record_merge_result(
         .fetch_optional(&mut *tx)
         .await?;
 
-        // A merged pull request no longer has a pending auto-merge.
-        sqlx::query(
-            "DELETE FROM auto_merges WHERE pull_request_id = \
-             (SELECT pull_request_id FROM merge_intents WHERE operation_id = $1)",
-        )
-        .bind(operation_id)
-        .execute(&mut *tx)
-        .await?;
-
         let organization_id: Option<Uuid> =
             sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id = $1")
                 .bind(repository_id)
                 .fetch_one(&mut *tx)
                 .await?;
+
+        // A merged pull request no longer has a pending auto-merge; record its
+        // completion so the auto-merge audit trail ends with an event rather
+        // than a silently vanished row.
+        let completed_auto_merge: Option<Uuid> = sqlx::query_scalar(
+            "DELETE FROM auto_merges WHERE pull_request_id = \
+             (SELECT pull_request_id FROM merge_intents WHERE operation_id = $1) \
+             RETURNING pull_request_id",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(pull_request_id) = completed_auto_merge {
+            crate::event_with(
+                &mut tx,
+                organization_id,
+                actor,
+                "pull_request.auto_merge_completed",
+                serde_json::json!({ "pull_request_id": pull_request_id }),
+            )
+            .await?;
+        }
 
         let audit_id = Uuid::new_v4();
         sqlx::query(

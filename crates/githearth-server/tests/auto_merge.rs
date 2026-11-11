@@ -11,7 +11,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use githearth_git::journal::{Journal, Kind, Record, Update};
-use githearth_server::{AppState, MIGRATOR, config::Config, connect, pushes, router};
+use githearth_server::{AppState, MIGRATOR, config::Config, connect, merge_worker, pushes, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -206,6 +206,9 @@ async fn build_fixture() -> Fixture {
         database_max_connections: 4,
         database_timeout_seconds: 3,
         storage_root: storage_root.clone(),
+        // The journaling hook execs the server binary; without it the merge
+        // ref update is not journaled, so the worker can never complete one.
+        hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
@@ -231,6 +234,17 @@ async fn build_fixture() -> Fixture {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let repo_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
     let repo_path = state_repo_path(&storage_root, repo_id);
+    // The fixture pushes refs straight to the bare repo, bypassing the server's
+    // admission socket; disable the journaling hook for those direct pushes so
+    // only the worker's compare-and-swap goes through it.
+    git_ok(git_cmd(&[
+        "--git-dir",
+        repo_path.to_str().unwrap(),
+        "config",
+        "core.hooksPath",
+        "/dev/null",
+    ]))
+    .await;
 
     let work = std::env::temp_dir().join(format!("git-am-work-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&work).unwrap();
@@ -816,6 +830,45 @@ async fn enablers_own_push_re_raises_the_merge_intent() {
         live_oid, new_head,
         "enabler's own push re-raises the merge intent"
     );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn merging_via_auto_merge_records_its_completion() {
+    let f = build_fixture().await;
+
+    // Enable auto-merge on a mergeable pull request (no approvals required):
+    // the intent is raised immediately.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &auto_merge_href(&f.org_slug, &f.repo_name, f.number),
+        Some(&f.token),
+        None,
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(auto_merge_count(&f).await, 1);
+
+    // The worker merges the raised intent, consuming the auto-merge.
+    let ran = merge_worker::run_once(&f.state, Some(f.repo_id))
+        .await
+        .unwrap();
+    assert_eq!(ran, 1);
+    assert_eq!(auto_merge_count(&f).await, 0, "merged auto-merge is gone");
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE kind = 'pull_request.auto_merge_completed' \
+         AND organization_id = $1",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1, "the merge records the auto-merge completion");
 
     finish(f).await;
 }
