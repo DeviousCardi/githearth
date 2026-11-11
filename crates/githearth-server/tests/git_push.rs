@@ -1901,8 +1901,8 @@ async fn add_protection_rule(
 async fn add_signed_commits_rule(pool: &PgPool, repo_id: Uuid, created_by: Uuid, pattern: &str) {
     sqlx::query(
         "INSERT INTO branch_protection_rules \
-         (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, require_checks, require_signed_commits, created_by) \
-         VALUES ($1, $2, $3, false, false, false, 0, false, true, $4)",
+         (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, required_status_checks, require_signed_commits, created_by) \
+         VALUES ($1, $2, $3, false, false, false, 0, '{}', true, $4)",
     )
     .bind(Uuid::new_v4())
     .bind(repo_id)
