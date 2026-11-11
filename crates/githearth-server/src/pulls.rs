@@ -179,6 +179,7 @@ pub(crate) struct PullDetail {
     pub(crate) approvals: i64,
     pub(crate) changes_requested: i64,
     pub(crate) statuses: Vec<crate::statuses::StatusJson>,
+    pub(crate) mergeability: Vec<crate::mergeability::Check>,
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow)]
@@ -350,6 +351,7 @@ async fn detail(
         approvals,
         changes_requested,
         statuses,
+        mergeability: Vec::new(),
     })
 }
 
@@ -575,8 +577,16 @@ pub(crate) async fn read_pull(
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
     let tips = tips(state, loaded.repo.id, &pull).await?;
+    let mergeability = match &tips {
+        (Some(head), Some(base)) => {
+            crate::mergeability::for_pull(state, loaded.repo.id, head, base).await?
+        }
+        _ => Vec::new(),
+    };
     let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, loaded.repo.id, pull, tips).await
+    let mut detail = detail(&mut conn, loaded.repo.id, pull, tips).await?;
+    detail.mergeability = mergeability;
+    Ok(detail)
 }
 
 #[derive(Deserialize)]

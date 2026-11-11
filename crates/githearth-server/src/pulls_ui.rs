@@ -594,6 +594,36 @@ async fn render_pull(
         .await
         .unwrap_or(false);
 
+    let mut conflict_paths: Vec<String> = Vec::new();
+    for check in &detail.mergeability {
+        if check.status == "conflicts" {
+            for path in &check.conflicts {
+                if !conflict_paths.iter().any(|p| p == path) {
+                    conflict_paths.push(path.clone());
+                }
+            }
+        }
+    }
+    let has_conflicts = !conflict_paths.is_empty();
+    let conflict_section = if has_conflicts {
+        let mut html = String::from(
+            "<p class=\"error\" role=\"alert\">This branch has conflicts that must be resolved</p><ul>",
+        );
+        for path in &conflict_paths {
+            html.push_str(&format!("<li>{}</li>", ui::esc(path)));
+        }
+        html.push_str("</ul>");
+        html.push_str(&format!(
+            "<h2>Resolve conflicts locally</h2>\
+<pre><code>git fetch origin\ngit checkout {}\ngit merge origin/{}</code></pre>",
+            ui::esc(&detail.pull.source_branch),
+            ui::esc(&detail.pull.target_branch),
+        ));
+        html
+    } else {
+        String::new()
+    };
+
     let mut review_list = String::new();
     for r in &reviews.items {
         review_list.push_str(&format!(
@@ -697,7 +727,11 @@ async fn render_pull(
         })
         .collect::<String>();
     let show_merge_form = detail.pull.state == "open" && !non_terminal && can_merge;
-    let merge_form = if show_merge_form {
+    let merge_form = if show_merge_form && has_conflicts {
+        "<p><button type=\"submit\" disabled>Merge pull request</button> \
+<span class=\"muted\">This branch has conflicts that must be resolved.</span></p>"
+            .to_string()
+    } else if show_merge_form {
         format!(
             "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/merge\">{}\
 <label for=\"method\">Merge method</label><select id=\"method\" name=\"method\">{}</select>\
@@ -751,6 +785,7 @@ async fn render_pull(
 <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
 {intent_section}\
 {status_section}\
+{conflict_section}\
 <h2>Reviews</h2>{review_list} \
 <h2>Comments</h2>{comment_list}<p>{pager}</p>{error}{review_error}{merge_error}\
 {merge_form}\
@@ -1114,11 +1149,40 @@ fn merge_notice(error: &crate::ApiError) -> &'static str {
     if let Some(message) = ui::idempotency_notice(error) {
         return message;
     }
+    if error.status_code() == StatusCode::CONFLICT && error.message() == "merge conflicts" {
+        return "This branch has conflicts that must be resolved.";
+    }
     match error.status_code() {
         StatusCode::NOT_FOUND => "This pull request no longer exists.",
         StatusCode::FORBIDDEN => "You may not merge this pull request.",
         StatusCode::CONFLICT => "This pull request cannot be merged right now.",
         StatusCode::UNPROCESSABLE_ENTITY => "One of the branches is missing.",
         _ => "The merge could not be created. Try again.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_notice_reports_a_conflicting_branch() {
+        let error = crate::ApiError(StatusCode::CONFLICT, "merge conflicts");
+        assert_eq!(
+            merge_notice(&error),
+            "This branch has conflicts that must be resolved."
+        );
+        // An unrelated conflict keeps its generic text.
+        let other = crate::ApiError(StatusCode::CONFLICT, "an open merge intent already exists");
+        assert_eq!(
+            merge_notice(&other),
+            "This pull request cannot be merged right now."
+        );
+        // A forbidden merge reports the permission message.
+        let forbidden = crate::ApiError(StatusCode::FORBIDDEN, "not permitted");
+        assert_eq!(
+            merge_notice(&forbidden),
+            "You may not merge this pull request."
+        );
     }
 }

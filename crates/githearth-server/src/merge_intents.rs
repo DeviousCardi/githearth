@@ -17,6 +17,7 @@ use axum::{
 };
 use githearth_authz::{Action, Merge, PullRequest, Ref, Resource};
 use githearth_core::RepositoryStatus;
+use githearth_git::merge::Method;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection};
@@ -53,6 +54,9 @@ fn already_queued() -> ApiError {
 }
 fn executing() -> ApiError {
     ApiError(StatusCode::CONFLICT, "merge intent is already executing")
+}
+fn merge_conflicts() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "merge conflicts")
 }
 
 const INTENT_COLUMNS: &str = "operation_id, repository_id, pull_request_id, source_ref, source_oid, \
@@ -411,6 +415,65 @@ pub(crate) async fn create_intent(
             )?;
 
             let digest = checks_approvals_digest(&head, &review_ids, &check_states);
+
+            // M3 conflicts: a conflicting merge is refused up front — nothing is
+            // queued and no ref moves — but the reason is recorded on a
+            // conflicted intent so the pull request page can show it.
+            if let Some(method) = match input.method.as_str() {
+                "merge" => Some(Method::Merge),
+                "squash" => Some(Method::Squash),
+                "rebase" => Some(Method::Rebase),
+                _ => None,
+            } {
+                let check = crate::mergeability::check_method(
+                    state,
+                    loaded.repo.id,
+                    method,
+                    &input.method,
+                    &base,
+                    &head,
+                )
+                .await?;
+                if check.status == "conflicts" {
+                    let operation_id = Uuid::new_v4();
+                    let mut tx = state.pool.begin().await?;
+                    if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
+                        return Err(issues::not_active());
+                    }
+                    pulls::require_open(&mut tx, pull.id).await?;
+                    sqlx::query(
+                        "INSERT INTO merge_intents \
+                         (operation_id, repository_id, pull_request_id, source_ref, source_oid, \
+                          target_ref, expected_target_oid, method, policy_generation, \
+                          checks_approvals_digest, actor_id, state, failure_reason) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'conflicted', $12)",
+                    )
+                    .bind(operation_id)
+                    .bind(loaded.repo.id)
+                    .bind(pull.id)
+                    .bind(&pull.source_branch)
+                    .bind(&head)
+                    .bind(&pull.target_branch)
+                    .bind(&base)
+                    .bind(&input.method)
+                    .bind(generation)
+                    .bind(&digest)
+                    .bind(actor_id)
+                    .bind(format!("merge conflicts: {}", check.conflicts.join(", ")))
+                    .execute(&mut *tx)
+                    .await?;
+                    crate::event(
+                        &mut tx,
+                        Some(loaded.org_id),
+                        actor_id,
+                        "pull_request.merge_intent_conflicted",
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    return Err(merge_conflicts());
+                }
+            }
+
             let operation_id = Uuid::new_v4();
 
             let mut tx = state.pool.begin().await?;
