@@ -675,27 +675,51 @@ async fn render_pull(
     }
     // A reply whose root is on an earlier comment page is orphaned here:
     // pagination is by seq and rendering iterates roots only, so without this
-    // it would be silently dropped. Render it under a marker linking the root.
+    // it would be silently dropped. Render it under a marker linking the root
+    // on the page that holds it.
     let root_ids: HashSet<Uuid> = roots.iter().map(|c| c.id).collect();
+    let orphan_roots: Vec<Uuid> = comments
+        .items
+        .iter()
+        .filter_map(|c| c.in_reply_to)
+        .filter(|parent| !root_ids.contains(parent))
+        .collect();
+    let orphan_seqs = pulls::comment_seqs(
+        state,
+        s.account.id,
+        s.auth_age,
+        slug,
+        name,
+        number,
+        &orphan_roots,
+    )
+    .await
+    .map_err(|e| api_error(s, e))?;
     for reply in &comments.items {
-        if reply
-            .in_reply_to
-            .is_some_and(|parent| !root_ids.contains(&parent))
-        {
-            comment_list.push_str(&format!(
-                "<li class=\"muted\">reply to <a href=\"{base}/pulls/{number}\">an earlier comment</a></li>"
-            ));
-            comment_list.push_str(&render_comment(
-                s,
-                &names,
-                &base,
-                number,
-                reply,
-                true,
-                abilities.may_resolve,
-                abilities.may_apply,
-            ));
-        }
+        let Some(parent) = reply.in_reply_to.filter(|p| !root_ids.contains(p)) else {
+            continue;
+        };
+        // The list query filters `seq > after`, so `after = seq - 1` puts the
+        // root first on its page; the anchor names the root element.
+        let href = match orphan_seqs.get(&parent) {
+            Some(&seq) if seq > 1 => {
+                format!("{base}/pulls/{number}?after={}#comment-{parent}", seq - 1)
+            }
+            _ => format!("{base}/pulls/{number}#comment-{parent}"),
+        };
+        comment_list.push_str(&format!(
+            "<li class=\"muted\">reply to <a href=\"{href}\">an earlier comment</a></li>"
+        ));
+        comment_list.push_str(&render_comment(
+            s,
+            &names,
+            &base,
+            number,
+            reply,
+            true,
+            abilities.may_resolve,
+            abilities.may_apply,
+        ));
     }
     let comment_list = if comment_list.is_empty() {
         "<p class=\"muted\">No comments yet.</p>".to_owned()
@@ -946,11 +970,12 @@ fn render_comment(
         ""
     };
     format!(
-        "<li><article aria-label=\"Comment {seq}\"><p class=\"muted\">{} commented at {}{}</p>{anchor}{body}{actions}</article></li>",
+        "<li><article id=\"comment-{id}\" aria-label=\"Comment {seq}\"><p class=\"muted\">{} commented at {}{}</p>{anchor}{body}{actions}</article></li>",
         who(names, &c.author_id),
         ui::esc(&c.created_at),
         resolved_mark,
         seq = c.seq,
+        id = c.id,
     )
 }
 

@@ -1307,19 +1307,8 @@ async fn replies_to_earlier_comments_are_rendered_with_a_marker() {
     let root_body = format!("root-{}", Uuid::new_v4().simple());
     let reply_body = format!("reply-{}", Uuid::new_v4().simple());
 
-    // A root comment, then enough filler that the root lands on the first
-    // page while a reply to it lands on the second page.
-    let (status, root) = api(
-        &f.app,
-        "POST",
-        &format!("{}/pulls/1/comments", f.api_base),
-        &f.token,
-        json!({"body": root_body}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let root_id = root["id"].as_str().unwrap().to_owned();
-
+    // Enough filler that the root lands on the second page while a reply to it
+    // lands on the third, so the reply's page no longer holds its root.
     for i in 0..30 {
         let (status, _) = api(
             &f.app,
@@ -1332,6 +1321,17 @@ async fn replies_to_earlier_comments_are_rendered_with_a_marker() {
         assert_eq!(status, StatusCode::CREATED);
     }
 
+    let (status, root) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!({"body": root_body}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let root_id = root["id"].as_str().unwrap().to_owned();
+
     let (status, _) = api(
         &f.app,
         "POST",
@@ -1342,18 +1342,24 @@ async fn replies_to_earlier_comments_are_rendered_with_a_marker() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // The reply sits on the second page while its root stays on the first.
+    // The reply sits on the page after its root: the root is the first item of
+    // `?after=30`, so the marker must point there rather than at the first page.
     let (status, page) = get(
         &f.app,
-        &format!("{}/pulls/1?after=30", f.base),
+        &format!("{}/pulls/1?after=31", f.base),
         Some(&f.cookie),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains(&reply_body), "{page}");
-    assert!(page.contains("reply to <a href="), "{page}");
-    assert!(page.contains("an earlier comment"), "{page}");
-    assert!(!page.contains(&root_body), "root stays on the first page");
+    assert!(
+        page.contains(&format!(
+            "reply to <a href=\"{}/pulls/1?after=30#comment-{root_id}\">an earlier comment</a>",
+            f.base
+        )),
+        "{page}"
+    );
+    assert!(!page.contains(&root_body), "root stays on its own page");
 
     finish(f).await;
 }
@@ -1453,6 +1459,26 @@ async fn resolve_apply_and_inline_controls_require_permission() {
     assert!(
         page.contains("name=\"path\""),
         "read members can comment inline"
+    );
+
+    // A closed pull request still accepts comments, but resolve and apply are
+    // refused (409), so their controls must not render either.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'closed', closed_at = now() \
+         WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains(">Resolve</button>"), "{page}");
+    assert!(!page.contains(">Unresolve</button>"), "{page}");
+    assert!(!page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(
+        page.contains("name=\"path\""),
+        "closed pull requests still accept inline comments"
     );
 
     finish(f).await;

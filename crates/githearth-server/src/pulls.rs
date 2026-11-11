@@ -20,6 +20,7 @@ use githearth_git::merge::Identity;
 use githearth_git::suggestion;
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, PgConnection};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -1101,6 +1102,46 @@ pub(crate) async fn list_pull_comments(
     Ok(page(rows, limit, |c| c.seq.into()))
 }
 
+/// The `seq` of each named comment that belongs to this pull request, so a reply
+/// can link to the page its root falls on. Ids from another pull request are
+/// absent rather than an error.
+pub(crate) async fn comment_seqs(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, i64>, ApiError> {
+    let mut seqs = HashMap::new();
+    if ids.is_empty() {
+        return Ok(seqs);
+    }
+    let (pull, _repo_id, _limit) = seq_page_start(
+        state,
+        actor_id,
+        auth_age,
+        org_slug,
+        repo_name,
+        number,
+        &SeqQuery::default(),
+    )
+    .await?;
+    let mut conn = state.pool.acquire().await?;
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT id, seq FROM pull_request_comments WHERE pull_request_id = $1 AND id = ANY($2)",
+    )
+    .bind(pull.id)
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (id, seq) in rows {
+        seqs.insert(id, seq.into());
+    }
+    Ok(seqs)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewReview {
@@ -1592,7 +1633,8 @@ pub(crate) async fn set_thread_resolved(
     comment_id: Uuid,
     resolved: bool,
 ) -> Result<CommentJson, ApiError> {
-    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    let loaded =
+        repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestComment).await?;
     // Resolving a thread is a review action: the author or an approver, not a
@@ -1786,10 +1828,12 @@ pub(crate) async fn viewer_abilities(
         .ok_or_else(not_found)?;
     drop(conn);
     let may_comment = require_pull(state, &loaded, &pull, Action::PullRequestComment).is_ok();
-    let may_resolve = require_review_permission(state, &loaded, &pull).is_ok();
-    let may_apply = require_apply_permission(state, &loaded, &pull)
-        .await
-        .is_ok();
+    let open = pull.state == "open";
+    let may_resolve = open && require_review_permission(state, &loaded, &pull).is_ok();
+    let may_apply = open
+        && require_apply_permission(state, &loaded, &pull)
+            .await
+            .is_ok();
     Ok(ViewerAbilities {
         may_comment,
         may_resolve,

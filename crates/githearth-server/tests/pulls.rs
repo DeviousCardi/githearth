@@ -1695,6 +1695,50 @@ async fn resolve_on_a_closed_pull_request_is_refused() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_through_a_renamed_away_name_is_404() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+
+    // Rename the repository: the old name still reads, but a mutation captured
+    // against it must not change data.
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        None,
+        json!({"name": format!("{}-renamed", f.repo_name)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "repository not found");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn resolve_rechecks_open_state_under_the_repository_lock() {
     let f = build_fixture().await;
     let (_, pull) = create_pull(&f).await;
