@@ -36,9 +36,18 @@ fn valid_state(state: &str) -> bool {
     matches!(state, "pending" | "success" | "failure" | "error")
 }
 
-/// A status context is a short, non-empty name (e.g. "ci/build").
+/// A status context is a short, non-empty name (e.g. "ci/build") with no
+/// leading or trailing whitespace. Such whitespace would make a posted status
+/// or a required check context impossible to match against a well-formed rule.
 pub(crate) fn valid_context(context: &str) -> bool {
-    (1..=255).contains(&context.len()) && !context.trim().is_empty()
+    (1..=255).contains(&context.len()) && context == context.trim()
+}
+
+/// Whether a context has leading or trailing whitespace around a non-empty
+/// name (e.g. " ci "). Such a name can never match a rule, so callers reject it
+/// with 422 rather than the generic 400 for an empty or oversized context.
+pub(crate) fn has_surrounding_whitespace(context: &str) -> bool {
+    !context.trim().is_empty() && context != context.trim()
 }
 
 /// The reserved context used to keep pre-M3 `require_checks = true` branch
@@ -99,6 +108,12 @@ struct NewStatus {
 
 fn new_status(body: &[u8]) -> Result<NewStatus, ApiError> {
     let input: NewStatus = serde_json::from_slice(body).map_err(|_| invalid())?;
+    if has_surrounding_whitespace(&input.context) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "context must not have leading or trailing whitespace",
+        ));
+    }
     if !valid_context(&input.context)
         || !valid_state(&input.state)
         || input.context == LEGACY_REQUIRE_CHECKS_CONTEXT
@@ -304,8 +319,12 @@ mod tests {
     fn context_and_state_validation() {
         assert!(valid_context("ci/build"));
         assert!(valid_context("x"));
+        assert!(valid_context("ci build"));
         assert!(!valid_context(""));
         assert!(!valid_context("   "));
+        assert!(!valid_context(" ci"));
+        assert!(!valid_context("ci "));
+        assert!(!valid_context(" ci "));
         assert!(!valid_context(&"x".repeat(256)));
 
         for state in ["pending", "success", "failure", "error"] {
@@ -371,6 +390,19 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn surrounding_whitespace_context_returns_unprocessable() {
+        for context in [" ci", "ci ", " ci "] {
+            let err = new_status(
+                serde_json::json!({"context": context, "state": "success"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap_err();
+            assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
     }
 
     #[test]

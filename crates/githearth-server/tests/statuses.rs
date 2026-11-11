@@ -379,6 +379,25 @@ async fn invalid_statuses_are_rejected() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    // A context with surrounding whitespace can never match a rule, so it is a
+    // 422 rather than a plain malformed-input 400.
+    for context in [" ci", "ci ", " ci "] {
+        let (status, _) = request(
+            &app,
+            "POST",
+            &base,
+            Some(&token),
+            None,
+            json!({"context": context, "state": "success"}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "context={context:?}"
+        );
+    }
+
     // target_url must be http/https; anything else is 422.
     for url in [
         "javascript:alert(1)",
