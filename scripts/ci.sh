@@ -32,6 +32,8 @@ step clippy
 cargo clippy --workspace --all-targets --locked -- -D warnings
 step deny
 cargo deny check advisories bans licenses sources
+step "fetch locked dependencies (all targets)"
+cargo fetch --locked
 step "third-party notices"
 python3 scripts/generate-third-party-notices.py --check
 python3 scripts/test_generate_third_party_notices.py
