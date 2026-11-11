@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -1175,6 +1176,694 @@ async fn resumed_fork_create_refreshes_updated_at() {
         age < 60.0,
         "resumed fork create must refresh updated_at (age={age}s)"
     );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resumed_fork_create_refuses_to_resurrect_a_failed_fork() {
+    let f = build_fixture().await;
+
+    let contributor_id: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+        .bind(&f.contributor_username)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    let contrib_org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&f.contrib_org_slug)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+
+    let fork_name = tag("resume-failed");
+    let body = json!({"organization": f.contrib_org_slug, "name": fork_name});
+    let path = format!(
+        "/api/v1/organizations/{}/repositories/{}/forks",
+        f.parent_org_slug, f.parent_repo_name
+    );
+    let operation_id = Uuid::new_v4();
+    let key = tag("resume-failed-key");
+    insert_abandoned_fork_claim(
+        &f,
+        contributor_id,
+        contrib_org_id,
+        &key,
+        &fork_name,
+        operation_id,
+        "failed",
+    )
+    .await;
+
+    // A `failed` fork is neither deletable-resume nor active: resuming its
+    // create must refuse with a conflict, never resurrect the storage.
+    let (status, _) = request_with_idempotency(
+        &f.app,
+        "POST",
+        &path,
+        Some(&f.contributor_token),
+        Some(&key),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    finish(f).await;
+}
+
+fn fork_href(org: &str, repo: &str) -> String {
+    format!("/api/v1/organizations/{org}/repositories/{repo}/forks")
+}
+
+fn csrf_for_session(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let token_hash = Sha256::digest(token.as_bytes());
+    hex::encode(&Sha256::digest(token_hash)[..16])
+}
+
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+async fn post_form(
+    app: &Router,
+    path: &str,
+    cookie: &str,
+    form: &[(&str, &str)],
+) -> (StatusCode, Option<String>, String) {
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", cookie)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .map(|v| v.to_str().unwrap().to_owned());
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        location,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn forking_requires_read_on_the_parent() {
+    let f = build_fixture().await;
+
+    // A stranger with no read grant on the private parent sees a plain 404,
+    // indistinguishable from a repository that does not exist.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.stranger_token),
+        json!({"organization": f.contrib_org_slug}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // A repository that does not exist is also 404.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, "does-not-exist"),
+        Some(&f.contributor_token),
+        json!({"organization": f.contrib_org_slug}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_rejects_unknown_or_forbidden_target_namespaces_and_bad_names() {
+    let f = build_fixture().await;
+
+    // An unknown target organization.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({"organization": "does-not-exist"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A namespace the contributor belongs to but cannot create repositories in
+    // (they hold only a read grant on the parent org).
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({"organization": f.parent_org_slug}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // An invalid fork name is rejected before any work happens.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({"organization": f.contrib_org_slug, "name": "bad name!"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A body the handler cannot deserialize is a 400 as well.
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(fork_href(&f.parent_org_slug, &f.parent_repo_name))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", f.contributor_token))
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn forking_onto_an_existing_name_is_a_conflict() {
+    let f = build_fixture().await;
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({"organization": f.contrib_org_slug, "name": f.fork_name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn forking_an_inactive_parent_is_a_conflict() {
+    let f = build_fixture().await;
+
+    sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+        .bind(f.parent_repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({"organization": f.contrib_org_slug}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_form_rejects_bad_csrf_and_bad_idempotency_key() {
+    let f = build_fixture().await;
+    let cookie = format!("githearth_session={}", f.contributor_token);
+    let path = format!(
+        "/organizations/{}/repositories/{}/fork",
+        f.parent_org_slug, f.parent_repo_name
+    );
+
+    // A forged CSRF token is refused with the forbidden page.
+    let (status, _, _) = post_form(
+        &f.app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", "deadbeef"),
+            ("idempotency_key", &tag("key")),
+            ("organization", &f.contrib_org_slug),
+            ("name", "renamed"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A valid CSRF token but a malformed idempotency key is a bad request.
+    let csrf = csrf_for_session(&f.contributor_token);
+    let (status, _, _) = post_form(
+        &f.app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &csrf),
+            ("idempotency_key", "with space"),
+            ("organization", &f.contrib_org_slug),
+            ("name", "renamed"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_form_maps_failures_to_friendly_pages() {
+    let f = build_fixture().await;
+    let path = format!(
+        "/organizations/{}/repositories/{}/fork",
+        f.parent_org_slug, f.parent_repo_name
+    );
+
+    // A stranger who cannot read the parent gets the not-found page.
+    let stranger_cookie = format!("githearth_session={}", f.stranger_token);
+    let stranger_csrf = csrf_for_session(&f.stranger_token);
+    let (status, _, body) = post_form(
+        &f.app,
+        &path,
+        &stranger_cookie,
+        &[
+            ("csrf_token", &stranger_csrf),
+            ("idempotency_key", &tag("key")),
+            ("organization", &f.contrib_org_slug),
+            ("name", "some-fork"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("The repository no longer exists."));
+
+    // A name collision maps to the conflict message.
+    let contributor_cookie = format!("githearth_session={}", f.contributor_token);
+    let contributor_csrf = csrf_for_session(&f.contributor_token);
+    let (status, _, _) = post_form(
+        &f.app,
+        &path,
+        &contributor_cookie,
+        &[
+            ("csrf_token", &contributor_csrf),
+            ("idempotency_key", &tag("key")),
+            ("organization", &f.contrib_org_slug),
+            ("name", &f.fork_name),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // An invalid name maps to the bad-request message.
+    let (status, _, body) = post_form(
+        &f.app,
+        &path,
+        &contributor_cookie,
+        &[
+            ("csrf_token", &contributor_csrf),
+            ("idempotency_key", &tag("key")),
+            ("organization", &f.contrib_org_slug),
+            ("name", "bad name!"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_form_submits_a_fork_and_redirects() {
+    let f = build_fixture().await;
+    let cookie = format!("githearth_session={}", f.contributor_token);
+    let csrf = csrf_for_session(&f.contributor_token);
+    let new_name = tag("fork-form");
+    let path = format!(
+        "/organizations/{}/repositories/{}/fork",
+        f.parent_org_slug, f.parent_repo_name
+    );
+
+    let (status, location, body) = post_form(
+        &f.app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &csrf),
+            ("idempotency_key", &tag("key")),
+            ("organization", &f.contrib_org_slug),
+            ("name", &new_name),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(
+        location.as_deref(),
+        Some(
+            format!(
+                "/organizations/{}/repositories/{new_name}",
+                f.contrib_org_slug
+            )
+            .as_str()
+        )
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn repository_page_offers_no_fork_section_without_a_creatable_namespace() {
+    let f = build_fixture().await;
+
+    // Give the stranger read access to the parent, but they belong to no
+    // organization at all, so there is no namespace to fork into.
+    let stranger_id: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+        .bind(&f.stranger_username)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id, account_id, role) VALUES ($1, $2, 'member')",
+    )
+    .bind(f.parent_org_id)
+    .bind(stranger_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO grants (id, role, subject_kind, subject_id, scope_kind, scope_id, granted_by) \
+         VALUES ($1, 'read', 'account', $2, 'organization', $3, $2)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(stranger_id)
+    .bind(f.parent_org_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let cookie = format!("githearth_session={}", f.stranger_token);
+    let path = format!(
+        "/organizations/{}/repositories/{}",
+        f.parent_org_slug, f.parent_repo_name
+    );
+    let (status, body) = get_body(&f.app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("<h2>Fork</h2>"));
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_merge_reports_source_moved_when_the_fork_head_changes() {
+    let f = build_fixture().await;
+
+    let (status, intent) = create_merge_intent(&f, "merge", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+
+    // Advance the fork's feature branch after the intent was recorded.
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "feature"])).await;
+    std::fs::write(f.work.join("moved.txt"), "moved\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "moved.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=C",
+        "-c",
+        "user.email=c@c",
+        "commit",
+        "-m",
+        "moved",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        f.fork_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+
+    let outcome = execute_intent(&f.state, op).await.unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::Stale {
+            reason: "source moved".into()
+        }
+    );
+    assert_eq!(main_tip(&f).await, f.main_head);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_merge_reports_source_not_active_when_the_fork_is_deleted() {
+    let f = build_fixture().await;
+
+    let (status, intent) = create_merge_intent(&f, "merge", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+
+    // The fork row moves to `deleting` without closing the pull request (that
+    // only happens on finish_delete), so the merge reaches the cross-repository
+    // source check and reports the source is not active.
+    sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+        .bind(f.fork_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let outcome = execute_intent(&f.state, op).await.unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::Stale {
+            reason: "source repository not active".into()
+        }
+    );
+    assert_eq!(main_tip(&f).await, f.main_head);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_migration_is_schema_scoped_beside_an_already_migrated_schema() {
+    let f = build_fixture().await;
+
+    // `public` is already migrated by the fixture (it holds the fork columns and
+    // `pull_requests_distinct_branches`). Migrating a second schema must drop
+    // only its own same-name check, never `public`'s, so a shared test database
+    // with several migrated schemas does not trip the migration's DO block.
+    let base =
+        std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+    let schema = format!("fork_migration_{}", Uuid::new_v4().simple());
+    let options = sqlx::postgres::PgConnectOptions::from_str(&base).unwrap();
+    let schema_clone = schema.clone();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            let s = schema_clone.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {s}"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    MIGRATOR.run(&pool).await.unwrap();
+
+    // The second schema reached the fork migration: it has the parent column and
+    // the schema-scoped distinct-branches constraint.
+    let has_parent: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'repositories' \
+         AND column_name = 'parent_repository_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        has_parent,
+        "second schema is missing the fork parent column"
+    );
+    let constraint_name: String = sqlx::query_scalar(
+        "SELECT con.conname FROM pg_constraint con \
+         JOIN pg_class rel ON rel.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = rel.relnamespace \
+         WHERE n.nspname = current_schema() AND rel.relname = 'pull_requests' \
+         AND con.conname = 'pull_requests_distinct_branches'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(constraint_name, "pull_requests_distinct_branches");
+
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_rejects_description_too_long_and_blank_organization() {
+    let f = build_fixture().await;
+
+    // A description over the length limit is refused before any work happens.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({"organization": f.contrib_org_slug, "description": "x".repeat(1001)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A blank target organization is refused too.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({"organization": "   "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_of_a_public_parent_is_public() {
+    let f = build_fixture().await;
+
+    let public_name = tag("pub-parent");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!("/api/v1/organizations/{}/repositories", f.parent_org_slug),
+        Some(&f.owner_token),
+        json!({"name": public_name, "visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let public_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let public_path = state_repo_path(&f.storage_root, public_id);
+
+    // Seed a commit so the fork has a head to copy.
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&[
+        "--git-dir",
+        public_path.to_str().unwrap(),
+        "config",
+        "core.hooksPath",
+        "/dev/null",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        public_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+
+    let fork_name = tag("pub-fork");
+    let (status, fork) = request(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &public_name),
+        Some(&f.contributor_token),
+        json!({"organization": f.contrib_org_slug, "name": fork_name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fork}");
+    assert_eq!(fork["visibility"], "public");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_rejects_an_invalid_idempotency_key_header() {
+    let f = build_fixture().await;
+
+    // The JSON handler validates the Idempotency-Key header before delegating.
+    let (status, _) = request_with_idempotency(
+        &f.app,
+        "POST",
+        &fork_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        Some("not a valid key"),
+        json!({"organization": f.contrib_org_slug}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 
     finish(f).await;
 }
