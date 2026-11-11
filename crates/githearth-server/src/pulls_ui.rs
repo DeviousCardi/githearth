@@ -13,7 +13,7 @@ use axum::{
     routing::get,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -646,6 +646,21 @@ async fn render_pull(
             for reply in thread_replies {
                 comment_list.push_str(&render_comment(s, &names, &base, number, reply, true));
             }
+        }
+    }
+    // A reply whose root is on an earlier comment page is orphaned here:
+    // pagination is by seq and rendering iterates roots only, so without this
+    // it would be silently dropped. Render it under a marker linking the root.
+    let root_ids: HashSet<Uuid> = roots.iter().map(|c| c.id).collect();
+    for reply in &comments.items {
+        if reply
+            .in_reply_to
+            .is_some_and(|parent| !root_ids.contains(&parent))
+        {
+            comment_list.push_str(&format!(
+                "<li class=\"muted\">reply to <a href=\"{base}/pulls/{number}\">an earlier comment</a></li>"
+            ));
+            comment_list.push_str(&render_comment(s, &names, &base, number, reply, true));
         }
     }
     let comment_list = if comment_list.is_empty() {

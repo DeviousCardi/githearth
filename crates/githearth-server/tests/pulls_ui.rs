@@ -1300,6 +1300,66 @@ async fn inline_comment_renders_and_applies_a_suggestion() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replies_to_earlier_comments_are_rendered_with_a_marker() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let root_body = format!("root-{}", Uuid::new_v4().simple());
+    let reply_body = format!("reply-{}", Uuid::new_v4().simple());
+
+    // A root comment, then enough filler that the root lands on the first
+    // page while a reply to it lands on the second page.
+    let (status, root) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!({"body": root_body}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let root_id = root["id"].as_str().unwrap().to_owned();
+
+    for i in 0..30 {
+        let (status, _) = api(
+            &f.app,
+            "POST",
+            &format!("{}/pulls/1/comments", f.api_base),
+            &f.token,
+            json!({"body": format!("filler-{i}")}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!({"body": reply_body, "in_reply_to": root_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The reply sits on the second page while its root stays on the first.
+    let (status, page) = get(
+        &f.app,
+        &format!("{}/pulls/1?after=30", f.base),
+        Some(&f.cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains(&reply_body), "{page}");
+    assert!(page.contains("reply to <a href="), "{page}");
+    assert!(page.contains("an earlier comment"), "{page}");
+    assert!(!page.contains(&root_body), "root stays on the first page");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn resolve_and_unresolve_through_forms() {
     let f = fixture().await;
     open_pull(&f).await;
