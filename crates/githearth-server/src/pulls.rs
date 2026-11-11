@@ -2081,6 +2081,41 @@ pub(crate) async fn apply_suggestion_record(
             }),
         )
         .await?;
+        // A suggestion commit is also a push: emit the same `repository.pushed`
+        // audit + outbox pair a normal push emits, so push webhooks fire.
+        let audit_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO audit_events (id, organization_id, actor_id, kind) \
+             SELECT $1, r.organization_id, $2, 'repository.pushed' \
+             FROM repositories r WHERE r.id = $3",
+        )
+        .bind(audit_id)
+        .bind(actor)
+        .bind(repository)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO outbox_events (id, organization_id, kind, payload) \
+             SELECT $1, r.organization_id, 'repository.pushed', $2 \
+             FROM repositories r WHERE r.id = $3",
+        )
+        .bind(audit_id)
+        .bind(serde_json::json!({
+            "repository_id": repository,
+            "journal_sequence": sequence,
+            "operation_id": prepared.operation,
+            "actor_id": actor,
+            "credential_kind": null,
+            "credential_id": null,
+            "updates": [{
+                "ref": update.reference,
+                "old": update.old,
+                "new": update.new,
+            }],
+        }))
+        .bind(repository)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(())

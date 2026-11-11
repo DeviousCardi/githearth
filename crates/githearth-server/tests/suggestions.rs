@@ -415,6 +415,26 @@ async fn applying_a_suggestion_moves_the_head_and_records_the_push() {
     .unwrap();
     assert_eq!(events, 1);
 
+    // A suggestion commit fires the same push webhook a normal push does.
+    let push_audit: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE kind = 'repository.pushed' AND organization_id = $1",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(push_audit >= 1);
+    let push_outbox: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_events \
+         WHERE kind = 'repository.pushed' AND organization_id = $1",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(push_outbox >= 1);
+
     finish(f).await;
 }
 
