@@ -714,6 +714,8 @@ async fn verify_signed_commits(
     let quarantine = (!object_dir.is_empty()).then(|| std::path::PathBuf::from(object_dir));
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
 
+    // Collect every new commit across the protected, signed-commit branches.
+    let mut oids: Vec<String> = Vec::new();
     for (update, _) in updates {
         if update.new.bytes().all(|b| b == b'0') {
             continue;
@@ -744,36 +746,115 @@ async fn verify_signed_commits(
         .await
         .map_err(|_| "signature verification failed".to_owned())?
         .map_err(|e| format!("cannot inspect the push: {e}"))?;
+        oids.extend(commits);
+    }
 
-        for oid in commits {
-            verify_one(state, &repo_path, quarantine.as_deref(), &oid).await?;
+    if oids.is_empty() {
+        return Ok(());
+    }
+
+    // One connection and one allowed-signers file for the whole push, instead
+    // of opening a connection and writing a fresh file per commit.
+    let mut conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|_| "database unavailable".to_owned())?;
+    let signers_dir = std::env::temp_dir().join(format!("githearth-signers-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&signers_dir)
+        .map_err(|_| "signature verification failed".to_owned())?;
+    let signers_file = signers_dir.join("allowed_signers");
+
+    let result = verify_all(
+        &repo_path,
+        quarantine.as_deref(),
+        &oids,
+        &mut conn,
+        &signers_file,
+        timeout,
+    )
+    .await;
+
+    let _ = std::fs::remove_dir_all(&signers_dir);
+    result
+}
+
+/// Resolves every commit's committer, collects the SSH keys registered to each
+/// committer's account, and verifies each commit's signature against the single
+/// allowed-signers file. A committer email must map to an account named
+/// `<username>@users.noreply.githearth.invalid`.
+async fn verify_all(
+    repo_path: &std::path::Path,
+    quarantine: Option<&std::path::Path>,
+    oids: &[String],
+    conn: &mut sqlx::PgConnection,
+    signers_file: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let mut signers = String::new();
+    for oid in oids {
+        let email = tokio::task::spawn_blocking({
+            let repo = repo_path.to_path_buf();
+            let quarantine = quarantine.map(std::path::Path::to_path_buf);
+            let oid = oid.to_owned();
+            move || {
+                githearth_git::signature::committer_email(
+                    &repo,
+                    &oid,
+                    quarantine.as_deref(),
+                    timeout,
+                )
+            }
+        })
+        .await
+        .map_err(|_| "signature verification failed".to_owned())?
+        .map_err(|e| format!("cannot inspect commit {oid}: {e}"))?;
+
+        let keys = registered_keys(conn, &email, oid).await?;
+        for key in &keys {
+            signers.push_str(&email);
+            signers.push(' ');
+            signers.push_str(key);
+            signers.push('\n');
+        }
+    }
+    std::fs::write(signers_file, signers)
+        .map_err(|_| "signature verification failed".to_owned())?;
+
+    for oid in oids {
+        let ok = tokio::task::spawn_blocking({
+            let repo = repo_path.to_path_buf();
+            let quarantine = quarantine.map(std::path::Path::to_path_buf);
+            let oid = oid.to_owned();
+            let signers = signers_file.to_path_buf();
+            move || {
+                githearth_git::signature::verify_ssh_signature(
+                    &repo,
+                    &oid,
+                    quarantine.as_deref(),
+                    &signers,
+                    timeout,
+                )
+            }
+        })
+        .await
+        .map_err(|_| "signature verification failed".to_owned())?
+        .map_err(|e| format!("cannot verify commit {oid}: {e}"))?;
+        if !ok {
+            return Err(format!(
+                "commit {oid} is not signed by a registered committer"
+            ));
         }
     }
     Ok(())
 }
 
-/// Verifies one new commit is signed by an SSH key registered to the account
-/// matching its committer email (`<username>@users.noreply.githearth.invalid`).
-async fn verify_one(
-    state: &AppState,
-    repo_path: &std::path::Path,
-    quarantine: Option<&std::path::Path>,
+/// The SSH public keys registered to the account named by `email`'s local part.
+async fn registered_keys(
+    conn: &mut sqlx::PgConnection,
+    email: &str,
     oid: &str,
-) -> Result<(), String> {
-    let timeout = Duration::from_secs(state.config.git_timeout_seconds);
-
-    let email = tokio::task::spawn_blocking({
-        let repo = repo_path.to_path_buf();
-        let quarantine = quarantine.map(std::path::Path::to_path_buf);
-        let oid = oid.to_owned();
-        move || {
-            githearth_git::signature::committer_email(&repo, &oid, quarantine.as_deref(), timeout)
-        }
-    })
-    .await
-    .map_err(|_| "signature verification failed".to_owned())?
-    .map_err(|e| format!("cannot inspect commit {oid}: {e}"))?;
-
+) -> Result<Vec<String>, String> {
     let username = match email.rsplit_once('@') {
         Some((local, "users.noreply.githearth.invalid")) => local,
         _ => {
@@ -783,11 +864,6 @@ async fn verify_one(
         }
     };
 
-    let mut conn = state
-        .pool
-        .acquire()
-        .await
-        .map_err(|_| "database unavailable".to_owned())?;
     let account_id: Option<Uuid> =
         sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
             .bind(username)
@@ -808,53 +884,13 @@ async fn verify_one(
     .fetch_all(&mut *conn)
     .await
     .map_err(|_| "database unavailable".to_owned())?;
-    drop(conn);
 
     if keys.is_empty() {
         return Err(format!(
             "commit {oid} is not signed by a registered committer"
         ));
     }
-
-    let mut signers = String::new();
-    for key in &keys {
-        signers.push_str(&email);
-        signers.push(' ');
-        signers.push_str(key);
-        signers.push('\n');
-    }
-    let signers_file = std::env::temp_dir().join(format!("githearth-signers-{}", Uuid::new_v4()));
-    std::fs::write(&signers_file, signers)
-        .map_err(|_| "signature verification failed".to_owned())?;
-
-    let ok = tokio::task::spawn_blocking({
-        let repo = repo_path.to_path_buf();
-        let quarantine = quarantine.map(std::path::Path::to_path_buf);
-        let oid = oid.to_owned();
-        let signers = signers_file.clone();
-        move || {
-            githearth_git::signature::verify_ssh_signature(
-                &repo,
-                &oid,
-                quarantine.as_deref(),
-                &signers,
-                timeout,
-            )
-        }
-    })
-    .await
-    .map_err(|_| "signature verification failed".to_owned())?
-    .map_err(|e| format!("cannot verify commit {oid}: {e}"))?;
-
-    let _ = std::fs::remove_file(&signers_file);
-
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "commit {oid} is not signed by a registered committer"
-        ))
-    }
+    Ok(keys)
 }
 
 // ---------------------------------------------------------------------------

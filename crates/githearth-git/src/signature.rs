@@ -64,7 +64,7 @@ pub fn committer_email(
     timeout: Duration,
 ) -> Result<String, StorageError> {
     let mut command = with_objects(repo, quarantine);
-    command.args(["log", "-1", "--format=%ce", oid]);
+    command.args(["show", "-s", "--format=%ce", oid]);
     let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
     if !result.success {
         return Err(stderr_error(&result.stderr));
