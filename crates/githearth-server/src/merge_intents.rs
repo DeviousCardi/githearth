@@ -497,7 +497,8 @@ pub(crate) async fn find_intent_json(
 
 /// The 1-based position of this pull request's live merge-queue entry among the
 /// other live queue entries for the same target branch, ordered by creation
-/// time. `None` when the pull request has no live queue entry.
+/// time with `operation_id` as a deterministic tie-break for entries created in
+/// the same instant. `None` when the pull request has no live queue entry.
 pub(crate) async fn queue_position(
     conn: &mut PgConnection,
     pull_request_id: Uuid,
@@ -507,7 +508,8 @@ pub(crate) async fn queue_position(
             WHERE other.repository_id = cur.repository_id \
               AND other.target_ref = cur.target_ref AND other.in_queue \
               AND other.state IN ('queued', 'validating', 'executing') \
-              AND other.created_at <= cur.created_at) \
+              AND (other.created_at, other.operation_id) \
+                  <= (cur.created_at, cur.operation_id)) \
          FROM merge_intents cur \
          WHERE cur.pull_request_id = $1 AND cur.in_queue \
            AND cur.state IN ('queued', 'validating', 'executing')",
@@ -970,6 +972,115 @@ mod tests {
         assert_eq!(queue_position(&mut conn, c).await.unwrap(), None);
         // `d` is on a different target, alone in its own queue.
         assert_eq!(queue_position(&mut conn, d).await.unwrap(), Some(1));
+        drop(conn);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn queue_position_tie_breaks_entries_with_the_same_timestamp() {
+        use sqlx::{ConnectOptions, postgres::PgPoolOptions};
+        use std::str::FromStr;
+
+        let url =
+            std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .disable_statement_logging();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused')")
+            .bind(account)
+            .bind(format!("t-{}", Uuid::new_v4().simple()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let org = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')",
+        )
+        .bind(org)
+        .bind(format!("o-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'r',$3,$4,'active','private')",
+        )
+        .bind(repo)
+        .bind(org)
+        .bind(account)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        async fn pull(pool: &sqlx::PgPool, repo: Uuid, account: Uuid, number: i32) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
+                 VALUES ($1,$2,$3,'t','',$4,$5,'main')",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(number)
+            .bind(account)
+            .bind(format!("src-{number}"))
+            .execute(pool)
+            .await
+            .unwrap();
+            id
+        }
+
+        async fn intent_at(
+            pool: &sqlx::PgPool,
+            pull: Uuid,
+            repo: Uuid,
+            account: Uuid,
+            operation: Uuid,
+        ) {
+            sqlx::query(
+                "INSERT INTO merge_intents (operation_id, repository_id, pull_request_id, source_ref, \
+                 source_oid, target_ref, expected_target_oid, method, policy_generation, \
+                 checks_approvals_digest, actor_id, state, in_queue, created_at) \
+                 VALUES ($1,$2,$3,'src',$4,'main',$4,'merge',0,'d',$5,'queued',true, \
+                         '2024-01-01T00:00:00Z'::timestamptz)",
+            )
+            .bind(operation)
+            .bind(repo)
+            .bind(pull)
+            .bind("a".repeat(40))
+            .bind(account)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        // Two live queue entries on main created in the same instant must still
+        // get distinct positions (tie-broken by `operation_id`).
+        let a = pull(&pool, repo, account, 1).await;
+        let b = pull(&pool, repo, account, 2).await;
+        intent_at(&pool, a, repo, account, Uuid::new_v4()).await;
+        intent_at(&pool, b, repo, account, Uuid::new_v4()).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let pa = queue_position(&mut conn, a).await.unwrap().unwrap();
+        let pb = queue_position(&mut conn, b).await.unwrap().unwrap();
+        let mut positions = [pa, pb];
+        positions.sort();
+        assert_eq!(
+            positions,
+            [1, 2],
+            "same-timestamp entries must tie-break to distinct positions"
+        );
         drop(conn);
         pool.close().await;
     }

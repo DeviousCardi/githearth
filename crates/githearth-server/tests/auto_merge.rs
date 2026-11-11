@@ -10,7 +10,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use githearth_git::journal::{Kind, Record, Update};
+use githearth_git::journal::{Journal, Kind, Record, Update};
 use githearth_server::{AppState, MIGRATOR, config::Config, connect, pushes, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -175,6 +175,7 @@ fn state_repo_path(storage_root: &Path, repo_id: Uuid) -> PathBuf {
 
 struct Fixture {
     app: Router,
+    state: AppState,
     pool: PgPool,
     storage_root: PathBuf,
     org_slug: String,
@@ -215,7 +216,7 @@ async fn build_fixture() -> Fixture {
     let (org_id, org_slug) = fixture_organization(&pool, owner).await;
 
     let state = AppState::new(pool.clone(), config).await.unwrap();
-    let app = router(state);
+    let app = router(state.clone());
 
     let repo_name = tag("repo");
     let (status, body) = request(
@@ -293,6 +294,7 @@ async fn build_fixture() -> Fixture {
 
     Fixture {
         app,
+        state,
         pool,
         storage_root,
         org_slug,
@@ -611,6 +613,19 @@ async fn a_head_change_by_the_reviewer_cancels_auto_merge() {
     );
     assert_eq!(intent_count(&f).await, 0, "no stale intent was raised");
 
+    // The auto-cancellation audit event names the triggering reviewer and the
+    // reason, matching the `on_push` cancellation.
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM outbox_events WHERE kind = 'pull_request.auto_merge_cancelled' \
+         AND organization_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(payload["reason"], "head changed");
+    assert_eq!(payload["actor_id"], reviewer.to_string());
+
     finish(f).await;
 }
 
@@ -651,7 +666,8 @@ async fn a_push_by_someone_else_cancels_auto_merge() {
     assert!(
         pushes::apply_committed(&mut conn, f.repo_id, &record)
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         "push applied"
     );
 
@@ -709,6 +725,96 @@ async fn losing_merge_permission_cancels_auto_merge() {
         auto_merge_count(&f).await,
         0,
         "lost permission cancels auto-merge"
+    );
+
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM outbox_events WHERE kind = 'pull_request.auto_merge_cancelled' \
+         AND organization_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(payload["reason"], "permission lost");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn enablers_own_push_re_raises_the_merge_intent() {
+    let f = build_fixture().await;
+
+    // Enable auto-merge (no approvals required): the intent is raised at once.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &auto_merge_href(&f.org_slug, &f.repo_name, f.number),
+        Some(&f.token),
+        None,
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(intent_count(&f).await, 1, "intent raised on enable");
+
+    // Simulate the worker consuming that intent (a stale merge), leaving the
+    // auto-merge pending with no live intent.
+    sqlx::query("UPDATE merge_intents SET state = 'stale' WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    // The enabler pushes a fresh commit to the source branch.
+    let new_head = advance_feature(&f).await;
+    assert_ne!(new_head, f.feature_head);
+
+    // Journal that push and replay it, exactly as the server does after a push.
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let mut journal = Journal::open(&repo_path).unwrap();
+    journal
+        .append_prepared(
+            Uuid::new_v4(),
+            Some(f.owner_id),
+            vec![Update {
+                old: f.feature_head.clone(),
+                new: new_head.clone(),
+                reference: "refs/heads/feature".into(),
+            }],
+            None,
+        )
+        .unwrap();
+    let summary = pushes::replay(&f.state, f.repo_id).await.unwrap();
+    assert_eq!(summary.committed, 1);
+
+    // The enabler's own push re-targeted the recorded head...
+    let source_oid: String = sqlx::query_scalar(
+        "SELECT source_oid FROM auto_merges WHERE pull_request_id = \
+         (SELECT id FROM pull_requests WHERE repository_id = $1 AND number = $2)",
+    )
+    .bind(f.repo_id)
+    .bind(f.number as i32)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        source_oid, new_head,
+        "auto-merge re-targeted to the new head"
+    );
+
+    // ...and re-raised a fresh intent at that head.
+    let live_oid: String = sqlx::query_scalar(
+        "SELECT source_oid FROM merge_intents WHERE repository_id = $1 \
+         AND state IN ('queued', 'validating', 'executing')",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        live_oid, new_head,
+        "enabler's own push re-raises the merge intent"
     );
 
     finish(f).await;

@@ -279,7 +279,7 @@ pub(crate) async fn enable_auto_merge(
     .await?;
     let am: AutoMergeJson = serde_json::from_value(value).unwrap();
     // If the pull request is already mergeable, raise the intent right away.
-    let _ = maybe_auto_merge(state, am.pull_request_id).await;
+    let _ = maybe_auto_merge(state, actor_id, am.pull_request_id).await;
     Ok((status, am))
 }
 
@@ -365,7 +365,7 @@ pub(crate) async fn cancel_auto_merge(
             let Some(row) = row else {
                 return Err(not_found());
             };
-            cancel_in_tx(&mut tx, loaded.org_id, actor_id, pull.id).await?;
+            cancel_in_tx(&mut tx, loaded.org_id, actor_id, pull.id, None).await?;
 
             let status = StatusCode::OK;
             let body = serde_json::to_value(&row).unwrap();
@@ -382,11 +382,14 @@ pub(crate) async fn cancel_auto_merge(
 
 /// Deletes the auto-merge row and records the cancellation audit event, all in
 /// the caller's transaction. Returns whether a row was actually deleted.
+/// `reason`, when set, names why the auto-merge was cancelled; an
+/// auto-cancellation passes it, while a user's manual cancel passes `None`.
 pub(crate) async fn cancel_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: Uuid,
     actor: Uuid,
     pull_request_id: Uuid,
+    reason: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let deleted = sqlx::query("DELETE FROM auto_merges WHERE pull_request_id = $1")
         .bind(pull_request_id)
@@ -395,25 +398,32 @@ pub(crate) async fn cancel_in_tx(
         .rows_affected()
         > 0;
     if deleted {
+        let mut extra = serde_json::json!({ "pull_request_id": pull_request_id });
+        if let Some(reason) = reason {
+            extra["reason"] = serde_json::json!(reason);
+        }
         crate::event_with(
             tx,
             Some(org_id),
             actor,
             "pull_request.auto_merge_cancelled",
-            serde_json::json!({ "pull_request_id": pull_request_id }),
+            extra,
         )
         .await?;
     }
     Ok(deleted)
 }
 
-/// The state-change trigger for auto-merge: called after enabling and after a
-/// review lands. It raises the intent when the pull request is now mergeable,
-/// and cancels the auto-merge when it is no longer eligible. Best-effort on
-/// purpose: every side effect here is also re-checked by the merge worker, so a
-/// failure just leaves the work to the next trigger.
+/// The state-change trigger for auto-merge: called after enabling, after a
+/// review lands, and after the enabler's own push re-targets the recorded head.
+/// `actor` is the account whose action triggered the re-check; it is named in
+/// any auto-cancellation audit event. It raises the intent when the pull
+/// request is now mergeable, and cancels the auto-merge when it is no longer
+/// eligible. Best-effort on purpose: every side effect here is also re-checked
+/// by the merge worker, so a failure just leaves the work to the next trigger.
 pub(crate) async fn maybe_auto_merge(
     state: &AppState,
+    actor: Uuid,
     pull_request_id: Uuid,
 ) -> Result<(), ApiError> {
     let mut conn = state.pool.acquire().await?;
@@ -457,7 +467,14 @@ pub(crate) async fn maybe_auto_merge(
     // A closed or merged pull request no longer has a pending auto-merge.
     if pull.state != "open" {
         let mut tx = state.pool.begin().await?;
-        cancel_in_tx(&mut tx, repo.organization_id, enabled_by, pull_request_id).await?;
+        cancel_in_tx(
+            &mut tx,
+            repo.organization_id,
+            actor,
+            pull_request_id,
+            Some("pull request closed"),
+        )
+        .await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -469,7 +486,14 @@ pub(crate) async fn maybe_auto_merge(
     let head = pulls::branch_tip(state, repository_id, &pull.source_branch).await?;
     if head.as_deref() != Some(source_oid.as_str()) {
         let mut tx = state.pool.begin().await?;
-        cancel_in_tx(&mut tx, repo.organization_id, enabled_by, pull_request_id).await?;
+        cancel_in_tx(
+            &mut tx,
+            repo.organization_id,
+            actor,
+            pull_request_id,
+            Some("head changed"),
+        )
+        .await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -487,7 +511,14 @@ pub(crate) async fn maybe_auto_merge(
         // The enabler no longer resolves in this organization.
         drop(conn);
         let mut tx = state.pool.begin().await?;
-        cancel_in_tx(&mut tx, repo.organization_id, enabled_by, pull_request_id).await?;
+        cancel_in_tx(
+            &mut tx,
+            repo.organization_id,
+            actor,
+            pull_request_id,
+            Some("enabler removed"),
+        )
+        .await?;
         tx.commit().await?;
         return Ok(());
     };
@@ -498,7 +529,14 @@ pub(crate) async fn maybe_auto_merge(
         state, &facts, &repo, &pull, protection, required, true, None,
     ) {
         let mut tx = state.pool.begin().await?;
-        cancel_in_tx(&mut tx, repo.organization_id, enabled_by, pull_request_id).await?;
+        cancel_in_tx(
+            &mut tx,
+            repo.organization_id,
+            actor,
+            pull_request_id,
+            Some("permission lost"),
+        )
+        .await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -536,27 +574,30 @@ pub(crate) async fn maybe_auto_merge(
 /// A push landed on `ref_name`. For every open pull request in this repository
 /// whose source branch is that ref with a pending auto-merge: the enabler's own
 /// push re-targets the recorded head; anyone else's push cancels the auto-merge.
+/// Returns the pull request ids whose auto-merge was re-targeted (the enabler's
+/// own push), so the caller can re-drive [`maybe_auto_merge`] afterward.
 pub(crate) async fn on_push(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: Uuid,
     ref_name: &str,
     new_oid: &str,
     actor: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<Vec<Uuid>, sqlx::Error> {
     let Some(branch) = ref_name.strip_prefix("refs/heads/") else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    sqlx::query(
+    let retargeted: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE auto_merges SET source_oid = $1, updated_at = now() \
          WHERE pull_request_id IN (SELECT id FROM pull_requests \
              WHERE repository_id = $2 AND source_branch = $3 AND state = 'open') \
-           AND enabled_by = $4",
+           AND enabled_by = $4 \
+         RETURNING pull_request_id",
     )
     .bind(new_oid)
     .bind(repository_id)
     .bind(branch)
     .bind(actor)
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
 
     let cancelled: Vec<Uuid> = sqlx::query_scalar(
@@ -589,7 +630,7 @@ pub(crate) async fn on_push(
             .await?;
         }
     }
-    Ok(())
+    Ok(retargeted)
 }
 
 #[cfg(test)]

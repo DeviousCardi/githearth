@@ -688,8 +688,14 @@ async fn update(
                 .execute(&mut *tx)
                 .await?;
                 // Closing also cancels any pending auto-merge.
-                crate::auto_merge::cancel_in_tx(&mut tx, loaded.org_id, actor.id, locked.id)
-                    .await?;
+                crate::auto_merge::cancel_in_tx(
+                    &mut tx,
+                    loaded.org_id,
+                    actor.id,
+                    locked.id,
+                    Some("pull request closed"),
+                )
+                .await?;
             }
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
@@ -1127,7 +1133,7 @@ pub(crate) async fn create_pull_review(
             }
             tx.commit().await?;
             // A new review may have just satisfied a pending auto-merge.
-            let _ = crate::auto_merge::maybe_auto_merge(state, pull.id).await;
+            let _ = crate::auto_merge::maybe_auto_merge(state, actor_id, pull.id).await;
             Ok((status, body))
         },
     )
