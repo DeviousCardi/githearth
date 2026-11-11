@@ -221,13 +221,13 @@ async fn require_checks_true_rules_still_gate_merges_after_upgrade() {
 
     // Build the schema just before 0023 (the commit statuses migration), where
     // branch_protection_rules still carries the bare `require_checks` boolean.
-    let all_but_last: Vec<sqlx::migrate::Migration> = githearth_server::MIGRATOR
+    let pre_0023: Vec<sqlx::migrate::Migration> = githearth_server::MIGRATOR
         .iter()
-        .take(githearth_server::MIGRATOR.iter().count().saturating_sub(1))
+        .filter(|m| m.version < 23)
         .cloned()
         .collect();
     let prev_migrator = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(all_but_last),
+        migrations: std::borrow::Cow::Owned(pre_0023),
         ..githearth_server::MIGRATOR
     };
 
