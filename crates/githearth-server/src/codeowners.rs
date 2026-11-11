@@ -328,16 +328,13 @@ pub(crate) async fn load(
     repo_id: Uuid,
     base: &str,
     head: &str,
-) -> Result<(Vec<Rule>, Vec<String>, Vec<String>), ApiError> {
+) -> Result<(Vec<Rule>, Option<Vec<String>>, Vec<String>), ApiError> {
     let base = base.to_owned();
     let head = head.to_owned();
     let (content, paths) = crate::browse::git_read(state, repo_id, move |fs_path, timeout| {
         let content = read_codeowners_blob(fs_path, &base, timeout)?;
         let paths = browse::changed_files(fs_path, &base, &head, timeout)?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|f| f.new_path)
-            .collect::<Vec<_>>();
+            .map(|files| files.into_iter().map(|f| f.new_path).collect::<Vec<_>>());
         Ok::<_, StorageError>((content, paths))
     })
     .await?;
@@ -516,6 +513,15 @@ pub(crate) async fn review(
     base: &str,
 ) -> Result<CodeOwnerReview, ApiError> {
     let (rules, paths, errors) = load(state, repo_id, base, head).await?;
+    // `changed_files` reports `None` when base or head does not resolve, so the
+    // changed-file set is unknown and the gate must fail closed.
+    let Some(paths) = paths else {
+        return Ok(CodeOwnerReview {
+            required: Vec::new(),
+            satisfied: false,
+            errors,
+        });
+    };
     let mut conn = state.pool.acquire().await?;
     let mut review =
         compute_review(&mut conn, org_id, org_slug, pull_id, head, &rules, &paths).await?;
@@ -615,6 +621,9 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Ok(v) => v,
         Err(_) => return retry(),
     };
+    // An unresolvable base/head leaves the changed-file set unknown, so there
+    // are no owners to request reviews from.
+    let paths = paths.unwrap_or_default();
 
     let account_ids = match reviewer_accounts(state, org_id, &org_slug, &rules, &paths).await {
         Ok(ids) => ids,
@@ -844,5 +853,60 @@ mod tests {
         assert!(match_glob_segment("f*.rs", "foo.rs"));
         assert!(match_glob_segment("f?.rs", "fo.rs"));
         assert!(!match_glob_segment("f*.rs", "x/foo.rs"));
+    }
+
+    #[tokio::test]
+    async fn review_fails_closed_when_changed_files_are_unresolvable() {
+        use githearth_authz::Engine;
+        use githearth_git::layout::{ObjectFormat, Storage};
+        use sqlx::postgres::PgPoolOptions;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let root = std::env::temp_dir().join(format!("codeowners-fail-closed-{}", Uuid::new_v4()));
+        let storage = Storage::open(&root).unwrap();
+        let repo_id = Uuid::new_v4();
+        storage
+            .create(repo_id, Uuid::new_v4(), ObjectFormat::Sha1)
+            .unwrap();
+
+        // The unresolvable revisions short-circuit before any database use, so
+        // a lazy pool that never connects is enough.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let state = AppState {
+            pool,
+            config: crate::config::Config {
+                storage_root: root.clone(),
+                database_url: "postgres://localhost/unused".into(),
+                ..crate::config::Config::default()
+            },
+            auth_slots: Arc::new(Semaphore::new(2)),
+            git_slots: Arc::new(Semaphore::new(2)),
+            dummy_hash: Arc::new(String::new()),
+            authz: Arc::new(Engine::new().unwrap()),
+            storage: Arc::new(storage),
+            hook_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            hook_socket_path: std::path::PathBuf::from("/nonexistent/hook.sock"),
+            trusted_proxies: Vec::new(),
+        };
+
+        let result = review(
+            &state,
+            repo_id,
+            Uuid::new_v4(),
+            "org",
+            Uuid::new_v4(),
+            "missing-head",
+            "missing-base",
+        )
+        .await
+        .unwrap();
+        assert!(!result.satisfied);
+        assert!(result.required.is_empty());
+        assert!(result.errors.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
