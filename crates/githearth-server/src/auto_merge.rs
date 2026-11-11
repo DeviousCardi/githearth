@@ -562,8 +562,8 @@ pub(crate) async fn on_push(
     let cancelled: Vec<Uuid> = sqlx::query_scalar(
         "DELETE FROM auto_merges \
          WHERE pull_request_id IN (SELECT id FROM pull_requests \
-             WHERE repository_id = $2 AND source_branch = $3 AND state = 'open') \
-           AND enabled_by <> $4 \
+             WHERE repository_id = $1 AND source_branch = $2 AND state = 'open') \
+           AND enabled_by <> $3 \
          RETURNING pull_request_id",
     )
     .bind(repository_id)

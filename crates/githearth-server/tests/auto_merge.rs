@@ -10,7 +10,8 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use githearth_server::{AppState, MIGRATOR, config::Config, connect, router};
+use githearth_git::journal::{Kind, Record, Update};
+use githearth_server::{AppState, MIGRATOR, config::Config, connect, pushes, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -609,6 +610,65 @@ async fn a_head_change_by_the_reviewer_cancels_auto_merge() {
         "moved head cancels auto-merge"
     );
     assert_eq!(intent_count(&f).await, 0, "no stale intent was raised");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_push_by_someone_else_cancels_auto_merge() {
+    let f = build_fixture().await;
+
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &auto_merge_href(&f.org_slug, &f.repo_name, f.number),
+        Some(&f.token),
+        None,
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(auto_merge_count(&f).await, 1);
+
+    // A different account pushes a new commit to the source branch through the
+    // committed-push path (`on_push`), which must cancel the auto-merge.
+    let other = add_member(&f.pool, f.org_id, "write").await;
+    let mut conn = f.pool.acquire().await.unwrap();
+    let new_oid = "1".repeat(40);
+    let record = Record {
+        sequence: 1,
+        operation: Uuid::new_v4(),
+        kind: Kind::Prepared,
+        actor: Some(other),
+        origin: None,
+        updates: vec![Update {
+            old: f.feature_head.clone(),
+            new: new_oid,
+            reference: "refs/heads/feature".into(),
+        }],
+    };
+    assert!(
+        pushes::apply_committed(&mut conn, f.repo_id, &record)
+            .await
+            .unwrap(),
+        "push applied"
+    );
+
+    assert_eq!(
+        auto_merge_count(&f).await,
+        0,
+        "a push by someone else cancels auto-merge"
+    );
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE kind = 'pull_request.auto_merge_cancelled' \
+         AND organization_id = $1",
+    )
+    .bind(f.org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
 
     finish(f).await;
 }
