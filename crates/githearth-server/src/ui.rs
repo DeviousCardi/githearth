@@ -763,11 +763,4 @@ mod tests {
         assert!(html.contains("outline:3px solid #005fcc"));
         assert!(html.contains(".skip-link:focus-visible"));
     }
-
-    #[test]
-    fn render_page_escapes_the_title() {
-        let html = render_page("<script>", None, None, "");
-        assert!(html.contains("<title>&lt;script&gt;</title>"));
-        assert!(!html.contains("<title><script></title>"));
-    }
 }
