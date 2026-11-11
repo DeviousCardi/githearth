@@ -645,22 +645,25 @@ async fn second_call_returns_already_merged_without_a_second_ref_update() {
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn conflicting_branches_return_conflicted_and_leave_the_ref() {
     let f = build_fixture(true).await;
-    let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
-    set_intent_executing(&f.pool, op).await;
-
     let before = main_tip(&f).await;
-    let outcome = execute_intent(&f.state, op).await.unwrap();
-    match outcome {
-        MergeOutcome::Conflicted { paths } => {
-            assert!(
-                paths.iter().any(|p| p.contains("README")),
-                "conflicting path reported: {paths:?}"
-            );
-        }
-        other => panic!("expected Conflicted, got {other:?}"),
-    }
+    let (status, body) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "merge conflicts");
+
+    // The refusal is recorded on a conflicted intent naming the path.
+    let (state, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, failure_reason FROM merge_intents \
+         WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "conflicted");
+    assert!(
+        reason.as_deref().is_some_and(|r| r.contains("README")),
+        "conflicting path in failure_reason: {reason:?}"
+    );
     assert_eq!(main_tip(&f).await, before, "the ref must not move");
 
     finish(f).await;

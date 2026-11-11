@@ -502,21 +502,30 @@ async fn queued_intent_runs_and_ends_merged_with_ref_moved() {
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn conflict_ends_conflicted_with_path_in_failure_reason() {
     let (f, paths) = build_fixture(true).await;
-    let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
-
     let before = main_tip(&paths).await;
+    let (status, body) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "merge conflicts");
+
+    // The refusal is recorded on a conflicted intent, so the worker has
+    // nothing to claim and no ref moves.
     let ran = merge_worker::run_once(&f.state, Some(f.repo_id))
         .await
         .unwrap();
-    assert_eq!(ran, 1);
+    assert_eq!(ran, 0, "a conflicted intent is refused, not queued");
 
-    assert_eq!(intent_state(&f, op).await, "conflicted");
-    let reason = intent_failure_reason(&f, op).await.unwrap();
+    let (state, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, failure_reason FROM merge_intents WHERE repository_id = $1 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "conflicted");
     assert!(
-        reason.contains("README"),
-        "conflicting path in failure_reason: {reason}"
+        reason.as_deref().is_some_and(|r| r.contains("README")),
+        "conflicting path in failure_reason: {reason:?}"
     );
     assert_eq!(main_tip(&paths).await, before, "the ref must not move");
 
@@ -676,7 +685,7 @@ async fn cancelled_intent_is_not_run() {
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn stale_fence_changes_nothing() {
-    let (f, paths) = build_fixture(true).await;
+    let (f, paths) = build_fixture(false).await;
     let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
     assert_eq!(status, StatusCode::CREATED);
     let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
