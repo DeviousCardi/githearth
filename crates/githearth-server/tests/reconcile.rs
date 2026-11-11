@@ -876,6 +876,64 @@ async fn reconcile_pass_completes_with_single_connection_pool() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn push_credential_sweep_count_lands_in_summary() {
+    let env = setup(30).await;
+    let mut conn = env.pool.acquire().await.unwrap();
+
+    let repo_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+         VALUES ($1,$2,$3,$4,$5,'active','private')",
+    )
+    .bind(repo_id)
+    .bind(env.org)
+    .bind(tag("sweep"))
+    .bind(env.owner)
+    .bind(Uuid::new_v4())
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    let operation = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO repository_pushes (repository_id,journal_sequence,operation_id,actor_id) \
+         VALUES ($1,1,$2,$3)",
+    )
+    .bind(repo_id)
+    .bind(operation)
+    .bind(env.owner)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, created_at) \
+         VALUES ($1, 'password', now() - interval '2 days')",
+    )
+    .bind(operation)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    drop(conn);
+
+    let mut attempts = HashMap::new();
+    let summary = reconcile::reconcile_once(&env.state, &mut attempts)
+        .await
+        .unwrap();
+    assert_eq!(summary.push_credentials_purged, 1);
+
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM push_credentials WHERE operation_id = $1")
+            .bind(operation)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0, "aged applied credential must be swept");
+
+    teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn repeated_create_failure_becomes_failed_after_max_attempts() {
     let env = setup(30).await; // minimum valid grace; rows are backdated past it
     let mut conn = env.pool.acquire().await.unwrap();

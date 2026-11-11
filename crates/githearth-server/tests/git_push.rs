@@ -2970,6 +2970,192 @@ async fn push_credentials_token() {
     fx.pool.close().await;
 }
 
+// ---------------------------------------------------------------------------
+// repository.pushed credential fields + retention sweep
+// ---------------------------------------------------------------------------
+
+/// A repository + organization + actor, scoped to unique fixture rows so these
+/// tests can share the database with the rest of the suite.
+struct CredFixture {
+    pool: PgPool,
+    repo_id: Uuid,
+    org_id: Uuid,
+    actor: Uuid,
+}
+
+async fn cred_fixture() -> CredFixture {
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
+            .expect("set GITHEARTH_TEST_DATABASE_URL"),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        ..Config::default()
+    };
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let actor = fixture_account(&pool, &tag("owner")).await;
+    let (org_id, _) = fixture_organization(&pool, actor).await;
+    let repo_id = create_active_repo(&pool, org_id, &tag("repo"), actor).await;
+    CredFixture {
+        pool,
+        repo_id,
+        org_id,
+        actor,
+    }
+}
+
+async fn apply_record(pool: &PgPool, repo_id: Uuid, operation: Uuid, actor: Uuid) {
+    let record = Record {
+        sequence: 1,
+        operation,
+        kind: Kind::Prepared,
+        actor: Some(actor),
+        origin: None,
+        updates: vec![Update {
+            old: "a".repeat(40),
+            new: "b".repeat(40),
+            reference: "refs/heads/main".into(),
+        }],
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let inserted = pushes::apply_committed(&mut conn, repo_id, &record)
+        .await
+        .unwrap();
+    assert!(inserted, "apply_committed must insert the push");
+}
+
+async fn pushed_payload(pool: &PgPool, org_id: Uuid) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT payload FROM outbox_events WHERE kind='repository.pushed' AND organization_id=$1",
+    )
+    .bind(org_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn pushed_event_payload_includes_credential_kind_and_id() {
+    let fx = cred_fixture().await;
+    let operation = Uuid::new_v4();
+    let token_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, credential_id) \
+         VALUES ($1, 'token', $2)",
+    )
+    .bind(operation)
+    .bind(token_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    apply_record(&fx.pool, fx.repo_id, operation, fx.actor).await;
+
+    let payload = pushed_payload(&fx.pool, fx.org_id).await;
+    assert_eq!(payload["credential_kind"], serde_json::json!("token"));
+    assert_eq!(
+        payload["credential_id"],
+        serde_json::json!(token_id.to_string())
+    );
+
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn pushed_event_payload_credentials_are_null_when_row_absent() {
+    let fx = cred_fixture().await;
+    let operation = Uuid::new_v4();
+
+    apply_record(&fx.pool, fx.repo_id, operation, fx.actor).await;
+
+    let payload = pushed_payload(&fx.pool, fx.org_id).await;
+    assert!(payload.get("credential_kind").is_some());
+    assert!(payload.get("credential_id").is_some());
+    assert!(payload["credential_kind"].is_null());
+    assert!(payload["credential_id"].is_null());
+
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn sweep_credentials_deletes_only_rows_older_than_a_day() {
+    let fx = cred_fixture().await;
+    let recent = Uuid::new_v4();
+    let old_applied = Uuid::new_v4();
+    let old_unapplied = Uuid::new_v4();
+    let fresh = Uuid::new_v4();
+
+    // Recent (12h) row: kept by the age filter.
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, created_at) \
+         VALUES ($1, 'password', now() - interval '12 hours')",
+    )
+    .bind(recent)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    // Aged (2 days) row with an applied push: deleted.
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, created_at) \
+         VALUES ($1, 'password', now() - interval '2 days')",
+    )
+    .bind(old_applied)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    apply_record(&fx.pool, fx.repo_id, old_applied, fx.actor).await;
+    // Aged (2 days) row without an applied push: kept.
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, created_at) \
+         VALUES ($1, 'password', now() - interval '2 days')",
+    )
+    .bind(old_unapplied)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    // Fresh row: kept.
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind) VALUES ($1, 'password')",
+    )
+    .bind(fresh)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    let purged = {
+        let mut conn = fx.pool.acquire().await.unwrap();
+        pushes::sweep_credentials(&mut conn).await.unwrap()
+    };
+    // The database is shared with the rest of the suite, and sweep_credentials
+    // deletes every aged-and-applied row in it, so other tests' rows make the
+    // exact count non-deterministic. A >= 1 bound is the strongest check on the
+    // return value; the assertions below verify this test's own rows precisely.
+    assert!(purged >= 1, "sweep must delete the aged applied row");
+
+    let remaining: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT operation_id FROM push_credentials WHERE operation_id = ANY($1)",
+    )
+    .bind(vec![recent, old_applied, old_unapplied, fresh])
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    assert!(
+        !remaining.contains(&old_applied),
+        "aged applied row must be deleted"
+    );
+    assert!(
+        remaining.contains(&old_unapplied),
+        "aged row without an applied push must survive"
+    );
+    assert!(remaining.contains(&recent), "12h-old row must survive");
+    assert!(remaining.contains(&fresh), "fresh row must survive");
+
+    fx.pool.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn fetch_inserts_no_push_credentials_row() {
