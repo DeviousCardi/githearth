@@ -3129,6 +3129,10 @@ async fn sweep_credentials_deletes_only_rows_older_than_a_day() {
         let mut conn = fx.pool.acquire().await.unwrap();
         pushes::sweep_credentials(&mut conn).await.unwrap()
     };
+    // The database is shared with the rest of the suite, and sweep_credentials
+    // deletes every aged-and-applied row in it, so other tests' rows make the
+    // exact count non-deterministic. A >= 1 bound is the strongest check on the
+    // return value; the assertions below verify this test's own rows precisely.
     assert!(purged >= 1, "sweep must delete the aged applied row");
 
     let remaining: Vec<Uuid> = sqlx::query_scalar(
