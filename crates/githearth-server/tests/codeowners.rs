@@ -759,3 +759,53 @@ async fn require_code_owner_review_blocks_merge_until_an_owner_approves() {
     finish(f).await;
     db.drop_db().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn malformed_codeowners_tokens_are_reported_on_the_pr_page() {
+    let db = TestDb::new().await;
+    let f = build_fixture(&db.url, "feat.txt @ @acme/ @acme/a/b").await;
+
+    // The JSON API lists the malformed owner tokens as code-owner errors.
+    let (status, detail) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.owner_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let errors = detail["code_owner_errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 3);
+    assert_eq!(errors[0], "malformed owner token `@`");
+    assert_eq!(errors[1], "malformed owner token `@acme/`");
+    assert_eq!(errors[2], "malformed owner token `@acme/a/b`");
+
+    // The HTML page renders the same errors.
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/organizations/{}/repositories/{}/pulls/{}",
+                    f.org_slug, f.repo_name, f.number
+                ))
+                .header("cookie", format!("githearth_session={}", f.owner_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains("<h2>Code owner errors</h2>"), "{html}");
+    assert!(html.contains("malformed owner token `@`"), "{html}");
+    assert!(html.contains("malformed owner token `@acme/`"), "{html}");
+    assert!(html.contains("malformed owner token `@acme/a/b`"), "{html}");
+
+    finish(f).await;
+    db.drop_db().await;
+}
