@@ -11,6 +11,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -82,6 +83,15 @@ fn execute(url: &str, statement: &str) {
         sqlx::query(statement).execute(&pool).await.unwrap();
         pool.close().await;
     });
+}
+
+fn execute_scalar(url: &str, statement: &str) -> String {
+    runtime().block_on(async {
+        let pool = sqlx::PgPool::connect(url).await.unwrap();
+        let row: (i64,) = sqlx::query_as(statement).fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        format!("{}", row.0)
+    })
 }
 
 fn schema_url(base: &str, schema: &str) -> String {
@@ -513,4 +523,158 @@ fn serve_reports_bind_failure() {
     assert!(message.contains("cannot bind HTTP listener"), "{message}");
     drop(listener);
     drop(storage);
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_prune_ips_rejects_invalid_days() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "prune-ips", "--older-than", "0"]);
+    let output = run(command);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("invalid value '0'"),
+        "{}",
+        stderr(&output)
+    );
+
+    let mut command2 = server();
+    command2.env("GITHEARTH_DATABASE_URL", schema.url());
+    command2.args(["audit", "prune-ips", "--older-than", "-5"]);
+    let output2 = run(command2);
+    assert_eq!(output2.status.code(), Some(2), "{}", stderr(&output2));
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_prune_ips_dry_run_counts_rows() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "prune-ips", "--older-than", "1", "--dry-run"]);
+    let output = run(command);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("DRY RUN:"), "{out}");
+    assert!(out.contains("clear"), "{out}");
+    assert!(out.contains("legacy"), "{out}");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_rotate_ip_key_creates_key() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "rotate-ip-key"]);
+    let output = run(command);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("created new key"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_drop_ip_keys_dry_run_counts_keys() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    // Insert two keys: a newer one (not a candidate) and an old one.
+    let old_key_id = Uuid::new_v4();
+    schema.execute(&format!(
+        "INSERT INTO audit_ip_keys (id, key, created_at) \
+         VALUES ('{old_key_id}', decode(repeat('01',32),'hex'), \
+         clock_timestamp() - '3 years'::interval)"
+    ));
+    // A newer key so the old one isn't the newest.
+    schema.execute(
+        "INSERT INTO audit_ip_keys (id, key) \
+         VALUES (gen_random_uuid(), decode(repeat('02',32),'hex'))",
+    );
+
+    let pre_count: i64 = execute_scalar(schema.url(), "SELECT COUNT(*) FROM audit_ip_keys")
+        .parse()
+        .unwrap();
+    assert_eq!(pre_count, 2);
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "drop-ip-keys", "--older-than", "1", "--dry-run"]);
+    let output = run(command);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("DRY RUN:"), "{out}");
+    assert!(
+        out.contains(&format!("{old_key_id}")),
+        "output must list the old key id: {out}"
+    );
+
+    let post_count: i64 = execute_scalar(schema.url(), "SELECT COUNT(*) FROM audit_ip_keys")
+        .parse()
+        .unwrap();
+    assert_eq!(post_count, pre_count, "dry-run must not delete keys");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn audit_drop_ip_keys_deletes_old_non_newest_key() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+
+    // Old key (candidate) + newer key (not candidate, keeps old key from being newest).
+    let old_key_id = Uuid::new_v4();
+    let new_key_id = Uuid::new_v4();
+    schema.execute(&format!(
+        "INSERT INTO audit_ip_keys (id, key, created_at) \
+         VALUES ('{old_key_id}', decode(repeat('01',32),'hex'), \
+         clock_timestamp() - '3 years'::interval)"
+    ));
+    schema.execute(&format!(
+        "INSERT INTO audit_ip_keys (id, key) \
+         VALUES ('{new_key_id}', decode(repeat('02',32),'hex'))"
+    ));
+
+    let mut command = server();
+    command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.args(["audit", "drop-ip-keys", "--older-than", "1"]);
+    let output = run(command);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("dropped:"), "{out}");
+    assert!(
+        out.contains(&format!("{old_key_id}")),
+        "must print old key id: {out}"
+    );
+
+    // Old key is gone, newest key remains.
+    let old_exists: i64 = execute_scalar(
+        schema.url(),
+        &format!("SELECT COUNT(*) FROM audit_ip_keys WHERE id = '{old_key_id}'"),
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(old_exists, 0, "old key must be deleted");
+    let new_exists: i64 = execute_scalar(
+        schema.url(),
+        &format!("SELECT COUNT(*) FROM audit_ip_keys WHERE id = '{new_key_id}'"),
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(new_exists, 1, "newest key must still exist");
 }

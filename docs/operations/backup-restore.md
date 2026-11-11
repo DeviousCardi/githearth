@@ -153,6 +153,10 @@ Keep N most-recent generations (e.g. `N=7` for a daily backup — one
 week).  Prune: keep the backup directory sorted by date, delete anything
 past the N-th most recent generation.
 
+Backup retention bounds IP retention: raw IPs pruned from the live
+database and old keys deleted still exist in backups — see
+[audit-retention.md](audit-retention.md).
+
 ### Restoring from the off-host copy
 
 1. Fetch the three files back to the (new) primary host:
