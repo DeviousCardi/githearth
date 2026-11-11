@@ -177,8 +177,9 @@ pub(crate) async fn approvals_at(
 
 /// Builds and evaluates the `pull_request.merge` request shared by the API
 /// handler and [`crate::merge::execute_intent`]. The merge facts are the
-/// approvals at the head and whether every required status check is `success`
-/// at the head, with the matching target-branch protection.
+/// approvals at the head, whether every required status check is `success`
+/// at the head, and code-owner review, with the matching target-branch
+/// protection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_allowed(
     state: &AppState,
@@ -188,6 +189,7 @@ pub(crate) fn merge_allowed(
     protection: Option<githearth_authz::Protection>,
     approvals: u32,
     checks_passed: bool,
+    code_owner_review_ok: bool,
     auth_age: Option<Duration>,
 ) -> bool {
     let authz_repo = repositories::authz_repository(repo);
@@ -212,6 +214,7 @@ pub(crate) fn merge_allowed(
         merge: Some(Merge {
             approvals,
             checks_passed,
+            code_owner_review_ok,
         }),
         auth_age,
         read_only: facts.read_only,
@@ -220,8 +223,8 @@ pub(crate) fn merge_allowed(
 }
 
 /// Authorize the merge with the matching target-branch protection as merge
-/// facts: approvals at the head and whether every required status check is
-/// `success` at the head.
+/// facts: approvals at the head, whether every required status check is
+/// `success` at the head, and code-owner review.
 fn require_merge(
     state: &AppState,
     loaded: &Loaded,
@@ -229,6 +232,7 @@ fn require_merge(
     protection: Option<githearth_authz::Protection>,
     approvals: u32,
     checks_passed: bool,
+    code_owner_review_ok: bool,
 ) -> Result<(), ApiError> {
     if merge_allowed(
         state,
@@ -238,6 +242,7 @@ fn require_merge(
         protection,
         approvals,
         checks_passed,
+        code_owner_review_ok,
         Some(Duration::from_secs(loaded.auth_age)),
     ) {
         return Ok(());
@@ -291,11 +296,28 @@ pub(crate) async fn may_merge(
     let Some(head) = head.as_deref() else {
         return Ok(false);
     };
+    let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
     let mut conn = state.pool.acquire().await?;
     let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
     let checks_passed =
         statuses::checks_passed(&mut conn, loaded.repo.id, head, &required_checks).await?;
     drop(conn);
+    let code_owner_review_ok = match base.as_deref() {
+        Some(base) => {
+            crate::codeowners::review(
+                state,
+                loaded.repo.id,
+                loaded.org_id,
+                org_slug,
+                pull.id,
+                head,
+                base,
+            )
+            .await?
+            .satisfied
+        }
+        None => false,
+    };
     let protection = crate::protection::matching(&rules, &target_ref);
     Ok(merge_allowed(
         state,
@@ -305,6 +327,7 @@ pub(crate) async fn may_merge(
         protection,
         approvals,
         checks_passed,
+        code_owner_review_ok,
         Some(Duration::from_secs(auth_age)),
     ))
 }
@@ -402,6 +425,17 @@ pub(crate) async fn create_intent(
 
             let protection = crate::protection::matching(&rules, &target_ref);
             let checks_passed = statuses::all_success(&required_checks, &check_states);
+            let code_owner_review_ok = crate::codeowners::review(
+                state,
+                loaded.repo.id,
+                loaded.org_id,
+                org_slug,
+                pull.id,
+                &head,
+                &base,
+            )
+            .await?
+            .satisfied;
             require_merge(
                 state,
                 &loaded,
@@ -409,6 +443,7 @@ pub(crate) async fn create_intent(
                 protection,
                 approvals as u32,
                 checks_passed,
+                code_owner_review_ok,
             )?;
 
             let digest = checks_approvals_digest(&head, &review_ids, &check_states);

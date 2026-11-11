@@ -328,6 +328,22 @@ pub async fn execute_intent(
             });
         };
         let protection = crate::protection::matching(&rules, &target_ref);
+        let org_slug: String = sqlx::query_scalar("SELECT slug FROM organizations WHERE id = $1")
+            .bind(repo.organization_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        let code_owner_review_ok = crate::codeowners::review(
+            state,
+            repository_id,
+            repo.organization_id,
+            &org_slug,
+            pull.id,
+            &intent.source_oid,
+            &intent.expected_target_oid,
+        )
+        .await
+        .map(|r| r.satisfied)
+        .unwrap_or(false);
         if !crate::merge_intents::merge_allowed(
             state,
             &facts,
@@ -336,6 +352,7 @@ pub async fn execute_intent(
             protection,
             approvals,
             checks_passed,
+            code_owner_review_ok,
             None,
         ) {
             return Ok(MergeOutcome::Stale {
