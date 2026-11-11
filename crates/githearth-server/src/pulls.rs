@@ -1372,7 +1372,7 @@ async fn list_review_requests(
 /// must be allowed `PullRequestComment` on the pull, and be either the author
 /// or allowed `PullRequestApprove`. A reader who can merely comment is not
 /// enough to resolve a thread or to request a reviewer.
-fn require_review_permission(
+pub(crate) fn require_review_permission(
     state: &AppState,
     loaded: &Loaded,
     pull: &PullJson,
@@ -1672,7 +1672,7 @@ pub(crate) async fn set_thread_resolved(
 /// judged). The pull request author has no special path — an author who cannot
 /// push to the head branch (read-only access, or a protected branch) may not
 /// apply.
-async fn require_apply_permission(
+pub(crate) async fn require_apply_permission(
     state: &AppState,
     loaded: &Loaded,
     pull: &PullJson,
@@ -1709,6 +1709,43 @@ async fn require_apply_permission(
     } else {
         Err(not_found())
     }
+}
+
+/// What the pull request page may render for the current viewer, mirroring the
+/// permission each matching handler checks, so a control is never shown for an
+/// action the server would refuse with 403.
+pub(crate) struct ViewerAbilities {
+    pub(crate) may_comment: bool,
+    pub(crate) may_resolve: bool,
+    pub(crate) may_apply: bool,
+}
+
+/// Loads the viewer's abilities for the browser pull page. Commenting maps to
+/// [`Action::PullRequestComment`], resolving to [`require_review_permission`]
+/// and applying to [`require_apply_permission`].
+pub(crate) async fn viewer_abilities(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<ViewerAbilities, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    require_readable_repo(&loaded)?;
+    let mut conn = state.pool.acquire().await?;
+    let pull = find_pull(&mut conn, loaded.repo.id, number)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    let may_comment = require_pull(state, &loaded, &pull, Action::PullRequestComment).is_ok();
+    let may_resolve = require_review_permission(state, &loaded, &pull).is_ok();
+    let may_apply = require_apply_permission(state, &loaded, &pull).await.is_ok();
+    Ok(ViewerAbilities {
+        may_comment,
+        may_resolve,
+        may_apply,
+    })
 }
 
 fn suggestion_not_applyable(message: &'static str) -> ApiError {

@@ -1411,3 +1411,46 @@ async fn resolve_and_unresolve_through_forms() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_apply_and_inline_controls_require_permission() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // An anchored comment carrying a suggestion gives the page resolve and
+    // apply controls to render (or hide) for each viewer.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!({
+            "body": "```suggestion\nFEATURE\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The owner can resolve, apply and comment inline.
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains(">Resolve</button>"), "{page}");
+    assert!(page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(page.contains("name=\"path\""), "{page}");
+
+    // A read-only member may comment inline, but may not resolve or apply.
+    let reader = member_cookie(&f, "read").await;
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains(">Resolve</button>"), "{page}");
+    assert!(!page.contains(">Unresolve</button>"), "{page}");
+    assert!(!page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(page.contains("name=\"path\""), "read members can comment inline");
+
+    finish(f).await;
+}

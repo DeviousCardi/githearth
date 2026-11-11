@@ -606,6 +606,13 @@ async fn render_pull(
     let can_merge = merge_intents::may_merge(state, s.account.id, s.auth_age, slug, name, number)
         .await
         .unwrap_or(false);
+    let abilities = pulls::viewer_abilities(state, s.account.id, s.auth_age, slug, name, number)
+        .await
+        .unwrap_or(pulls::ViewerAbilities {
+            may_comment: false,
+            may_resolve: false,
+            may_apply: false,
+        });
 
     let mut review_list = String::new();
     for r in &reviews.items {
@@ -641,10 +648,15 @@ async fn render_pull(
     }
     let mut comment_list = String::new();
     for c in &roots {
-        comment_list.push_str(&render_comment(s, &names, &base, number, c, false));
+        comment_list.push_str(&render_comment(
+            s, &names, &base, number, c, false, abilities.may_resolve, abilities.may_apply,
+        ));
         if let Some(thread_replies) = replies.get(&c.id) {
             for reply in thread_replies {
-                comment_list.push_str(&render_comment(s, &names, &base, number, reply, true));
+                comment_list.push_str(&render_comment(
+                    s, &names, &base, number, reply, true, abilities.may_resolve,
+                    abilities.may_apply,
+                ));
             }
         }
     }
@@ -660,7 +672,16 @@ async fn render_pull(
             comment_list.push_str(&format!(
                 "<li class=\"muted\">reply to <a href=\"{base}/pulls/{number}\">an earlier comment</a></li>"
             ));
-            comment_list.push_str(&render_comment(s, &names, &base, number, reply, true));
+            comment_list.push_str(&render_comment(
+                s,
+                &names,
+                &base,
+                number,
+                reply,
+                true,
+                abilities.may_resolve,
+                abilities.may_apply,
+            ));
         }
     }
     let comment_list = if comment_list.is_empty() {
@@ -746,6 +767,22 @@ async fn render_pull(
     } else {
         String::new()
     };
+    let files_html = files_changed(state, s, slug, name, &detail).await;
+    let inline_form = if detail.head_id.is_some() && abilities.may_comment {
+        format!(
+            "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/comments\">{}\
+<label for=\"path\">File path</label><input id=\"path\" name=\"path\" required>\
+<label for=\"line\">Line number</label><input id=\"line\" name=\"line\" type=\"number\" min=\"1\" required>\
+<label for=\"side\">Side</label><select id=\"side\" name=\"side\"><option value=\"new\">New (head)</option><option value=\"old\">Old (base)</option></select>\
+<label for=\"comment\">Comment on this line</label><textarea id=\"comment\" name=\"body\" rows=\"3\" required style=\"width:100%;box-sizing:border-box\"></textarea>\
+<input type=\"hidden\" name=\"commit_id\" value=\"{}\">\
+<p><button type=\"submit\">Add inline comment</button></p></form>",
+            form_fields(s, &new_key()),
+            ui::esc(head_id),
+        )
+    } else {
+        String::new()
+    };
     // The latest status per context at the current head, newest first.
     let mut status_rows = String::new();
     for st in &detail.statuses {
@@ -773,22 +810,6 @@ async fn render_pull(
         String::new()
     } else {
         format!("<h2>Checks</h2><ul>{status_rows}</ul>")
-    };
-    let files_html = files_changed(state, s, slug, name, &detail).await;
-    let inline_form = if detail.head_id.is_some() {
-        format!(
-            "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/comments\">{}\
-<label for=\"path\">File path</label><input id=\"path\" name=\"path\" required>\
-<label for=\"line\">Line number</label><input id=\"line\" name=\"line\" type=\"number\" min=\"1\" required>\
-<label for=\"side\">Side</label><select id=\"side\" name=\"side\"><option value=\"new\">New (head)</option><option value=\"old\">Old (base)</option></select>\
-<label for=\"comment\">Comment on this line</label><textarea id=\"comment\" name=\"body\" rows=\"3\" required style=\"width:100%;box-sizing:border-box\"></textarea>\
-<input type=\"hidden\" name=\"commit_id\" value=\"{}\">\
-<p><button type=\"submit\">Add inline comment</button></p></form>",
-            form_fields(s, &new_key()),
-            ui::esc(head_id),
-        )
-    } else {
-        String::new()
     };
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
@@ -840,7 +861,8 @@ async fn render_pull(
 
 /// Renders one comment, with its anchor (path, line and side), an outdated
 /// badge when the head moved, its suggestion block, and the resolve and apply
-/// actions available to a reviewer.
+/// actions available to a viewer with the matching permission.
+#[allow(clippy::too_many_arguments)]
 fn render_comment(
     s: &Session,
     names: &HashMap<Uuid, String>,
@@ -848,6 +870,8 @@ fn render_comment(
     number: i32,
     c: &pulls::CommentJson,
     is_reply: bool,
+    may_resolve: bool,
+    may_apply: bool,
 ) -> String {
     let mut anchor = String::new();
     if let (Some(path), Some(line)) = (&c.path, c.line) {
@@ -874,7 +898,7 @@ fn render_comment(
         ));
     }
     let mut actions = String::new();
-    if !is_reply {
+    if !is_reply && may_resolve {
         let resolve_action = if c.resolved {
             format!(
                 "<form method=\"post\" action=\"{base}/pulls/{number}/comments/{id}/unresolve\" style=\"display:inline\">\
@@ -894,7 +918,7 @@ fn render_comment(
         };
         actions.push_str(&resolve_action);
     }
-    if c.suggestion.is_some() && !c.outdated {
+    if c.suggestion.is_some() && !c.outdated && may_apply {
         actions.push_str(&format!(
             "<form method=\"post\" action=\"{base}/pulls/{number}/comments/{id}/apply\" style=\"display:inline\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
