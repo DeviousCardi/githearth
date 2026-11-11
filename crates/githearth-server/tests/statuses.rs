@@ -456,6 +456,24 @@ async fn unauthenticated_post_with_malformed_input_returns_unauthorized() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn unauthenticated_list_with_malformed_sha_returns_unauthorized() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    fixture_repository(&pool, org_id, "r", owner).await;
+
+    // A missing token must be reported as 401 before any validation, so a
+    // malformed commit id still yields 401 rather than 400, matching a valid id.
+    for sha in ["not-a-commit", &"c".repeat(40)] {
+        let base = statuses_path(&slug, "r", sha);
+        let (status, _) = request(&app, "GET", &base, None, None, Value::Null).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "sha={sha:?}");
+    }
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn read_only_token_cannot_post_status() {
     let (app, pool, storage, owner, org_id, slug) = setup().await;
     fixture_repository(&pool, org_id, "ro", owner).await;

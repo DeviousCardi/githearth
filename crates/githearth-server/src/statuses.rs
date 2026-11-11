@@ -224,10 +224,10 @@ async fn list(
     headers: HeaderMap,
     Path((org_slug, repo_name, sha)): Path<(String, String, String)>,
 ) -> Result<Json<Vec<StatusJson>>, ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     if !valid_commit_id(&sha) {
         return Err(invalid());
     }
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let loaded =
         repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
     repository_api::require(&state, &loaded, Action::RepositoryRead)?;
