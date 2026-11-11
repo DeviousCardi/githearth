@@ -50,9 +50,11 @@ pub(crate) struct Rule {
 
 /// Parses CODEOWNERS content into rules in file order. Blank lines and comment
 /// lines (a `#` after optional whitespace) are skipped; a `\` escapes the next
-/// character so patterns and owners may contain spaces or `#`.
-pub(crate) fn parse(content: &str) -> Vec<Rule> {
+/// character so patterns and owners may contain spaces or `#`. Malformed owner
+/// tokens are skipped but returned as human-readable errors.
+pub(crate) fn parse(content: &str) -> (Vec<Rule>, Vec<String>) {
     let mut rules = Vec::new();
+    let mut errors = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -63,14 +65,17 @@ pub(crate) fn parse(content: &str) -> Vec<Rule> {
             continue;
         }
         let pattern = tokens[0].clone();
-        let owners = tokens[1..]
-            .iter()
-            .filter_map(|t| parse_owner(t))
-            .collect::<Vec<_>>();
+        let mut owners = Vec::new();
+        for token in &tokens[1..] {
+            match parse_owner(token) {
+                Ok(owner) => owners.push(owner),
+                Err(message) => errors.push(message),
+            }
+        }
         // A pattern with no owners names nobody; keep it out of the way.
         rules.push(Rule { pattern, owners });
     }
-    rules
+    (rules, errors)
 }
 
 /// Splits a line on unescaped whitespace, honouring `\` escapes.
@@ -101,19 +106,20 @@ fn tokenize(line: &str) -> Vec<String> {
     tokens
 }
 
-fn parse_owner(token: &str) -> Option<OwnerRef> {
-    let token = token.strip_prefix('@').unwrap_or(token);
-    if token.is_empty() {
-        return None;
+fn parse_owner(token: &str) -> Result<OwnerRef, String> {
+    let stripped = token.strip_prefix('@').unwrap_or(token);
+    if stripped.is_empty() {
+        return Err(format!("malformed owner token `{token}`"));
     }
-    match token.split_once('/') {
+    match stripped.split_once('/') {
         Some((org, team)) if !org.is_empty() && !team.is_empty() && !team.contains('/') => {
-            Some(OwnerRef::Team {
+            Ok(OwnerRef::Team {
                 org: org.to_owned(),
                 team: team.to_owned(),
             })
         }
-        _ => Some(OwnerRef::Account(token.to_owned())),
+        Some(_) => Err(format!("malformed owner token `{token}`")),
+        None => Ok(OwnerRef::Account(stripped.to_owned())),
     }
 }
 
@@ -289,6 +295,7 @@ pub(crate) struct RequiredOwner {
 pub(crate) struct CodeOwnerReview {
     pub(crate) required: Vec<RequiredOwner>,
     pub(crate) satisfied: bool,
+    pub(crate) errors: Vec<String>,
 }
 
 struct ResolvedOwner {
@@ -321,7 +328,7 @@ pub(crate) async fn load(
     repo_id: Uuid,
     base: &str,
     head: &str,
-) -> Result<(Vec<Rule>, Vec<String>), ApiError> {
+) -> Result<(Vec<Rule>, Vec<String>, Vec<String>), ApiError> {
     let base = base.to_owned();
     let head = head.to_owned();
     let (content, paths) = crate::browse::git_read(state, repo_id, move |fs_path, timeout| {
@@ -334,7 +341,8 @@ pub(crate) async fn load(
         Ok::<_, StorageError>((content, paths))
     })
     .await?;
-    Ok((parse(&content.unwrap_or_default()), paths))
+    let (rules, errors) = parse(&content.unwrap_or_default());
+    Ok((rules, paths, errors))
 }
 
 /// The reviewer ids whose latest non-comment review at `head` is an approval.
@@ -493,6 +501,7 @@ pub(crate) async fn compute_review(
     Ok(CodeOwnerReview {
         required,
         satisfied,
+        errors: Vec::new(),
     })
 }
 
@@ -506,9 +515,12 @@ pub(crate) async fn review(
     head: &str,
     base: &str,
 ) -> Result<CodeOwnerReview, ApiError> {
-    let (rules, paths) = load(state, repo_id, base, head).await?;
+    let (rules, paths, errors) = load(state, repo_id, base, head).await?;
     let mut conn = state.pool.acquire().await?;
-    Ok(compute_review(&mut conn, org_id, org_slug, pull_id, head, &rules, &paths).await?)
+    let mut review =
+        compute_review(&mut conn, org_id, org_slug, pull_id, head, &rules, &paths).await?;
+    review.errors = errors;
+    Ok(review)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +611,7 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Err(_) => return retry(),
     };
 
-    let (rules, paths) = match load(state, pull.repository_id, &base, &head).await {
+    let (rules, paths, _errors) = match load(state, pull.repository_id, &base, &head).await {
         Ok(v) => v,
         Err(_) => return retry(),
     };
@@ -711,7 +723,7 @@ mod tests {
 
     #[test]
     fn parsing_skips_comments_and_blanks_and_reads_owners() {
-        let rules = parse(
+        let (rules, errors) = parse(
             "# comment\n\
              \n\
              *.rs   @alice @acme/eng\n\
@@ -719,6 +731,7 @@ mod tests {
              # another comment\n\
              \n",
         );
+        assert!(errors.is_empty());
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].pattern, "*.rs");
         assert_eq!(
@@ -737,38 +750,41 @@ mod tests {
 
     #[test]
     fn owner_tokens_require_at_and_split_org_team() {
-        assert_eq!(
-            parse_owner("@alice"),
-            Some(OwnerRef::Account("alice".into()))
-        );
-        assert_eq!(
-            parse_owner("alice"),
-            Some(OwnerRef::Account("alice".into()))
-        );
+        assert_eq!(parse_owner("@alice"), Ok(OwnerRef::Account("alice".into())));
+        assert_eq!(parse_owner("alice"), Ok(OwnerRef::Account("alice".into())));
         assert_eq!(
             parse_owner("@acme/eng"),
-            Some(OwnerRef::Team {
+            Ok(OwnerRef::Team {
                 org: "acme".into(),
                 team: "eng".into()
             })
         );
-        assert_eq!(parse_owner("@"), None);
-        assert_eq!(
-            parse_owner("@acme/"),
-            Some(OwnerRef::Account("acme/".into()))
-        );
+    }
+
+    #[test]
+    fn malformed_owner_tokens_are_reported_errors() {
+        for token in ["@", "@acme/", "@acme/a/b"] {
+            assert!(
+                parse_owner(token).is_err(),
+                "token {token:?} should be malformed"
+            );
+        }
+        let (rules, errors) = parse("*.rs @alice @ @acme/ @acme/a/b\n");
+        assert_eq!(errors.len(), 3);
+        assert_eq!(rules[0].owners, vec![OwnerRef::Account("alice".into())]);
     }
 
     #[test]
     fn escaped_spaces_and_hashes_survive_tokenization() {
-        let rules = parse("src/my\\ file.rs @alice\n");
+        let (rules, errors) = parse("src/my\\ file.rs @alice\n");
+        assert!(errors.is_empty());
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].pattern, "src/my file.rs");
     }
 
     #[test]
     fn last_matching_rule_wins() {
-        let rules = parse(
+        let (rules, _) = parse(
             "*.rs @alice\n\
              src/ @bob\n",
         );

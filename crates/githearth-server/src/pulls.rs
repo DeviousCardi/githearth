@@ -184,6 +184,8 @@ pub(crate) struct PullDetail {
     pub(crate) required_code_owners: Vec<crate::codeowners::RequiredOwner>,
     #[serde(default)]
     pub(crate) code_owner_review_satisfied: bool,
+    #[serde(default)]
+    pub(crate) code_owner_errors: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow)]
@@ -358,6 +360,7 @@ async fn detail(
         mergeability: Vec::new(),
         required_code_owners: Vec::new(),
         code_owner_review_satisfied: true,
+        code_owner_errors: Vec::new(),
     })
 }
 
@@ -617,6 +620,7 @@ pub(crate) async fn read_pull(
         .await?;
         detail.required_code_owners = review.required;
         detail.code_owner_review_satisfied = review.satisfied;
+        detail.code_owner_errors = review.errors;
     }
     Ok(detail)
 }
