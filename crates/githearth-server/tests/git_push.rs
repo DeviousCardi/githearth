@@ -3082,9 +3082,11 @@ async fn pushed_event_payload_credentials_are_null_when_row_absent() {
 async fn sweep_credentials_deletes_only_rows_older_than_a_day() {
     let fx = cred_fixture().await;
     let recent = Uuid::new_v4();
-    let old = Uuid::new_v4();
+    let old_applied = Uuid::new_v4();
+    let old_unapplied = Uuid::new_v4();
     let fresh = Uuid::new_v4();
 
+    // Recent (12h) row: kept by the age filter.
     sqlx::query(
         "INSERT INTO push_credentials (operation_id, credential_kind, created_at) \
          VALUES ($1, 'password', now() - interval '12 hours')",
@@ -3093,14 +3095,26 @@ async fn sweep_credentials_deletes_only_rows_older_than_a_day() {
     .execute(&fx.pool)
     .await
     .unwrap();
+    // Aged (2 days) row with an applied push: deleted.
     sqlx::query(
         "INSERT INTO push_credentials (operation_id, credential_kind, created_at) \
          VALUES ($1, 'password', now() - interval '2 days')",
     )
-    .bind(old)
+    .bind(old_applied)
     .execute(&fx.pool)
     .await
     .unwrap();
+    apply_record(&fx.pool, fx.repo_id, old_applied, fx.actor).await;
+    // Aged (2 days) row without an applied push: kept.
+    sqlx::query(
+        "INSERT INTO push_credentials (operation_id, credential_kind, created_at) \
+         VALUES ($1, 'password', now() - interval '2 days')",
+    )
+    .bind(old_unapplied)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    // Fresh row: kept.
     sqlx::query(
         "INSERT INTO push_credentials (operation_id, credential_kind) VALUES ($1, 'password')",
     )
@@ -3113,16 +3127,23 @@ async fn sweep_credentials_deletes_only_rows_older_than_a_day() {
         let mut conn = fx.pool.acquire().await.unwrap();
         pushes::sweep_credentials(&mut conn).await.unwrap()
     };
-    assert!(purged >= 1, "sweep must delete the two-day-old row");
+    assert!(purged >= 1, "sweep must delete the aged applied row");
 
     let remaining: Vec<Uuid> = sqlx::query_scalar(
         "SELECT operation_id FROM push_credentials WHERE operation_id = ANY($1)",
     )
-    .bind(vec![recent, old, fresh])
+    .bind(vec![recent, old_applied, old_unapplied, fresh])
     .fetch_all(&fx.pool)
     .await
     .unwrap();
-    assert!(!remaining.contains(&old), "old row must be deleted");
+    assert!(
+        !remaining.contains(&old_applied),
+        "aged applied row must be deleted"
+    );
+    assert!(
+        remaining.contains(&old_unapplied),
+        "aged row without an applied push must survive"
+    );
     assert!(remaining.contains(&recent), "12h-old row must survive");
     assert!(remaining.contains(&fresh), "fresh row must survive");
 

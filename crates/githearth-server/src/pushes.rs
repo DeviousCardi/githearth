@@ -188,14 +188,22 @@ pub async fn applied_through(
     Ok(val as u64)
 }
 
-/// Deletes `push_credentials` rows older than one day. A push is committed long
-/// before the credential record reaches this age, so any replay that needs the
-/// credential has already read it; afterwards the event degrades to null fields.
+/// Deletes `push_credentials` rows older than one day whose push has already
+/// been applied. A push is committed long before the credential record reaches
+/// this age, so any replay that needs the credential has already read it;
+/// afterwards the event degrades to null fields. Rows without an applied push
+/// (a refused or still-pending push) are kept.
 pub async fn sweep_credentials(conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
-    let result =
-        sqlx::query("DELETE FROM push_credentials WHERE created_at < now() - interval '1 day'")
-            .execute(conn)
-            .await?;
+    let result = sqlx::query(
+        "DELETE FROM push_credentials
+         WHERE created_at < now() - interval '1 day'
+           AND EXISTS (
+             SELECT 1 FROM repository_pushes p
+             WHERE p.operation_id = push_credentials.operation_id
+           )",
+    )
+    .execute(conn)
+    .await?;
     Ok(result.rows_affected())
 }
 
