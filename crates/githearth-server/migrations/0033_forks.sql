@@ -23,11 +23,20 @@ ALTER TABLE pull_requests ALTER COLUMN source_repository_id SET NOT NULL;
 DO $$ DECLARE
     cn text;
 BEGIN
+    -- Scope to the current schema: a shared test database may hold several
+    -- migrated schemas, each with its own `pull_requests` table and a
+    -- `pull_requests_distinct_branches` check that also contains
+    -- `source_branch <> target_branch`. Without the namespace filter the DO
+    -- block would match a foreign schema's constraint and try to drop it here.
     SELECT con.conname INTO cn
     FROM pg_constraint con
     JOIN pg_class rel ON rel.oid = con.conrelid
-    WHERE rel.relname = 'pull_requests' AND con.contype = 'c'
-      AND pg_get_constraintdef(con.oid) LIKE '%source_branch <> target_branch%';
+    JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+    WHERE ns.nspname = current_schema()
+      AND rel.relname = 'pull_requests' AND con.contype = 'c'
+      AND pg_get_constraintdef(con.oid) LIKE '%source_branch <> target_branch%'
+    ORDER BY con.conname
+    LIMIT 1;
     IF cn IS NOT NULL THEN
         EXECUTE format('ALTER TABLE pull_requests DROP CONSTRAINT %I', cn);
     END IF;
