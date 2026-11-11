@@ -285,17 +285,16 @@ pub(crate) async fn may_merge(
     let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
     let target_ref = format!("refs/heads/{}", pull.target_branch);
     let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
-    let (approvals, checks_passed) = match head.as_deref() {
-        Some(head) => {
-            let mut conn = state.pool.acquire().await?;
-            let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
-            let checks_passed =
-                statuses::checks_passed(&mut conn, loaded.repo.id, head, &required_checks).await?;
-            drop(conn);
-            (approvals, checks_passed)
-        }
-        None => (0, required_checks.is_empty()),
+    // A deleted source branch has no head; create_intent would refuse this
+    // merge with 422 "branch not found", so the merge form must not offer it.
+    let Some(head) = head.as_deref() else {
+        return Ok(false);
     };
+    let mut conn = state.pool.acquire().await?;
+    let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
+    let checks_passed =
+        statuses::checks_passed(&mut conn, loaded.repo.id, head, &required_checks).await?;
+    drop(conn);
     let protection = crate::protection::matching(&rules, &target_ref);
     Ok(merge_allowed(
         state,
