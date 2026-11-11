@@ -22,8 +22,8 @@ pub(crate) const ENABLED: [(&str, Method); 3] = [
 ];
 
 /// The mergeability of one method. `status` is `clean`, `conflicts`,
-/// `unrelated` or `up_to_date`; `conflicts` lists the conflicted paths only
-/// when `status` is `conflicts`.
+/// `unrelated`, `up_to_date` or `unmergeable`; `conflicts` lists the conflicted
+/// paths only when `status` is `conflicts`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Check {
     pub(crate) method: String,
@@ -82,6 +82,28 @@ async fn store(
     Ok(())
 }
 
+/// Folds a built candidate into a mergeability `(status, conflicts)`. The
+/// candidate commit is never referenced, only its outcome matters.
+fn status_for(candidate: Candidate) -> (String, Vec<String>) {
+    match candidate {
+        Candidate::Ready { .. } => ("clean".to_owned(), vec![]),
+        Candidate::Conflicts(paths) => ("conflicts".to_owned(), paths),
+        Candidate::UpToDate => ("up_to_date".to_owned(), vec![]),
+        Candidate::Unrelated => ("unrelated".to_owned(), vec![]),
+        // A rebase that refuses a merge commit still merges cleanly by
+        // merge/squash, but the rebase method itself cannot run: it must not
+        // be reported as `clean`.
+        Candidate::RebaseMergeCommit => ("unmergeable".to_owned(), vec![]),
+        // Only `Method::FastForward` produces `NotFastForward`, and mergeability
+        // never checks that method.
+        Candidate::NotFastForward => {
+            panic!(
+                "NotFastForward is only produced by Method::FastForward, which mergeability never checks"
+            )
+        }
+    }
+}
+
 /// Builds a candidate for `head` into `target` and folds it into a
 /// mergeability `(status, conflicts)`. Shared identities are enough: the
 /// candidate commit is never referenced, only its outcome matters.
@@ -112,18 +134,7 @@ async fn compute(
             author: &identity,
             committer: &identity,
         };
-        match merge::build_candidate(path, &request, timeout) {
-            Ok(Candidate::Ready { .. }) => Ok(("clean".to_owned(), vec![])),
-            Ok(Candidate::Conflicts(paths)) => Ok(("conflicts".to_owned(), paths)),
-            Ok(Candidate::UpToDate) => Ok(("up_to_date".to_owned(), vec![])),
-            Ok(Candidate::Unrelated) => Ok(("unrelated".to_owned(), vec![])),
-            // Not a conflict: `ff_only` never reaches here, and a rebase that
-            // refuses a merge commit still merges cleanly by merge/squash.
-            Ok(Candidate::NotFastForward) | Ok(Candidate::RebaseMergeCommit) => {
-                Ok(("clean".to_owned(), vec![]))
-            }
-            Err(error) => Err(error),
-        }
+        merge::build_candidate(path, &request, timeout).map(status_for)
     })
     .await
 }
@@ -195,6 +206,41 @@ mod tests {
         assert_eq!(value["conflicts"][0], "a.txt");
         let back: Check = serde_json::from_value(value).unwrap();
         assert_eq!(back, check);
+    }
+
+    #[test]
+    fn status_for_maps_every_candidate_outcome() {
+        assert_eq!(
+            status_for(Candidate::Ready {
+                oid: "0".repeat(40)
+            }),
+            ("clean".to_owned(), vec![])
+        );
+        assert_eq!(
+            status_for(Candidate::Conflicts(vec!["a.txt".into()])),
+            ("conflicts".to_owned(), vec!["a.txt".to_owned()])
+        );
+        assert_eq!(
+            status_for(Candidate::UpToDate),
+            ("up_to_date".to_owned(), vec![])
+        );
+        assert_eq!(
+            status_for(Candidate::Unrelated),
+            ("unrelated".to_owned(), vec![])
+        );
+    }
+
+    #[test]
+    fn rebase_merge_commit_is_unmergeable_not_clean() {
+        let (status, conflicts) = status_for(Candidate::RebaseMergeCommit);
+        assert_eq!(status, "unmergeable");
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "NotFastForward is only produced by Method::FastForward")]
+    fn not_fast_forward_is_not_mapped_to_clean() {
+        let _ = status_for(Candidate::NotFastForward);
     }
 
     #[tokio::test]

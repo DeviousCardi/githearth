@@ -364,6 +364,98 @@ async fn reset_feature_onto_main(f: &Fixture, content: &str) -> String {
     git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await
 }
 
+/// Adds a merge commit to `feature` by merging a divergent `side` branch with
+/// `--no-ff`, then pushes it. The head still merges cleanly by merge/squash,
+/// but a rebase would have to replay a two-parent commit, which the merge
+/// worker refuses — so the rebase method is `unmergeable`, not `clean`.
+async fn merge_side_into_feature(f: &Fixture) -> String {
+    let tw = f.work.to_str().unwrap();
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C", tw, "checkout", "-q", "-b", "side", &f.head,
+    ]))
+    .await;
+    std::fs::write(f.work.join("side.txt"), "side\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "side.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "side",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "feature"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "merge",
+        "--no-ff",
+        "-q",
+        "side",
+        "-m",
+        "merge side",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+    git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await
+}
+
+/// Creates an orphan branch (no shared history with `main`) and pushes it,
+/// returning its tip oid.
+async fn push_orphan_branch(f: &Fixture, branch: &str) -> String {
+    let tw = f.work.to_str().unwrap();
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "--orphan", branch])).await;
+    git_ok(git_cmd(&["-C", tw, "rm", "-rf", "-q", "."])).await;
+    std::fs::write(f.work.join("orphan.txt"), "orphan\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "orphan.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "orphan root",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        branch,
+    ]))
+    .await;
+    git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await
+}
+
 async fn finish(f: Fixture) {
     let _ = std::fs::remove_dir_all(&f.storage_root);
     let _ = std::fs::remove_dir_all(&f.work);
@@ -372,9 +464,13 @@ async fn finish(f: Fixture) {
 
 /// Fetches the browser pull request page with the owner's session cookie.
 async fn pull_page(f: &Fixture) -> String {
+    pull_page_for(f, f.number).await
+}
+
+async fn pull_page_for(f: &Fixture, number: i64) -> String {
     let path = format!(
         "/organizations/{}/repositories/{}/pulls/{}",
-        f.org_slug, f.repo_name, f.number
+        f.org_slug, f.repo_name, number
     );
     let response = f
         .app
@@ -393,17 +489,35 @@ async fn pull_page(f: &Fixture) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-async fn pull_detail(f: &Fixture) -> Value {
+async fn pull_detail_for(f: &Fixture, number: i64) -> Value {
     let (status, body) = request(
         &f.app,
         "GET",
-        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), number),
         Some(&f.token),
         Value::Null,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body
+}
+
+async fn pull_detail(f: &Fixture) -> Value {
+    pull_detail_for(f, f.number).await
+}
+
+/// Opens a second pull request on the fixture repository and returns its number.
+async fn create_pull(f: &Fixture, source: &str, target: &str) -> i64 {
+    let (status, pull) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.org_slug, &f.repo_name),
+        Some(&f.token),
+        json!({"title": "second pull", "source_branch": source, "target_branch": target}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{pull}");
+    pull["number"].as_i64().unwrap()
 }
 
 fn mergeability_of<'a>(detail: &'a Value, method: &str) -> &'a Value {
@@ -598,6 +712,101 @@ async fn a_target_move_that_introduces_a_conflict_flips_the_status_and_recompute
         stale, 3,
         "the old (head, target) row is still keyed correctly"
     );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_source_with_a_merge_commit_reports_rebase_as_unmergeable_not_clean() {
+    let f = build_fixture().await;
+    let head = merge_side_into_feature(&f).await;
+
+    let detail = pull_detail(&f).await;
+    assert_eq!(detail["head_id"], head.as_str());
+    assert_eq!(mergeability_of(&detail, "merge")["status"], "clean");
+    assert_eq!(mergeability_of(&detail, "squash")["status"], "clean");
+    // The rebase method cannot run — it must not be claimed as `clean`.
+    assert_eq!(mergeability_of(&detail, "rebase")["status"], "unmergeable");
+
+    // The cache records the distinct status rather than a stale `clean`.
+    let rebase_status: String = sqlx::query_scalar(
+        "SELECT status FROM merge_checks WHERE repository_id = $1 AND head_oid = $2 \
+         AND target_oid = $3 AND method = 'rebase'",
+    )
+    .bind(f.repo_id)
+    .bind(&head)
+    .bind(&f.head)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(rebase_status, "unmergeable");
+
+    // The form is still live for the default `merge` method, but the rebase
+    // option is disabled so it cannot be submitted.
+    let page = pull_page(&f).await;
+    assert!(page.contains("<select id=\"method\""), "{page}");
+    assert!(
+        page.contains("<option value=\"rebase\" disabled>Rebase and merge</option>"),
+        "{page}"
+    );
+    assert!(
+        page.contains("<option value=\"merge\" selected>Merge commit</option>"),
+        "{page}"
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn an_up_to_date_pull_disables_the_merge_button_with_its_reason() {
+    let f = build_fixture().await;
+    // `main` (root) is an ancestor of `feature`, so `main -> feature` is up to
+    // date rather than conflicted.
+    let number = create_pull(&f, "main", "feature").await;
+
+    let detail = pull_detail_for(&f, number).await;
+    for method in ["merge", "squash", "rebase"] {
+        assert_eq!(mergeability_of(&detail, method)["status"], "up_to_date");
+    }
+
+    let page = pull_page_for(&f, number).await;
+    assert!(
+        page.contains("<button type=\"submit\" disabled>Merge pull request</button>"),
+        "{page}"
+    );
+    assert!(
+        page.contains("This branch is already up to date with the target."),
+        "{page}"
+    );
+    assert!(!page.contains("<select id=\"method\""), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn an_unrelated_pull_disables_the_merge_button_with_its_reason() {
+    let f = build_fixture().await;
+    push_orphan_branch(&f, "orphan").await;
+    let number = create_pull(&f, "orphan", "main").await;
+
+    let detail = pull_detail_for(&f, number).await;
+    for method in ["merge", "squash", "rebase"] {
+        assert_eq!(mergeability_of(&detail, method)["status"], "unrelated");
+    }
+
+    let page = pull_page_for(&f, number).await;
+    assert!(
+        page.contains("<button type=\"submit\" disabled>Merge pull request</button>"),
+        "{page}"
+    );
+    assert!(
+        page.contains("These branches have no common history."),
+        "{page}"
+    );
+    assert!(!page.contains("<select id=\"method\""), "{page}");
 
     finish(f).await;
 }

@@ -69,6 +69,19 @@ fn intent_state_label(state: &str) -> &str {
     }
 }
 
+/// A mergeability status that means the selected method cannot run, with the
+/// reason shown next to the disabled merge button. `clean` (and the un-checked
+/// `ff_only` method) map to `None` — the form stays live.
+fn merge_block_reason(status: &str) -> Option<&'static str> {
+    match status {
+        "conflicts" => Some("This branch has conflicts that must be resolved."),
+        "unrelated" => Some("These branches have no common history."),
+        "up_to_date" => Some("This branch is already up to date with the target."),
+        "unmergeable" => Some("This branch cannot be rebased because it contains merge commits."),
+        _ => None,
+    }
+}
+
 struct Session {
     account: crate::Account,
     auth_age: u64,
@@ -715,6 +728,9 @@ async fn render_pull(
         }
         (None, _) => String::new(),
     };
+    // Methods whose mergeability says they cannot run are dropped from the
+    // selector, and the selected method's own status disables the button with
+    // its reason. `ff_only` has no mergeability entry, so it always stays live.
     let merge_options = MERGE_METHODS
         .iter()
         .map(|(value, label)| {
@@ -723,24 +739,46 @@ async fn render_pull(
             } else {
                 ""
             };
-            format!("<option value=\"{value}\"{sel}>{label}</option>")
+            let dis = if detail
+                .mergeability
+                .iter()
+                .find(|c| c.method == *value)
+                .is_some_and(|c| merge_block_reason(&c.status).is_some())
+            {
+                " disabled"
+            } else {
+                ""
+            };
+            format!("<option value=\"{value}\"{sel}{dis}>{label}</option>")
         })
         .collect::<String>();
     let show_merge_form = detail.pull.state == "open" && !non_terminal && can_merge;
-    let merge_form = if show_merge_form && has_conflicts {
-        "<p><button type=\"submit\" disabled>Merge pull request</button> \
-<span class=\"muted\">This branch has conflicts that must be resolved.</span></p>"
-            .to_string()
-    } else if show_merge_form {
-        format!(
-            "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/merge\">{}\
+    let blocked_reason = if has_conflicts {
+        Some("This branch has conflicts that must be resolved.")
+    } else {
+        detail
+            .mergeability
+            .iter()
+            .find(|c| c.method == merge.method)
+            .and_then(|c| merge_block_reason(&c.status))
+    };
+    let merge_form = if show_merge_form {
+        if let Some(reason) = blocked_reason {
+            format!(
+                "<p><button type=\"submit\" disabled>Merge pull request</button> \
+<span class=\"muted\">{reason}</span></p>"
+            )
+        } else {
+            format!(
+                "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/merge\">{}\
 <label for=\"method\">Merge method</label><select id=\"method\" name=\"method\">{}</select>\
 <input type=\"hidden\" name=\"expected_head_oid\" value=\"{}\">\
 <p><button type=\"submit\">Merge pull request</button></p></form>",
-            form_fields(s, merge.key),
-            merge_options,
-            ui::esc(head_id),
-        )
+                form_fields(s, merge.key),
+                merge_options,
+                ui::esc(head_id),
+            )
+        }
     } else {
         String::new()
     };

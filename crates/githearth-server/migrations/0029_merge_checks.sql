@@ -7,7 +7,7 @@ CREATE TABLE merge_checks (
     head_oid text NOT NULL CHECK (head_oid ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'),
     target_oid text NOT NULL CHECK (target_oid ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'),
     method text NOT NULL CHECK (method IN ('merge', 'squash', 'rebase')),
-    status text NOT NULL CHECK (status IN ('clean', 'conflicts', 'unrelated', 'up_to_date')),
+    status text NOT NULL CHECK (status IN ('clean', 'conflicts', 'unrelated', 'up_to_date', 'unmergeable')),
     conflicts text[] NOT NULL DEFAULT '{}',
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (repository_id, head_oid, target_oid, method)
