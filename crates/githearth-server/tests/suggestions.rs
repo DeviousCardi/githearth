@@ -618,11 +618,12 @@ async fn applying_an_outdated_suggestion_is_refused_with_head_moved() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
+async fn writer_cannot_apply_to_a_protected_head_branch() {
     let f = build_fixture().await;
 
-    // A read-only member authors their own pull request.
-    let author = add_member(&f.pool, f.org_id, "read").await;
+    // A write-role member (who could otherwise push) authors their own pull
+    // request, so the refusal below isolates the protected-branch check.
+    let author = add_member(&f.pool, f.org_id, "write").await;
     let author_token = fixture_session(&f.pool, author).await;
 
     let tw = f.work.to_str().unwrap();
@@ -632,11 +633,11 @@ async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
         "checkout",
         "-q",
         "-b",
-        "reader-branch",
+        "writer-branch",
     ]))
     .await;
-    std::fs::write(f.work.join("reader.txt"), "reader\n").unwrap();
-    git_ok(git_cmd(&["-C", tw, "add", "reader.txt"])).await;
+    std::fs::write(f.work.join("writer.txt"), "writer\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "writer.txt"])).await;
     git_ok(git_cmd(&[
         "-C",
         tw,
@@ -647,10 +648,10 @@ async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
         "commit",
         "-q",
         "-m",
-        "reader",
+        "writer",
     ]))
     .await;
-    let reader_head = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    let writer_head = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
     let repo_path = state_repo_path(&f.storage_root, f.repo_id);
     git_ok(git_cmd(&[
         "-C",
@@ -660,7 +661,7 @@ async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
         "push",
         "--",
         repo_path.to_str().unwrap(),
-        "reader-branch",
+        "writer-branch",
     ]))
     .await;
 
@@ -669,7 +670,7 @@ async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
         "POST",
         &repo_href(&f.org_slug, &f.repo_name),
         Some(&author_token),
-        json!({"title": "reader pull", "source_branch": "reader-branch", "target_branch": "main"}),
+        json!({"title": "writer pull", "source_branch": "writer-branch", "target_branch": "main"}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{pull}");
@@ -684,7 +685,7 @@ async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
             f.org_slug, f.repo_name
         ),
         Some(&f.token),
-        json!({"pattern": "reader-branch", "require_pull_request": true}),
+        json!({"pattern": "writer-branch", "require_pull_request": true}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{rule}");
@@ -701,8 +702,8 @@ async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
         Some(&author_token),
         json!({
             "body": "```suggestion\nchanged\n```",
-            "commit_id": reader_head,
-            "path": "reader.txt",
+            "commit_id": writer_head,
+            "path": "writer.txt",
             "line": 1,
             "side": "new",
         }),
