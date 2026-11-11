@@ -356,10 +356,39 @@ async fn invalid_statuses_are_rejected() {
         json!({"context": "", "state": "success"}),
         json!({"context": "ci"}),
         json!({"context": "ci", "state": "success", "extra": 1}),
+        json!({"context": "githearth/legacy-require-checks", "state": "success"}),
     ] {
         let (status, _) = request(&app, "POST", &base, Some(&token), None, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    // target_url must be http/https; anything else is 422.
+    for url in [
+        "javascript:alert(1)",
+        "ftp://ci.example/1",
+        "data:text/html,hello",
+    ] {
+        let (status, _) = request(
+            &app,
+            "POST",
+            &base,
+            Some(&token),
+            None,
+            json!({"context": "ci", "state": "success", "target_url": url}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "target_url={url}");
+    }
+    let (status, _) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"context": "ci", "state": "success", "target_url": "https://ci.example/1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
 
     cleanup(&storage);
     pool.close().await;

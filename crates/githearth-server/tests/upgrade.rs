@@ -212,6 +212,124 @@ async fn previous_release_schema_upgrades_and_keeps_data() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn require_checks_true_rules_still_gate_merges_after_upgrade() {
+    let db_name = format!(
+        "githearth_tupg_checks_{}",
+        Uuid::new_v4().to_string().replace('-', "_")
+    );
+    let database_url = fresh_database(&db_name).await;
+
+    // Build the schema just before 0023 (the commit statuses migration), where
+    // branch_protection_rules still carries the bare `require_checks` boolean.
+    let all_but_last: Vec<sqlx::migrate::Migration> = githearth_server::MIGRATOR
+        .iter()
+        .take(githearth_server::MIGRATOR.iter().count().saturating_sub(1))
+        .cloned()
+        .collect();
+    let prev_migrator = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(all_but_last),
+        ..githearth_server::MIGRATOR
+    };
+
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    prev_migrator.run(&pool).await.unwrap();
+
+    let account = Uuid::new_v4();
+    sqlx::query("INSERT INTO accounts (id, username, password_hash) VALUES ($1,$2,'unused')")
+        .bind(account)
+        .bind(format!("a-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let org = Uuid::new_v4();
+    sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Org')")
+        .bind(org)
+        .bind(format!("o-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repo = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+         VALUES ($1,$2,'r',$3,$4,'active','private')",
+    )
+    .bind(repo)
+    .bind(org)
+    .bind(account)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let gated = Uuid::new_v4();
+    let open = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO branch_protection_rules \
+         (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, require_checks, created_by) \
+         VALUES ($1,$2,'main',false,false,true,0,true,$3)",
+    )
+    .bind(gated)
+    .bind(repo)
+    .bind(account)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO branch_protection_rules \
+         (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, require_checks, created_by) \
+         VALUES ($1,$2,'release/*',false,false,false,0,false,$3)",
+    )
+    .bind(open)
+    .bind(repo)
+    .bind(account)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // Apply 0023 on top.
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    githearth_server::MIGRATOR.run(&pool).await.unwrap();
+
+    // A rule that required checks must keep gating: it is mapped to the
+    // reserved, un-satisfiable context (a non-empty list), never to the empty
+    // no-gate list. A rule that did not require checks maps to the empty list.
+    let gated_checks: Vec<String> = sqlx::query_scalar(
+        "SELECT required_status_checks FROM branch_protection_rules WHERE id = $1",
+    )
+    .bind(gated)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        gated_checks,
+        vec!["githearth/legacy-require-checks".to_owned()]
+    );
+
+    let open_checks: Vec<String> = sqlx::query_scalar(
+        "SELECT required_status_checks FROM branch_protection_rules WHERE id = $1",
+    )
+    .bind(open)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(open_checks.is_empty());
+
+    // The old toggle column is gone.
+    let has_require_checks: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_name = 'branch_protection_rules' AND column_name = 'require_checks')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!has_require_checks);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn newer_schema_is_refused_by_older_binary() {
     let db_name = format!(
         "githearth_tupg_newer_{}",

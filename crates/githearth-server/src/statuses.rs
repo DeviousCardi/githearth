@@ -41,6 +41,23 @@ pub(crate) fn valid_context(context: &str) -> bool {
     (1..=255).contains(&context.len()) && !context.trim().is_empty()
 }
 
+/// The reserved context used to keep pre-M3 `require_checks = true` branch
+/// protection rules gating merges after the migration to `required_status_checks`
+/// (see migration 0023). It is intentionally un-satisfiable: the status API
+/// refuses to post a status under this context, so a rule requiring it never
+/// passes. Owners must replace it with a real context list to unblock merges.
+pub(crate) const LEGACY_REQUIRE_CHECKS_CONTEXT: &str = "githearth/legacy-require-checks";
+
+/// A `target_url` may only use an `http`/`https` scheme; anything else (such as
+/// `javascript:`) must be refused on create and never rendered as a link href.
+pub(crate) fn valid_target_url(url: &str) -> bool {
+    url.get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+        || url
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+}
+
 /// Full lowercase commit ids only, as stored and compared.
 fn valid_commit_id(id: &str) -> bool {
     crate::browse::is_commit_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
@@ -69,7 +86,7 @@ pub(crate) struct StatusJson {
     pub(crate) created_at: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewStatus {
     context: String,
@@ -84,6 +101,7 @@ fn new_status(body: &[u8]) -> Result<NewStatus, ApiError> {
     let input: NewStatus = serde_json::from_slice(body).map_err(|_| invalid())?;
     if !valid_context(&input.context)
         || !valid_state(&input.state)
+        || input.context == LEGACY_REQUIRE_CHECKS_CONTEXT
         || input
             .description
             .as_ref()
@@ -94,6 +112,14 @@ fn new_status(body: &[u8]) -> Result<NewStatus, ApiError> {
             .is_some_and(|u| u.chars().count() > 4096)
     {
         return Err(invalid());
+    }
+    if let Some(ref url) = input.target_url
+        && !valid_target_url(url)
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "target_url must use an http or https scheme",
+        ));
     }
     Ok(input)
 }
@@ -309,11 +335,65 @@ mod tests {
             "context": "ci", "state": "failure",
             "description": "tests failed", "target_url": "https://ci.example/1"
         })));
+        assert!(ok(serde_json::json!({
+            "context": "ci", "state": "failure", "target_url": "http://ci.example/1"
+        })));
         assert!(!ok(serde_json::json!({"context": "", "state": "success"})));
         assert!(!ok(serde_json::json!({"context": "ci", "state": "nope"})));
         assert!(!ok(serde_json::json!({"context": "ci"})));
         assert!(!ok(
             serde_json::json!({"context": "ci", "state": "success", "extra": 1})
+        ));
+        // The reserved legacy context is never postable.
+        assert!(!ok(serde_json::json!({
+            "context": LEGACY_REQUIRE_CHECKS_CONTEXT, "state": "success"
+        })));
+    }
+
+    #[test]
+    fn target_url_scheme_is_restricted_to_http_and_https() {
+        assert!(valid_target_url("https://ci.example/1"));
+        assert!(valid_target_url("http://ci.example/1"));
+        assert!(valid_target_url("HTTPS://ci.example/1"));
+        assert!(!valid_target_url("javascript:alert(1)"));
+        assert!(!valid_target_url("ftp://ci.example/1"));
+        assert!(!valid_target_url("data:text/html,hello"));
+        assert!(!valid_target_url(""));
+        assert!(!valid_target_url("http"));
+    }
+
+    #[test]
+    fn legacy_context_payload_returns_bad_request() {
+        let err = new_status(
+            serde_json::json!({"context": LEGACY_REQUIRE_CHECKS_CONTEXT, "state": "success"})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn unsafe_target_url_returns_unprocessable() {
+        let err = new_status(
+            serde_json::json!({"context": "ci", "state": "success", "target_url": "javascript:alert(1)"})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn legacy_reserved_context_never_passes_checks() {
+        // A rule migrated from require_checks=true requires the reserved
+        // context, and no status can ever be posted under it, so it blocks the
+        // merge even when other contexts pass.
+        let required = [LEGACY_REQUIRE_CHECKS_CONTEXT.to_owned()];
+        assert!(!all_success(&required, &[]));
+        assert!(!all_success(
+            &[LEGACY_REQUIRE_CHECKS_CONTEXT.to_owned(), "ci".to_owned()],
+            &[("ci".into(), "success".into())],
         ));
     }
 

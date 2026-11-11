@@ -36,6 +36,15 @@ CREATE TRIGGER commit_statuses_append_only
 -- required status check contexts. A non-empty list means checks are required;
 -- the merge path treats the rule as requiring every listed context to be
 -- `success` on the pull request's current head commit.
-ALTER TABLE branch_protection_rules DROP COLUMN require_checks;
+--
+-- A rule that had `require_checks = true` would otherwise become an empty
+-- (no-check) list and silently stop gating merges. Those rules are mapped to a
+-- single reserved, un-satisfiable context so they keep refusing merges until an
+-- owner reconfigures. The context can never be satisfied: the status API
+-- refuses to post a status under `githearth/legacy-require-checks`.
 ALTER TABLE branch_protection_rules
   ADD COLUMN required_status_checks text[] NOT NULL DEFAULT '{}';
+UPDATE branch_protection_rules
+  SET required_status_checks = ARRAY['githearth/legacy-require-checks']
+  WHERE require_checks = true;
+ALTER TABLE branch_protection_rules DROP COLUMN require_checks;

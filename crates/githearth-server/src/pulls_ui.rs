@@ -721,6 +721,7 @@ async fn render_pull(
         let target = st
             .target_url
             .as_deref()
+            .filter(|u| crate::statuses::valid_target_url(u))
             .map(|u| format!(" <a href=\"{}\">details</a>", ui::esc(u)))
             .unwrap_or_default();
         status_rows.push_str(&format!(
