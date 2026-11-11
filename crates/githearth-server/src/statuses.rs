@@ -40,7 +40,7 @@ fn valid_state(state: &str) -> bool {
 /// leading or trailing whitespace. Such whitespace would make a posted status
 /// or a required check context impossible to match against a well-formed rule.
 pub(crate) fn valid_context(context: &str) -> bool {
-    (1..=255).contains(&context.len()) && context == context.trim()
+    (1..=255).contains(&context.chars().count()) && context == context.trim()
 }
 
 /// Whether a context has leading or trailing whitespace around a non-empty
@@ -332,6 +332,19 @@ mod tests {
         }
         assert!(!valid_state("running"));
         assert!(!valid_state(""));
+    }
+
+    #[test]
+    fn context_length_is_measured_in_characters_not_bytes() {
+        // 100 CJK characters are 300 UTF-8 bytes but 100 characters, so
+        // migration 0023's CHECK (1..=255 chars) accepts them. The validator
+        // must agree instead of rejecting the context for its byte length.
+        let cjk: String = "界".repeat(100);
+        assert_eq!(cjk.chars().count(), 100);
+        assert!(cjk.len() > 255);
+        assert!(valid_context(&cjk));
+        // The upper bound is still 255 characters.
+        assert!(!valid_context(&"界".repeat(256)));
     }
 
     #[test]

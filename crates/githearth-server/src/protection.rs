@@ -680,6 +680,12 @@ mod tests {
         assert_eq!(too_many.status_code(), StatusCode::BAD_REQUEST);
 
         assert!(validate_required_status_checks(&["ci".to_owned(), "lint".to_owned()]).is_ok());
+
+        // A multi-byte context is bounded by character count, not bytes, so a
+        // 100-CJK-character context (300 bytes) is a valid required check.
+        assert!(validate_required_status_checks(&["界".repeat(100)]).is_ok());
+        let overlong = validate_required_status_checks(&["界".repeat(256)]).unwrap_err();
+        assert_eq!(overlong.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
