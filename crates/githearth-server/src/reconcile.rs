@@ -48,6 +48,7 @@ pub struct Summary {
     pub orphaned: usize,
     pub tmp_cleaned: usize,
     pub trash_purged: usize,
+    pub push_credentials_purged: usize,
     pub errors: usize,
 }
 
@@ -59,6 +60,7 @@ impl Summary {
             || self.orphaned > 0
             || self.tmp_cleaned > 0
             || self.trash_purged > 0
+            || self.push_credentials_purged > 0
             || self.errors > 0
     }
 }
@@ -222,6 +224,7 @@ pub async fn reconcile_once(
     let mut conn = state.pool.acquire().await?;
     let purged = pushes::sweep_credentials(&mut conn).await?;
     drop(conn);
+    summary.push_credentials_purged = purged as usize;
     if purged > 0 {
         tracing::info!(purged, "push credential retention swept rows");
     }
@@ -557,6 +560,7 @@ async fn run_pass(state: &AppState, attempts: &mut HashMap<Uuid, u32>) {
                     orphaned = summary.orphaned,
                     tmp_cleaned = summary.tmp_cleaned,
                     trash_purged = summary.trash_purged,
+                    push_credentials_purged = summary.push_credentials_purged,
                     errors = summary.errors,
                     "reconciler pass complete"
                 );
