@@ -664,3 +664,34 @@ async fn logout_with_expired_session_clears_cookie() {
     assert!(set_cookie.unwrap().contains("githearth_session=; "));
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn pages_declare_lang_labels_and_skip_link() {
+    let (app, pool, _db) = setup().await;
+    let (status, body) = get_page(&app, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<html lang=\"en\">"));
+    assert!(body.contains("<a class=\"skip-link\" href=\"#main\">Skip to content</a>"));
+    assert!(body.contains("<label for=\"username\">Username</label>"));
+    assert!(body.contains("<label for=\"password\">Password</label>"));
+
+    let cookie = login(&app, "alice", "password123456").await;
+    let (status, body) = get_page(&app, "/", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<html lang=\"en\">"));
+    assert!(body.contains("<a class=\"skip-link\" href=\"#main\">Skip to content</a>"));
+    assert!(body.contains("<main id=\"main\" tabindex=\"-1\">"));
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn login_error_is_tied_to_the_credential_fields() {
+    let (app, pool, _db) = setup().await;
+    let (status, body) = get_page(&app, "/login?error=1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("id=\"login-error\""));
+    assert!(body.contains("aria-invalid=\"true\" aria-describedby=\"login-error\""));
+    pool.close().await;
+}

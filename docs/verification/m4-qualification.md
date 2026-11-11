@@ -101,7 +101,7 @@ The harness does **not** cover the following M4 exit items:
 - **The `compose.yaml` file itself.** Covered by s13, which runs the real compose file with ephemeral ports.
 - **Off-host backup.** The backup and restore run on the same host.
 - **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are not measured.
-- **License files and notices, and accessibility review.** Not part of this harness.
+- **License files and notices, and accessibility review.** Not part of this harness; resolved separately by [accessibility.md](accessibility.md) (WCAG 2.2 AA basics audit and fixes) and [third-party-notices.md](../operations/third-party-notices.md) (the `LICENSE` file, a generated `THIRD_PARTY_NOTICES`, and the stale check in `scripts/ci.sh`).
 - **SHA-256 repositories and public/internal visibility.** Covered by s11 and s12 (and by the Rust integration tests in `tests/visibility.rs` and `tests/repository_api.rs`).
 - **Online (non-maintenance-window) backup.** Not implemented; backup/restore is maintenance-window-only (s4). This is documented precisely below.
 
