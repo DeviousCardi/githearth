@@ -303,22 +303,55 @@ struct ResolvedOwner {
     account_ids: Vec<Uuid>,
 }
 
+/// Where the CODEOWNERS file lives on the target branch, and whether it could
+/// be read. The first path that resolves to a file is authoritative: if that
+/// file is binary, oversized or not UTF-8 the gate must fail closed rather than
+/// fall back to a later path.
+enum CodeOwnersBlob {
+    Missing,
+    Readable(String),
+    Unreadable(String),
+}
+
 fn read_codeowners_blob(
     repo: &Path,
     rev: &str,
     timeout: Duration,
-) -> Result<Option<String>, StorageError> {
+) -> Result<CodeOwnersBlob, StorageError> {
     for path in CODEOWNERS_PATHS {
-        if let Some(blob) = browse::blob(repo, rev, path, browse::MAX_BLOB_BYTES, timeout)? {
-            if blob.binary || blob.truncated {
-                continue;
-            }
-            if let Ok(text) = String::from_utf8(blob.content) {
-                return Ok(Some(text));
+        let Some(blob) = browse::blob(repo, rev, path, browse::MAX_BLOB_BYTES, timeout)? else {
+            continue;
+        };
+        if blob.binary {
+            return Ok(CodeOwnersBlob::Unreadable(format!(
+                "{path} is not a text file"
+            )));
+        }
+        if blob.truncated {
+            return Ok(CodeOwnersBlob::Unreadable(format!(
+                "{path} exceeds the size limit"
+            )));
+        }
+        match String::from_utf8(blob.content) {
+            Ok(text) => return Ok(CodeOwnersBlob::Readable(text)),
+            Err(_) => {
+                return Ok(CodeOwnersBlob::Unreadable(format!(
+                    "{path} is not valid UTF-8"
+                )));
             }
         }
     }
-    Ok(None)
+    Ok(CodeOwnersBlob::Missing)
+}
+
+/// The CODEOWNERS file and changed files for a pull request, with enough
+/// context for the review gate to fail closed.
+pub(crate) struct CodeOwnersLoad {
+    pub(crate) rules: Vec<Rule>,
+    pub(crate) paths: Option<Vec<String>>,
+    pub(crate) errors: Vec<String>,
+    pub(crate) diff_truncated: bool,
+    pub(crate) unreadable: bool,
 }
 
 /// Reads the CODEOWNERS file from `base` and the changed files between `base`
@@ -328,18 +361,42 @@ pub(crate) async fn load(
     repo_id: Uuid,
     base: &str,
     head: &str,
-) -> Result<(Vec<Rule>, Option<Vec<String>>, Vec<String>), ApiError> {
+) -> Result<CodeOwnersLoad, ApiError> {
     let base = base.to_owned();
     let head = head.to_owned();
     let (content, paths) = crate::browse::git_read(state, repo_id, move |fs_path, timeout| {
         let content = read_codeowners_blob(fs_path, &base, timeout)?;
-        let paths = browse::changed_files(fs_path, &base, &head, timeout)?
-            .map(|files| files.into_iter().map(|f| f.new_path).collect::<Vec<_>>());
+        let paths =
+            browse::changed_files(fs_path, &base, &head, timeout)?.map(|(files, truncated)| {
+                (
+                    files.into_iter().map(|f| f.new_path).collect::<Vec<_>>(),
+                    truncated,
+                )
+            });
         Ok::<_, StorageError>((content, paths))
     })
     .await?;
-    let (rules, errors) = parse(&content.unwrap_or_default());
-    Ok((rules, paths, errors))
+
+    let (rules, errors, unreadable) = match content {
+        CodeOwnersBlob::Missing => (Vec::new(), Vec::new(), false),
+        CodeOwnersBlob::Readable(text) => {
+            let (rules, errors) = parse(&text);
+            (rules, errors, false)
+        }
+        CodeOwnersBlob::Unreadable(reason) => (Vec::new(), vec![reason], true),
+    };
+    let (paths, diff_truncated) = match paths {
+        Some((paths, truncated)) => (Some(paths), truncated),
+        None => (None, false),
+    };
+
+    Ok(CodeOwnersLoad {
+        rules,
+        paths,
+        errors,
+        diff_truncated,
+        unreadable,
+    })
 }
 
 /// The reviewer ids whose latest non-comment review at `head` is an approval.
@@ -512,20 +569,36 @@ pub(crate) async fn review(
     head: &str,
     base: &str,
 ) -> Result<CodeOwnerReview, ApiError> {
-    let (rules, paths, errors) = load(state, repo_id, base, head).await?;
-    // `changed_files` reports `None` when base or head does not resolve, so the
-    // changed-file set is unknown and the gate must fail closed.
-    let Some(paths) = paths else {
+    let loaded = load(state, repo_id, base, head).await?;
+    // `changed_files` reports `None` when base or head does not resolve, and a
+    // truncated diff or an unreadable CODEOWNERS file leaves the changed-file
+    // set unknown, so the gate must fail closed.
+    let Some(paths) = loaded.paths else {
         return Ok(CodeOwnerReview {
             required: Vec::new(),
             satisfied: false,
-            errors,
+            errors: loaded.errors,
         });
     };
+    if loaded.diff_truncated || loaded.unreadable {
+        return Ok(CodeOwnerReview {
+            required: Vec::new(),
+            satisfied: false,
+            errors: loaded.errors,
+        });
+    }
     let mut conn = state.pool.acquire().await?;
-    let mut review =
-        compute_review(&mut conn, org_id, org_slug, pull_id, head, &rules, &paths).await?;
-    review.errors = errors;
+    let mut review = compute_review(
+        &mut conn,
+        org_id,
+        org_slug,
+        pull_id,
+        head,
+        &loaded.rules,
+        &paths,
+    )
+    .await?;
+    review.errors = loaded.errors;
     Ok(review)
 }
 
@@ -617,15 +690,16 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Err(_) => return retry(),
     };
 
-    let (rules, paths, _errors) = match load(state, pull.repository_id, &base, &head).await {
+    let loaded = match load(state, pull.repository_id, &base, &head).await {
         Ok(v) => v,
         Err(_) => return retry(),
     };
     // An unresolvable base/head leaves the changed-file set unknown, so there
     // are no owners to request reviews from.
-    let paths = paths.unwrap_or_default();
+    let paths = loaded.paths.unwrap_or_default();
 
-    let account_ids = match reviewer_accounts(state, org_id, &org_slug, &rules, &paths).await {
+    let account_ids = match reviewer_accounts(state, org_id, &org_slug, &loaded.rules, &paths).await
+    {
         Ok(ids) => ids,
         Err(()) => return retry(),
     };
@@ -729,6 +803,100 @@ fn retry() -> jobs::JobOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as StdCommand;
+
+    fn run_git(args: &[&str]) -> String {
+        let mut command = StdCommand::new("git");
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .args(args);
+        let out = command.output().expect("git");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Creates a repository with the given files committed on `main` and
+    /// returns `(work tree, git dir)`.
+    fn make_repo(files: &[(&str, &[u8])]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("codeowners-blob-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        run_git(&["init", "-q", "-b", "main", d]);
+        for (path, content) in files {
+            if let Some(parent) = Path::new(path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(dir.join(parent)).unwrap();
+            }
+            std::fs::write(dir.join(path), content).unwrap();
+        }
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "root",
+        ]);
+        (dir.clone(), dir.join(".git"))
+    }
+
+    #[test]
+    fn read_codeowners_blob_resolves_readable_and_missing_files() {
+        let (dir, repo) = make_repo(&[("CODEOWNERS", b"*.rs @alice\n")]);
+        assert!(matches!(
+            read_codeowners_blob(&repo, "HEAD", Duration::from_secs(10)).unwrap(),
+            CodeOwnersBlob::Readable(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, repo) = make_repo(&[("README.md", b"hello\n")]);
+        assert!(matches!(
+            read_codeowners_blob(&repo, "HEAD", Duration::from_secs(10)).unwrap(),
+            CodeOwnersBlob::Missing
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_codeowners_blob_is_authoritative_once_a_path_resolves() {
+        // A later path with valid content must not mask an earlier file that is
+        // unreadable: once CODEOWNERS resolves it is authoritative.
+        for content in [b"*.rs @alice\0".to_vec(), b"*.rs @alice\xff\n".to_vec()] {
+            let (dir, repo) = make_repo(&[
+                ("CODEOWNERS", &content),
+                ("docs/CODEOWNERS", b"*.rs @bob\n"),
+            ]);
+            assert!(
+                matches!(
+                    read_codeowners_blob(&repo, "HEAD", Duration::from_secs(10)).unwrap(),
+                    CodeOwnersBlob::Unreadable(_)
+                ),
+                "an unreadable CODEOWNERS must not fall back to docs/CODEOWNERS"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // An oversized CODEOWNERS is authoritative too.
+        let oversized = vec![b'a'; browse::MAX_BLOB_BYTES + 1];
+        let (dir, repo) = make_repo(&[("CODEOWNERS", &oversized)]);
+        assert!(matches!(
+            read_codeowners_blob(&repo, "HEAD", Duration::from_secs(10)).unwrap(),
+            CodeOwnersBlob::Unreadable(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parsing_skips_comments_and_blanks_and_reads_owners() {
