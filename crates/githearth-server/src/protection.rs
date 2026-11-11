@@ -260,6 +260,12 @@ struct NewRule {
     /// rule explicitly opts out, matching the pre-flag semantics.
     #[serde(default = "default_true")]
     dismiss_stale_approvals: bool,
+    /// Refuses pushes to the protected branch unless every new commit carries
+    /// an SSH signature that verifies against a key registered to the
+    /// committer's account. This gates client pushes only: server-created
+    /// merges bypass it (ADR 0007 "Merge exception"), so a merge commit and the
+    /// commits it brings in are not re-verified and a protected branch can
+    /// still gain server-created merge history.
     #[serde(default)]
     require_signed_commits: bool,
 }

@@ -1950,13 +1950,20 @@ fn generate_ssh_key() -> (PathBuf, String) {
 }
 
 async fn register_ssh_key(pool: &PgPool, account_id: Uuid, public_key: &str) {
+    // Production stores the key with its trailing comment stripped (ssh_keys.rs
+    // sets the comment to ""), so strip it here to match the real stored format.
+    let canonical = public_key
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
     sqlx::query(
         "INSERT INTO ssh_keys (id, account_id, name, algorithm, public_key, fingerprint) \
          VALUES ($1, $2, 'test', 'ed25519', $3, $4)",
     )
     .bind(Uuid::new_v4())
     .bind(account_id)
-    .bind(public_key)
+    .bind(canonical)
     .bind(format!("SHA256:{}", Uuid::new_v4().simple()))
     .execute(pool)
     .await
