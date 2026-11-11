@@ -1692,3 +1692,79 @@ async fn resolve_on_a_closed_pull_request_is_refused() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_rechecks_open_state_under_the_repository_lock() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap().to_owned();
+
+    // Hold the repository row exclusively so a concurrent resolve blocks at
+    // `lock_active` — after its early open check, but before it resolves.
+    let mut blocker = f.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM repositories WHERE id = $1 FOR UPDATE")
+        .bind(f.repo_id)
+        .fetch_optional(&mut *blocker)
+        .await
+        .unwrap();
+
+    let app = f.app.clone();
+    let path = format!(
+        "{}/{number}/comments/{root_id}",
+        repo_href(&f.org_slug, &f.repo_name)
+    );
+    let token = f.token.clone();
+    let resolve = tokio::spawn(async move {
+        request(
+            &app,
+            "PATCH",
+            &path,
+            Some(&token),
+            None,
+            json!({"resolved": true}),
+        )
+        .await
+    });
+
+    // Wait for the resolve to block on the repository lock, so it has already
+    // read the pull request as open.
+    for _ in 0..500 {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND state = 'active')",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Close the pull request on another connection, then release the lock so
+    // the resolve's under-lock re-check observes the close.
+    let pull_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM pull_requests WHERE repository_id = $1 AND number = $2")
+            .bind(f.repo_id)
+            .bind(number as i32)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE pull_requests SET state = 'closed', closed_at = now() WHERE id = $1")
+        .bind(pull_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    blocker.commit().await.unwrap();
+
+    let (status, body) = resolve.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "pull request is not open");
+
+    finish(f).await;
+}

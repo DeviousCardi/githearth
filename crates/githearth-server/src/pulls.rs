@@ -1605,6 +1605,9 @@ pub(crate) async fn set_thread_resolved(
     if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
         return Err(not_active());
     }
+    // The early `pull.state != "open"` check above races a concurrent close;
+    // re-check under the row lock the close/reopen path takes.
+    require_open(&mut tx, pull.id).await?;
     // The comment must be on this pull request; the thread root is its
     // topmost ancestor (walking `in_reply_to` up).
     let root_id: Option<Uuid> = sqlx::query_scalar(
