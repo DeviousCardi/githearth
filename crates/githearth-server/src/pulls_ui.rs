@@ -649,12 +649,25 @@ async fn render_pull(
     let mut comment_list = String::new();
     for c in &roots {
         comment_list.push_str(&render_comment(
-            s, &names, &base, number, c, false, abilities.may_resolve, abilities.may_apply,
+            s,
+            &names,
+            &base,
+            number,
+            c,
+            false,
+            abilities.may_resolve,
+            abilities.may_apply,
         ));
         if let Some(thread_replies) = replies.get(&c.id) {
             for reply in thread_replies {
                 comment_list.push_str(&render_comment(
-                    s, &names, &base, number, reply, true, abilities.may_resolve,
+                    s,
+                    &names,
+                    &base,
+                    number,
+                    reply,
+                    true,
+                    abilities.may_resolve,
                     abilities.may_apply,
                 ));
             }

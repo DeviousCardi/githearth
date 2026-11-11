@@ -1746,14 +1746,7 @@ pub(crate) async fn require_apply_permission_locked(
         .await?
         .ok_or_else(not_found)?;
     drop(conn);
-    apply_permission_decision(
-        state,
-        &facts,
-        &loaded.repo,
-        pull,
-        &rules,
-        loaded.auth_age,
-    )
+    apply_permission_decision(state, &facts, &loaded.repo, pull, &rules, loaded.auth_age)
 }
 
 /// What the pull request page may render for the current viewer, mirroring the
@@ -1785,7 +1778,9 @@ pub(crate) async fn viewer_abilities(
     drop(conn);
     let may_comment = require_pull(state, &loaded, &pull, Action::PullRequestComment).is_ok();
     let may_resolve = require_review_permission(state, &loaded, &pull).is_ok();
-    let may_apply = require_apply_permission(state, &loaded, &pull).await.is_ok();
+    let may_apply = require_apply_permission(state, &loaded, &pull)
+        .await
+        .is_ok();
     Ok(ViewerAbilities {
         may_comment,
         may_resolve,
@@ -2371,12 +2366,14 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')")
-            .bind(org)
-            .bind(account)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+        )
+        .bind(org)
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
         let grant_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) \
@@ -2438,12 +2435,14 @@ mod tests {
 
         // Revoke the write grant and leave only read access. The early check's
         // facts are stale, but the under-lock re-check reloads them and refuses.
-        sqlx::query("UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 WHERE id = $2")
-            .bind(account)
-            .bind(grant_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 WHERE id = $2",
+        )
+        .bind(account)
+        .bind(grant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) \
              VALUES ($1,'read','account',$2,'organization',$3,$2)",

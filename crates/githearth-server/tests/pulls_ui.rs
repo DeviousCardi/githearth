@@ -1450,7 +1450,10 @@ async fn resolve_apply_and_inline_controls_require_permission() {
     assert!(!page.contains(">Resolve</button>"), "{page}");
     assert!(!page.contains(">Unresolve</button>"), "{page}");
     assert!(!page.contains(">Apply suggestion</button>"), "{page}");
-    assert!(page.contains("name=\"path\""), "read members can comment inline");
+    assert!(
+        page.contains("name=\"path\""),
+        "read members can comment inline"
+    );
 
     finish(f).await;
 }
