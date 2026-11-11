@@ -491,7 +491,7 @@ mod tests {
             allow_deletion: false,
             require_pull_request,
             required_approvals: 0,
-            require_checks: false,
+            required_status_checks: Vec::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }

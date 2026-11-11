@@ -213,11 +213,11 @@ async fn create_list_update_delete_with_generation_bumps() {
         &format!("{base}/{rule_id}"),
         Some(&token),
         None,
-        json!({"require_checks": true, "allow_force_push": false}),
+        json!({"required_status_checks": ["ci"], "allow_force_push": false}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["require_checks"], true);
+    assert_eq!(body["required_status_checks"], json!(["ci"]));
     assert_eq!(body["allow_force_push"], false);
 
     let generation: i64 = sqlx::query_scalar(

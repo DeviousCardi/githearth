@@ -45,13 +45,13 @@ pub struct ProtectionRule {
     pub allow_deletion: bool,
     pub require_pull_request: bool,
     pub required_approvals: i32,
-    pub require_checks: bool,
+    pub required_status_checks: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const RULE_COLUMNS: &str = "id, repository_id, pattern, allow_force_push, allow_deletion, \
- require_pull_request, required_approvals, require_checks, \
+ require_pull_request, required_approvals, required_status_checks, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
 
@@ -96,6 +96,16 @@ fn valid_segments(segments: &str) -> bool {
 /// (`refs/heads/release/v1` picks `release/v1/*` over `release/*`). A
 /// trailing `*` is a prefix match, so `release/*` also protects `release/a/b`.
 pub(crate) fn matching(rules: &[ProtectionRule], ref_name: &str) -> Option<Protection> {
+    matching_rule(rules, ref_name).map(protection_of)
+}
+
+/// The most specific rule matching `ref_name`, using the same ranking as
+/// [`matching`]. The rule (not just its protection payload) is exposed so
+/// callers can read its `required_status_checks`.
+pub(crate) fn matching_rule<'a>(
+    rules: &'a [ProtectionRule],
+    ref_name: &str,
+) -> Option<&'a ProtectionRule> {
     let branch = ref_name.strip_prefix("refs/heads/")?;
     let mut best_glob: Option<(&str, &ProtectionRule)> = None;
     for rule in rules {
@@ -106,7 +116,7 @@ pub(crate) fn matching(rules: &[ProtectionRule], ref_name: &str) -> Option<Prote
         if let Some(name) = exact
             && name == branch
         {
-            return Some(protection_of(rule));
+            return Some(rule);
         }
         if let Some(prefix) = glob
             && branch.starts_with(prefix)
@@ -115,7 +125,15 @@ pub(crate) fn matching(rules: &[ProtectionRule], ref_name: &str) -> Option<Prote
             best_glob = Some((prefix, rule));
         }
     }
-    best_glob.map(|(_, rule)| protection_of(rule))
+    best_glob.map(|(_, rule)| rule)
+}
+
+/// The required status check contexts of the rule matching `ref_name`, or the
+/// empty list when no rule matches.
+pub(crate) fn required_status_checks(rules: &[ProtectionRule], ref_name: &str) -> Vec<String> {
+    matching_rule(rules, ref_name)
+        .map(|rule| rule.required_status_checks.clone())
+        .unwrap_or_default()
 }
 
 fn protection_of(rule: &ProtectionRule) -> Protection {
@@ -124,7 +142,7 @@ fn protection_of(rule: &ProtectionRule) -> Protection {
         allow_deletion: rule.allow_deletion,
         require_pull_request: rule.require_pull_request,
         required_approvals: rule.required_approvals as u32,
-        require_checks: rule.require_checks,
+        require_checks: !rule.required_status_checks.is_empty(),
     }
 }
 
@@ -232,7 +250,14 @@ struct NewRule {
     #[serde(default)]
     required_approvals: i32,
     #[serde(default)]
-    require_checks: bool,
+    required_status_checks: Vec<String>,
+}
+
+fn validate_required_status_checks(checks: &[String]) -> Result<(), ApiError> {
+    if checks.len() > 100 || checks.iter().any(|c| !crate::statuses::valid_context(c)) {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn validate_rule(input: &NewRule) -> Result<(), ApiError> {
@@ -242,7 +267,7 @@ fn validate_rule(input: &NewRule) -> Result<(), ApiError> {
     if !(0..=10).contains(&input.required_approvals) {
         return Err(invalid());
     }
-    Ok(())
+    validate_required_status_checks(&input.required_status_checks)
 }
 
 async fn create(
@@ -282,7 +307,7 @@ async fn create(
             let inserted = sqlx::query(
                 "INSERT INTO branch_protection_rules \
                  (id, repository_id, pattern, allow_force_push, allow_deletion, \
-                  require_pull_request, required_approvals, require_checks, created_by) \
+                  require_pull_request, required_approvals, required_status_checks, created_by) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(id)
@@ -292,7 +317,7 @@ async fn create(
             .bind(input.allow_deletion)
             .bind(input.require_pull_request)
             .bind(input.required_approvals)
-            .bind(input.require_checks)
+            .bind(&input.required_status_checks)
             .bind(actor.id)
             .execute(&mut *tx)
             .await;
@@ -346,7 +371,7 @@ struct PatchRule {
     #[serde(default)]
     required_approvals: Option<i32>,
     #[serde(default)]
-    require_checks: Option<bool>,
+    required_status_checks: Option<Vec<String>>,
 }
 
 async fn update(
@@ -375,7 +400,7 @@ async fn update(
                 && input.allow_deletion.is_none()
                 && input.require_pull_request.is_none()
                 && input.required_approvals.is_none()
-                && input.require_checks.is_none()
+                && input.required_status_checks.is_none()
             {
                 return Err(invalid());
             }
@@ -388,6 +413,9 @@ async fn update(
                 && !(0..=10).contains(&apps)
             {
                 return Err(invalid());
+            }
+            if let Some(ref checks) = input.required_status_checks {
+                validate_required_status_checks(checks)?;
             }
 
             let loaded =
@@ -421,7 +449,7 @@ async fn update(
             let res = sqlx::query(
                 "UPDATE branch_protection_rules SET pattern = $1, \
                  allow_force_push = $2, allow_deletion = $3, require_pull_request = $4, \
-                 required_approvals = $5, require_checks = $6, updated_at = now() \
+                 required_approvals = $5, required_status_checks = $6, updated_at = now() \
                  WHERE id = $7",
             )
             .bind(updated_pattern)
@@ -437,7 +465,11 @@ async fn update(
                     .required_approvals
                     .unwrap_or(locked.required_approvals),
             )
-            .bind(input.require_checks.unwrap_or(locked.require_checks))
+            .bind(
+                input
+                    .required_status_checks
+                    .unwrap_or(locked.required_status_checks),
+            )
             .bind(id)
             .execute(&mut *tx)
             .await;
@@ -551,7 +583,7 @@ mod tests {
             allow_deletion: false,
             require_pull_request: false,
             required_approvals: 0,
-            require_checks: false,
+            required_status_checks: Vec::new(),
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -649,8 +681,8 @@ mod tests {
         // Create a rule and bump the generation exactly as create/update/delete do.
         sqlx::query(
             "INSERT INTO branch_protection_rules \
-             (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, require_checks, created_by) \
-             VALUES ($1, $2, 'main', false, false, true, 2, false, $3)",
+             (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, required_status_checks, created_by) \
+             VALUES ($1, $2, 'main', false, false, true, 2, '{}', $3)",
         )
         .bind(Uuid::new_v4())
         .bind(repo)
@@ -723,7 +755,7 @@ mod tests {
             r.allow_force_push = true;
             r.require_pull_request = true;
             r.required_approvals = 7;
-            r.require_checks = true;
+            r.required_status_checks = vec!["ci".to_owned()];
         });
         let rules2 = [force];
         let p = matching(&rules2, "refs/heads/force/x").unwrap();
@@ -731,5 +763,10 @@ mod tests {
         assert!(p.require_pull_request);
         assert_eq!(p.required_approvals, 7);
         assert!(p.require_checks);
+        assert_eq!(
+            required_status_checks(&rules2, "refs/heads/force/x"),
+            vec!["ci".to_owned()]
+        );
+        assert!(required_status_checks(&rules2, "refs/heads/other").is_empty());
     }
 }

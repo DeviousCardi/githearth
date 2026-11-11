@@ -167,8 +167,9 @@ pub(crate) struct PullJson {
     pub(crate) closed_at: Option<String>,
 }
 
-/// A pull request with its live head and base and the reviews that count
-/// at that head. A deleted branch reads as a null id.
+/// A pull request with its live head and base, the reviews that count at that
+/// head, and the latest status per check context at that head. A deleted branch
+/// reads as a null id.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PullDetail {
     #[serde(flatten)]
@@ -177,6 +178,7 @@ pub(crate) struct PullDetail {
     pub(crate) base_id: Option<String>,
     pub(crate) approvals: i64,
     pub(crate) changes_requested: i64,
+    pub(crate) statuses: Vec<crate::statuses::StatusJson>,
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow)]
@@ -313,6 +315,7 @@ type Tips = (Option<String>, Option<String>);
 /// second connection; `tips` are resolved beforehand, outside it.
 async fn detail(
     conn: &mut PgConnection,
+    repository_id: Uuid,
     pull: PullJson,
     tips: Tips,
 ) -> Result<PullDetail, ApiError> {
@@ -335,12 +338,18 @@ async fn detail(
         }
         None => (0, 0),
     };
+    // The latest status per context at the current head, for the pull page.
+    let statuses = match &head_id {
+        Some(head) => crate::statuses::latest_by_context(conn, repository_id, head).await?,
+        None => Vec::new(),
+    };
     Ok(PullDetail {
         pull,
         head_id,
         base_id,
         approvals,
         changes_requested,
+        statuses,
     })
 }
 
@@ -454,7 +463,9 @@ pub(crate) async fn create_pull(
 
             let pull = fetch_pull(&mut tx, id).await?.unwrap();
             let status = StatusCode::CREATED;
-            let body = serde_json::to_value(detail(&mut tx, pull, (head, base)).await?).unwrap();
+            let body =
+                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, (head, base)).await?)
+                    .unwrap();
             if !idem.store(&mut tx, status, &body).await? {
                 return Err(idempotency::claim_lost());
             }
@@ -565,7 +576,7 @@ pub(crate) async fn read_pull(
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
     let tips = tips(state, loaded.repo.id, &pull).await?;
     let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, pull, tips).await
+    detail(&mut conn, loaded.repo.id, pull, tips).await
 }
 
 #[derive(Deserialize)]
@@ -680,7 +691,8 @@ async fn update(
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
             let status = StatusCode::OK;
-            let body = serde_json::to_value(detail(&mut tx, pull, tips).await?).unwrap();
+            let body =
+                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, tips).await?).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
                 return Err(idempotency::claim_lost());
             }
