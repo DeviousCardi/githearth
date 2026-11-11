@@ -32,6 +32,8 @@ step clippy
 cargo clippy --workspace --all-targets --locked -- -D warnings
 step deny
 cargo deny check advisories bans licenses sources
+step "third-party notices"
+python3 scripts/generate-third-party-notices.py --check
 step "tests with coverage (including PostgreSQL)"
 cargo llvm-cov --workspace --locked --summary-only --fail-under-lines "$min_lines" -- --include-ignored
 step "container image"
