@@ -254,8 +254,32 @@ struct NewRule {
 }
 
 fn validate_required_status_checks(checks: &[String]) -> Result<(), ApiError> {
-    if checks.len() > 100 || checks.iter().any(|c| !crate::statuses::valid_context(c)) {
+    if checks.len() > 100 {
         return Err(invalid());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for context in checks {
+        if context.as_str() == crate::statuses::LEGACY_REQUIRE_CHECKS_CONTEXT {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "required status checks cannot include the reserved context",
+            ));
+        }
+        if crate::statuses::has_surrounding_whitespace(context) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "required status check context must not have leading or trailing whitespace",
+            ));
+        }
+        if !seen.insert(context) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "required status checks must not contain duplicates",
+            ));
+        }
+        if !crate::statuses::valid_context(context) {
+            return Err(invalid());
+        }
     }
     Ok(())
 }
@@ -624,6 +648,38 @@ mod tests {
     fn a_malformed_rule_does_not_disable_the_others() {
         let rules = [rule("bad/../x", &|_| {}), rule("main", &|_| {})];
         assert!(matching(&rules, "refs/heads/main").is_some());
+    }
+
+    #[test]
+    fn required_status_checks_reject_reserved_duplicates_and_whitespace() {
+        let reserved = crate::statuses::LEGACY_REQUIRE_CHECKS_CONTEXT.to_owned();
+        for checks in [
+            vec![reserved.clone()],
+            vec!["ci".to_owned(), "ci".to_owned()],
+            vec!["ci".to_owned(), "lint".to_owned(), "ci".to_owned()],
+            vec![" ci".to_owned()],
+            vec!["ci ".to_owned()],
+            vec![" ci ".to_owned()],
+        ] {
+            let err = validate_required_status_checks(&checks).unwrap_err();
+            assert_eq!(
+                err.status_code(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{checks:?}"
+            );
+        }
+
+        // Structural failures stay 400: empty, all-whitespace, and oversized.
+        let empty = validate_required_status_checks(&[String::new()]).unwrap_err();
+        assert_eq!(empty.status_code(), StatusCode::BAD_REQUEST);
+        let blank = validate_required_status_checks(&["   ".to_owned()]).unwrap_err();
+        assert_eq!(blank.status_code(), StatusCode::BAD_REQUEST);
+        let oversized = validate_required_status_checks(&["x".repeat(256)]).unwrap_err();
+        assert_eq!(oversized.status_code(), StatusCode::BAD_REQUEST);
+        let too_many = validate_required_status_checks(&vec!["ci".to_owned(); 101]).unwrap_err();
+        assert_eq!(too_many.status_code(), StatusCode::BAD_REQUEST);
+
+        assert!(validate_required_status_checks(&["ci".to_owned(), "lint".to_owned()]).is_ok());
     }
 
     #[tokio::test]
