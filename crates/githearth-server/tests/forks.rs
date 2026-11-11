@@ -99,6 +99,37 @@ async fn request(
     )
 }
 
+async fn request_with_idempotency(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    idem_key: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(key) = idem_key {
+        builder = builder.header("Idempotency-Key", key);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn get(app: &Router, path: &str, cookie: Option<&str>) -> StatusCode {
     let mut builder = Request::builder().uri(path);
     if let Some(cookie) = cookie {
@@ -983,6 +1014,167 @@ async fn cross_repo_merge_holds_the_fork_lock() {
     let outcome = handle.await.unwrap().unwrap();
     let oid = expect_merged(outcome);
     assert_eq!(main_tip(&f).await, oid);
+
+    finish(f).await;
+}
+
+async fn insert_abandoned_fork_claim(
+    f: &Fixture,
+    contributor_id: Uuid,
+    contrib_org_id: Uuid,
+    key: &str,
+    fork_name: &str,
+    operation_id: Uuid,
+    status: &str,
+) -> Uuid {
+    let fork_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, description, parent_repository_id, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,'private','',$7, now() - interval '1 hour')",
+    )
+    .bind(fork_id)
+    .bind(contrib_org_id)
+    .bind(fork_name)
+    .bind(contributor_id)
+    .bind(operation_id)
+    .bind(status)
+    .bind(f.parent_repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let path = format!(
+        "/api/v1/organizations/{}/repositories/{}/forks",
+        f.parent_org_slug, f.parent_repo_name
+    );
+    let body = json!({"organization": f.contrib_org_slug, "name": fork_name});
+    let hash =
+        githearth_server::idempotency::request_hash("POST", &path, body.to_string().as_bytes());
+    sqlx::query(
+        "INSERT INTO operations (actor_id, key, request_hash, status, claim_id, operation_id, created_at, expires_at) \
+         VALUES ($1,$2,$3,'running',$4,$5, clock_timestamp() - interval '120 seconds', clock_timestamp() + interval '24 hours')",
+    )
+    .bind(contributor_id)
+    .bind(key)
+    .bind(hash)
+    .bind(Uuid::new_v4())
+    .bind(operation_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    fork_id
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resumed_fork_create_refuses_to_resurrect_a_deleted_fork() {
+    let f = build_fixture().await;
+
+    let contributor_id: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+        .bind(&f.contributor_username)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    let contrib_org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&f.contrib_org_slug)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+
+    let fork_name = tag("resume-deleted");
+    let body = json!({"organization": f.contrib_org_slug, "name": fork_name});
+    let path = format!(
+        "/api/v1/organizations/{}/repositories/{}/forks",
+        f.parent_org_slug, f.parent_repo_name
+    );
+    let operation_id = Uuid::new_v4();
+    let key = tag("resume-deleted-key");
+    insert_abandoned_fork_claim(
+        &f,
+        contributor_id,
+        contrib_org_id,
+        &key,
+        &fork_name,
+        operation_id,
+        "deleted",
+    )
+    .await;
+
+    // Resuming the abandoned create must refuse to resurrect the deleted fork,
+    // mirroring the repository create resume path (404, not 409).
+    let (status, _) = request_with_idempotency(
+        &f.app,
+        "POST",
+        &path,
+        Some(&f.contributor_token),
+        Some(&key),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resumed_fork_create_refreshes_updated_at() {
+    let f = build_fixture().await;
+
+    let contributor_id: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+        .bind(&f.contributor_username)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    let contrib_org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&f.contrib_org_slug)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+
+    let fork_name = tag("resume-touch");
+    let body = json!({"organization": f.contrib_org_slug, "name": fork_name});
+    let path = format!(
+        "/api/v1/organizations/{}/repositories/{}/forks",
+        f.parent_org_slug, f.parent_repo_name
+    );
+    let operation_id = Uuid::new_v4();
+    let key = tag("resume-touch-key");
+    let fork_id = insert_abandoned_fork_claim(
+        &f,
+        contributor_id,
+        contrib_org_id,
+        &key,
+        &fork_name,
+        operation_id,
+        "active",
+    )
+    .await;
+
+    // A resumed create whose row is already active still refreshes updated_at,
+    // so the reconciler (which only visits rows older than its grace) does not
+    // race a resumed fork copy.
+    let (status, _) = request_with_idempotency(
+        &f.app,
+        "POST",
+        &path,
+        Some(&f.contributor_token),
+        Some(&key),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let age: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))::float8 FROM repositories WHERE id = $1",
+    )
+    .bind(fork_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(
+        age < 60.0,
+        "resumed fork create must refresh updated_at (age={age}s)"
+    );
 
     finish(f).await;
 }

@@ -145,9 +145,25 @@ pub(crate) async fn create_fork(
         |idem| async move {
             let mut tx = state.pool.begin().await?;
             let fork = match idem.prior_operation_id {
-                Some(operation_id) => repositories::find_by_operation(&mut tx, operation_id)
-                    .await?
-                    .ok_or_else(not_found)?,
+                Some(operation_id) => {
+                    let repo = repositories::find_by_operation(&mut tx, operation_id)
+                        .await?
+                        .ok_or_else(not_found)?;
+                    // A previously deleted repository must never be resurrected.
+                    if matches!(
+                        repo.status,
+                        RepositoryStatus::Deleted | RepositoryStatus::Deleting
+                    ) {
+                        return Err(not_found());
+                    }
+                    // Refresh updated_at before storage so the reconciler (which
+                    // visits only rows older than its grace) does not redo this
+                    // fork copy against the same tmp/<operation> while we build it.
+                    if !repositories::touch(&mut tx, repo.id).await? {
+                        return Err(not_found());
+                    }
+                    repo
+                }
                 None => {
                     let operation_id = Uuid::new_v4();
                     if !idem.record_operation(&mut tx, operation_id).await? {

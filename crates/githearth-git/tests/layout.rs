@@ -124,6 +124,111 @@ fn create_is_idempotent_and_refuses_mismatched_format() {
 }
 
 #[test]
+fn fetch_refs_mirrors_the_source_default_branch() {
+    let fixture = Fixture::new();
+    let storage = Storage::open(fixture.0.join("storage")).unwrap();
+
+    // A source repository whose default branch is `master`, not `main`.
+    let source = Uuid::new_v4();
+    let source_path = storage
+        .create(source, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+
+    let work = fixture.0.join("work");
+    fs::create_dir(&work).unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::new("git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("-C")
+            .arg(&work)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+
+    run(&["init", "-b", "master"]);
+    run(&["config", "user.name", "Fixture"]);
+    run(&["config", "user.email", "fixture@example.invalid"]);
+    fs::write(work.join("file.txt"), b"content\n").unwrap();
+    run(&["add", "file.txt"]);
+    run(&["commit", "-m", "root"]);
+    run(&["push", source_path.to_str().unwrap(), "master"]);
+
+    // Point the source's default branch at master regardless of git's own HEAD
+    // handling on the first push.
+    let head = Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .arg("--git-dir")
+        .arg(&source_path)
+        .args(["symbolic-ref", "HEAD", "refs/heads/master"])
+        .output()
+        .unwrap();
+    assert!(
+        head.status.success(),
+        "{}",
+        String::from_utf8_lossy(&head.stderr)
+    );
+
+    // Fork: copy refs and HEAD into a fresh target.
+    let target = Uuid::new_v4();
+    storage
+        .create(target, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+    storage.fetch_refs(target, source).unwrap();
+
+    let target_path = repo_dir(&fixture.0.join("storage"), target);
+    let head = fs::read_to_string(target_path.join("HEAD")).unwrap();
+    assert_eq!(head, "ref: refs/heads/master\n");
+
+    // `git clone` of the fork must check out the same default branch.
+    let clone = fixture.0.join("clone");
+    let output = Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "clone",
+            "--",
+            target_path.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let checked_out = Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .arg("-C")
+        .arg(&clone)
+        .args(["symbolic-ref", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(checked_out.stdout).unwrap().trim(),
+        "refs/heads/master"
+    );
+}
+
+#[test]
 fn create_removes_leftover_tmp_before_reuse() {
     let fixture = Fixture::new();
     let root = fixture.0.join("storage");

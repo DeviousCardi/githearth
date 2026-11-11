@@ -447,6 +447,10 @@ impl Storage {
     /// The target keeps its own configuration, hooks and empty journal; only Git
     /// objects and branch/tag refs are brought over. Used to create a fork.
     ///
+    /// The source's `HEAD` is mirrored too, so a fork of a repository whose
+    /// default branch is not `main` still points its default branch at the same
+    /// branch instead of a dangling `main` (which would break `git clone`).
+    ///
     /// The caller must hold the target repository's lock (and, to be safe
     /// against concurrent pushes, the source's) before calling this.
     pub fn fetch_refs(&self, target: Uuid, source: Uuid) -> Result<(), StorageError> {
@@ -464,6 +468,10 @@ impl Storage {
                 .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"])
                 .output()?,
         )?;
+        // Mirror the source's HEAD (symbolic ref, or a detached object id) so
+        // the fork's default branch matches the parent's.
+        let head = std::fs::read_to_string(source_path.join("HEAD"))?;
+        std::fs::write(target_path.join("HEAD"), head)?;
         Ok(())
     }
 
