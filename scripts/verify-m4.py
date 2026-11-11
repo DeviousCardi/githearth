@@ -50,6 +50,7 @@ EXPECTED_ACCESS = {
     ("reader", "archived", "clone"): True, ("reader", "archived", "push"): False,
 }
 HarnessError = _m2.HarnessError
+Skipped = _m2.Skipped
 
 
 class M4Server:
@@ -1968,11 +1969,7 @@ class M4Harness(_m2.Harness):
             subprocess.run(["docker", "compose", "version"],
                            capture_output=True, check=True)
         except (FileNotFoundError, subprocess.CalledProcessError):
-            self.scenarios.append({
-                "name": "s13_compose", "result": "SKIP", "wall_seconds": 0.0,
-                "detail": "docker compose is unavailable"})
-            print("SKIP: s13_compose (docker compose is unavailable)")
-            return
+            raise Skipped("docker compose is unavailable")
 
         project = "githearth-m4-compose-" + uuid.uuid4().hex[:12]
         pg_port = self.free_port()
@@ -1980,20 +1977,16 @@ class M4Harness(_m2.Harness):
         ssh_port = self.free_port()
         password = secrets.token_hex(32)
 
-        override = self.tmp / "compose.override.yaml"
-        override.write_text(
-            "services:\n"
-            "  postgres:\n"
-            f"    ports: [\"127.0.0.1:{pg_port}:5432\"]\n"
-            "  app:\n"
-            f"    ports: [\"127.0.0.1:{http_port}:8080\", \"127.0.0.1:{ssh_port}:2222\"]\n"
-        )
         envf = self.tmp / "compose.env"
-        envf.write_text("POSTGRES_PASSWORD=" + password + "\n")
+        envf.write_text(
+            "POSTGRES_PASSWORD=" + password + "\n"
+            f"GITHEARTH_POSTGRES_PORT={pg_port}\n"
+            f"GITHEARTH_HTTP_PORT={http_port}\n"
+            f"GITHEARTH_SSH_PORT={ssh_port}\n")
         envf.chmod(0o600)
 
         base = ["docker", "compose", "-p", project,
-                "-f", str(ROOT / "compose.yaml"), "-f", str(override),
+                "-f", str(ROOT / "compose.yaml"),
                 "--env-file", str(envf)]
         self._compose_base = base
         try:
