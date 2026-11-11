@@ -189,10 +189,10 @@ pub async fn applied_through(
 }
 
 /// Deletes `push_credentials` rows older than one day whose push has already
-/// been applied. A push is committed long before the credential record reaches
-/// this age, so any replay that needs the credential has already read it;
-/// afterwards the event degrades to null fields. Rows without an applied push
-/// (a refused or still-pending push) are kept.
+/// been applied. Safety comes from the EXISTS(repository_pushes.operation_id =
+/// push_credentials.operation_id) guard, which keeps any not-yet-applied
+/// push's credential regardless of age. Rows without an applied push (a
+/// refused or still-pending push) are kept.
 pub async fn sweep_credentials(conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "DELETE FROM push_credentials
