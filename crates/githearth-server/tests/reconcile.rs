@@ -883,10 +883,11 @@ async fn push_credential_sweep_count_lands_in_summary() {
     let repo_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
-         VALUES ($1,$2,'sweep', $3,$4,'active','private')",
+         VALUES ($1,$2,$3,$4,$5,'active','private')",
     )
     .bind(repo_id)
     .bind(env.org)
+    .bind(tag("sweep"))
     .bind(env.owner)
     .bind(Uuid::new_v4())
     .execute(&mut *conn)
