@@ -15,7 +15,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    AppState, authenticate_token_hash, facts, repositories, repository_api, verify_password,
+    AppState, authenticate_token_hash, facts, forks, idempotency, repositories, repository_api,
+    verify_password,
 };
 
 #[derive(Deserialize)]
@@ -590,7 +591,7 @@ async fn repository(
     headers: HeaderMap,
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, UiError> {
-    let (repo, username, csrf) = match browser_auth(&state, &headers).await {
+    let (repo, username, csrf, account_id) = match browser_auth(&state, &headers).await {
         Ok((account, auth_age)) => {
             let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
                 .await
@@ -611,12 +612,13 @@ async fn repository(
                 loaded.repo,
                 Some(account.username),
                 Some(csrf_expected(&hash)),
+                Some(account.id),
             )
         }
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
             // An anonymous visitor may read public repositories only.
             match repository_api::load_public_anonymous(&state, &slug, &name).await {
-                Some(repo) => (repo, None, None),
+                Some(repo) => (repo, None, None, None),
                 None => return Err(auth_required()),
             }
         }
@@ -675,14 +677,58 @@ async fn repository(
         url_encode(&slug),
         url_encode(&repo.name)
     ));
+    // A fork is offered to anyone who can read the repository and belongs to at
+    // least one (non-suspended) organization to fork into.
+    let fork_section = match account_id {
+        Some(account_id) if repo.status == githearth_core::RepositoryStatus::Active => {
+            let org_rows = sqlx::query(
+                "SELECT o.slug FROM organizations o JOIN memberships m ON m.organization_id = o.id \
+                 WHERE m.account_id = $1 AND NOT o.suspended ORDER BY o.slug",
+            )
+            .bind(account_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| unavailable_page(username.as_deref()))?;
+            if org_rows.is_empty() {
+                String::new()
+            } else {
+                let mut options = String::new();
+                for row in &org_rows {
+                    let org_slug: String = row.get("slug");
+                    options.push_str(&format!(
+                        "<option value=\"{}\">{}</option>",
+                        esc(&org_slug),
+                        esc(&org_slug)
+                    ));
+                }
+                format!(
+                    "<div class=\"card\"><h2>Fork</h2>\
+<form method=\"post\" action=\"/organizations/{}/repositories/{}/fork\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<input type=\"hidden\" name=\"idempotency_key\" value=\"{}\">\
+<label for=\"fork_org\">Organization</label><select id=\"fork_org\" name=\"organization\">{}</select>\
+<label for=\"fork_name\">Name</label><input id=\"fork_name\" name=\"name\" value=\"{}\">\
+<p><button type=\"submit\">Fork repository</button></p></form></div>",
+                    url_encode(&slug),
+                    url_encode(&repo.name),
+                    esc(csrf.as_deref().unwrap_or_default()),
+                    esc(&Uuid::new_v4().simple().to_string()),
+                    options,
+                    esc(&repo.name),
+                )
+            }
+        }
+        _ => String::new(),
+    };
     let body = format!(
-        "<h1>{}</h1><div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>",
+        "<h1>{}</h1><div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>{}",
         esc(&repo.name),
         esc(&slug),
         esc(&repo.visibility),
         esc(repo.status.as_str()),
         esc(&repo.description),
-        browse_section
+        browse_section,
+        fork_section
     );
     Ok(Html(render_page(
         "Repository",
@@ -696,6 +742,106 @@ async fn repository(
 /// Pages carry account data and a sign-out form: keep them out of shared caches and frames.
 pub(crate) const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; \
      form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+#[derive(Deserialize)]
+struct ForkForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    #[serde(default)]
+    organization: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// Submits a fork from the repository page. Same authorization and validation
+/// as the JSON API, driven by the browser session and CSRF token.
+async fn fork_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name)): Path<(String, String)>,
+    Form(form): Form<ForkForm>,
+) -> Result<Response, UiError> {
+    let token_hash = browser_token_hash(&headers).ok_or_else(auth_required)?;
+    if !csrf_matches(&form.csrf_token, &csrf_expected(&token_hash)) {
+        return Err(forbidden_page());
+    }
+    let (account, auth_age) = match browser_auth(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
+        Err(_) => return Err(unavailable_page(None)),
+    };
+    let key = if idempotency::valid_key(&form.idempotency_key) {
+        &form.idempotency_key
+    } else {
+        return Err(UiError(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Html(render_page(
+                    "Invalid request",
+                    Some(&account.username),
+                    None,
+                    "<h1>Invalid request</h1><p>Reload the page and submit the form again.</p>",
+                )),
+            )
+                .into_response(),
+        )));
+    };
+    let payload = serde_json::json!({
+        "organization": form.organization,
+        "name": if form.name.trim().is_empty() { serde_json::Value::Null } else { serde_json::Value::String(form.name.trim().to_owned()) },
+    })
+    .to_string();
+    let result = forks::create_fork(
+        &state,
+        account.id,
+        auth_age,
+        &slug,
+        &name,
+        payload.as_bytes(),
+        Some(key),
+    )
+    .await;
+    match result {
+        Ok((_, value)) => {
+            let fork_name = value["name"].as_str().unwrap_or(&name);
+            Ok(Redirect::to(&format!(
+                "/organizations/{}/repositories/{}",
+                url_encode(&form.organization),
+                url_encode(fork_name)
+            ))
+            .into_response())
+        }
+        Err(e) => Err(fork_error(&account.username, e)),
+    }
+}
+
+/// Maps a fork-submit failure to the page a browser should see.
+fn fork_error(username: &str, error: crate::ApiError) -> UiError {
+    let (status, message) = match error.status_code() {
+        StatusCode::NOT_FOUND => (StatusCode::NOT_FOUND, "The repository no longer exists."),
+        StatusCode::FORBIDDEN => (
+            StatusCode::FORBIDDEN,
+            "You do not have permission to fork this repository.",
+        ),
+        StatusCode::CONFLICT => (StatusCode::CONFLICT, error.message()),
+        StatusCode::BAD_REQUEST => (StatusCode::BAD_REQUEST, "Check the form and try again."),
+        _ => return unavailable_page(Some(username)),
+    };
+    UiError(Box::new(
+        (
+            status,
+            Html(render_page(
+                "Fork",
+                Some(username),
+                None,
+                &format!("<h1>Fork failed</h1><p>{}</p>", esc(message)),
+            )),
+        )
+            .into_response(),
+    ))
+}
 
 async fn page_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
@@ -714,6 +860,10 @@ pub fn router() -> Router<AppState> {
         .route("/organizations/{slug}", get(organization))
         .route("/organizations/{slug}/repositories", get(organization))
         .route("/organizations/{slug}/repositories/{name}", get(repository))
+        .route(
+            "/organizations/{slug}/repositories/{name}/fork",
+            axum::routing::post(fork_submit),
+        )
         .merge(crate::issues_ui::router())
         .merge(crate::pulls_ui::router())
         .merge(crate::browse_ui::router())

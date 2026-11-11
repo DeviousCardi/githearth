@@ -2325,8 +2325,8 @@ async fn update_ref_expected_journals_merge_origin_and_replay_records_merge_resu
     let pull_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO pull_requests \
-         (id, repository_id, number, title, body, author_id, source_branch, target_branch) \
-         VALUES ($1, $2, 1, 'merge', '', $3, 'feature', 'main')",
+         (id, repository_id, number, title, body, author_id, source_branch, target_branch, source_repository_id) \
+         VALUES ($1, $2, 1, 'merge', '', $3, 'feature', 'main', $2)",
     )
     .bind(pull_id)
     .bind(fx.repo_id)

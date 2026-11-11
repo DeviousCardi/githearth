@@ -296,12 +296,49 @@ pub async fn execute_intent(
             reason: "target moved".into(),
         });
     }
-    if read_ref(&repo_path, &source_ref, timeout).await?.as_deref()
+
+    // A cross-repository pull takes its head from a fork. Read the head from
+    // the fork (which must still be active) and bring its objects into the
+    // target so the candidate can be built there (ADR 0007). The target's
+    // per-repository lock is already held; the fork is only read.
+    let source_repository_id = pull.source_repository_id;
+    let cross_repo = source_repository_id != repository_id;
+    let source_repo_path = if cross_repo {
+        let mut conn = state.pool.acquire().await?;
+        let Some(source_repo) = crate::repositories::get(&mut conn, source_repository_id).await?
+        else {
+            return Ok(MergeOutcome::Stale {
+                reason: "source repository not found".into(),
+            });
+        };
+        if source_repo.status != githearth_core::RepositoryStatus::Active {
+            return Ok(MergeOutcome::Stale {
+                reason: "source repository not active".into(),
+            });
+        }
+        state.storage.repository_path(source_repository_id)
+    } else {
+        repo_path.clone()
+    };
+
+    if read_ref(&source_repo_path, &source_ref, timeout)
+        .await?
+        .as_deref()
         != Some(intent.source_oid.as_str())
     {
         return Ok(MergeOutcome::Stale {
             reason: "source moved".into(),
         });
+    }
+
+    if cross_repo {
+        let storage = state.storage.clone();
+        let fetch_ref = source_ref.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.fetch_ref(repository_id, source_repository_id, &fetch_ref)
+        })
+        .await
+        .map_err(MergeError::Join)??;
     }
 
     // Actor authorization, re-evaluated under the lock. A merge is a routine

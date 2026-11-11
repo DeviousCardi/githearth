@@ -15,6 +15,7 @@ pub struct RepositoryRow {
     pub operation_id: Uuid,
     pub created_by: Uuid,
     pub object_format: String,
+    pub parent_repository_id: Option<Uuid>,
 }
 
 fn row_to_repository(row: &sqlx::postgres::PgRow) -> RepositoryRow {
@@ -30,10 +31,11 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> RepositoryRow {
         operation_id: row.get("operation_id"),
         created_by: row.get("created_by"),
         object_format: row.get("object_format"),
+        parent_repository_id: row.get("parent_repository_id"),
     }
 }
 
-const REPO_COLS: &str = "id, organization_id, name, description, visibility, archived, status, operation_id, created_by, object_format";
+const REPO_COLS: &str = "id, organization_id, name, description, visibility, archived, status, operation_id, created_by, object_format, parent_repository_id";
 
 pub async fn insert_creating(
     conn: &mut PgConnection,
@@ -44,7 +46,7 @@ pub async fn insert_creating(
     visibility: &str,
     description: &str,
 ) -> Result<RepositoryRow, sqlx::Error> {
-    insert_creating_with_format(
+    insert_creating_impl(
         conn,
         organization_id,
         name,
@@ -53,6 +55,7 @@ pub async fn insert_creating(
         visibility,
         description,
         "sha1",
+        None,
     )
     .await
 }
@@ -68,10 +71,65 @@ pub async fn insert_creating_with_format(
     description: &str,
     object_format: &str,
 ) -> Result<RepositoryRow, sqlx::Error> {
+    insert_creating_impl(
+        conn,
+        organization_id,
+        name,
+        created_by,
+        operation_id,
+        visibility,
+        description,
+        object_format,
+        None,
+    )
+    .await
+}
+
+/// Like [`insert_creating`], but records `parent_repository_id` (and the
+/// parent's `object_format`) so the new repository is a fork of an existing one
+/// (M3 fork contributions).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_creating_with_parent(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+    created_by: Uuid,
+    operation_id: Uuid,
+    visibility: &str,
+    description: &str,
+    object_format: &str,
+    parent_repository_id: Option<Uuid>,
+) -> Result<RepositoryRow, sqlx::Error> {
+    insert_creating_impl(
+        conn,
+        organization_id,
+        name,
+        created_by,
+        operation_id,
+        visibility,
+        description,
+        object_format,
+        parent_repository_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_creating_impl(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+    created_by: Uuid,
+    operation_id: Uuid,
+    visibility: &str,
+    description: &str,
+    object_format: &str,
+    parent_repository_id: Option<Uuid>,
+) -> Result<RepositoryRow, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query(
         "WITH retired AS (DELETE FROM repository_redirects WHERE organization_id=$2 AND lower(name)=lower($3)) \
-         INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, description, object_format) VALUES ($1,$2,$3,$4,$5,'creating',$6,$7,$8)",
+         INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, description, object_format, parent_repository_id) VALUES ($1,$2,$3,$4,$5,'creating',$6,$7,$8,$9)",
     )
     .bind(id)
     .bind(organization_id)
@@ -81,6 +139,7 @@ pub async fn insert_creating_with_format(
     .bind(visibility)
     .bind(description)
     .bind(object_format)
+    .bind(parent_repository_id)
     .execute(&mut *conn)
     .await?;
     find_by_operation(conn, operation_id)
@@ -130,7 +189,30 @@ pub async fn finish_delete(
     .bind(id)
     .execute(&mut *conn)
     .await?;
+    // A deleted (or otherwise inaccessible) fork can no longer be the source of
+    // an open pull request: close those pulls with a recorded reason (M3).
+    close_fork_pull_requests(conn, id, "source repository deleted").await?;
     Ok(true)
+}
+
+/// Closes every open pull request whose head lives in `source_repository_id`,
+/// recording `reason`. This runs when a fork is deleted or made inaccessible so
+/// its outstanding contributions are not left dangling on an unreadable head.
+pub async fn close_fork_pull_requests(
+    conn: &mut PgConnection,
+    source_repository_id: Uuid,
+    reason: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE pull_requests SET state = 'closed', closed_at = now(), \
+         closed_reason = $1, updated_at = now() \
+         WHERE source_repository_id = $2 AND state = 'open'",
+    )
+    .bind(reason)
+    .bind(source_repository_id)
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Bump `updated_at` so the lifecycle reconciler (which only visits rows older
@@ -175,7 +257,7 @@ pub async fn find_by_name(
         return Ok(row);
     }
     sqlx::query(
-        "SELECT r.id, r.organization_id, r.name, r.description, r.visibility, r.archived, r.status, r.operation_id, r.created_by, r.object_format FROM repository_redirects d JOIN repositories r ON r.id = d.repository_id WHERE d.organization_id=$1 AND lower(d.name)=lower($2) AND r.status <> 'deleted'",
+        "SELECT r.id, r.organization_id, r.name, r.description, r.visibility, r.archived, r.status, r.operation_id, r.created_by, r.object_format, r.parent_repository_id FROM repository_redirects d JOIN repositories r ON r.id = d.repository_id WHERE d.organization_id=$1 AND lower(d.name)=lower($2) AND r.status <> 'deleted'",
     )
     .bind(organization_id)
     .bind(name)

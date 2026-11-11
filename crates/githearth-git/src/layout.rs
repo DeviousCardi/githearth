@@ -442,6 +442,58 @@ impl Storage {
         self.verified_dir(&final_path)
     }
 
+    /// Copies every head and tag ref (and the objects they reach) from `source`
+    /// into `target`, which must already exist (see [`create`](Storage::create)).
+    /// The target keeps its own configuration, hooks and empty journal; only Git
+    /// objects and branch/tag refs are brought over. Used to create a fork.
+    ///
+    /// The caller must hold the target repository's lock (and, to be safe
+    /// against concurrent pushes, the source's) before calling this.
+    pub fn fetch_refs(&self, target: Uuid, source: Uuid) -> Result<(), StorageError> {
+        let target_path = self.verified_dir(&self.repository_path(target))?;
+        let source_path = self.verified_dir(&self.repository_path(source))?;
+        checked(
+            git()
+                .arg("--git-dir")
+                .arg(&target_path)
+                // A server-managed copy, not a user push: skip the
+                // reference-transaction hook that refuses internal ref writes.
+                .args(["-c", "core.hooksPath=/dev/null"])
+                .args(["fetch", "--no-write-fetch-head", "--"])
+                .arg(&source_path)
+                .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"])
+                .output()?,
+        )?;
+        Ok(())
+    }
+
+    /// Fetches one ref (as `refs/...`) and the objects it reaches from `source`
+    /// into `target` without creating or moving any ref in the target. Used to
+    /// bring a fork's head branch into the target so a merge candidate can be
+    /// built there (ADR 0007). The caller must hold the target's lock.
+    pub fn fetch_ref(
+        &self,
+        target: Uuid,
+        source: Uuid,
+        reference: &str,
+    ) -> Result<(), StorageError> {
+        let target_path = self.verified_dir(&self.repository_path(target))?;
+        let source_path = self.verified_dir(&self.repository_path(source))?;
+        checked(
+            git()
+                .arg("--git-dir")
+                .arg(&target_path)
+                // Objects only, no target ref is written, but keep the hook
+                // disabled so an internal ref write can never run admission.
+                .args(["-c", "core.hooksPath=/dev/null"])
+                .args(["fetch", "--no-write-fetch-head", "--"])
+                .arg(&source_path)
+                .arg(reference)
+                .output()?,
+        )?;
+        Ok(())
+    }
+
     pub fn trash(&self, repository: Uuid) -> Result<PathBuf, StorageError> {
         let source = self.repository_path(repository);
         self.verified_dir(&source)?;

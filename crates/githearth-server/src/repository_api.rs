@@ -40,7 +40,7 @@ pub(crate) struct NewRepository {
     object_format: Option<String>,
 }
 
-fn valid_repo_name(name: &str) -> bool {
+pub(crate) fn valid_repo_name(name: &str) -> bool {
     (1..=100).contains(&name.len())
         && name
             .bytes()
@@ -59,6 +59,7 @@ pub(crate) struct RepositoryJson {
     visibility: String,
     archived: bool,
     status: String,
+    parent_repository_id: Option<Uuid>,
 }
 
 impl From<&repositories::RepositoryRow> for RepositoryJson {
@@ -71,6 +72,7 @@ impl From<&repositories::RepositoryRow> for RepositoryJson {
             visibility: row.visibility.clone(),
             archived: row.archived,
             status: row.status.as_str().to_owned(),
+            parent_repository_id: row.parent_repository_id,
         }
     }
 }

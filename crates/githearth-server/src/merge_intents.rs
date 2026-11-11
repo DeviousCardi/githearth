@@ -288,7 +288,7 @@ pub(crate) async fn may_merge(
         crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
     drop(conn);
 
-    let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+    let head = pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
     let target_ref = format!("refs/heads/{}", pull.target_branch);
     let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
     // A deleted source branch has no head; create_intent would refuse this
@@ -397,7 +397,8 @@ pub(crate) async fn create_intent(
                 crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
             drop(conn);
 
-            let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+            let head =
+                pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
             let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
             let (Some(head), Some(base)) = (head, base) else {
                 return Err(branch_missing());
@@ -879,8 +880,8 @@ mod tests {
         .unwrap();
         let pull = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst',$2)",
         )
         .bind(pull)
         .bind(repo)

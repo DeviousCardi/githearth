@@ -200,8 +200,8 @@ async fn finish(f: Fixture) {
 async fn pull_request(f: &Fixture, title: &str, number: i32) -> (Uuid, i32) {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-         VALUES ($1,$2,$3,$4,'',$5,'feature','main')",
+        "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+         VALUES ($1,$2,$3,$4,'',$5,'feature','main',$2)",
     )
     .bind(id)
     .bind(f.repo_id)

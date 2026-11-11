@@ -141,6 +141,7 @@ fn line_count(content: &[u8]) -> usize {
 }
 
 const PULL_COLUMNS: &str = "id, number, title, body, state, author_id, source_branch, target_branch, \
+ source_repository_id, closed_reason, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at, \
  to_char(closed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS closed_at";
@@ -162,6 +163,8 @@ pub(crate) struct PullJson {
     pub(crate) author_id: Uuid,
     pub(crate) source_branch: String,
     pub(crate) target_branch: String,
+    pub(crate) source_repository_id: Uuid,
+    pub(crate) closed_reason: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) closed_at: Option<String>,
@@ -312,7 +315,7 @@ pub(crate) async fn branch_tip(
 
 async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, ApiError> {
     Ok((
-        branch_tip(state, repo_id, &pull.source_branch).await?,
+        branch_tip(state, pull.source_repository_id, &pull.source_branch).await?,
         branch_tip(state, repo_id, &pull.target_branch).await?,
     ))
 }
@@ -372,20 +375,77 @@ struct NewPull {
     body: String,
     source_branch: String,
     target_branch: String,
+    /// `"{org}/{repo}"` of a fork to take the head from. Absent means a
+    /// same-repository pull request.
+    #[serde(default)]
+    source_repository: Option<String>,
 }
 
 fn new_pull(body: &[u8]) -> Result<NewPull, ApiError> {
     let input: NewPull = serde_json::from_slice(body).map_err(|_| invalid())?;
+    let same_repo = input.source_repository.is_none();
     if input.title.trim().is_empty()
         || input.title.chars().count() > 256
         || input.body.chars().count() > 65536
         || !valid_branch(&input.source_branch)
         || !valid_branch(&input.target_branch)
-        || input.source_branch == input.target_branch
+        // A same-repository pull must name two distinct branches; a
+        // cross-repository pull may use the same branch name on both sides.
+        || (same_repo && input.source_branch == input.target_branch)
+        || input
+            .source_repository
+            .as_deref()
+            .is_some_and(|s| s.is_empty() || s.matches('/').count() != 1)
     {
         return Err(invalid());
     }
     Ok(input)
+}
+
+/// Resolves a `"{org}/{repo}"` source specification to the fork repository id,
+/// verifying it is an active fork of `target` that the actor can read.
+async fn resolve_source_repository(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    target: &Loaded,
+    spec: &str,
+) -> Result<Uuid, ApiError> {
+    let (source_org, source_name) = spec
+        .split_once('/')
+        .filter(|(o, n)| !o.is_empty() && !n.is_empty())
+        .ok_or_else(invalid)?;
+    let mut conn = state.pool.acquire().await?;
+    let source_org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(source_org)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "organization not found"))?;
+    let source_repo = repositories::find_by_name(&mut conn, source_org_id, source_name)
+        .await?
+        .ok_or_else(not_found)?;
+    if source_repo.parent_repository_id != Some(target.repo.id) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "source repository is not a fork of the target",
+        ));
+    }
+    if source_repo.status != RepositoryStatus::Active {
+        return Err(not_active());
+    }
+    let Some(facts) = facts::load(&mut conn, actor_id, source_org_id).await? else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "organization not found"));
+    };
+    let authz_repo = repositories::authz_repository(&source_repo);
+    let read = state.authz.authorize(&facts.request(
+        Action::RepositoryRead,
+        Resource::Repository(&authz_repo),
+        Some(Duration::from_secs(auth_age)),
+    ));
+    if !read.is_allowed() {
+        return Err(not_found());
+    }
+    Ok(source_repo.id)
 }
 
 async fn create(
@@ -432,7 +492,14 @@ pub(crate) async fn create_pull(
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
             }
-            let head = branch_tip(state, loaded.repo.id, &input.source_branch).await?;
+            // Resolve the source repository: the target itself for a
+            // same-repository pull, or a fork of the target (M3).
+            let source_repository_id = match input.source_repository.as_deref() {
+                None => loaded.repo.id,
+                Some(spec) => resolve_source_repository(state, actor_id, auth_age, &loaded, spec)
+                    .await?,
+            };
+            let head = branch_tip(state, source_repository_id, &input.source_branch).await?;
             let base = branch_tip(state, loaded.repo.id, &input.target_branch).await?;
             if head.is_none() || base.is_none() {
                 return Err(branch_missing());
@@ -446,9 +513,9 @@ pub(crate) async fn create_pull(
             let id = Uuid::new_v4();
             let inserted = sqlx::query(
                 "INSERT INTO pull_requests \
-                 (id, repository_id, number, title, body, author_id, source_branch, target_branch) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (repository_id, source_branch, target_branch) WHERE state = 'open' \
+                 (id, repository_id, number, title, body, author_id, source_branch, target_branch, source_repository_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 ON CONFLICT (repository_id, source_repository_id, source_branch, target_branch) WHERE state = 'open' \
                  DO NOTHING",
             )
             .bind(id)
@@ -459,6 +526,7 @@ pub(crate) async fn create_pull(
             .bind(actor_id)
             .bind(&input.source_branch)
             .bind(&input.target_branch)
+            .bind(source_repository_id)
             .execute(&mut *tx)
             .await?;
             if inserted.rows_affected() == 0 {
@@ -832,7 +900,7 @@ pub(crate) async fn create_pull_comment(
                 return Err(not_active());
             }
             if let Some(commit) = input.commit_id.clone() {
-                if branch_tip(state, loaded.repo.id, &pull.source_branch)
+                if branch_tip(state, pull.source_repository_id, &pull.source_branch)
                     .await?
                     .as_ref()
                     != Some(&commit)
@@ -1104,7 +1172,7 @@ pub(crate) async fn create_pull_review(
             }
             // A push racing this check leaves a review bound to the commit the
             // reviewer saw, which simply stops counting.
-            if branch_tip(state, loaded.repo.id, &pull.source_branch)
+            if branch_tip(state, pull.source_repository_id, &pull.source_branch)
                 .await?
                 .as_ref()
                 != Some(&input.commit_id)
@@ -1645,8 +1713,8 @@ mod tests {
         .unwrap();
         let pull = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst',$2)",
         )
         .bind(pull)
         .bind(repo)
