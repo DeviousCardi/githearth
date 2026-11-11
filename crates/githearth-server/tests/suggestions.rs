@@ -810,3 +810,77 @@ async fn a_member_without_read_access_cannot_probe_a_comment() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_comment_from_another_pull_request_cannot_be_applied() {
+    let f = build_fixture().await;
+
+    // A suggestion comment anchored to the first pull request's head.
+    let (status, comment) = add_suggestion_comment(&f, &f.token, "other\n").await;
+    assert_eq!(status, StatusCode::CREATED, "{comment}");
+    let comment_id = comment["id"].as_str().unwrap().to_owned();
+
+    // A second pull request in the same repository, on its own branch.
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "-b", "other-branch"])).await;
+    std::fs::write(f.work.join("other.txt"), "other\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "other.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "other",
+    ]))
+    .await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "other-branch",
+    ]))
+    .await;
+
+    let (status, pull) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.org_slug, &f.repo_name),
+        Some(&f.token),
+        json!({"title": "other pull", "source_branch": "other-branch", "target_branch": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{pull}");
+    let other_number = pull["number"].as_i64().unwrap();
+
+    // Applying the first pull's comment through the second pull's URL reads as
+    // a missing comment — the same 404 as a nonexistent id, not a 409 or 422.
+    let missing = Uuid::nil().to_string();
+    for id in [comment_id.as_str(), missing.as_str()] {
+        let (status, body) = request(
+            &f.app,
+            "POST",
+            &format!(
+                "{}/{}/comments/{id}/apply",
+                repo_href(&f.org_slug, &f.repo_name),
+                other_number
+            ),
+            Some(&f.token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    finish(f).await;
+}

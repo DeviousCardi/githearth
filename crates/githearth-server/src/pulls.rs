@@ -272,18 +272,22 @@ fn comment_json(row: CommentRow, head: Option<&str>) -> CommentJson {
     }
 }
 
-/// Loads one comment with its thread's resolution (a reply's parent carries
-/// the resolution; a root resolves itself).
+/// Loads one comment on `pull_request_id` with its thread's resolution (a
+/// reply's parent carries the resolution; a root resolves itself). Scoping to
+/// the pull request means a comment id from another pull request (or
+/// repository) reads as missing, the same 404 as a nonexistent one.
 async fn fetch_comment_row(
     conn: &mut PgConnection,
+    pull_request_id: Uuid,
     comment_id: Uuid,
 ) -> Result<Option<CommentRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {COMMENT_ROW_COLUMNS} FROM pull_request_comments c \
          LEFT JOIN pull_request_comments parent ON parent.id = c.in_reply_to \
-         WHERE c.id = $1"
+         WHERE c.id = $1 AND c.pull_request_id = $2"
     ))
     .bind(comment_id)
+    .bind(pull_request_id)
     .fetch_optional(&mut *conn)
     .await
 }
@@ -988,7 +992,9 @@ pub(crate) async fn create_pull_comment(
             )
             .await?;
 
-            let comment = fetch_comment_row(&mut tx, id).await?.expect("just inserted");
+            let comment = fetch_comment_row(&mut tx, pull.id, id)
+                .await?
+                .expect("just inserted");
             let comment = comment_json(comment, input.commit_id.as_deref());
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&comment).unwrap();
@@ -1663,7 +1669,7 @@ pub(crate) async fn set_thread_resolved(
     )
     .await?;
 
-    let row = fetch_comment_row(&mut tx, comment_id)
+    let row = fetch_comment_row(&mut tx, pull.id, comment_id)
         .await?
         .expect("the target comment exists");
     tx.commit().await?;
@@ -1861,7 +1867,7 @@ pub(crate) async fn apply_pull_suggestion(
     require_pull(state, &loaded, &pull, Action::PullRequestRead)?;
 
     let mut conn = state.pool.acquire().await?;
-    let comment = fetch_comment_row(&mut conn, comment_id)
+    let comment = fetch_comment_row(&mut conn, pull.id, comment_id)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "comment not found"))?;
     drop(conn);
