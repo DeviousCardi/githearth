@@ -1672,6 +1672,48 @@ pub(crate) async fn set_thread_resolved(
 /// judged). The pull request author has no special path — an author who cannot
 /// push to the head branch (read-only access, or a protected branch) may not
 /// apply.
+/// The shared authorization check for applying a suggestion: `ref.push` on the
+/// source branch with its matching protection. A denial maps to 403 when the
+/// viewer can still read the repository and to 404 otherwise.
+fn apply_permission_decision(
+    state: &AppState,
+    facts: &facts::Facts,
+    repo: &repositories::RepositoryRow,
+    pull: &PullJson,
+    rules: &[protection::ProtectionRule],
+    auth_age: u64,
+) -> Result<(), ApiError> {
+    let ref_name = format!("refs/heads/{}", pull.source_branch);
+    let reference = Ref {
+        repository: repo.id,
+        name: ref_name.clone(),
+        protection: protection::matching(rules, &ref_name),
+        exists: true,
+    };
+    let authz_repo = repositories::authz_repository(repo);
+    let decision = state.authz.authorize(&facts.request(
+        Action::RefPush,
+        Resource::Ref(&authz_repo, &reference),
+        Some(Duration::from_secs(auth_age)),
+    ));
+    if decision.is_allowed() {
+        return Ok(());
+    }
+    let read_ok = state
+        .authz
+        .authorize(&facts.request(
+            Action::RepositoryRead,
+            Resource::Repository(&authz_repo),
+            Some(Duration::from_secs(auth_age)),
+        ))
+        .is_allowed();
+    if read_ok {
+        Err(ApiError(StatusCode::FORBIDDEN, "not permitted"))
+    } else {
+        Err(not_found())
+    }
+}
+
 pub(crate) async fn require_apply_permission(
     state: &AppState,
     loaded: &Loaded,
@@ -1680,35 +1722,38 @@ pub(crate) async fn require_apply_permission(
     let mut conn = state.pool.acquire().await?;
     let rules = protection::load_rules(&mut conn, loaded.repo.id).await?;
     drop(conn);
-    let ref_name = format!("refs/heads/{}", pull.source_branch);
-    let reference = Ref {
-        repository: loaded.repo.id,
-        name: ref_name.clone(),
-        protection: protection::matching(&rules, &ref_name),
-        exists: true,
-    };
-    let authz_repo = repositories::authz_repository(&loaded.repo);
-    let decision = state.authz.authorize(&loaded.facts.request(
-        Action::RefPush,
-        Resource::Ref(&authz_repo, &reference),
-        Some(Duration::from_secs(loaded.auth_age)),
-    ));
-    if decision.is_allowed() {
-        return Ok(());
-    }
-    let read_ok = state
-        .authz
-        .authorize(&loaded.facts.request(
-            Action::RepositoryRead,
-            Resource::Repository(&authz_repo),
-            Some(Duration::from_secs(loaded.auth_age)),
-        ))
-        .is_allowed();
-    if read_ok {
-        Err(ApiError(StatusCode::FORBIDDEN, "not permitted"))
-    } else {
-        Err(not_found())
-    }
+    apply_permission_decision(
+        state,
+        &loaded.facts,
+        &loaded.repo,
+        pull,
+        &rules,
+        loaded.auth_age,
+    )
+}
+
+/// Re-checks apply permission under the repository lock, reloading facts and
+/// rules so a protection rule added or a grant revoked between the early check
+/// and the ref update is not missed.
+pub(crate) async fn require_apply_permission_locked(
+    state: &AppState,
+    loaded: &Loaded,
+    pull: &PullJson,
+) -> Result<(), ApiError> {
+    let mut conn = state.pool.acquire().await?;
+    let rules = protection::load_rules(&mut conn, loaded.repo.id).await?;
+    let facts = facts::load(&mut conn, loaded.actor_id, loaded.org_id)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    apply_permission_decision(
+        state,
+        &facts,
+        &loaded.repo,
+        pull,
+        &rules,
+        loaded.auth_age,
+    )
 }
 
 /// What the pull request page may render for the current viewer, mirroring the
@@ -1843,6 +1888,9 @@ pub(crate) async fn apply_pull_suggestion(
         .repository_lock(loaded.repo.id)
         .lock_owned()
         .await;
+    // Re-check under the lock: a protection rule added or a grant revoked
+    // between the early check and now must not let a stale permission through.
+    require_apply_permission_locked(state, &loaded, &pull).await?;
     let repo_path = state.storage.repository_path(loaded.repo.id);
     let hooks_dir = state.config.storage_root.join("hooks");
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
@@ -2250,6 +2298,134 @@ mod tests {
 
         // close() waits for every checked-out connection, so return ours first.
         drop(conn);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn apply_permission_is_rechecked_under_the_lock() {
+        use sqlx::{ConnectOptions, postgres::PgPoolOptions};
+        use std::str::FromStr;
+
+        let url =
+            std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .disable_statement_logging();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused')")
+            .bind(account)
+            .bind(format!("al-{}", Uuid::new_v4().simple()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let org = Uuid::new_v4();
+        let org_slug = format!("o-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')",
+        )
+        .bind(org)
+        .bind(&org_slug)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')")
+            .bind(org)
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let grant_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) \
+             VALUES ($1,'write','account',$2,'organization',$3,$2)",
+        )
+        .bind(grant_id)
+        .bind(account)
+        .bind(org)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'r',$3,$4,'active','private')",
+        )
+        .bind(repo)
+        .bind(org)
+        .bind(account)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pull = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+        )
+        .bind(pull)
+        .bind(repo)
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let storage_root =
+            std::env::temp_dir().join(format!("githearth-apply-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let config = crate::Config {
+            database_url: url,
+            database_max_connections: 4,
+            database_timeout_seconds: 3,
+            storage_root: storage_root.clone(),
+            ..crate::Config::default()
+        };
+        let state = crate::AppState::new(pool.clone(), config).await.unwrap();
+
+        let loaded = repository_api::load_repo(&state, account, 0, &org_slug, "r")
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let pull = find_pull(&mut conn, repo, 1).await.unwrap().unwrap();
+        drop(conn);
+
+        // The write grant admits the early check.
+        require_apply_permission(&state, &loaded, &pull)
+            .await
+            .unwrap();
+
+        // Revoke the write grant and leave only read access. The early check's
+        // facts are stale, but the under-lock re-check reloads them and refuses.
+        sqlx::query("UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 WHERE id = $2")
+            .bind(account)
+            .bind(grant_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) \
+             VALUES ($1,'read','account',$2,'organization',$3,$2)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(account)
+        .bind(org)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = require_apply_permission_locked(&state, &loaded, &pull)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+
+        std::fs::remove_dir_all(&storage_root).unwrap();
         pool.close().await;
     }
 }
