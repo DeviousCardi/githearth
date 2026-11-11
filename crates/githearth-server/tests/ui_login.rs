@@ -695,3 +695,17 @@ async fn login_error_is_tied_to_the_credential_fields() {
     assert!(body.contains("aria-invalid=\"true\" aria-describedby=\"login-error\""));
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn login_csrf_error_is_tied_to_the_form() {
+    let (app, pool, _db) = setup().await;
+    let (status, body) = get_page(&app, "/login?error=csrf", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("id=\"csrf-error\""));
+    assert!(body.contains("role=\"alert\""));
+    assert!(
+        body.contains("<form method=\"post\" action=\"/login\" aria-describedby=\"csrf-error\">")
+    );
+    pool.close().await;
+}

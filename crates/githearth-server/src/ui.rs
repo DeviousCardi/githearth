@@ -306,18 +306,20 @@ async fn login_page(
         }
         Err(_) => {}
     }
-    let (error, credential_invalid) = if q.error.as_deref() == Some("1") {
+    let (error, credential_invalid, form_describedby) = if q.error.as_deref() == Some("1") {
         (
             "<p class=\"error\" role=\"alert\" id=\"login-error\">Invalid username or password.</p>",
             " aria-invalid=\"true\" aria-describedby=\"login-error\"",
+            "",
         )
     } else if q.error.as_deref() == Some("csrf") {
         (
-            "<p class=\"error\" role=\"alert\">Invalid CSRF token.</p>",
+            "<p class=\"error\" role=\"alert\" id=\"csrf-error\">Invalid CSRF token.</p>",
             "",
+            " aria-describedby=\"csrf-error\"",
         )
     } else {
-        ("", "")
+        ("", "", "")
     };
     // Reuse a well-formed token so a second sign-in tab does not invalidate the first.
     let token = csrf_cookie(&headers)
@@ -328,13 +330,14 @@ async fn login_page(
             hex::encode(bytes)
         });
     let body = format!(
-        "<h1>Sign in</h1><div class=\"card\">{error}<form method=\"post\" action=\"/login\">\
+        "<h1>Sign in</h1><div class=\"card\">{error}<form method=\"post\" action=\"/login\"{form_describedby}>\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
 <label for=\"username\">Username</label><input id=\"username\" name=\"username\" autocomplete=\"username\" required{credential_invalid}>\
 <label for=\"password\">Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required{credential_invalid}>\
 <button type=\"submit\">Sign in</button></form></div>",
         error = error,
-        csrf = esc(&token)
+        csrf = esc(&token),
+        form_describedby = form_describedby
     );
     let secure = if state.config.secure_cookies {
         "; Secure"
