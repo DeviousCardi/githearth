@@ -591,7 +591,7 @@ async fn repository(
     headers: HeaderMap,
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, UiError> {
-    let (repo, username, csrf, account_id) = match browser_auth(&state, &headers).await {
+    let (repo, username, csrf, account_id, auth_age) = match browser_auth(&state, &headers).await {
         Ok((account, auth_age)) => {
             let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
                 .await
@@ -613,12 +613,13 @@ async fn repository(
                 Some(account.username),
                 Some(csrf_expected(&hash)),
                 Some(account.id),
+                Some(auth_age),
             )
         }
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
             // An anonymous visitor may read public repositories only.
             match repository_api::load_public_anonymous(&state, &slug, &name).await {
-                Some(repo) => (repo, None, None, None),
+                Some(repo) => (repo, None, None, None, None),
                 None => return Err(auth_required()),
             }
         }
@@ -677,30 +678,55 @@ async fn repository(
         url_encode(&slug),
         url_encode(&repo.name)
     ));
-    // A fork is offered to anyone who can read the repository and belongs to at
-    // least one (non-suspended) organization to fork into.
-    let fork_section = match account_id {
-        Some(account_id) if repo.status == githearth_core::RepositoryStatus::Active => {
+    // A fork is offered to anyone who can read the repository and can create
+    // repositories in at least one (non-suspended) organization they belong to.
+    let fork_section = match (account_id, auth_age) {
+        (Some(account_id), Some(auth_age))
+            if repo.status == githearth_core::RepositoryStatus::Active =>
+        {
             let org_rows = sqlx::query(
-                "SELECT o.slug FROM organizations o JOIN memberships m ON m.organization_id = o.id \
+                "SELECT o.slug, o.id FROM organizations o JOIN memberships m ON m.organization_id = o.id \
                  WHERE m.account_id = $1 AND NOT o.suspended ORDER BY o.slug",
             )
             .bind(account_id)
             .fetch_all(&state.pool)
             .await
             .map_err(|_| unavailable_page(username.as_deref()))?;
-            if org_rows.is_empty() {
+            let mut options = String::new();
+            for row in &org_rows {
+                let org_slug: String = row.get("slug");
+                let org_id: Uuid = row.get("id");
+                // Forking needs `repository.create` on the target namespace, so a
+                // read-only member is never offered a namespace they cannot write to.
+                let mut conn = state
+                    .pool
+                    .acquire()
+                    .await
+                    .map_err(|_| unavailable_page(username.as_deref()))?;
+                let Some(facts) = facts::load(&mut conn, account_id, org_id)
+                    .await
+                    .map_err(|_| unavailable_page(username.as_deref()))?
+                else {
+                    continue;
+                };
+                drop(conn);
+                let create = state.authz.authorize(&facts.request(
+                    Action::RepositoryCreate,
+                    Resource::Organization,
+                    Some(Duration::from_secs(auth_age)),
+                ));
+                if !create.is_allowed() {
+                    continue;
+                }
+                options.push_str(&format!(
+                    "<option value=\"{}\">{}</option>",
+                    esc(&org_slug),
+                    esc(&org_slug)
+                ));
+            }
+            if options.is_empty() {
                 String::new()
             } else {
-                let mut options = String::new();
-                for row in &org_rows {
-                    let org_slug: String = row.get("slug");
-                    options.push_str(&format!(
-                        "<option value=\"{}\">{}</option>",
-                        esc(&org_slug),
-                        esc(&org_slug)
-                    ));
-                }
                 format!(
                     "<div class=\"card\"><h2>Fork</h2>\
 <form method=\"post\" action=\"/organizations/{}/repositories/{}/fork\">\

@@ -112,6 +112,21 @@ async fn get(app: &Router, path: &str, cookie: Option<&str>) -> StatusCode {
     response.status()
 }
 
+async fn get_body(app: &Router, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+    let mut builder = Request::builder().uri(path);
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn find_port_and_serve(app: &Router) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -213,6 +228,7 @@ struct Fixture {
     pool: PgPool,
     storage_root: PathBuf,
     parent_org_slug: String,
+    parent_org_id: Uuid,
     contrib_org_slug: String,
     owner_token: String,
     contributor_token: String,
@@ -223,6 +239,7 @@ struct Fixture {
     parent_repo_id: Uuid,
     parent_repo_path: PathBuf,
     fork_name: String,
+    fork_id: Uuid,
     fork_path: PathBuf,
     main_head: String,
     fork_feature_head: String,
@@ -432,6 +449,7 @@ async fn build_fixture() -> Fixture {
         pool,
         storage_root,
         parent_org_slug,
+        parent_org_id,
         contrib_org_slug,
         owner_token,
         contributor_token,
@@ -442,6 +460,7 @@ async fn build_fixture() -> Fixture {
         parent_repo_id,
         parent_repo_path,
         fork_name,
+        fork_id,
         fork_path,
         main_head,
         fork_feature_head,
@@ -714,6 +733,21 @@ async fn private_fork_is_hidden_from_unrelated_users_over_api_ui_and_git_http() 
 async fn deleting_the_fork_closes_its_open_pull_requests() {
     let f = build_fixture().await;
 
+    // A queued merge intent for the pull: fork deletion must cancel it.
+    let (status, intent) = create_merge_intent(&f, "merge", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let operation_id: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+
+    let closed_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE kind = 'pull_request.closed' AND organization_id = $1",
+    )
+    .bind(f.parent_org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(closed_before, 0);
+
     // Delete the fork via the API.
     let (status, _) = request(
         &f.app,
@@ -746,6 +780,209 @@ async fn deleting_the_fork_closes_its_open_pull_requests() {
     .await
     .unwrap();
     assert_eq!(reason.as_deref(), Some("source repository deleted"));
+
+    // The system close cancels the queued merge intent, like an author close.
+    let intent_state: String =
+        sqlx::query_scalar("SELECT state FROM merge_intents WHERE operation_id = $1")
+            .bind(operation_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(intent_state, "cancelled");
+
+    // And it leaves a per-pull audit trail.
+    let closed_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE kind = 'pull_request.closed' AND organization_id = $1",
+    )
+    .bind(f.parent_org_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(closed_after, 1);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn source_repository_fork_status_is_not_leaked_without_read_access() {
+    let f = build_fixture().await;
+
+    // Give the stranger read access to the parent (so they can open a pull
+    // request) but not to the contributor's organization.
+    let stranger_id: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+        .bind(&f.stranger_username)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id, account_id, role) VALUES ($1, $2, 'member')",
+    )
+    .bind(f.parent_org_id)
+    .bind(stranger_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO grants (id, role, subject_kind, subject_id, scope_kind, scope_id, granted_by) \
+         VALUES ($1, 'read', 'account', $2, 'organization', $3, $2)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(stranger_id)
+    .bind(f.parent_org_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    // A second, non-fork private repository in the contributor's organization.
+    let other_name = tag("other");
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!("/api/v1/organizations/{}/repositories", f.contrib_org_slug),
+        Some(&f.contributor_token),
+        json!({"name": other_name, "visibility": "private"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A source that is not a fork (and that the stranger cannot read) must look
+    // exactly like a source that does not exist: both are 404, so the fork
+    // relationship cannot be enumerated without read access.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.stranger_token),
+        json!({
+            "title": "probe",
+            "source_branch": "feature",
+            "target_branch": "main",
+            "source_repository": format!("{}/{}", f.contrib_org_slug, other_name),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.stranger_token),
+        json!({
+            "title": "probe",
+            "source_branch": "feature",
+            "target_branch": "main",
+            "source_repository": format!("{}/does-not-exist", f.contrib_org_slug),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_form_lists_only_namespaces_the_viewer_can_create_repositories_in() {
+    let f = build_fixture().await;
+
+    // The contributor owns contrib_org (so they can create repositories there)
+    // but has only read access to parent_org, so the fork form must offer only
+    // contrib_org and never parent_org.
+    let cookie = format!("githearth_session={}", f.contributor_token);
+    let path = format!(
+        "/organizations/{}/repositories/{}",
+        f.parent_org_slug, f.parent_repo_name
+    );
+    let (status, body) = get_body(&f.app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&format!("<option value=\"{}\">", f.contrib_org_slug)));
+    assert!(!body.contains(&format!("<option value=\"{}\">", f.parent_org_slug)));
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reopening_a_pull_request_clears_its_closed_reason() {
+    let f = build_fixture().await;
+
+    // Simulate a system close (as fork deletion would) directly, so the fork
+    // still exists and the pull request can be reopened through the API.
+    let pull_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM pull_requests WHERE repository_id = $1 AND number = $2")
+            .bind(f.parent_repo_id)
+            .bind(f.number as i32)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'closed', closed_at = now(), \
+         closed_reason = 'source repository deleted', updated_at = now() WHERE id = $1",
+    )
+    .bind(pull_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{}",
+            repo_href(&f.parent_org_slug, &f.parent_repo_name),
+            f.number
+        ),
+        Some(&f.owner_token),
+        json!({"state": "open"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT closed_reason FROM pull_requests WHERE id = $1")
+            .bind(pull_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(reason, None);
+
+    finish(f).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_merge_holds_the_fork_lock() {
+    let f = build_fixture().await;
+    let (status, intent) = create_merge_intent(&f, "merge", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+
+    // Hold the fork's repository lock, then run the merge: it must block until
+    // the lock is released, proving the merge serializes against fork pushes.
+    let fork_guard = f
+        .state
+        .storage
+        .repository_lock(f.fork_id)
+        .lock_owned()
+        .await;
+    let state = f.state.clone();
+    let merge_op = op;
+    let handle = tokio::spawn(async move { execute_intent(&state, merge_op).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !handle.is_finished(),
+        "merge completed while the fork lock was held"
+    );
+
+    drop(fork_guard);
+    let outcome = handle.await.unwrap().unwrap();
+    let oid = expect_merged(outcome);
+    assert_eq!(main_tip(&f).await, oid);
 
     finish(f).await;
 }

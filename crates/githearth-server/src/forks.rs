@@ -1,4 +1,4 @@
-//! Fork creation (M3 "fork contributions", ADR 0007).
+//! Fork creation (M3 "fork contributions", ADR 0008).
 //!
 //! A user with read access on a parent repository can fork it into a namespace
 //! they can create repositories in. The fork stores the parent id, copies Git
@@ -187,7 +187,7 @@ pub(crate) async fn create_fork(
             tx.commit().await?;
 
             // Storage: create the fork's bare repository, then copy the parent's
-            // refs and objects in (ADR 0007 chooses a full copy). Both locks are
+            // refs and objects in (ADR 0008 chooses a full copy). Both locks are
             // taken before any pool connection (lock ordering).
             let storage = state.storage.clone();
             let fork_guard = storage.repository_lock(fork_id).lock_owned().await;

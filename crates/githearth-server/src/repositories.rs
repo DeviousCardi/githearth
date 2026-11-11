@@ -167,12 +167,12 @@ pub async fn set_status(
 }
 
 pub async fn finish_delete(
-    conn: &mut PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
     actor: Uuid,
 ) -> Result<bool, sqlx::Error> {
     let changed = set_status(
-        conn,
+        tx,
         id,
         RepositoryStatus::Deleting,
         RepositoryStatus::Deleted,
@@ -187,22 +187,53 @@ pub async fn finish_delete(
     )
     .bind(actor)
     .bind(id)
-    .execute(&mut *conn)
+    .execute(&mut **tx)
     .await?;
-    // A deleted (or otherwise inaccessible) fork can no longer be the source of
-    // an open pull request: close those pulls with a recorded reason (M3).
-    close_fork_pull_requests(conn, id, "source repository deleted").await?;
+    // A deleted fork can no longer be the source of an open pull request: close
+    // those pulls with a recorded reason and the usual audit trail (M3).
+    close_fork_pull_requests(tx, id, actor, "source repository deleted").await?;
     Ok(true)
 }
 
 /// Closes every open pull request whose head lives in `source_repository_id`,
-/// recording `reason`. This runs when a fork is deleted or made inaccessible so
-/// its outstanding contributions are not left dangling on an unreadable head.
+/// recording `reason`, emitting a `pull_request.closed` audit event per pull and
+/// cancelling any queued or validating merge intents, so a system close leaves
+/// the same audit and intent state as an author close. Runs when a fork is
+/// deleted.
 pub async fn close_fork_pull_requests(
-    conn: &mut PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     source_repository_id: Uuid,
+    actor: Uuid,
     reason: &str,
 ) -> Result<u64, sqlx::Error> {
+    // The target repository and organization of each affected pull, so every
+    // close is audited under the repository the pull request belongs to.
+    let targets: Vec<(Uuid, Uuid)> = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT pr.id, r.organization_id FROM pull_requests pr \
+         JOIN repositories r ON r.id = pr.repository_id \
+         WHERE pr.source_repository_id = $1 AND pr.state = 'open'",
+    )
+    .bind(source_repository_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for (pull_id, organization_id) in targets {
+        crate::event(
+            &mut *tx,
+            Some(organization_id),
+            actor,
+            "pull_request.closed",
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE merge_intents SET state = 'cancelled', updated_at = now() \
+             WHERE pull_request_id = $1 AND state IN ('queued', 'validating')",
+        )
+        .bind(pull_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
     let result = sqlx::query(
         "UPDATE pull_requests SET state = 'closed', closed_at = now(), \
          closed_reason = $1, updated_at = now() \
@@ -210,7 +241,7 @@ pub async fn close_fork_pull_requests(
     )
     .bind(reason)
     .bind(source_repository_id)
-    .execute(conn)
+    .execute(&mut **tx)
     .await?;
     Ok(result.rows_affected())
 }

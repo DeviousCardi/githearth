@@ -158,17 +158,20 @@ pub async fn execute_intent(
     state: &AppState,
     operation_id: Uuid,
 ) -> Result<MergeOutcome, MergeError> {
-    // 1. Read only the repository id, before any lock, so the per-repository
-    // lock below is always acquired before a pool connection.
-    let repository_id: Uuid = {
+    // 1. Read the repository id and the pull's source repository id before any
+    // lock, so every lock below is acquired before a pool connection.
+    let (repository_id, source_repository_id): (Uuid, Uuid) = {
         let mut conn = state.pool.acquire().await?;
-        let id: Option<Uuid> =
-            sqlx::query_scalar("SELECT repository_id FROM merge_intents WHERE operation_id = $1")
-                .bind(operation_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-        match id {
-            Some(id) => id,
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT mi.repository_id, pr.source_repository_id \
+             FROM merge_intents mi JOIN pull_requests pr ON pr.id = mi.pull_request_id \
+             WHERE mi.operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        match row {
+            Some(row) => row,
             None => {
                 return Ok(MergeOutcome::Failed {
                     reason: "merge intent not found".into(),
@@ -177,7 +180,23 @@ pub async fn execute_intent(
         }
     };
 
-    // 2. Serialize every ref writer on this repository, held to the end.
+    // 2. Serialize every ref writer on the source fork (if any) and then on
+    // this repository. A cross-repository merge reads and fetches the fork's
+    // head, so it must exclude a concurrent push to or deletion of the fork.
+    // The lock order matches fork creation (fork before parent); the target
+    // lock is held to the end.
+    let cross_repo = source_repository_id != repository_id;
+    let _source_guard = if cross_repo {
+        Some(
+            state
+                .storage
+                .repository_lock(source_repository_id)
+                .lock_owned()
+                .await,
+        )
+    } else {
+        None
+    };
     let _guard = state
         .storage
         .repository_lock(repository_id)
@@ -299,10 +318,9 @@ pub async fn execute_intent(
 
     // A cross-repository pull takes its head from a fork. Read the head from
     // the fork (which must still be active) and bring its objects into the
-    // target so the candidate can be built there (ADR 0007). The target's
-    // per-repository lock is already held; the fork is only read.
-    let source_repository_id = pull.source_repository_id;
-    let cross_repo = source_repository_id != repository_id;
+    // target so the candidate can be built there (ADR 0008). The target's
+    // per-repository lock and the fork's lock are already held (step 2); the
+    // fork is only read, never written.
     let source_repo_path = if cross_repo {
         let mut conn = state.pool.acquire().await?;
         let Some(source_repo) = crate::repositories::get(&mut conn, source_repository_id).await?

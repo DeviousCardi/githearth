@@ -424,15 +424,10 @@ async fn resolve_source_repository(
     let source_repo = repositories::find_by_name(&mut conn, source_org_id, source_name)
         .await?
         .ok_or_else(not_found)?;
-    if source_repo.parent_repository_id != Some(target.repo.id) {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "source repository is not a fork of the target",
-        ));
-    }
-    if source_repo.status != RepositoryStatus::Active {
-        return Err(not_active());
-    }
+    // Authorize read on the source before examining its fork relationship or
+    // status: a caller who cannot read it must see the same "not found" as a
+    // non-existent repository, so private existence and fork status cannot be
+    // enumerated through this route.
     let Some(facts) = facts::load(&mut conn, actor_id, source_org_id).await? else {
         return Err(ApiError(StatusCode::NOT_FOUND, "organization not found"));
     };
@@ -444,6 +439,15 @@ async fn resolve_source_repository(
     ));
     if !read.is_allowed() {
         return Err(not_found());
+    }
+    if source_repo.parent_repository_id != Some(target.repo.id) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "source repository is not a fork of the target",
+        ));
+    }
+    if source_repo.status != RepositoryStatus::Active {
+        return Err(not_active());
     }
     Ok(source_repo.id)
 }
@@ -768,8 +772,12 @@ async fn update(
                 return Err(already_merged());
             }
             let new_state = input.state.as_deref().unwrap_or(locked.state.as_str());
+            // Reopening clears any system-close reason (e.g. "source repository
+            // deleted") so a reopened pull no longer reports why it was closed.
             let updated = sqlx::query(
-                "UPDATE pull_requests SET title = $1, body = $2, state = $3, updated_at = now() \
+                "UPDATE pull_requests SET title = $1, body = $2, state = $3, \
+                 closed_reason = CASE WHEN $3 = 'open' THEN NULL ELSE closed_reason END, \
+                 updated_at = now() \
                  WHERE id = $4",
             )
             .bind(input.title.as_deref().unwrap_or(&locked.title))

@@ -470,7 +470,8 @@ impl Storage {
     /// Fetches one ref (as `refs/...`) and the objects it reaches from `source`
     /// into `target` without creating or moving any ref in the target. Used to
     /// bring a fork's head branch into the target so a merge candidate can be
-    /// built there (ADR 0007). The caller must hold the target's lock.
+    /// built there (ADR 0008). The caller must hold the target's lock and, to
+    /// be safe against a concurrent push, the source's.
     pub fn fetch_ref(
         &self,
         target: Uuid,

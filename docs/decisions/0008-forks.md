@@ -1,4 +1,4 @@
-# ADR 0007: Fork contributions
+# ADR 0008: Fork contributions
 
 Date: 2026-11-11.
 
@@ -31,8 +31,7 @@ the storage layer had no way to copy one repository's Git data into another.
   names" check are rebuilt around it: only a same-repository pull must keep its
   two branch names distinct.
 - `pull_requests.closed_reason` records why the system closed a pull (a fork
-  being deleted or made inaccessible); a normal author/triage close leaves it
-  `NULL`.
+  being deleted); a normal author/triage close leaves it `NULL`.
 
 ### Forking
 
@@ -90,13 +89,17 @@ implement the policy without special cases:
 Forking therefore records only the `repository.forked` audit event and the
 fork's row; it never writes a grant on the parent.
 
-### Deleting or making a fork inaccessible
+### Deleting a fork
 
 `repositories::finish_delete` closes every open pull request whose
 `source_repository_id` is the deleted fork, recording
-`closed_reason = 'source repository deleted'`. This runs on both the API delete
-and the reconciler's delete path, so a fork that becomes inaccessible either way
-cannot leave its pull requests dangling on an unreadable head.
+`closed_reason = 'source repository deleted'`, emitting a `pull_request.closed`
+audit event per pull and cancelling any queued or validating merge intents, so
+the system close leaves the same audit and intent state as an author close.
+This runs on both the API delete and the reconciler's delete path. Making a fork
+inaccessible without deleting it (for example by suspending its organization or
+changing its visibility) is not wired to close its pull requests; such a fork's
+head simply stops resolving, which the merge path treats as a stale source.
 
 ## Consequences
 
