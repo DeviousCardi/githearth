@@ -46,12 +46,15 @@ pub struct ProtectionRule {
     pub require_pull_request: bool,
     pub required_approvals: i32,
     pub required_status_checks: Vec<String>,
+    pub dismiss_stale_approvals: bool,
+    pub require_signed_commits: bool,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const RULE_COLUMNS: &str = "id, repository_id, pattern, allow_force_push, allow_deletion, \
  require_pull_request, required_approvals, required_status_checks, \
+ dismiss_stale_approvals, require_signed_commits, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
 
@@ -143,6 +146,8 @@ fn protection_of(rule: &ProtectionRule) -> Protection {
         require_pull_request: rule.require_pull_request,
         required_approvals: rule.required_approvals as u32,
         require_checks: !rule.required_status_checks.is_empty(),
+        dismiss_stale_approvals: rule.dismiss_stale_approvals,
+        require_signed_commits: rule.require_signed_commits,
     }
 }
 
@@ -251,6 +256,16 @@ struct NewRule {
     required_approvals: i32,
     #[serde(default)]
     required_status_checks: Vec<String>,
+    /// Defaults ON for new rules: stale approvals are dismissed unless the
+    /// rule explicitly opts out, matching the pre-flag semantics.
+    #[serde(default = "default_true")]
+    dismiss_stale_approvals: bool,
+    #[serde(default)]
+    require_signed_commits: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn validate_required_status_checks(checks: &[String]) -> Result<(), ApiError> {
@@ -331,8 +346,9 @@ async fn create(
             let inserted = sqlx::query(
                 "INSERT INTO branch_protection_rules \
                  (id, repository_id, pattern, allow_force_push, allow_deletion, \
-                  require_pull_request, required_approvals, required_status_checks, created_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                  require_pull_request, required_approvals, required_status_checks, \
+                  dismiss_stale_approvals, require_signed_commits, created_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             )
             .bind(id)
             .bind(loaded.repo.id)
@@ -342,6 +358,8 @@ async fn create(
             .bind(input.require_pull_request)
             .bind(input.required_approvals)
             .bind(&input.required_status_checks)
+            .bind(input.dismiss_stale_approvals)
+            .bind(input.require_signed_commits)
             .bind(actor.id)
             .execute(&mut *tx)
             .await;
@@ -396,6 +414,10 @@ struct PatchRule {
     required_approvals: Option<i32>,
     #[serde(default)]
     required_status_checks: Option<Vec<String>>,
+    #[serde(default)]
+    dismiss_stale_approvals: Option<bool>,
+    #[serde(default)]
+    require_signed_commits: Option<bool>,
 }
 
 async fn update(
@@ -425,6 +447,8 @@ async fn update(
                 && input.require_pull_request.is_none()
                 && input.required_approvals.is_none()
                 && input.required_status_checks.is_none()
+                && input.dismiss_stale_approvals.is_none()
+                && input.require_signed_commits.is_none()
             {
                 return Err(invalid());
             }
@@ -473,8 +497,9 @@ async fn update(
             let res = sqlx::query(
                 "UPDATE branch_protection_rules SET pattern = $1, \
                  allow_force_push = $2, allow_deletion = $3, require_pull_request = $4, \
-                 required_approvals = $5, required_status_checks = $6, updated_at = now() \
-                 WHERE id = $7",
+                 required_approvals = $5, required_status_checks = $6, \
+                 dismiss_stale_approvals = $7, require_signed_commits = $8, updated_at = now() \
+                 WHERE id = $9",
             )
             .bind(updated_pattern)
             .bind(input.allow_force_push.unwrap_or(locked.allow_force_push))
@@ -493,6 +518,16 @@ async fn update(
                 input
                     .required_status_checks
                     .unwrap_or(locked.required_status_checks),
+            )
+            .bind(
+                input
+                    .dismiss_stale_approvals
+                    .unwrap_or(locked.dismiss_stale_approvals),
+            )
+            .bind(
+                input
+                    .require_signed_commits
+                    .unwrap_or(locked.require_signed_commits),
             )
             .bind(id)
             .execute(&mut *tx)
@@ -608,6 +643,8 @@ mod tests {
             require_pull_request: false,
             required_approvals: 0,
             required_status_checks: Vec::new(),
+            dismiss_stale_approvals: true,
+            require_signed_commits: false,
             created_at: String::new(),
             updated_at: String::new(),
         };

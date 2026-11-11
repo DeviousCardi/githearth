@@ -97,6 +97,12 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
     }
     let socket = env[HOOK_SOCKET].as_str();
     let token = env[HOOK_TOKEN].as_str();
+    // The quarantine object directory (unset for a delete-only push): forwarded
+    // so the server can verify commits that exist only in the incoming pack.
+    let object_dir = env
+        .get("GIT_OBJECT_DIRECTORY")
+        .map(String::as_str)
+        .unwrap_or("");
     let mut input = String::new();
     if stdin.read_to_string(&mut input).is_err() {
         let _ = writeln!(stderr, "cannot read ref updates from stdin");
@@ -118,7 +124,7 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
         let ff = !is_zero(old) && !is_zero(new) && fast_forward(old, new);
         updates.push((old.to_owned(), new.to_owned(), reference.to_owned(), ff));
     }
-    match query_policy(socket, token, &updates) {
+    match query_policy(socket, token, object_dir, &updates) {
         Ok(()) => 0,
         Err(reason) => {
             let _ = writeln!(stderr, "{reason}");
@@ -166,6 +172,7 @@ fn check_quota(env: &HashMap<String, String>) -> Result<(), String> {
 fn query_policy(
     socket: &str,
     token: &str,
+    object_dir: &str,
     updates: &[(String, String, String, bool)],
 ) -> Result<(), String> {
     use std::io::ErrorKind;
@@ -182,6 +189,8 @@ fn query_policy(
 
     let mut request = String::with_capacity(64 + 64 * updates.len());
     request.push_str(token);
+    request.push('\n');
+    request.push_str(object_dir);
     request.push('\n');
     for (old, new, reference, ff) in updates {
         request.push_str(old);

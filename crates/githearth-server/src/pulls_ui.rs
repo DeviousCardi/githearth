@@ -596,11 +596,19 @@ async fn render_pull(
 
     let mut review_list = String::new();
     for r in &reviews.items {
+        let stale = if r.verdict == "approved"
+            && detail.head_id.as_deref().is_some_and(|h| h != r.commit_id)
+        {
+            " · <span class=\"muted\">approved an older commit</span>"
+        } else {
+            ""
+        };
         review_list.push_str(&format!(
-            "<li><p class=\"muted\">{} {} at {}</p>{}</li>",
+            "<li><p class=\"muted\">{} {} at {}{}</p>{}</li>",
             who(&names, &r.reviewer_id),
             ui::esc(&r.verdict),
             ui::esc(&r.created_at),
+            stale,
             if r.body.is_empty() {
                 String::new()
             } else {
