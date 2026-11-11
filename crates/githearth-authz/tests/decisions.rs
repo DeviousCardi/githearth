@@ -280,6 +280,7 @@ impl Site<'_> {
             | IssueCreate
             | PullRequestCreate => Resource::Repository(repository),
             RefPush | RefForcePush | RefDelete => Resource::Ref(repository, &self.reference),
+            StatusCreate => Resource::Repository(repository),
             IssueRead | IssueComment | IssueLabel | IssueAssign | IssueClose => {
                 Resource::Issue(repository, &self.issue)
             }

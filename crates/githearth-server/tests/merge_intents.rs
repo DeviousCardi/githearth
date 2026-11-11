@@ -396,7 +396,8 @@ async fn create_refuses_closed_head_moved_no_permission_few_approvals_checks_and
     let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // require_checks refuses in M3 (no checks recorded).
+    // Required status checks refuse unless every required context is `success`
+    // on the current head: no status at all, then an explicit failure.
     let (_, prot) = request(
         &f.app,
         "GET",
@@ -419,9 +420,24 @@ async fn create_refuses_closed_head_moved_no_permission_few_approvals_checks_and
         ),
         Some(&f.token),
         None,
-        json!({"require_checks": true, "required_approvals": 0}),
+        json!({"required_status_checks": ["ci"], "required_approvals": 0}),
     )
     .await;
+    let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/commits/{}/statuses",
+            f.org_slug, f.repo_name, f.feature_head
+        ),
+        Some(&f.token),
+        None,
+        json!({"context": "ci", "state": "failure"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
     let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
@@ -856,6 +872,106 @@ async fn digest_changes_when_a_change_request_arrives_at_the_same_head() {
         digest1, digest2,
         "a new change request must change the digest"
     );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_status_for_a_different_sha_never_authorizes_the_merge() {
+    let f = build_fixture().await;
+
+    // Require "ci" on main.
+    request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/protection",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        None,
+        json!({"pattern": "main", "required_status_checks": ["ci"]}),
+    )
+    .await;
+
+    // A success status for a *different* commit must not satisfy the check.
+    let other_sha = "e".repeat(40);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/commits/{other_sha}/statuses",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        None,
+        json!({"context": "ci", "state": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A success status at the actual head does.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/commits/{}/statuses",
+            f.org_slug, f.repo_name, f.feature_head
+        ),
+        Some(&f.token),
+        None,
+        json!({"context": "ci", "state": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn pull_detail_reports_the_latest_status_per_context() {
+    let f = build_fixture().await;
+    let statuses = format!(
+        "/api/v1/organizations/{}/repositories/{}/commits/{}/statuses",
+        f.org_slug, f.repo_name, f.feature_head
+    );
+    for (context, state) in [("ci", "pending"), ("ci", "success"), ("lint", "failure")] {
+        let (status, _) = request(
+            &f.app,
+            "POST",
+            &statuses,
+            Some(&f.token),
+            None,
+            json!({"context": context, "state": state}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["statuses"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "one latest status per context: {items:?}");
+    let by_context: std::collections::HashMap<&str, &str> = items
+        .iter()
+        .map(|s| (s["context"].as_str().unwrap(), s["state"].as_str().unwrap()))
+        .collect();
+    assert_eq!(by_context.get("ci"), Some(&"success"));
+    assert_eq!(by_context.get("lint"), Some(&"failure"));
 
     finish(f).await;
 }

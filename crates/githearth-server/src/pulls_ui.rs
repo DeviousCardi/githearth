@@ -710,6 +710,34 @@ async fn render_pull(
     } else {
         String::new()
     };
+    // The latest status per context at the current head, newest first.
+    let mut status_rows = String::new();
+    for st in &detail.statuses {
+        let description = st
+            .description
+            .as_deref()
+            .map(|d| format!(" — {}", ui::esc(d)))
+            .unwrap_or_default();
+        let target = st
+            .target_url
+            .as_deref()
+            .filter(|u| crate::statuses::valid_target_url(u))
+            .map(|u| format!(" <a href=\"{}\">details</a>", ui::esc(u)))
+            .unwrap_or_default();
+        status_rows.push_str(&format!(
+            "<li><span class=\"badge\">{}</span> {} · {}{}{}</li>",
+            ui::esc(&st.state),
+            ui::esc(&st.context),
+            ui::esc(&st.created_at),
+            description,
+            target,
+        ));
+    }
+    let status_section = if status_rows.is_empty() {
+        String::new()
+    } else {
+        format!("<h2>Checks</h2><ul>{status_rows}</ul>")
+    };
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
@@ -722,6 +750,7 @@ async fn render_pull(
 </dl></div>\
 <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
 {intent_section}\
+{status_section}\
 <h2>Reviews</h2>{review_list} \
 <h2>Comments</h2>{comment_list}<p>{pager}</p>{error}{review_error}{merge_error}\
 {merge_form}\

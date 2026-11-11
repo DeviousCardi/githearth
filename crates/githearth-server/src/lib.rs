@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod audit_retention;
 pub mod browse;
 mod browse_ui;
 pub mod client_ip;
@@ -27,6 +28,7 @@ pub mod repository_api;
 mod settings_ui;
 pub mod ssh;
 pub mod ssh_keys;
+pub mod statuses;
 mod tokens;
 pub mod ui;
 
@@ -253,6 +255,7 @@ pub fn router(state: AppState) -> Router {
         .merge(pulls::router())
         .merge(merge_intents::router())
         .merge(protection::router())
+        .merge(statuses::router())
         .merge(audit::router())
         .merge(ui::router())
         .merge(browse::router())
@@ -989,14 +992,13 @@ async fn current_or_new_ip_key(
         return Ok(key);
     }
     let id = Uuid::new_v4();
-    let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    let key = audit_retention::new_ip_key_bytes();
     sqlx::query(
         "INSERT INTO audit_ip_keys (id, key) \
          SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM audit_ip_keys)",
     )
     .bind(id)
-    .bind(key.to_vec())
+    .bind(&key)
     .execute(&mut *conn)
     .await?;
     sqlx::query_as::<_, (Uuid, Vec<u8>)>(
@@ -1006,7 +1008,7 @@ async fn current_or_new_ip_key(
     .await
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()

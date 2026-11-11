@@ -1875,8 +1875,8 @@ async fn add_protection_rule(
 ) {
     sqlx::query(
         "INSERT INTO branch_protection_rules \
-         (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, require_checks, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, 0, false, $7)",
+         (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, required_status_checks, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, 0, '{}', $7)",
     )
     .bind(Uuid::new_v4())
     .bind(repo_id)

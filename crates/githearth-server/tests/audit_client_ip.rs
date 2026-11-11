@@ -138,6 +138,41 @@ async fn http_action_records_client_ip_on_audit_row() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn mapped_and_plain_ipv4_share_digest() {
+    let (app, pool, storage_root, username, account) = setup().await;
+
+    let mapped = SocketAddr::from((
+        std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xcb00, 0x7107),
+        4242,
+    ));
+    let status = login_request(&app, &username, Some(mapped)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let plain = SocketAddr::from(([203, 0, 113, 7], 4242));
+    let status = login_request(&app, &username, Some(plain)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rows: Vec<(Option<String>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT host(client_ip), client_ip_digest FROM audit_events \
+         WHERE actor_id = $1 AND kind = 'session.created' AND seq IS NOT NULL ORDER BY seq",
+    )
+    .bind(account)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0.as_deref(), Some("203.0.113.7"));
+    assert_eq!(rows[1].0.as_deref(), Some("203.0.113.7"));
+    assert_eq!(rows[0].1, rows[1].1);
+    assert!(rows[0].1.is_some());
+
+    let _ = std::fs::remove_dir_all(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn http_action_without_connect_info_records_null() {
     let (app, pool, storage_root, username, account) = setup().await;
     let status = login_request(&app, &username, None).await;

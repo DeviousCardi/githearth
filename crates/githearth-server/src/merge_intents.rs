@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::{
     ApiError, AppState, authenticate, browse, idempotency, invalid, issues, pulls, repositories,
     repository_api::{self, Loaded},
+    statuses,
 };
 
 pub fn router() -> Router<AppState> {
@@ -131,15 +132,24 @@ pub(crate) async fn latest_review_ids(
     .await
 }
 
-/// SHa256 over the source oid and the ids of each reviewer's latest non-comment
-/// review at that oid, sorted. A new approval or change request (or a moved
-/// head) changes the digest, making the intent stale. Check results contribute
-/// nothing in M3 (no check system yet), so `require_checks` refuses every merge.
-pub(crate) fn checks_approvals_digest(source_oid: &str, review_ids: &[Uuid]) -> String {
+/// SHA256 over the source oid, the ids of each reviewer's latest non-comment
+/// review at that oid (sorted), and the latest `(context, state)` of each
+/// required status check at that oid (sorted). A new approval or change
+/// request, a moved head, or a change to any required check result changes the
+/// digest, making the intent stale.
+pub(crate) fn checks_approvals_digest(
+    source_oid: &str,
+    review_ids: &[Uuid],
+    check_states: &[(String, String)],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(source_oid.as_bytes());
     for id in review_ids {
         hasher.update(id.as_bytes());
+    }
+    for (context, state) in check_states {
+        hasher.update(context.as_bytes());
+        hasher.update(state.as_bytes());
     }
     hex::encode(hasher.finalize())
 }
@@ -166,8 +176,8 @@ pub(crate) async fn approvals_at(
 
 /// Builds and evaluates the `pull_request.merge` request shared by the API
 /// handler and [`crate::merge::execute_intent`]. The merge facts are the
-/// approvals at the head and (in M3, always false) checks, with the matching
-/// target-branch protection.
+/// approvals at the head and whether every required status check is `success`
+/// at the head, with the matching target-branch protection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_allowed(
     state: &AppState,
@@ -209,7 +219,8 @@ pub(crate) fn merge_allowed(
 }
 
 /// Authorize the merge with the matching target-branch protection as merge
-/// facts: approvals at the head and (in M3, always false) checks.
+/// facts: approvals at the head and whether every required status check is
+/// `success` at the head.
 fn require_merge(
     state: &AppState,
     loaded: &Loaded,
@@ -272,17 +283,19 @@ pub(crate) async fn may_merge(
     drop(conn);
 
     let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
-    let approvals = match head.as_deref() {
-        Some(head) => {
-            let mut conn = state.pool.acquire().await?;
-            let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
-            drop(conn);
-            approvals
-        }
-        None => 0,
+    let target_ref = format!("refs/heads/{}", pull.target_branch);
+    let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
+    // A deleted source branch has no head; create_intent would refuse this
+    // merge with 422 "branch not found", so the merge form must not offer it.
+    let Some(head) = head.as_deref() else {
+        return Ok(false);
     };
-    let protection =
-        crate::protection::matching(&rules, &format!("refs/heads/{}", pull.target_branch));
+    let mut conn = state.pool.acquire().await?;
+    let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
+    let checks_passed =
+        statuses::checks_passed(&mut conn, loaded.repo.id, head, &required_checks).await?;
+    drop(conn);
+    let protection = crate::protection::matching(&rules, &target_ref);
     Ok(merge_allowed(
         state,
         &loaded.facts,
@@ -290,7 +303,7 @@ pub(crate) async fn may_merge(
         &pull,
         protection,
         approvals,
-        false,
+        checks_passed,
         Some(Duration::from_secs(auth_age)),
     ))
 }
@@ -369,17 +382,35 @@ pub(crate) async fn create_intent(
                 return Err(head_moved());
             }
 
-            // Approvals and digest are computed at the exact source oid.
+            // Approvals, required-check results and the digest are computed at
+            // the exact source oid, so a status for a different commit can
+            // never authorize this merge.
+            let target_ref = format!("refs/heads/{}", pull.target_branch);
+            let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
             let mut conn = state.pool.acquire().await?;
             let approvals = approvals_at(&mut conn, pull.id, &head).await?;
             let review_ids = latest_review_ids(&mut conn, pull.id, &head).await?;
+            let check_states = statuses::latest_required_states(
+                &mut conn,
+                loaded.repo.id,
+                &head,
+                &required_checks,
+            )
+            .await?;
             drop(conn);
 
-            let protection =
-                crate::protection::matching(&rules, &format!("refs/heads/{}", pull.target_branch));
-            require_merge(state, &loaded, &pull, protection, approvals as u32, false)?;
+            let protection = crate::protection::matching(&rules, &target_ref);
+            let checks_passed = statuses::all_success(&required_checks, &check_states);
+            require_merge(
+                state,
+                &loaded,
+                &pull,
+                protection,
+                approvals as u32,
+                checks_passed,
+            )?;
 
-            let digest = checks_approvals_digest(&head, &review_ids);
+            let digest = checks_approvals_digest(&head, &review_ids, &check_states);
             let operation_id = Uuid::new_v4();
 
             let mut tx = state.pool.begin().await?;

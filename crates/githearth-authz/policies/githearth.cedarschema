@@ -190,6 +190,12 @@ namespace GitHearth {
       resource: Repository,
       context: Auth,
     };
+  action "status.create" in ["write"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
 
   // Refs
   action "ref.push" in ["write"]
