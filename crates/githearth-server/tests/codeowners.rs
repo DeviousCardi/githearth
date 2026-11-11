@@ -809,3 +809,118 @@ async fn malformed_codeowners_tokens_are_reported_on_the_pr_page() {
     finish(f).await;
     db.drop_db().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn review_fails_closed_when_the_changed_file_list_is_truncated() {
+    let db = TestDb::new().await;
+    let f = build_fixture(&db.url, "*").await;
+
+    // A head change touching more than MAX_DIFF_FILES files truncates the
+    // changed-file listing, so the code-owner review cannot be evaluated and
+    // must report the pull request as unsatisfied.
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let tw = f.work.to_str().unwrap();
+    std::fs::create_dir_all(f.work.join("many")).unwrap();
+    for i in 0..301 {
+        std::fs::write(f.work.join(format!("many/f{i:03}.txt")), "x\n").unwrap();
+    }
+    git_ok(git_cmd(&["-C", tw, "add", "many"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "many",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+
+    let (status, detail) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.owner_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["code_owner_review_satisfied"], false);
+    assert!(
+        detail["required_code_owners"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    finish(f).await;
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn review_fails_closed_when_codeowners_is_unreadable() {
+    let db = TestDb::new().await;
+    let f = build_fixture(&db.url, "*").await;
+
+    // A binary (non-UTF-8) CODEOWNERS on the target branch cannot be parsed, so
+    // the review must fail closed rather than treat the pull request as having
+    // no owners.
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    std::fs::write(f.work.join("CODEOWNERS"), b"* @owner\xff\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "CODEOWNERS"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "binary owners",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+
+    let (status, detail) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.owner_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["code_owner_review_satisfied"], false);
+    assert!(!detail["code_owner_errors"].as_array().unwrap().is_empty());
+
+    finish(f).await;
+    db.drop_db().await;
+}

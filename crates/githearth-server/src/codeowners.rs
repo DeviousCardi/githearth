@@ -107,7 +107,9 @@ fn tokenize(line: &str) -> Vec<String> {
 }
 
 fn parse_owner(token: &str) -> Result<OwnerRef, String> {
-    let stripped = token.strip_prefix('@').unwrap_or(token);
+    let Some(stripped) = token.strip_prefix('@') else {
+        return Err(format!("malformed owner token `{token}`"));
+    };
     if stripped.is_empty() {
         return Err(format!("malformed owner token `{token}`"));
     }
@@ -141,8 +143,12 @@ pub(crate) fn owners_for(rules: &[Rule], path: &str) -> Vec<OwnerRef> {
 /// under it.
 pub(crate) fn pattern_matches(pattern: &str, path: &str) -> bool {
     if pattern.ends_with('/') {
+        // A trailing slash matches the directory's contents only, never a file
+        // that happens to share the directory's name. `dir/**` alone would also
+        // match the path `dir` itself (`**` may consume no segments), so the
+        // bare directory is excluded.
         let dir = pattern.trim_end_matches('/');
-        return match_core(dir, path) || match_core(&format!("{dir}/**"), path);
+        return path != dir && match_core(&format!("{dir}/**"), path);
     }
     match_core(pattern, path)
 }
@@ -928,7 +934,7 @@ mod tests {
     #[test]
     fn owner_tokens_require_at_and_split_org_team() {
         assert_eq!(parse_owner("@alice"), Ok(OwnerRef::Account("alice".into())));
-        assert_eq!(parse_owner("alice"), Ok(OwnerRef::Account("alice".into())));
+        assert!(parse_owner("alice").is_err());
         assert_eq!(
             parse_owner("@acme/eng"),
             Ok(OwnerRef::Team {
@@ -940,14 +946,14 @@ mod tests {
 
     #[test]
     fn malformed_owner_tokens_are_reported_errors() {
-        for token in ["@", "@acme/", "@acme/a/b"] {
+        for token in ["alice", "@", "@acme/", "@acme/a/b"] {
             assert!(
                 parse_owner(token).is_err(),
                 "token {token:?} should be malformed"
             );
         }
-        let (rules, errors) = parse("*.rs @alice @ @acme/ @acme/a/b\n");
-        assert_eq!(errors.len(), 3);
+        let (rules, errors) = parse("*.rs @alice alice @ @acme/ @acme/a/b\n");
+        assert_eq!(errors.len(), 4);
         assert_eq!(rules[0].owners, vec![OwnerRef::Account("alice".into())]);
     }
 
@@ -987,6 +993,8 @@ mod tests {
             ("docs/**", "docs/sub/a.md", true),
             ("docs/**", "docs/a.md", true),
             ("docs/", "docs/a.md", true),
+            ("docs/", "docs/a/b.md", true),
+            ("docs/", "docs", false),
             ("docs/", "other/a.md", false),
             ("/root.txt", "root.txt", true),
             ("/root.txt", "sub/root.txt", false),
