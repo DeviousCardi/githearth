@@ -55,9 +55,6 @@ fn already_queued() -> ApiError {
 fn executing() -> ApiError {
     ApiError(StatusCode::CONFLICT, "merge intent is already executing")
 }
-fn merge_conflicts() -> ApiError {
-    ApiError(StatusCode::CONFLICT, "merge conflicts")
-}
 
 const INTENT_COLUMNS: &str = "operation_id, repository_id, pull_request_id, source_ref, source_oid, \
  target_ref, expected_target_oid, method, candidate_oid, policy_generation, checks_approvals_digest, \
@@ -469,8 +466,22 @@ pub(crate) async fn create_intent(
                         "pull_request.merge_intent_conflicted",
                     )
                     .await?;
+                    // The refusal is stored under the idempotency key so a retry
+                    // replays this exact conflicted intent instead of inserting a
+                    // second row and audit event.
+                    let intent: MergeIntentJson = sqlx::query_as(&format!(
+                        "SELECT {INTENT_COLUMNS} FROM merge_intents WHERE operation_id = $1"
+                    ))
+                    .bind(operation_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let status = StatusCode::CONFLICT;
+                    let body = serde_json::to_value(&intent).unwrap();
+                    if !idem.store(&mut tx, status, &body).await? {
+                        return Err(idempotency::claim_lost());
+                    }
                     tx.commit().await?;
-                    return Err(merge_conflicts());
+                    return Ok((status, body));
                 }
             }
 

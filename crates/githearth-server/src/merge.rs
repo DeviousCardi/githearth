@@ -437,7 +437,7 @@ pub async fn execute_intent(
                     author: &author_owned,
                     committer: &committer_owned,
                 };
-                githearth_git::merge::build_candidate(&repo, &request, timeout)
+                githearth_git::merge::build_candidate(&repo, None, &request, timeout)
             })
             .await?;
             match candidate? {

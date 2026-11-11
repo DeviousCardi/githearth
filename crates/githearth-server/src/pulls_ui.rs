@@ -82,6 +82,19 @@ fn merge_block_reason(status: &str) -> Option<&'static str> {
     }
 }
 
+/// The reason the selected merge method cannot run, if any. Computed from the
+/// selected method only: a conflicting or unmergeable rebase must not disable
+/// the form for a clean merge/squash, whose statuses agree with each other.
+fn selected_block_reason(
+    mergeability: &[crate::mergeability::Check],
+    method: &str,
+) -> Option<&'static str> {
+    mergeability
+        .iter()
+        .find(|c| c.method == method)
+        .and_then(|c| merge_block_reason(&c.status))
+}
+
 struct Session {
     account: crate::Account,
     auth_age: u64,
@@ -753,15 +766,7 @@ async fn render_pull(
         })
         .collect::<String>();
     let show_merge_form = detail.pull.state == "open" && !non_terminal && can_merge;
-    let blocked_reason = if has_conflicts {
-        Some("This branch has conflicts that must be resolved.")
-    } else {
-        detail
-            .mergeability
-            .iter()
-            .find(|c| c.method == merge.method)
-            .and_then(|c| merge_block_reason(&c.status))
-    };
+    let blocked_reason = selected_block_reason(&detail.mergeability, merge.method);
     let merge_form = if show_merge_form {
         if let Some(reason) = blocked_reason {
             format!(
@@ -1187,9 +1192,6 @@ fn merge_notice(error: &crate::ApiError) -> &'static str {
     if let Some(message) = ui::idempotency_notice(error) {
         return message;
     }
-    if error.status_code() == StatusCode::CONFLICT && error.message() == "merge conflicts" {
-        return "This branch has conflicts that must be resolved.";
-    }
     match error.status_code() {
         StatusCode::NOT_FOUND => "This pull request no longer exists.",
         StatusCode::FORBIDDEN => "You may not merge this pull request.",
@@ -1204,12 +1206,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_notice_reports_a_conflicting_branch() {
-        let error = crate::ApiError(StatusCode::CONFLICT, "merge conflicts");
-        assert_eq!(
-            merge_notice(&error),
-            "This branch has conflicts that must be resolved."
-        );
+    fn merge_notice_reports_a_generic_conflict_and_forbidden() {
         // An unrelated conflict keeps its generic text.
         let other = crate::ApiError(StatusCode::CONFLICT, "an open merge intent already exists");
         assert_eq!(
@@ -1222,5 +1219,35 @@ mod tests {
             merge_notice(&forbidden),
             "You may not merge this pull request."
         );
+    }
+
+    #[test]
+    fn selected_block_reason_uses_only_the_selected_method() {
+        let checks = vec![
+            crate::mergeability::Check {
+                method: "merge".into(),
+                status: "clean".into(),
+                conflicts: vec![],
+            },
+            crate::mergeability::Check {
+                method: "squash".into(),
+                status: "clean".into(),
+                conflicts: vec![],
+            },
+            crate::mergeability::Check {
+                method: "rebase".into(),
+                status: "conflicts".into(),
+                conflicts: vec!["a.txt".into()],
+            },
+        ];
+        // A conflicting rebase must not block the clean merge and squash methods.
+        assert_eq!(selected_block_reason(&checks, "merge"), None);
+        assert_eq!(selected_block_reason(&checks, "squash"), None);
+        assert_eq!(
+            selected_block_reason(&checks, "rebase"),
+            Some("This branch has conflicts that must be resolved.")
+        );
+        // A method with no mergeability entry is always live.
+        assert_eq!(selected_block_reason(&checks, "ff_only"), None);
     }
 }

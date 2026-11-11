@@ -4,9 +4,10 @@
 //!
 //! The check reuses [`githearth_git::merge::build_candidate`] — the same
 //! candidate construction the merge worker runs — so a "clean" result here
-//! always matches what an executed merge would produce. Objects written by the
-//! candidate build are unreferenced and harmless; the cache means each unique
-//! (head, target) pair is computed at most once.
+//! always matches what an executed merge would produce. The candidate build
+//! writes its objects into a scratch directory (removed when the check
+//! returns), so the repository object store gains nothing; the cache means each
+//! unique (head, target) pair is computed at most once.
 
 use crate::{ApiError, AppState, browse};
 use githearth_git::merge::{self, Candidate, Identity, Method, Request};
@@ -114,7 +115,7 @@ async fn compute(
     target: String,
     head: String,
 ) -> Result<(String, Vec<String>), ApiError> {
-    browse::git_read(state, repo_id, move |path, timeout| {
+    browse::git_compare(state, repo_id, move |path, scratch, timeout| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -134,7 +135,7 @@ async fn compute(
             author: &identity,
             committer: &identity,
         };
-        merge::build_candidate(path, &request, timeout).map(status_for)
+        merge::build_candidate(path, Some(scratch), &request, timeout).map(status_for)
     })
     .await
 }

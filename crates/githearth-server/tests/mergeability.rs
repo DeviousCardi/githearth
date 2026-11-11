@@ -95,6 +95,35 @@ async fn request(
     )
 }
 
+async fn request_with_key(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    key: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("Idempotency-Key", key);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn fixture_account(pool: &PgPool, username: &str) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused') RETURNING id",
@@ -554,11 +583,13 @@ async fn conflicting_pull_cannot_merge_by_any_method_and_lists_paths() {
         assert_eq!(check["conflicts"][0], "notes&tips.md", "{method}: {detail}");
     }
 
-    // Each merge attempt is refused cleanly with 409 and never moves the ref.
+    // Each merge attempt is refused cleanly with 409, returns the conflicted
+    // intent, and never moves the ref.
     for method in ["merge", "squash", "rebase"] {
         let (status, body) = create_merge_intent(&f, method, &f.feature_head).await;
         assert_eq!(status, StatusCode::CONFLICT, "{method}: {body}");
-        assert_eq!(body["error"], "merge conflicts", "{method}: {body}");
+        assert_eq!(body["state"], "conflicted", "{method}: {body}");
+        assert_eq!(body["method"], method, "{method}: {body}");
     }
 
     // The refusal is recorded on a conflicted intent with the reason.
@@ -586,6 +617,55 @@ async fn conflicting_pull_cannot_merge_by_any_method_and_lists_paths() {
     assert_eq!(queued, 0);
     let detail = pull_detail(&f).await;
     assert_eq!(detail["base_id"], main_head.as_str());
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_conflict_refusal_is_idempotent_under_its_key() {
+    let f = build_fixture().await;
+    advance_main(&f, "main\n").await;
+
+    let key = tag("idem");
+    let body = json!({"method": "merge", "expected_head_oid": f.feature_head});
+    let merge = merge_href(&f.org_slug, &f.repo_name, f.number);
+
+    let (status, first) =
+        request_with_key(&f.app, "POST", &merge, Some(&f.token), &key, body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{first}");
+    assert_eq!(first["state"], "conflicted");
+
+    // The same key replays the stored refusal instead of writing a second row.
+    let (status2, second) =
+        request_with_key(&f.app, "POST", &merge, Some(&f.token), &key, body).await;
+    assert_eq!(status2, StatusCode::CONFLICT, "{second}");
+    assert_eq!(second["operation_id"], first["operation_id"]);
+    assert_eq!(second["state"], "conflicted");
+
+    // Exactly one conflicted intent and one audit event, despite the retry.
+    let intents: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        intents, 1,
+        "a retried conflict refusal must not duplicate the intent"
+    );
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE kind = 'pull_request.merge_intent_conflicted' \
+         AND organization_id = (SELECT organization_id FROM repositories WHERE id = $1)",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audits, 1,
+        "a retried conflict refusal must not duplicate the audit event"
+    );
 
     finish(f).await;
 }

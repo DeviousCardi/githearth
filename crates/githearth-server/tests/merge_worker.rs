@@ -505,7 +505,7 @@ async fn conflict_ends_conflicted_with_path_in_failure_reason() {
     let before = main_tip(&paths).await;
     let (status, body) = create_merge_intent(&f, "merge", &f.feature_head).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"], "merge conflicts");
+    assert_eq!(body["state"], "conflicted");
 
     // The refusal is recorded on a conflicted intent, so the worker has
     // nothing to claim and no ref moves.
