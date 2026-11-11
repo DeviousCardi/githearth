@@ -531,6 +531,61 @@ async fn approval_satisfying_requirements_raises_the_intent() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_status_satisfying_requirements_raises_the_intent() {
+    let f = build_fixture().await;
+
+    // Require "ci" on main, but no approvals.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/protection",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        None,
+        json!({"pattern": "main", "required_status_checks": ["ci"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Enabling auto-merge is allowed even though the required check is still
+    // unsatisfied, and it must not raise the intent prematurely.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &auto_merge_href(&f.org_slug, &f.repo_name, f.number),
+        Some(&f.token),
+        None,
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(intent_count(&f).await, 0, "not mergeable before the check");
+
+    // Posting the required success status must raise the intent without any
+    // further review or push.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/commits/{}/statuses",
+            f.org_slug, f.repo_name, f.feature_head
+        ),
+        Some(&f.token),
+        None,
+        json!({"context": "ci", "state": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(intent_count(&f).await, 1, "status satisfies auto-merge");
+    assert_eq!(auto_merge_count(&f).await, 1, "auto-merge stays enabled");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn cancel_removes_the_auto_merge_and_audits() {
     let f = build_fixture().await;
     let href = auto_merge_href(&f.org_slug, &f.repo_name, f.number);

@@ -217,6 +217,10 @@ async fn create(
                 return Err(idempotency::claim_lost());
             }
             tx.commit().await?;
+            // A status may have just satisfied the last required check on a
+            // pull request with a pending auto-merge: re-drive it now so the
+            // intent is raised without waiting for another review or push.
+            let _ = crate::auto_merge::on_status(state, loaded.repo.id, &sha, actor.id).await;
             Ok((created, response))
         },
     )

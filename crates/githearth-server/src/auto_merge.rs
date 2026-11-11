@@ -580,6 +580,34 @@ pub(crate) async fn maybe_auto_merge(
     Ok(())
 }
 
+/// A commit status landed for `oid`. Re-drives auto-merge for every open pull
+/// request whose recorded source head is that commit, because a required check
+/// may have just satisfied the last remaining requirement; this raises the
+/// intent now instead of waiting for the next review or push. Best-effort like
+/// the other triggers: the merge worker re-checks as a backstop.
+pub(crate) async fn on_status(
+    state: &AppState,
+    repository_id: Uuid,
+    oid: &str,
+    actor: Uuid,
+) -> Result<(), ApiError> {
+    let mut conn = state.pool.acquire().await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT am.pull_request_id FROM auto_merges am \
+         JOIN pull_requests pr ON pr.id = am.pull_request_id \
+         WHERE pr.repository_id = $1 AND pr.state = 'open' AND am.source_oid = $2",
+    )
+    .bind(repository_id)
+    .bind(oid)
+    .fetch_all(&mut *conn)
+    .await?;
+    drop(conn);
+    for id in ids {
+        let _ = maybe_auto_merge(state, actor, id).await;
+    }
+    Ok(())
+}
+
 /// A push landed on `ref_name`. For every open pull request in this repository
 /// whose source branch is that ref with a pending auto-merge: the enabler's own
 /// push re-targets the recorded head; anyone else's push cancels the auto-merge.
