@@ -1207,3 +1207,147 @@ async fn merging_a_pull_with_an_open_intent_shows_a_conflict_notice() {
 
     finish(f).await;
 }
+
+/// Returns the id of the first comment in the pull request's comment list.
+async fn first_comment_id(f: &Fixture) -> String {
+    let (status, list) = api(
+        &f.app,
+        "GET",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    list["items"][0]["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn inline_comment_renders_and_applies_a_suggestion() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Files changed"), "{page}");
+    assert!(page.contains("name=\"path\""), "{page}");
+    assert!(page.contains("name=\"side\""), "{page}");
+
+    // Add an anchored comment carrying a suggestion.
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("commit_id", &f.feature_head),
+            ("path", "feat.txt"),
+            ("line", "1"),
+            ("side", "new"),
+            ("body", "```suggestion\nFEATURE\n```"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &location.unwrap(), Some(&f.cookie)).await;
+    assert!(
+        page.contains("on <code>feat.txt</code> line 1 (new)"),
+        "{page}"
+    );
+    assert!(page.contains("<pre class=\"card\">FEATURE"), "{page}");
+    assert!(page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(page.contains(">Resolve</button>"), "{page}");
+
+    let comment_id = first_comment_id(&f).await;
+
+    // Apply the suggestion: the head moves and the comment turns outdated.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments/{comment_id}/apply", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let new_head = git_output(git_cmd(&[
+        "--git-dir",
+        repo_path.to_str().unwrap(),
+        "rev-parse",
+        "feature",
+    ]))
+    .await;
+    assert_ne!(new_head, f.feature_head);
+    let content = git_output(git_cmd(&[
+        "--git-dir",
+        repo_path.to_str().unwrap(),
+        "cat-file",
+        "blob",
+        &format!("{new_head}:feat.txt"),
+    ]))
+    .await;
+    assert_eq!(content, "FEATURE");
+
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("outdated"), "{page}");
+    assert!(!page.contains(">Apply suggestion</button>"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_and_unresolve_through_forms() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("body", "a thread"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let comment_id = first_comment_id(&f).await;
+
+    // Resolve the thread through the form.
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments/{comment_id}/resolve", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("(resolved)"), "{page}");
+    assert!(page.contains(">Unresolve</button>"), "{page}");
+    assert!(!page.contains(">Resolve</button>"), "{page}");
+
+    // Unresolve it again.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments/{comment_id}/unresolve", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(!page.contains("(resolved)"), "{page}");
+    assert!(page.contains(">Resolve</button>"), "{page}");
+
+    finish(f).await;
+}

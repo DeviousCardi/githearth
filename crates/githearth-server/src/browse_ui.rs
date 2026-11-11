@@ -408,7 +408,7 @@ async fn commits_page(
 
 /// Render a diff exactly as the commit page does: binary notices, escaped
 /// patch text, and a truncation notice.
-fn render_diff(files: &[browse::FileDiff], truncated: bool) -> String {
+pub(crate) fn render_diff(files: &[browse::FileDiff], truncated: bool) -> String {
     let mut out = String::new();
     for file in files {
         if file.binary {

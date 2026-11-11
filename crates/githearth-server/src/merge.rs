@@ -482,6 +482,7 @@ pub async fn execute_intent(
             &expected_old,
             operation_id,
             actor_id,
+            githearth_git::journal::Origin::Merge,
             timeout,
         )
     })

@@ -1291,3 +1291,222 @@ async fn unrelated_user_404_everywhere() {
 
     finish(f).await;
 }
+
+/// Pushes a new empty commit onto `branch` directly into storage, returning
+/// the new head.
+async fn advance_branch(f: &Fixture, branch: &str) -> String {
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", branch])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "advance",
+    ]))
+    .await;
+    let oid = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        branch,
+    ]))
+    .await;
+    oid
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn inline_comments_carry_side_and_turn_outdated() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (status, c) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\nfeature!\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{c}");
+    assert_eq!(c["side"], "new");
+    assert_eq!(c["outdated"], false);
+    assert_eq!(c["resolved"], false);
+    assert_eq!(c["suggestion"], "feature!\n");
+
+    // A comment without an explicit side is null (treated as new).
+    let (status, c2) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "plain", "commit_id": f.feature_head, "path": "feat.txt", "line": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(c2["side"], Value::Null);
+
+    // Pushing a new commit makes the anchored comment outdated.
+    advance_branch(&f, "feature").await;
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{number}/comments", repo_href(&f.org_slug, &f.repo_name)),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["outdated"], true);
+    assert_eq!(items[0]["suggestion"], "feature!\n");
+    assert_eq!(items[1]["outdated"], true);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn threads_resolve_and_unresolve() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+    let (_, reply) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "reply", "in_reply_to": root_id}),
+    )
+    .await;
+    let reply_id = reply["id"].as_str().unwrap();
+
+    // Resolving the reply resolves the whole thread.
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{reply_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["resolved"], true);
+    assert!(body["resolved_at"].is_string());
+
+    // The list shows both the root and the reply resolved.
+    let (_, list) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{number}/comments", repo_href(&f.org_slug, &f.repo_name)),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["resolved"], true);
+    assert_eq!(items[1]["resolved"], true);
+
+    // Unresolving the root clears the thread.
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["resolved"], false);
+
+    // A comment on another pull request is not found.
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "checkout",
+        "-q",
+        "-b",
+        "other2",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "other2",
+    ]))
+    .await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "other2",
+    ]))
+    .await;
+    let (_, other) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.org_slug, &f.repo_name),
+        Some(&f.token),
+        None,
+        json!({"title": "other2", "source_branch": "other2", "target_branch": "main"}),
+    )
+    .await;
+    let other_number = other["number"].as_i64().unwrap();
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{other_number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    finish(f).await;
+}
