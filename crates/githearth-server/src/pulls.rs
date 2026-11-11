@@ -1854,6 +1854,11 @@ pub(crate) async fn apply_pull_suggestion(
     if pull.state != "open" {
         return Err(not_open());
     }
+    // A viewer who cannot read the pull request must not learn anything about
+    // the comment: authorize read access before touching it, so a member with
+    // no access to a private repository gets the same 404 whether or not the
+    // comment exists.
+    require_pull(state, &loaded, &pull, Action::PullRequestRead)?;
 
     let mut conn = state.pool.acquire().await?;
     let comment = fetch_comment_row(&mut conn, comment_id)

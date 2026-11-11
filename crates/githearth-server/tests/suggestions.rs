@@ -156,6 +156,20 @@ async fn add_member(pool: &PgPool, org_id: Uuid, role: &str) -> Uuid {
     account
 }
 
+/// An organization member with no grant: not authorized to read repositories.
+async fn add_grantless_member(pool: &PgPool, org_id: Uuid) -> Uuid {
+    let account = fixture_account(pool, &tag("member")).await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(account)
+    .execute(pool)
+    .await
+    .unwrap();
+    account
+}
+
 fn state_repo_path(storage_root: &Path, repo_id: Uuid) -> PathBuf {
     let id_simple = repo_id.simple().to_string();
     storage_root
@@ -745,6 +759,54 @@ async fn writer_cannot_apply_to_a_protected_head_branch() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_member_without_read_access_cannot_probe_a_comment() {
+    let f = build_fixture().await;
+
+    // A general comment has no suggestion, so an authorized viewer would get a
+    // 422 on apply; it is the existence probe a no-access member must not get.
+    let (status, comment) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "{}/{}/comments",
+            repo_href(&f.org_slug, &f.repo_name),
+            f.number
+        ),
+        Some(&f.token),
+        json!({"body": "no suggestion here"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{comment}");
+    let comment_id = comment["id"].as_str().unwrap().to_owned();
+
+    // A member with a membership but no grant cannot read the private repo.
+    let stranger = add_grantless_member(&f.pool, f.org_id).await;
+    let stranger_token = fixture_session(&f.pool, stranger).await;
+
+    // Whether the comment exists or not, the member gets the same 404.
+    let missing = Uuid::nil().to_string();
+    for id in [comment_id.as_str(), missing.as_str()] {
+        let (status, body) = request(
+            &f.app,
+            "POST",
+            &format!(
+                "{}/{}/comments/{}/apply",
+                repo_href(&f.org_slug, &f.repo_name),
+                f.number,
+                id
+            ),
+            Some(&stranger_token),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
 
     finish(f).await;
 }
