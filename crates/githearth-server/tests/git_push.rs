@@ -3071,6 +3071,8 @@ async fn pushed_event_payload_credentials_are_null_when_row_absent() {
     apply_record(&fx.pool, fx.repo_id, operation, fx.actor).await;
 
     let payload = pushed_payload(&fx.pool, fx.org_id).await;
+    assert!(payload.get("credential_kind").is_some());
+    assert!(payload.get("credential_id").is_some());
     assert!(payload["credential_kind"].is_null());
     assert!(payload["credential_id"].is_null());
 
