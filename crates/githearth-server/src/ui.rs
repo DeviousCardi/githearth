@@ -739,7 +739,7 @@ mod tests {
     use super::render_page;
 
     #[test]
-    fn render_page_declares_language_and_escape_hatch() {
+    fn render_page_declares_lang_skip_link_and_landmarks() {
         let html = render_page("Sign in", None, None, "<h1>Sign in</h1>");
         assert!(
             html.contains("<html lang=\"en\">"),
