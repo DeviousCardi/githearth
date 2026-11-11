@@ -1593,6 +1593,9 @@ pub(crate) async fn set_thread_resolved(
     if loaded.repo.status != RepositoryStatus::Active {
         return Err(not_active());
     }
+    if pull.state != "open" {
+        return Err(not_open());
+    }
     let head = branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
     let head = head.as_deref();
 

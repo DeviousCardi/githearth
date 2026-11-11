@@ -1588,3 +1588,45 @@ async fn replies_attach_to_the_root_not_to_another_reply() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_on_a_closed_pull_request_is_refused() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+
+    // Close the pull request; resolving and unresolving must both be refused.
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &format!("{}/{number}", repo_href(&f.org_slug, &f.repo_name)),
+        Some(&f.token),
+        None,
+        json!({"state": "closed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for resolved in [true, false] {
+        let (status, body) = request(
+            &f.app,
+            "PATCH",
+            &format!(
+                "{}/{number}/comments/{root_id}",
+                repo_href(&f.org_slug, &f.repo_name)
+            ),
+            Some(&f.token),
+            None,
+            json!({"resolved": resolved}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "pull request is not open");
+    }
+
+    finish(f).await;
+}
