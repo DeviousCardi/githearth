@@ -16,7 +16,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::{AppState, idempotency, merge_intents, pulls, ui};
+use crate::{AppState, auto_merge, idempotency, merge_intents, pulls, ui};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -43,6 +43,14 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/organizations/{slug}/repositories/{name}/pulls/{number}/merge",
             axum::routing::post(merge_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/auto_merge",
+            axum::routing::post(auto_merge_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/auto_merge/cancel",
+            axum::routing::post(auto_merge_cancel_submit),
         )
 }
 
@@ -594,6 +602,29 @@ async fn render_pull(
         .await
         .unwrap_or(false);
 
+    let auto_merge_row: Option<auto_merge::AutoMergeJson> = match state.pool.acquire().await {
+        Ok(mut conn) => auto_merge::find_auto_merge(&mut conn, detail.pull.id)
+            .await
+            .unwrap_or(None),
+        Err(_) => None,
+    };
+    let can_auto_merge =
+        auto_merge::may_enable(state, s.account.id, s.auth_age, slug, name, number)
+            .await
+            .unwrap_or(false);
+    let queue_position = if intended.as_ref().is_some_and(|i| {
+        i.in_queue && matches!(i.state.as_str(), "queued" | "validating" | "executing")
+    }) {
+        match state.pool.acquire().await {
+            Ok(mut conn) => merge_intents::queue_position(&mut conn, detail.pull.id)
+                .await
+                .unwrap_or(None),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     let mut review_list = String::new();
     for r in &reviews.items {
         review_list.push_str(&format!(
@@ -738,6 +769,30 @@ async fn render_pull(
     } else {
         format!("<h2>Checks</h2><ul>{status_rows}</ul>")
     };
+
+    // Auto-merge: enabled state with a cancel button, or an enable form for a
+    // viewer with merge permission. Queue position for a live queue entry.
+    let queue_notice = match queue_position {
+        Some(pos) => format!("<p class=\"muted\">Merge queue position: {pos}</p>"),
+        None => String::new(),
+    };
+    let auto_merge_section = match (&auto_merge_row, detail.pull.state.as_str()) {
+        (Some(am), "open") => format!(
+            "<div class=\"card\"><p>Auto-merge enabled ({})</p>\
+<form method=\"post\" action=\"{base}/pulls/{number}/auto_merge/cancel\">{}\
+<p><button type=\"submit\">Disable auto-merge</button></p></form></div>",
+            ui::esc(&am.method),
+            form_fields(s, &new_key()),
+        ),
+        (None, "open") if can_auto_merge && !non_terminal => format!(
+            "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/auto_merge\">{}\
+<label for=\"auto_method\">Auto-merge method</label><select id=\"auto_method\" name=\"method\">{}</select>\
+<p><button type=\"submit\">Enable auto-merge</button></p></form>",
+            form_fields(s, &new_key()),
+            merge_options,
+        ),
+        _ => String::new(),
+    };
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
@@ -750,10 +805,10 @@ async fn render_pull(
 </dl></div>\
 <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
 {intent_section}\
-{status_section}\
+{status_section}{queue_notice}\
 <h2>Reviews</h2>{review_list} \
 <h2>Comments</h2>{comment_list}<p>{pager}</p>{error}{review_error}{merge_error}\
-{merge_form}\
+{merge_form}{auto_merge_section}\
 <form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/comments\">{}\
 <label for=\"comment\">Add a comment</label><textarea id=\"comment\" name=\"body\" rows=\"5\" required style=\"width:100%;box-sizing:border-box\">{}</textarea>\
 <p><button type=\"submit\">Comment</button></p></form>\
@@ -1121,4 +1176,78 @@ fn merge_notice(error: &crate::ApiError) -> &'static str {
         StatusCode::UNPROCESSABLE_ENTITY => "One of the branches is missing.",
         _ => "The merge could not be created. Try again.",
     }
+}
+
+#[derive(Deserialize)]
+struct AutoMergeForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    #[serde(default)]
+    method: String,
+}
+
+async fn auto_merge_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<AutoMergeForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    let key = checked_key(&s, &form.idempotency_key)?;
+    let payload = serde_json::json!({ "method": &form.method }).to_string();
+    if let Err(e) = auto_merge::enable_auto_merge(
+        &state,
+        s.account.id,
+        s.auth_age,
+        &slug,
+        &name,
+        number,
+        payload.as_bytes(),
+        Some(key),
+    )
+    .await
+    {
+        return Err(api_error(&s, e));
+    }
+    Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
+}
+
+#[derive(Deserialize)]
+struct AutoMergeCancelForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+}
+
+async fn auto_merge_cancel_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<AutoMergeCancelForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    let key = checked_key(&s, &form.idempotency_key)?;
+    if let Err(e) = auto_merge::cancel_auto_merge(
+        &state,
+        s.account.id,
+        s.auth_age,
+        &slug,
+        &name,
+        number,
+        Some(key),
+    )
+    .await
+    {
+        return Err(api_error(&s, e));
+    }
+    Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
 }

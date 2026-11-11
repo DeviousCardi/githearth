@@ -115,19 +115,42 @@ async fn apply_outcome(
     claim: &Claim,
     outcome: MergeOutcome,
 ) -> Result<(), sqlx::Error> {
+    // A merge-queue entry whose target moved is re-targeted to the new tip and
+    // returned to `queued`, so the next claim re-validates and merges it. The
+    // fence is the same as any other outcome apply; only the claim's holder may
+    // move it. `lease_attempt` is preserved so the attempt cap still bounds a
+    // pathological re-target loop.
+    if let MergeOutcome::Retarget { new_target } = outcome {
+        let mut tx = state.pool.begin().await?;
+        sqlx::query(
+            "UPDATE merge_intents SET expected_target_oid = $1, state = 'queued', \
+             lease_holder = NULL, lease_expires_at = NULL, updated_at = now() \
+             WHERE operation_id = $2 AND state = 'executing' \
+             AND lease_holder = $3 AND lease_attempt = $4",
+        )
+        .bind(new_target)
+        .bind(claim.operation_id)
+        .bind(holder())
+        .bind(claim.attempt)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
     let (new_state, failure_reason, kind) = match outcome {
         MergeOutcome::Merged { .. } | MergeOutcome::AlreadyMerged { .. } => {
             // No transition: `record_merge_result` owns `merged`. If replay
             // failed the row stays `executing` and a later reclaim converges.
             return Ok(());
         }
+        MergeOutcome::Retarget { .. } => unreachable!("handled above"),
         MergeOutcome::Conflicted { paths } => (
             "conflicted",
             Some(paths.join(", ")),
             "pull_request.merge_intent_conflicted",
         ),
         MergeOutcome::Stale { reason } => {
-            // shortcut: ADR 0004 re-drives a target-moved intent; stale is terminal until the merge queue increment.
             ("stale", Some(reason), "pull_request.merge_intent_stale")
         }
         MergeOutcome::Failed { reason } => {

@@ -1207,3 +1207,110 @@ async fn merging_a_pull_with_an_open_intent_shows_a_conflict_notice() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn auto_merge_button_enables_and_cancels_through_the_form() {
+    let f = fixture().await;
+    open_pull(&f).await;
+    // Require an approval so enabling auto-merge does not immediately raise a
+    // merge intent (which would otherwise keep the enable form hidden).
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/protection", f.api_base),
+        &f.token,
+        json!({"pattern": "main", "required_approvals": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Enable auto-merge"), "{page}");
+
+    // Enable auto-merge through the form (its own CSRF token and a fresh key).
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/auto_merge", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", "auto-merge-key-1"),
+            ("method", "squash"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("{}/pulls/1", f.base).as_str())
+    );
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Auto-merge enabled"), "{page}");
+
+    // Cancel auto-merge through the form.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/auto_merge/cancel", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", "auto-merge-cancel-key-1"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Enable auto-merge"), "{page}");
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM auto_merges WHERE pull_request_id IN \
+            (SELECT id FROM pull_requests WHERE repository_id = $1 AND number = 1)",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn queue_position_is_shown_on_the_pull_request_page() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // Require a merge queue on main, then enqueue the pull request.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/protection", f.api_base),
+        &f.token,
+        json!({"pattern": "main", "require_merge_queue": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, intent) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/merge", f.api_base),
+        &f.token,
+        json!({"method": "merge", "expected_head_oid": f.feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    assert_eq!(intent["in_queue"], true);
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Merge queue position: 1"), "{page}");
+
+    finish(f).await;
+}

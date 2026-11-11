@@ -687,6 +687,9 @@ async fn update(
                 .bind(locked.id)
                 .execute(&mut *tx)
                 .await?;
+                // Closing also cancels any pending auto-merge.
+                crate::auto_merge::cancel_in_tx(&mut tx, loaded.org_id, actor.id, locked.id)
+                    .await?;
             }
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
@@ -1123,6 +1126,8 @@ pub(crate) async fn create_pull_review(
                 return Err(idempotency::claim_lost());
             }
             tx.commit().await?;
+            // A new review may have just satisfied a pending auto-merge.
+            let _ = crate::auto_merge::maybe_auto_merge(state, pull.id).await;
             Ok((status, body))
         },
     )

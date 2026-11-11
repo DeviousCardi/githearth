@@ -112,6 +112,11 @@ pub async fn apply_committed(
             .execute(&mut *tx)
             .await?;
         }
+        // A push to a pull request's source branch re-targets or cancels any
+        // auto-merge on it (see `auto_merge::on_push`).
+        for u in &prepared.updates {
+            crate::auto_merge::on_push(&mut tx, repository_id, &u.reference, &u.new, actor).await?;
+        }
         let audit_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO audit_events (id, organization_id, actor_id, kind)

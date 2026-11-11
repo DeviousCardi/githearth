@@ -640,6 +640,7 @@ mod tests {
             require_pull_request,
             required_approvals: 0,
             required_status_checks: Vec::new(),
+            require_merge_queue: false,
             created_at: String::new(),
             updated_at: String::new(),
         }
