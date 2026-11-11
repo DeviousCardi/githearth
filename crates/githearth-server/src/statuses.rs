@@ -114,9 +114,14 @@ fn new_status(body: &[u8]) -> Result<NewStatus, ApiError> {
             "context must not have leading or trailing whitespace",
         ));
     }
+    if input.context == LEGACY_REQUIRE_CHECKS_CONTEXT {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "context is reserved and cannot be posted",
+        ));
+    }
     if !valid_context(&input.context)
         || !valid_state(&input.state)
-        || input.context == LEGACY_REQUIRE_CHECKS_CONTEXT
         || input
             .description
             .as_ref()
@@ -395,14 +400,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_context_payload_returns_bad_request() {
+    fn legacy_context_payload_returns_unprocessable() {
         let err = new_status(
             serde_json::json!({"context": LEGACY_REQUIRE_CHECKS_CONTEXT, "state": "success"})
                 .to_string()
                 .as_bytes(),
         )
         .unwrap_err();
-        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
