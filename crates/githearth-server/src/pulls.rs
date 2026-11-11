@@ -852,7 +852,7 @@ async fn create_comment(
 }
 
 /// Comments on a pull request as `actor_id`. An anchored comment must name
-/// the current head; a reply must name a comment on the same pull request.
+/// the current head; a reply must name a root comment on the same pull request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_pull_comment(
     state: &AppState,
@@ -925,16 +925,27 @@ pub(crate) async fn create_pull_comment(
                 return Err(not_active());
             }
             if let Some(parent) = input.in_reply_to {
-                let same_pull: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM pull_request_comments \
-                     WHERE id = $1 AND pull_request_id = $2)",
+                let parent_in_reply_to: Option<Option<Uuid>> = sqlx::query_scalar(
+                    "SELECT in_reply_to FROM pull_request_comments \
+                     WHERE id = $1 AND pull_request_id = $2",
                 )
                 .bind(parent)
                 .bind(pull.id)
-                .fetch_one(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await?;
-                if !same_pull {
-                    return Err(invalid());
+                match parent_in_reply_to {
+                    // The parent must be a comment on this pull request.
+                    None => return Err(invalid()),
+                    // Replies attach to the thread root, never another reply,
+                    // so the display groups one root with its direct replies
+                    // and a reply's resolution is its root's.
+                    Some(Some(_)) => {
+                        return Err(ApiError(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "replies attach to the thread root",
+                        ))
+                    }
+                    Some(None) => {}
                 }
             }
             let seq: i32 = sqlx::query_scalar(
@@ -1355,10 +1366,11 @@ async fn list_review_requests(
     Ok(Json(list_review_requests_query(&mut conn, pull.id).await?))
 }
 
-/// Permission shared by POST and DELETE: the caller must be allowed
-/// `PullRequestComment` on the pull, and be either the author or allowed
-/// `PullRequestApprove`.
-fn require_request_permission(
+/// Permission shared by review requests and thread resolution: the caller
+/// must be allowed `PullRequestComment` on the pull, and be either the author
+/// or allowed `PullRequestApprove`. A reader who can merely comment is not
+/// enough to resolve a thread or to request a reviewer.
+fn require_review_permission(
     state: &AppState,
     loaded: &Loaded,
     pull: &PullJson,
@@ -1391,7 +1403,7 @@ async fn add_review_request(
     let loaded =
         repository_api::load_current(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
     let pull = load_pull(&state, &loaded, number, Action::PullRequestComment).await?;
-    require_request_permission(&state, &loaded, &pull)?;
+    require_review_permission(&state, &loaded, &pull)?;
     if loaded.repo.status != RepositoryStatus::Active {
         return Err(not_active());
     }
@@ -1494,7 +1506,7 @@ async fn remove_review_request(
     let loaded =
         repository_api::load_current(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
     let pull = load_pull(&state, &loaded, number, Action::PullRequestComment).await?;
-    require_request_permission(&state, &loaded, &pull)?;
+    require_review_permission(&state, &loaded, &pull)?;
 
     let mut tx = state.pool.begin().await?;
     let reviewer_id: Option<Uuid> =
@@ -1559,7 +1571,8 @@ async fn resolve_comment(
 
 /// Resolves or unresolves the thread `comment_id` belongs to, returning the
 /// target comment enriched like a list entry. Resolution lives on the thread
-/// root; a reply's parent carries it.
+/// root; a reply's parent carries it. The caller must be the pull request
+/// author or able to approve.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn set_thread_resolved(
     state: &AppState,
@@ -1574,6 +1587,9 @@ pub(crate) async fn set_thread_resolved(
     let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestComment).await?;
+    // Resolving a thread is a review action: the author or an approver, not a
+    // member who can merely read and comment.
+    require_review_permission(state, &loaded, &pull)?;
     if loaded.repo.status != RepositoryStatus::Active {
         return Err(not_active());
     }
@@ -1646,17 +1662,16 @@ pub(crate) async fn set_thread_resolved(
     Ok(comment_json(row, head))
 }
 
-/// Whether `actor_id` may apply a suggestion: the pull request author, or
-/// anyone allowed `ref.push` on the source branch (including branch
-/// protection, exactly as a push would be judged).
+/// Whether `actor_id` may apply a suggestion: anyone allowed `ref.push` on the
+/// source branch (including branch protection, exactly as a push would be
+/// judged). The pull request author has no special path — an author who cannot
+/// push to the head branch (read-only access, or a protected branch) may not
+/// apply.
 async fn require_apply_permission(
     state: &AppState,
     loaded: &Loaded,
     pull: &PullJson,
 ) -> Result<(), ApiError> {
-    if loaded.actor_id == pull.author_id {
-        return Ok(());
-    }
     let mut conn = state.pool.acquire().await?;
     let rules = protection::load_rules(&mut conn, loaded.repo.id).await?;
     drop(conn);
@@ -1760,7 +1775,7 @@ pub(crate) async fn apply_pull_suggestion(
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "comment not found"))?;
     drop(conn);
-    let (Some(_commit_id), Some(path), Some(line)) =
+    let (Some(commit_id), Some(path), Some(line)) =
         (&comment.commit_id, &comment.path, comment.line)
     else {
         return Err(suggestion_not_applyable(
@@ -1795,6 +1810,11 @@ pub(crate) async fn apply_pull_suggestion(
     let head = branch_tip(state, loaded.repo.id, &pull.source_branch)
         .await?
         .ok_or_else(branch_missing)?;
+    // A suggestion applies to the exact commit it commented; once the head has
+    // moved the comment is outdated and must not rewrite the current line.
+    if commit_id.as_str() != head.as_str() {
+        return Err(head_moved());
+    }
 
     let (actor_username, comment_author_username) = {
         let mut conn = state.pool.acquire().await?;
@@ -2093,6 +2113,27 @@ mod tests {
         assert!(!ok(
             serde_json::json!({"verdict": "approved", "commit_id": "main"})
         ));
+    }
+
+    #[test]
+    fn suggestion_storage_errors_map_to_api_statuses() {
+        use githearth_git::StorageError;
+
+        let invalid = suggestion_storage_error(StorageError::Invalid("x".into()));
+        assert_eq!(invalid.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            invalid.message(),
+            "the suggestion no longer applies to the file"
+        );
+
+        let too_large = suggestion_storage_error(StorageError::TooLarge { size: 1, limit: 0 });
+        assert_eq!(too_large.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let timeout = suggestion_storage_error(StorageError::Timeout);
+        assert_eq!(timeout.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let other = suggestion_storage_error(StorageError::Git("boom".into()));
+        assert_eq!(other.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

@@ -1510,3 +1510,81 @@ async fn threads_resolve_and_unresolve() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_requires_the_author_or_an_approver() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+
+    // A read-only member can read and comment, but cannot resolve a thread.
+    let reader = add_member(&f.pool, f.org_id, "read").await;
+    let reader_token = fixture_session(&f.pool, reader).await;
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&reader_token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The author can resolve the thread.
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resolved"], true);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replies_attach_to_the_root_not_to_another_reply() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+    let (_, reply) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "reply", "in_reply_to": root_id}),
+    )
+    .await;
+    let reply_id = reply["id"].as_str().unwrap();
+
+    // Replying to a reply is rejected so the display nests one root with its
+    // direct replies and a reply's resolution is its root's.
+    let (status, body) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "nested", "in_reply_to": reply_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    finish(f).await;
+}

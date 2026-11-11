@@ -560,17 +560,19 @@ async fn apply_rejects_non_suggestions_and_old_side_comments() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn applying_a_suggestion_that_no_longer_applies_fails_cleanly() {
+async fn applying_an_outdated_suggestion_is_refused_with_head_moved() {
     let f = build_fixture().await;
 
     let (status, comment) = add_suggestion_comment(&f, &f.token, "after\n").await;
     assert_eq!(status, StatusCode::CREATED);
     let comment_id = comment["id"].as_str().unwrap().to_owned();
 
-    // Move the head and drop the file, so the line no longer exists.
+    // Move the head without deleting the target line. The line still exists,
+    // but the comment is now outdated and must not silently rewrite it.
     let tw = f.work.to_str().unwrap();
     git_ok(git_cmd(&["-C", tw, "checkout", "-q", "feature"])).await;
-    git_ok(git_cmd(&["-C", tw, "rm", "-q", "feat.txt"])).await;
+    std::fs::write(f.work.join("feat.txt"), "before\nchanged\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "feat.txt"])).await;
     git_ok(git_cmd(&[
         "-C",
         tw,
@@ -581,7 +583,7 @@ async fn applying_a_suggestion_that_no_longer_applies_fails_cleanly() {
         "commit",
         "-q",
         "-m",
-        "drop feat",
+        "move head",
     ]))
     .await;
     let repo_path = state_repo_path(&f.storage_root, f.repo_id);
@@ -609,7 +611,119 @@ async fn applying_a_suggestion_that_no_longer_applies_fails_cleanly() {
         Value::Null,
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn read_only_author_cannot_apply_to_a_protected_head_branch() {
+    let f = build_fixture().await;
+
+    // A read-only member authors their own pull request.
+    let author = add_member(&f.pool, f.org_id, "read").await;
+    let author_token = fixture_session(&f.pool, author).await;
+
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "checkout",
+        "-q",
+        "-b",
+        "reader-branch",
+    ]))
+    .await;
+    std::fs::write(f.work.join("reader.txt"), "reader\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "reader.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "reader",
+    ]))
+    .await;
+    let reader_head = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "reader-branch",
+    ]))
+    .await;
+
+    let (status, pull) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.org_slug, &f.repo_name),
+        Some(&author_token),
+        json!({"title": "reader pull", "source_branch": "reader-branch", "target_branch": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{pull}");
+    let number = pull["number"].as_i64().unwrap();
+
+    // Protect the head branch so a push would be refused.
+    let (status, rule) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/protection",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        json!({"pattern": "reader-branch", "require_pull_request": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{rule}");
+
+    // The author adds a suggestion and tries to apply it.
+    let (status, comment) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "{}/{}/comments",
+            repo_href(&f.org_slug, &f.repo_name),
+            number
+        ),
+        Some(&author_token),
+        json!({
+            "body": "```suggestion\nchanged\n```",
+            "commit_id": reader_head,
+            "path": "reader.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{comment}");
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "{}/{}/comments/{}/apply",
+            repo_href(&f.org_slug, &f.repo_name),
+            number,
+            comment["id"].as_str().unwrap()
+        ),
+        Some(&author_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
     finish(f).await;
 }
