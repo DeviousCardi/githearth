@@ -159,6 +159,77 @@ async fn create_and_bare_repo_on_disk() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn create_sha256_repository_on_disk() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let token = fixture_session(&pool, owner_id).await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "sha256-repo", "object_format": "sha256"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["name"], "sha256-repo");
+
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let id_simple = id.simple().to_string();
+    let repo_path = storage_root
+        .join("repositories")
+        .join(&id_simple[..2])
+        .join(format!("{id_simple}.git"));
+    assert_eq!(
+        githearth_git::layout::detect_object_format(&repo_path).unwrap(),
+        githearth_git::layout::ObjectFormat::Sha256
+    );
+
+    let stored: String = sqlx::query_scalar("SELECT object_format FROM repositories WHERE id=$1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, "sha256");
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn invalid_object_format_400() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let token = fixture_session(&pool, owner_id).await;
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "bad-format", "object_format": "sha512"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn duplicate_name_409() {
     let (app, pool, storage_root, _, org_slug) = setup().await;
     let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")

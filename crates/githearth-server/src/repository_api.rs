@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use githearth_authz::{Action, Resource};
+use githearth_authz::{Action, Organization, Principal, Request, Resource};
 use githearth_core::RepositoryStatus;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -36,6 +36,8 @@ pub(crate) struct NewRepository {
     description: String,
     #[serde(default)]
     visibility: Option<String>,
+    #[serde(default)]
+    object_format: Option<String>,
 }
 
 fn valid_repo_name(name: &str) -> bool {
@@ -153,6 +155,46 @@ async fn load_by_operation(
     })
 }
 
+/// Load a repository for an anonymous visitor. Only a public repository in a
+/// non-suspended organization is visible; anything else yields `None` so the
+/// caller can fall back to a sign-in prompt without revealing the repository.
+pub(crate) async fn load_public_anonymous(
+    state: &AppState,
+    org_slug: &str,
+    name: &str,
+) -> Option<repositories::RepositoryRow> {
+    let mut conn = state.pool.acquire().await.ok()?;
+    let (org_id, suspended): (Uuid, bool) =
+        sqlx::query_as("SELECT id, suspended FROM organizations WHERE slug = $1")
+            .bind(org_slug)
+            .fetch_optional(&mut *conn)
+            .await
+            .ok()??;
+    let repo = repositories::find_by_name(&mut conn, org_id, name)
+        .await
+        .ok()??;
+    if repo.status != RepositoryStatus::Active {
+        return None;
+    }
+    let organization = Organization {
+        id: org_id,
+        suspended,
+    };
+    let authz_repo = repositories::authz_repository(&repo);
+    let request = Request {
+        principal: Principal::Anonymous,
+        teams: &[],
+        grants: &[],
+        action: Action::RepositoryRead,
+        organization: &organization,
+        resource: Resource::Repository(&authz_repo),
+        merge: None,
+        auth_age: None,
+        read_only: false,
+    };
+    state.authz.authorize(&request).is_allowed().then_some(repo)
+}
+
 pub(crate) fn require(state: &AppState, loaded: &Loaded, action: Action) -> Result<(), ApiError> {
     let authz_repo = repositories::authz_repository(&loaded.repo);
     let decision = state.authz.authorize(&loaded.facts.request(
@@ -196,6 +238,11 @@ pub(crate) async fn create(
     {
         return Err(invalid());
     }
+    if let Some(ref v) = input.object_format
+        && !matches!(v.as_str(), "sha1" | "sha256")
+    {
+        return Err(invalid());
+    }
 
     let mut conn = state.pool.acquire().await?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
@@ -231,6 +278,8 @@ pub(crate) async fn create(
         key,
         |idem| async move {
             let visibility = input.visibility.as_deref().unwrap_or("private");
+            let object_format = input.object_format.as_deref().unwrap_or("sha1");
+            let object_format_enum = repositories::object_format(object_format);
             let description = &input.description;
 
             let mut tx = state.pool.begin().await?;
@@ -260,7 +309,7 @@ pub(crate) async fn create(
                     if !idem.record_operation(&mut tx, operation_id).await? {
                         return Err(idempotency::claim_lost());
                     }
-                    match repositories::insert_creating(
+                    match repositories::insert_creating_with_format(
                         &mut tx,
                         org_id,
                         &input.name,
@@ -268,6 +317,7 @@ pub(crate) async fn create(
                         operation_id,
                         visibility,
                         description,
+                        object_format,
                     )
                     .await
                     {
@@ -312,11 +362,7 @@ pub(crate) async fn create(
                 RepositoryStatus::Creating => {
                     tokio::task::spawn_blocking(move || {
                         let _guard = guard;
-                        storage.create(
-                            repo_id,
-                            operation_id,
-                            githearth_git::layout::ObjectFormat::Sha1,
-                        )
+                        storage.create(repo_id, operation_id, object_format_enum)
                     })
                     .await
                     .map_err(|_| {

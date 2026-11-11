@@ -590,26 +590,39 @@ async fn repository(
     headers: HeaderMap,
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, UiError> {
-    let (account, auth_age) = match browser_auth(&state, &headers).await {
-        Ok(v) => v,
+    let (repo, username, csrf) = match browser_auth(&state, &headers).await {
+        Ok((account, auth_age)) => {
+            let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
+                .await
+                .map_err(|e| {
+                    if e.status_code() == StatusCode::NOT_FOUND {
+                        not_found_page(Some(&account.username))
+                    } else {
+                        unavailable_page(Some(&account.username))
+                    }
+                })?;
+            if repository_api::require(&state, &loaded, githearth_authz::Action::RepositoryRead)
+                .is_err()
+            {
+                return Err(not_found_page(Some(&account.username)));
+            }
+            let hash = browser_token_hash(&headers).unwrap_or_default();
+            (
+                loaded.repo,
+                Some(account.username),
+                Some(csrf_expected(&hash)),
+            )
+        }
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
-            return Err(auth_required());
+            // An anonymous visitor may read public repositories only.
+            match repository_api::load_public_anonymous(&state, &slug, &name).await {
+                Some(repo) => (repo, None, None),
+                None => return Err(auth_required()),
+            }
         }
         Err(_) => return Err(unavailable_page(None)),
     };
-    let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
-        .await
-        .map_err(|e| {
-            if e.status_code() == StatusCode::NOT_FOUND {
-                not_found_page(Some(&account.username))
-            } else {
-                unavailable_page(Some(&account.username))
-            }
-        })?;
-    if repository_api::require(&state, &loaded, githearth_authz::Action::RepositoryRead).is_err() {
-        return Err(not_found_page(Some(&account.username)));
-    }
-    let repo = &loaded.repo;
+    let repo = &repo;
     let mut browse_section = String::new();
     if repo.status == githearth_core::RepositoryStatus::Active {
         let storage = state.storage.clone();
@@ -671,11 +684,9 @@ async fn repository(
         esc(&repo.description),
         browse_section
     );
-    let hash = browser_token_hash(&headers).unwrap_or_default();
-    let csrf = Some(csrf_expected(&hash));
     Ok(Html(render_page(
         "Repository",
-        Some(&account.username),
+        username.as_deref(),
         csrf.as_deref(),
         &body,
     ))

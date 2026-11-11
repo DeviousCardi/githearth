@@ -78,9 +78,21 @@ async fn info_refs(
         }
     };
 
-    let admitted = git_admission::admit(&state, &headers, &org, repo_name, want)
-        .await
-        .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
+    let repo_id = match want {
+        git_admission::Want::Fetch => {
+            git_admission::admit_fetch(&state, &headers, &org, repo_name)
+                .await
+                .map_err(|e| GitHttpError::Auth(e.0, e.1))?
+                .id
+        }
+        git_admission::Want::Push => {
+            git_admission::admit(&state, &headers, &org, repo_name, want)
+                .await
+                .map_err(|e| GitHttpError::Auth(e.0, e.1))?
+                .repository
+                .id
+        }
+    };
 
     let permit = acquire_git_permit(&state).await?;
     let deadline =
@@ -90,14 +102,14 @@ async fn info_refs(
 
     let cmd = if want == git_admission::Want::Fetch {
         state.storage.upload_pack(
-            admitted.repository.id,
+            repo_id,
             githearth_git::layout::PackMode::Advertise,
             git_protocol.as_deref(),
         )
     } else {
         let hooks_dir = state.config.storage_root.join("hooks");
         state.storage.receive_pack(
-            admitted.repository.id,
+            repo_id,
             githearth_git::layout::PackMode::Advertise,
             git_protocol.as_deref(),
             &hooks_dir,
@@ -106,7 +118,7 @@ async fn info_refs(
     .map_err(|e| {
         tracing::error!(
             category = "git",
-            repository_id = %admitted.repository.id,
+            repository_id = %repo_id,
             "storage error: {e}"
         );
         GitHttpError::ServerError
@@ -121,7 +133,7 @@ async fn info_refs(
         .map_err(|e| {
             tracing::error!(
                 category = "git",
-                repository_id = %admitted.repository.id,
+                repository_id = %repo_id,
                 "cannot spawn git: {e}"
             );
             GitHttpError::ServerError
@@ -129,7 +141,6 @@ async fn info_refs(
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
-    let repo_id = admitted.repository.id;
 
     let use_v2 = is_protocol_v2(git_protocol.as_deref());
     let prefix: Vec<u8> = if use_v2 {
@@ -171,15 +182,10 @@ async fn upload_pack(
 ) -> Result<Response, GitHttpError> {
     let repo_name = strip_dot_git(&repo).ok_or(GitHttpError::NotFound)?;
 
-    let admitted = git_admission::admit(
-        &state,
-        &headers,
-        &org,
-        repo_name,
-        git_admission::Want::Fetch,
-    )
-    .await
-    .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
+    let repo_row = git_admission::admit_fetch(&state, &headers, &org, repo_name)
+        .await
+        .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
+    let repo_id = repo_row.id;
 
     let permit = acquire_git_permit(&state).await?;
     let deadline =
@@ -213,14 +219,14 @@ async fn upload_pack(
     let cmd = state
         .storage
         .upload_pack(
-            admitted.repository.id,
+            repo_id,
             githearth_git::layout::PackMode::Rpc,
             git_protocol.as_deref(),
         )
         .map_err(|e| {
             tracing::error!(
                 category = "git",
-                repository_id = %admitted.repository.id,
+                repository_id = %repo_id,
                 "storage error: {e}"
             );
             GitHttpError::ServerError
@@ -235,7 +241,7 @@ async fn upload_pack(
         .map_err(|e| {
             tracing::error!(
                 category = "git",
-                repository_id = %admitted.repository.id,
+                repository_id = %repo_id,
                 "cannot spawn git: {e}"
             );
             GitHttpError::ServerError
@@ -244,7 +250,6 @@ async fn upload_pack(
     let stdin = child.stdin.take().expect("stdin piped");
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
-    let repo_id = admitted.repository.id;
 
     // Kill channel: stdin feeder sends when the decoded body exceeds the limit.
     let (kill_tx, kill_rx) = oneshot::channel::<()>();

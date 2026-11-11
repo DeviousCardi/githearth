@@ -3,7 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use githearth_authz::{Action, Ref, Resource};
+use githearth_authz::{Action, Organization, Principal, Ref, Request, Resource};
 use githearth_git::journal::Update;
 use std::time::Duration;
 use uuid::Uuid;
@@ -159,6 +159,81 @@ pub async fn admit(
         state, account_id, read_only, credential, org_slug, repo_name, want,
     )
     .await
+}
+
+/// Admit a fetch. A request without an Authorization header may read a public
+/// repository anonymously; anything else must authenticate.
+pub async fn admit_fetch(
+    state: &AppState,
+    headers: &HeaderMap,
+    org_slug: &str,
+    repo_name: &str,
+) -> Result<RepositoryRow, AuthError> {
+    if headers.contains_key("authorization") {
+        admit(state, headers, org_slug, repo_name, Want::Fetch)
+            .await
+            .map(|a| a.repository)
+    } else {
+        admit_anonymous(state, org_slug, repo_name).await
+    }
+}
+
+/// An anonymous visitor may fetch a public repository only. Loads the
+/// organization and repository, then evaluates the read and clone actions
+/// against the `Anonymous` principal; push is never anonymous.
+///
+/// Every denial fails with 401 rather than 404: an unauthenticated client must
+/// be challenged for credentials (and a missing repository must not be
+/// distinguishable from a private one).
+async fn admit_anonymous(
+    state: &AppState,
+    org_slug: &str,
+    repo_name: &str,
+) -> Result<RepositoryRow, AuthError> {
+    let unauthorized = || AuthError(StatusCode::UNAUTHORIZED, "invalid or expired credentials");
+    let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    let mut conn = state.pool.acquire().await.map_err(unavailable)?;
+    let (org_id, suspended): (Uuid, bool) =
+        sqlx::query_as("SELECT id, suspended FROM organizations WHERE slug = $1")
+            .bind(org_slug)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(unavailable)?
+            .ok_or_else(unauthorized)?;
+    let repo = repositories::find_by_name(&mut conn, org_id, repo_name)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(unauthorized)?;
+    if repo.status != githearth_core::RepositoryStatus::Active {
+        return Err(unauthorized());
+    }
+    let organization = Organization {
+        id: org_id,
+        suspended,
+    };
+    let authz_repo = repositories::authz_repository(&repo);
+    let read = Request {
+        principal: Principal::Anonymous,
+        teams: &[],
+        grants: &[],
+        action: Action::RepositoryRead,
+        organization: &organization,
+        resource: Resource::Repository(&authz_repo),
+        merge: None,
+        auth_age: None,
+        read_only: false,
+    };
+    if !state.authz.authorize(&read).is_allowed() {
+        return Err(unauthorized());
+    }
+    let clone = Request {
+        action: Action::RepositoryClone,
+        ..read
+    };
+    if !state.authz.authorize(&clone).is_allowed() {
+        return Err(unauthorized());
+    }
+    Ok(repo)
 }
 
 /// Authorization after authentication, shared by HTTP and SSH transports (ADR 0005).
@@ -408,6 +483,7 @@ mod tests {
                 status: RepositoryStatus::Active,
                 operation_id: uuid::Uuid::new_v4(),
                 created_by: uuid::Uuid::new_v4(),
+                object_format: "sha1".into(),
             },
             facts: crate::facts::Facts {
                 account,

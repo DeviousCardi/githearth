@@ -21,7 +21,7 @@ use crate::AppState;
 use crate::pushes;
 use crate::repositories;
 use githearth_core::RepositoryStatus;
-use githearth_git::layout::{ObjectFormat, TmpEntry};
+use githearth_git::layout::TmpEntry;
 use sqlx::{Connection, Row};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -389,17 +389,16 @@ async fn reconcile_creating(
     // Re-read the row under the lock: a concurrent API delete may have already
     // removed it, and the reconciler must not recreate the directory.
     let mut conn = state.pool.acquire().await?;
-    let still_creating = repositories::get(&mut conn, repo_id)
-        .await?
-        .is_some_and(|r| r.status == RepositoryStatus::Creating);
-    if !still_creating {
+    let row = repositories::get(&mut conn, repo_id).await?;
+    let Some(row) = row.filter(|r| r.status == RepositoryStatus::Creating) else {
         attempts.remove(&repo_id);
         return Ok(None);
-    }
+    };
+    let format = repositories::object_format(&row.object_format);
 
     let create_result = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        storage.create(repo_id, op_id, ObjectFormat::Sha1)
+        storage.create(repo_id, op_id, format)
     })
     .await
     .map_err(|e| anyhow::anyhow!("create task panicked: {e}"))?;

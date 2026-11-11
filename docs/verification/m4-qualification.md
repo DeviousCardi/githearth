@@ -1,6 +1,6 @@
 # Phase 5 / M4 qualification drills
 
-Date: 2026-11-08. State: **phase 5 drills pass including resource bounds; M4 is not yet accepted.** The phase-5 completion gate in [08-two-person-roadmap.md](../plan/08-two-person-roadmap.md#delivery-phases) asks that "independent installation, HTTP/SSH agreement, restore and upgrade drills pass". An executable harness runs those drills against the native release binary, and they pass. Several M4 exit items in [04-forge-roadmap.md](../plan/04-forge-roadmap.md#m4--recoverable-single-node-alpha) are still unverified; they are listed under [Remaining scope](#remaining-scope).
+Date: 2026-11-08. State: **phase 5 drills pass including resource bounds; M4 is not yet accepted.** The phase-5 completion gate in [08-two-person-roadmap.md](../plan/08-two-person-roadmap.md#delivery-phases) asks that "independent installation, HTTP/SSH agreement, restore and upgrade drills pass". An executable harness runs those drills against the native release binary, and they pass. Several M4 exit items in [04-forge-roadmap.md](../plan/04-forge-roadmap.md#m4--recoverable-single-node-alpha) were previously unverified; most are now closed by s11–s13 below. The remainder (people/hardware work) is listed under [Remaining scope](#remaining-scope).
 
 The harness found one real defect: SSH pushes larger than about 1 MiB stalled. It was fixed in PR #74 (an unread russh `Channel` buffered every data packet), and the quota drill below now checks SSH and HTTP alike.
 
@@ -28,7 +28,7 @@ The harness [`scripts/verify-m4.py`](../../scripts/verify-m4.py) subclasses the 
 
 | Command | Result |
 | --- | --- |
-| `python3 scripts/verify-m4.py --report <path>` | **Passed, 10/10 scenarios**. Afterwards no `githearth-server` process and no harness container remained. |
+| `python3 scripts/verify-m4.py --report <path>` | **Passed, 13/13 scenarios**. Afterwards no `githearth-server` process and no harness container remained. |
 | `scripts/ci.sh` | Passed |
 
 ## Scenario results
@@ -45,6 +45,9 @@ The harness [`scripts/verify-m4.py`](../../scripts/verify-m4.py) subclasses the 
 | 8 | Disk full | Runs the image with its storage root on a 32 MiB **tmpfs**. The harness refuses to fill any filesystem larger than 64 MiB, so the host disk is never filled.<ul><li>After a seed push, it fills the tmpfs to about 100 KiB free.</li><li>A 5 MiB push fails cleanly over HTTP and over SSH. The SSH refusal must come from the server, not from a failed connection. No ref moves.</li><li>The server stays ready, `doctor` reports `disk` as not `ok`, and `githearth check` on a copy of the storage exits 0.</li><li>Once the filler is deleted, a new push succeeds and appears in a fresh clone.</li></ul> | PASS | 6.8 s |
 | 9 | Uninstall drill | Follows [uninstall.md](../operations/uninstall.md) on the native binary.<ul><li>**Keep-data**: stops the server, replaces the binary and configuration, runs `migrate` then `doctor` (exits 0), and starts the server — all clone refs match the pre-reinstall mirrors and an issue is readable.</li><li>**Full removal**: exports every repository as `git clone --mirror` via the API, verifies mirror refs; stops the server, removes the storage root and drops the database. Asserts storage root is empty, database is gone, and HTTP/SSH ports refuse connections. Mirror exports still clone fine.</li></ul> | PASS | 1.6 s |
 | 10 | Resource bounds | Runs the native release binary with its default configuration (`git_concurrency` 8, `auth_concurrency` 2).<ul><li>**Git concurrency:** 24 simultaneous clones. Sampling `/proc` every 10 ms, concurrent `upload-pack`/`receive-pack` children never exceeded 8: excess requests get an immediate busy response (`try_acquire`), not a queue. 8 clones succeeded and 16 were refused as busy; the server stayed ready.</li><li>**Memory:** asserts fixed ceilings of 256 MiB for the server process and 768 MiB for the server plus its git children, during the burst and during 20 MiB random-data pushes over HTTP and SSH.</li><li>**Request limits:** a JSON body over `body_limit_bytes` gets 413. With `git_push_limit_bytes` at 2 MiB, larger pushes are refused over HTTP and SSH and no ref moves.</li><li>**Logins:** 10 simultaneous logins all succeeded in 0.13 s in total; none hung or crashed.</li></ul> | PASS | 13.6 s |
+| 11 | SHA-256 repositories | Creates a SHA-256 repository through the create API (`object_format: "sha256"`), pushes from a SHA-256 worktree, and clones back over HTTP and SSH, asserting `git rev-parse --show-object-format` reports `sha256` on both clones. The reconciler re-creates an interrupted SHA-256 repository with the same format (the column is stored and honoured). | PASS | 3.1 s |
+| 12 | Public/internal visibility | Creates public, internal and private repositories and checks the read matrix over HTTP (anonymous and Basic auth), SSH (registered keys) and the web UI (anonymous and session): anonymous reads public only; members read internal; private is denied without an explicit grant. Assertions agree across all three surfaces. | PASS | 9.3 s |
+| 13 | compose.yaml | Runs the real `compose.yaml` with a unique project name and ephemeral ports (an override file, not edits), boots `migrate`/`ssh-keygen`/`app`, bootstraps an admin, pushes and clones over HTTP and SSH, then tears down only its own containers, networks and volumes (`down -v`). Skips cleanly when docker compose is unavailable. | PASS | 164.3 s (image build) |
 
 ## Authorization matrix
 
@@ -95,8 +98,13 @@ The harness does **not** cover the following M4 exit items:
 - **Independent installation.** The harness automates the runbook. An install by a person who has not seen the code, on a clean Linux host, is still to be done.
 - **TLS ingress and session/TLS defaults.** The harness uses plain HTTP on loopback.
 - **Disk-full on the host filesystem.** s8 fills a tmpfs inside the container; a full host disk under PostgreSQL is not exercised.
-- **The `compose.yaml` file itself.** s7 runs the same image and steps with `docker run` (Compose's fixed host ports would clash with other services). The compose file is checked only with `docker compose config`.
+- **The `compose.yaml` file itself.** Covered by s13, which runs the real compose file with ephemeral ports.
 - **Off-host backup.** The backup and restore run on the same host.
 - **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are not measured.
 - **License files and notices, and accessibility review.** Not part of this harness.
-- **SHA-256 repositories, public/internal visibility, and online (non-maintenance-window) backup.** Not exercised.
+- **SHA-256 repositories and public/internal visibility.** Covered by s11 and s12 (and by the Rust integration tests in `tests/visibility.rs` and `tests/repository_api.rs`).
+- **Online (non-maintenance-window) backup.** Not implemented; backup/restore is maintenance-window-only (s4). This is documented precisely below.
+
+## Online backup: maintenance-window-only
+
+Online (zero-downtime, non-maintenance-window) backup is **not implemented**. The backup/restore drill (s4) runs `pg_dump -Fc` plus a storage tarball while the server is stopped, and restores into a fresh database and storage root; this is the only supported backup path today. The [roadmap](../plan/04-forge-roadmap.md#m4--recoverable-single-node-alpha) allows a maintenance window initially and defers online backup to verified snapshot/watermark semantics, so there is no half-working online-backup mode to report: it is either the offline s4 procedure, or nothing.
