@@ -245,11 +245,13 @@ fn comment_json(row: CommentRow, head: Option<&str>) -> CommentJson {
         (Some(_), None) => true,
         (None, _) => false,
     };
-    let suggestion = row
-        .commit_id
-        .is_some()
-        .then(|| suggestion::suggestion_replacement(&row.body))
-        .flatten();
+    // A suggestion applies to the head (new) side only; an "old"-side comment
+    // may carry a ```suggestion block, but the server always refuses to apply
+    // it, so no Apply button must be offered for it.
+    let suggestion = (row.commit_id.is_some()
+        && !row.side.as_deref().is_some_and(|side| side == "old"))
+    .then(|| suggestion::suggestion_replacement(&row.body))
+    .flatten();
     CommentJson {
         id: row.id,
         author_id: row.author_id,

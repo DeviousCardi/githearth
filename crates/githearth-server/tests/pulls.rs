@@ -1385,6 +1385,68 @@ async fn inline_comments_carry_side_and_turn_outdated() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn old_side_comments_do_not_expose_a_suggestion() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    // A suggestion on the base (old) side must not expose an applyable
+    // suggestion, because the server always refuses to apply it.
+    let (status, old) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\nx\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "old",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{old}");
+    assert_eq!(old["side"], "old");
+    assert_eq!(old["suggestion"], Value::Null);
+
+    // The same suggestion on the new side is exposed.
+    let (status, new) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\nx\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(new["suggestion"], "x\n");
+
+    // An unspecified side is treated as new and also exposes the suggestion.
+    let (status, unspecified) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\ny\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(unspecified["suggestion"], "y\n");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn threads_resolve_and_unresolve() {
     let f = build_fixture().await;
     let (_, pull) = create_pull(&f).await;
