@@ -34,6 +34,7 @@ step deny
 cargo deny check advisories bans licenses sources
 step "third-party notices"
 python3 scripts/generate-third-party-notices.py --check
+python3 scripts/test_generate_third_party_notices.py
 step "tests with coverage (including PostgreSQL)"
 cargo llvm-cov --workspace --locked --summary-only --fail-under-lines "$min_lines" -- --include-ignored
 step "container image"

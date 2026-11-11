@@ -28,6 +28,13 @@ NOTICES = ROOT / "THIRD_PARTY_NOTICES"
 # image) and the `githearth` command-line interface.
 BINARY_CRATES = {"githearth-server", "githearth-cli"}
 
+# A crate whose manifest only declares `license-file` (no SPDX `license`
+# field) cannot be resolved offline, so it would otherwise be written out as
+# "Unspecified". Every such crate in the release build graph must be listed
+# here with the SPDX expression its license file corresponds to; the generator
+# and `--check` fail with a clear message instead of underreporting a license.
+ALLOWLIST: dict[str, str] = {}
+
 HEADER = """\
 GitHearth third-party notices
 =============================
@@ -60,6 +67,27 @@ def load_metadata() -> dict:
     return json.loads(proc.stdout)
 
 
+class MissingLicenseError(Exception):
+    """A third-party crate declares no SPDX license and is not allowlisted."""
+
+    def __init__(self, name: str, version: str) -> None:
+        super().__init__(
+            f"{name} {version} declares no SPDX license expression "
+            "(only `license-file`); add it to ALLOWLIST in "
+            "scripts/generate-third-party-notices.py with its licence."
+        )
+
+
+def license_expression(package: dict) -> str:
+    expression = package.get("license")
+    if expression:
+        return expression
+    expression = ALLOWLIST.get(package["name"])
+    if expression is None:
+        raise MissingLicenseError(package["name"], package["version"])
+    return expression
+
+
 def third_party_dependencies(meta: dict) -> list[tuple[str, str, str]]:
     packages = {p["id"]: p for p in meta["packages"]}
     workspace = set(meta["workspace_members"])
@@ -90,8 +118,9 @@ def third_party_dependencies(meta: dict) -> list[tuple[str, str, str]]:
         package = packages[pkg_id]
         if pkg_id in workspace:
             continue
-        license_expr = package.get("license") or "Unspecified"
-        result.append((package["name"], package["version"], license_expr))
+        result.append(
+            (package["name"], package["version"], license_expression(package))
+        )
 
     result.sort()
     return result
@@ -115,7 +144,11 @@ def main() -> int:
     args = parser.parse_args()
 
     meta = load_metadata()
-    generated = render(third_party_dependencies(meta))
+    try:
+        generated = render(third_party_dependencies(meta))
+    except MissingLicenseError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
 
     if args.check:
         current = NOTICES.read_text() if NOTICES.exists() else None
