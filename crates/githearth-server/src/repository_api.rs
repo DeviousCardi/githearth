@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use githearth_authz::{Action, Organization, Principal, Request, Resource};
+use githearth_authz::{Action, Resource};
 use githearth_core::RepositoryStatus;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -158,41 +158,16 @@ async fn load_by_operation(
 /// Load a repository for an anonymous visitor. Only a public repository in a
 /// non-suspended organization is visible; anything else yields `None` so the
 /// caller can fall back to a sign-in prompt without revealing the repository.
+///
+/// The anonymous read decision is shared with the git fetch path: this calls
+/// [`crate::git_admission::anonymous_readable_repository`], which additionally
+/// requires the clone action before serving a fetch over HTTP or SSH.
 pub(crate) async fn load_public_anonymous(
     state: &AppState,
     org_slug: &str,
     name: &str,
 ) -> Option<repositories::RepositoryRow> {
-    let mut conn = state.pool.acquire().await.ok()?;
-    let (org_id, suspended): (Uuid, bool) =
-        sqlx::query_as("SELECT id, suspended FROM organizations WHERE slug = $1")
-            .bind(org_slug)
-            .fetch_optional(&mut *conn)
-            .await
-            .ok()??;
-    let repo = repositories::find_by_name(&mut conn, org_id, name)
-        .await
-        .ok()??;
-    if repo.status != RepositoryStatus::Active {
-        return None;
-    }
-    let organization = Organization {
-        id: org_id,
-        suspended,
-    };
-    let authz_repo = repositories::authz_repository(&repo);
-    let request = Request {
-        principal: Principal::Anonymous,
-        teams: &[],
-        grants: &[],
-        action: Action::RepositoryRead,
-        organization: &organization,
-        resource: Resource::Repository(&authz_repo),
-        merge: None,
-        auth_age: None,
-        read_only: false,
-    };
-    state.authz.authorize(&request).is_allowed().then_some(repo)
+    crate::git_admission::anonymous_readable_repository(state, org_slug, name).await
 }
 
 pub(crate) fn require(state: &AppState, loaded: &Loaded, action: Action) -> Result<(), ApiError> {
