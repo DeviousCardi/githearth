@@ -50,6 +50,7 @@ EXPECTED_ACCESS = {
     ("reader", "archived", "clone"): True, ("reader", "archived", "push"): False,
 }
 HarnessError = _m2.HarnessError
+Skipped = _m2.Skipped
 
 
 class M4Server:
@@ -1754,6 +1755,333 @@ class M4Harness(_m2.Harness):
               f"HTTP push {peak_push_rss_kib} KiB, SSH push {peak_ssh_rss_kib} KiB")
         print(f"    auth: {ok_logins} ok + {throttled} throttled in {auth_latency_s}s")
 
+    # ================================================================== S11
+    def s11_sha256_repositories(self):
+        self.stop_server()
+        self.generate_ssh_host_key()
+        self.start_server(MAIN_DB, self.storage_root, "sha256")
+        tok = self.api_session(self.admin_username, self.admin_password)
+
+        st, repo = self.api_json(
+            "POST", "/api/v1/organizations/m4-org/repositories",
+            {"name": "sha256-repo", "visibility": "private", "object_format": "sha256"},
+            token=tok)
+        if st != 201:
+            raise HarnessError(f"create sha256 repo status {st}")
+        rname = "sha256-repo"
+        http_url = f"http://127.0.0.1:{self.server.http_port}/m4-org/{rname}.git"
+        ssh_url = self.ssh_repo_url(org="m4-org", repo=rname)
+
+        # Build a SHA-256 client worktree.
+        w = self.tmp / "sha256-work"
+        w.mkdir()
+        subprocess.run(
+            ["git", "init", "--object-format=sha256", "-b", "main"], cwd=str(w),
+            env=self.git_env(), capture_output=True, check=True)
+        (w / "README.md").write_text("# SHA-256\n")
+        for ea in (["config", "user.name", "S"], ["config", "user.email", "s@t"],
+                   ["add", "-A"], ["commit", "-m", "init"]):
+            subprocess.run(["git", "-C", str(w)] + ea, capture_output=True)
+        penv = self.git_env(self.admin_username, self.admin_password)
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}",
+             "-C", str(w), "push", http_url, "main"],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+
+        ch = self.tmp / "sha256-clone-http"
+        ch.mkdir()
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}", "clone", http_url, str(ch)],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+        fmt = subprocess.run(
+            ["git", "-C", str(ch), "rev-parse", "--show-object-format"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        if fmt != "sha256":
+            raise HarnessError(f"HTTP clone object format {fmt} != sha256")
+
+        try:
+            self.api_register_ssh_key(tok, self.admin_ssh_key.with_suffix(".pub"))
+        except HarnessError as e:
+            if "already registered" not in str(e) and "409" not in str(e):
+                raise
+        ssh_e = self.ssh_git_env(self.admin_ssh_key)
+        subprocess.run(
+            ["git", "-C", str(w), "-c", "user.name=S", "-c", "user.email=s@t",
+             "commit", "--allow-empty", "-m", "ssh"], capture_output=True)
+        sproc = subprocess.run(
+            ["git", "-C", str(w), "push", ssh_url, "main"], env=ssh_e,
+            capture_output=True, text=True, timeout=120)
+        if sproc.returncode != 0:
+            raise HarnessError(f"sha256 SSH push failed: {sproc.stderr.strip()[:400]}")
+        cs = self.tmp / "sha256-clone-ssh"
+        cs.mkdir()
+        subprocess.run(["git", "clone", ssh_url, str(cs)], env=ssh_e,
+                       capture_output=True, text=True, check=True, timeout=120)
+        fmt2 = subprocess.run(
+            ["git", "-C", str(cs), "rev-parse", "--show-object-format"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        if fmt2 != "sha256":
+            raise HarnessError(f"SSH clone object format {fmt2} != sha256")
+
+        shutil.rmtree(str(w), ignore_errors=True)
+        shutil.rmtree(str(ch), ignore_errors=True)
+        shutil.rmtree(str(cs), ignore_errors=True)
+
+    # ================================================================== S12
+    def _mk_account(self, prefix):
+        username = prefix + "-" + uuid.uuid4().hex[:8]
+        self.sql(MAIN_DB,
+                 "INSERT INTO accounts (id, username, password_hash) "
+                 "SELECT gen_random_uuid(), '" + username
+                 + "', password_hash FROM accounts WHERE is_admin LIMIT 1;")
+        aid = self.sql(MAIN_DB, "SELECT id FROM accounts WHERE username='" + username + "'")
+        return username, aid
+
+    def _browser_session_cookie(self, account_id):
+        token = secrets.token_hex(32)
+        self.sql(MAIN_DB,
+                 "INSERT INTO sessions (token_hash, account_id, expires_at) "
+                 "VALUES (sha256('" + token + "'::bytea), '" + account_id
+                 + "', clock_timestamp() + interval '1 hour')")
+        return "githearth_session=" + token
+
+    def _seed_repo(self, org, name):
+        w = self.tmp / f"seed-{name}"
+        w.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(w),
+                       env=self.git_env(), capture_output=True, check=True)
+        (w / "f.txt").write_text(name + "\n")
+        for ea in (["config", "user.name", "S"], ["config", "user.email", "s@t"],
+                   ["add", "-A"], ["commit", "-m", "seed"]):
+            subprocess.run(["git", "-C", str(w)] + ea, capture_output=True)
+        penv = self.git_env(self.admin_username, self.admin_password)
+        url = f"http://127.0.0.1:{self.server.http_port}/{org}/{name}.git"
+        subprocess.run(
+            ["git", "-c", f"credential.helper={self.cred_helper}",
+             "-C", str(w), "push", url, "main"],
+            env=penv, capture_output=True, text=True, check=True, timeout=120)
+        shutil.rmtree(str(w), ignore_errors=True)
+
+    def s12_visibility(self):
+        self.stop_server()
+        self.generate_ssh_host_key()
+        self.start_server(MAIN_DB, self.storage_root, "visibility")
+        tok = self.api_session(self.admin_username, self.admin_password)
+        org = "m4-org"
+        org_id = self.sql(MAIN_DB, "SELECT id FROM organizations WHERE slug='m4-org'")
+
+        member, member_id = self._mk_account("m4-member")
+        outsider, outsider_id = self._mk_account("m4-outsider")
+        self.sql(MAIN_DB,
+                 "INSERT INTO memberships (organization_id, account_id, role) "
+                 "VALUES ('" + org_id + "', '" + member_id + "', 'member');")
+
+        mkey = self.tmp / "member_vis_key"
+        _, mpub = self.ssh_keygen(mkey)
+        self.api_register_ssh_key(self.api_session(member, self.admin_password), mpub)
+        okey = self.tmp / "outsider_vis_key"
+        _, opub = self.ssh_keygen(okey)
+        self.api_register_ssh_key(self.api_session(outsider, self.admin_password), opub)
+
+        repos = {}
+        for vis in ("public", "internal", "private"):
+            name = "vis-" + vis
+            st, _ = self.api_json(
+                "POST", f"/api/v1/organizations/{org}/repositories",
+                {"name": name, "visibility": vis}, token=tok)
+            if st != 201:
+                raise HarnessError(f"create {name} status {st}")
+            repos[vis] = name
+            self._seed_repo(org, name)
+
+        http = f"http://127.0.0.1:{self.server.http_port}"
+        pw = self.admin_password
+
+        def clone_http(user, vis):
+            cd = self.tmp / f"vh-{vis}-{uuid.uuid4().hex[:6]}"
+            proc = self.git("clone", f"{http}/{org}/{repos[vis]}.git", str(cd),
+                            user=user, password=pw, check=False)
+            shutil.rmtree(str(cd), ignore_errors=True)
+            return "ALLOWED" if proc.returncode == 0 else "DENIED"
+
+        def clone_anon(vis):
+            cd = self.tmp / f"va-{vis}-{uuid.uuid4().hex[:6]}"
+            proc = subprocess.run(
+                ["git", "clone", f"{http}/{org}/{repos[vis]}.git", str(cd)],
+                env=self.git_env(), capture_output=True, text=True, timeout=120)
+            shutil.rmtree(str(cd), ignore_errors=True)
+            return "ALLOWED" if proc.returncode == 0 else "DENIED"
+
+        def clone_ssh(kp, vis):
+            cd = self.tmp / f"vs-{vis}-{uuid.uuid4().hex[:6]}"
+            proc = self.ssh_git(kp, "clone", self.ssh_repo_url(org=org, repo=repos[vis]),
+                                str(cd), check=False)
+            shutil.rmtree(str(cd), ignore_errors=True)
+            return "ALLOWED" if proc.returncode == 0 else "DENIED"
+
+        def expect(actual, expected, label):
+            if actual != expected:
+                raise HarnessError(f"{label}: expected {expected}, got {actual}")
+
+        # HTTP: anonymous public only; member public+internal; outsider public only.
+        expect(clone_anon("public"), "ALLOWED", "anon public clone")
+        expect(clone_anon("internal"), "DENIED", "anon internal clone")
+        expect(clone_anon("private"), "DENIED", "anon private clone")
+        expect(clone_http(member, "public"), "ALLOWED", "member public clone")
+        expect(clone_http(member, "internal"), "ALLOWED", "member internal clone")
+        expect(clone_http(member, "private"), "DENIED", "member private clone")
+        expect(clone_http(outsider, "public"), "ALLOWED", "outsider public clone")
+        expect(clone_http(outsider, "internal"), "DENIED", "outsider internal clone")
+        expect(clone_http(outsider, "private"), "DENIED", "outsider private clone")
+
+        # SSH: no anonymous transport; members and outsiders both carry keys.
+        expect(clone_ssh(mkey, "public"), "ALLOWED", "member ssh public clone")
+        expect(clone_ssh(mkey, "internal"), "ALLOWED", "member ssh internal clone")
+        expect(clone_ssh(mkey, "private"), "DENIED", "member ssh private clone")
+        expect(clone_ssh(okey, "public"), "ALLOWED", "outsider ssh public clone")
+        expect(clone_ssh(okey, "internal"), "DENIED", "outsider ssh internal clone")
+        expect(clone_ssh(okey, "private"), "DENIED", "outsider ssh private clone")
+
+        # Web UI: anonymous public page; member internal page; private hidden.
+        cookie = self._browser_session_cookie(member_id)
+
+        def ui(path, c=None):
+            st, _, body = self.api("GET", path, headers={"Cookie": c} if c else None)
+            return st, body
+
+        st, body = ui(f"/organizations/{org}/repositories/{repos['public']}")
+        if st != 200 or b"public" not in body:
+            raise HarnessError(f"anon public UI page status {st}")
+        for vis in ("internal", "private"):
+            st, _ = ui(f"/organizations/{org}/repositories/{repos[vis]}")
+            if st != 303:
+                raise HarnessError(f"anon {vis} UI should redirect, got {st}")
+        st, body = ui(f"/organizations/{org}/repositories/{repos['internal']}", cookie)
+        if st != 200 or repos["internal"].encode() not in body:
+            raise HarnessError(f"member internal UI page status {st}")
+        st, _ = ui(f"/organizations/{org}/repositories/{repos['private']}", cookie)
+        if st != 404:
+            raise HarnessError(f"member private UI should be 404, got {st}")
+
+    # ================================================================== S13
+    def s13_compose(self):
+        try:
+            subprocess.run(["docker", "compose", "version"],
+                           capture_output=True, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            raise Skipped("docker compose is unavailable")
+
+        project = "githearth-m4-compose-" + uuid.uuid4().hex[:12]
+        pg_port = self.free_port()
+        http_port = self.free_port()
+        ssh_port = self.free_port()
+        password = secrets.token_hex(32)
+
+        envf = self.tmp / "compose.env"
+        envf.write_text(
+            "POSTGRES_PASSWORD=" + password + "\n"
+            f"GITHEARTH_POSTGRES_PORT={pg_port}\n"
+            f"GITHEARTH_HTTP_PORT={http_port}\n"
+            f"GITHEARTH_SSH_PORT={ssh_port}\n")
+        envf.chmod(0o600)
+
+        base = ["docker", "compose", "-p", project,
+                "-f", str(ROOT / "compose.yaml"),
+                "--env-file", str(envf)]
+        self._compose_base = base
+        try:
+            subprocess.run(base + ["up", "-d", "--wait"], check=True, timeout=900,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            boot = subprocess.run(
+                base + ["exec", "-T", "app", "githearth-server", "bootstrap-admin",
+                        "--username", self.admin_username],
+                input=self.admin_password, text=True, capture_output=True, timeout=60)
+            if boot.returncode != 0:
+                raise HarnessError("compose bootstrap-admin failed: " + boot.stderr.strip()[:300])
+
+            base_url = f"http://127.0.0.1:{http_port}"
+            for _ in range(300):
+                try:
+                    st, _ = self.api_json("GET", "/health/ready", base=base_url)
+                    if st == 200:
+                        break
+                except (OSError, urllib.error.URLError):
+                    pass
+                time.sleep(0.1)
+            else:
+                raise HarnessError("compose server readiness timed out")
+
+            tok = self.api_session(self.admin_username, self.admin_password, base=base_url)
+            st, org = self.api_json(
+                "POST", "/api/v1/organizations",
+                {"slug": "compose-org", "name": "Compose Org"}, token=tok, base=base_url)
+            if st != 201:
+                raise HarnessError(f"compose create org status {st}")
+            oslug = org["slug"]
+            st, repo = self.api_json(
+                "POST", f"/api/v1/organizations/{oslug}/repositories",
+                {"name": "compose-repo", "visibility": "private"}, token=tok, base=base_url)
+            if st != 201:
+                raise HarnessError(f"compose create repo status {st}")
+            rname = repo["name"]
+
+            http_url = f"http://127.0.0.1:{http_port}/{oslug}/{rname}.git"
+            ssh_url = f"ssh://git@127.0.0.1:{ssh_port}/{oslug}/{rname}.git"
+
+            w = self.tmp / "compose-work"
+            w.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(w),
+                           env=self.git_env(), capture_output=True, check=True)
+            (w / "README.md").write_text("# Compose\n")
+            for ea in (["config", "user.name", "C"], ["config", "user.email", "c@t"],
+                       ["add", "-A"], ["commit", "-m", "init"]):
+                subprocess.run(["git", "-C", str(w)] + ea, capture_output=True)
+            penv = self.git_env(self.admin_username, self.admin_password)
+            subprocess.run(
+                ["git", "-c", f"credential.helper={self.cred_helper}",
+                 "-C", str(w), "push", http_url, "main"],
+                env=penv, capture_output=True, text=True, check=True, timeout=120)
+
+            skey = self.tmp / "compose_ssh_key"
+            _, spub = self.ssh_keygen(skey)
+            self.api_register_ssh_key(tok, spub, base=base_url)
+            subprocess.run(
+                ["git", "-C", str(w), "-c", "user.name=C", "-c", "user.email=c@t",
+                 "commit", "--allow-empty", "-m", "ssh"], capture_output=True)
+            ssh_e = self.ssh_git_env(skey)
+            sproc = subprocess.run(
+                ["git", "-C", str(w), "push", ssh_url, "main"], env=ssh_e,
+                capture_output=True, text=True, timeout=120)
+            if sproc.returncode != 0:
+                raise HarnessError(f"compose SSH push failed: {sproc.stderr.strip()[:400]}")
+
+            ch = self.tmp / "compose-clone-http"
+            ch.mkdir()
+            subprocess.run(
+                ["git", "-c", f"credential.helper={self.cred_helper}", "clone", http_url, str(ch)],
+                env=penv, capture_output=True, text=True, check=True, timeout=120)
+            cs = self.tmp / "compose-clone-ssh"
+            cs.mkdir()
+            subprocess.run(["git", "clone", ssh_url, str(cs)], env=ssh_e,
+                           capture_output=True, text=True, check=True, timeout=120)
+            http_refs = subprocess.run(
+                ["git", "-C", str(ch), "show-ref", "--heads"],
+                capture_output=True, text=True, check=True).stdout.strip()
+            ssh_refs = subprocess.run(
+                ["git", "-C", str(cs), "show-ref", "--heads"],
+                capture_output=True, text=True, check=True).stdout.strip()
+            if http_refs != ssh_refs:
+                raise HarnessError("compose HTTP and SSH refs differ")
+
+            shutil.rmtree(str(w), ignore_errors=True)
+            shutil.rmtree(str(ch), ignore_errors=True)
+            shutil.rmtree(str(cs), ignore_errors=True)
+        finally:
+            self._compose_base = None
+            subprocess.run(base + ["down", "-v"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+
     # ================================================================== runner
 
     def run(self):
@@ -1770,14 +2098,19 @@ class M4Harness(_m2.Harness):
             self.scenario("s7_container_install", self.s7_container_install)
             self.scenario("s8_disk_full", self.s8_disk_full)
             self.scenario("s10_resource_bounds", self.s10_resource_bounds)
+            self.scenario("s11_sha256_repositories", self.s11_sha256_repositories)
+            self.scenario("s12_visibility", self.s12_visibility)
+            self.scenario("s13_compose", self.s13_compose)
             self.scenario("s9_uninstall_drill", self.s9_uninstall_drill)
         finally:
             self.cleanup()
         self.write_report()
         ps = sum(1 for s in self.scenarios if s["result"] == "PASS")
-        print(f"\nM4 verification: {ps}/{len(self.scenarios)} scenarios passed")
+        skips = sum(1 for s in self.scenarios if s["result"] == "SKIP")
+        suffix = f" ({skips} skipped)" if skips else ""
+        print(f"\nM4 verification: {ps}/{len(self.scenarios)} scenarios passed{suffix}")
         print(f"report: {self.report_path}")
-        return 0 if ps == len(self.scenarios) else 1
+        return 0 if all(s["result"] in ("PASS", "SKIP") for s in self.scenarios) else 1
 
     def write_report(self):
         info = {}
@@ -1799,6 +2132,10 @@ class M4Harness(_m2.Harness):
         for proc in self._extra_procs:
             _kill_proc(proc)
         self._extra_procs.clear()
+        if getattr(self, "_compose_base", None):
+            subprocess.run(self._compose_base + ["down", "-v"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._compose_base = None
         super().cleanup()
         if self._old_worktree and Path(self._old_worktree).exists():
             subprocess.run(

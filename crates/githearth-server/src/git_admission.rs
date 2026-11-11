@@ -3,7 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use githearth_authz::{Action, Ref, Resource};
+use githearth_authz::{Action, Organization, Principal, Ref, Request, Resource};
 use githearth_git::journal::Update;
 use std::time::Duration;
 use uuid::Uuid;
@@ -161,6 +161,170 @@ pub async fn admit(
     .await
 }
 
+/// Admit a fetch. A request without an Authorization header may read a public
+/// repository anonymously; anything else must authenticate.
+pub async fn admit_fetch(
+    state: &AppState,
+    headers: &HeaderMap,
+    org_slug: &str,
+    repo_name: &str,
+) -> Result<RepositoryRow, AuthError> {
+    if headers.contains_key("authorization") {
+        admit(state, headers, org_slug, repo_name, Want::Fetch)
+            .await
+            .map(|a| a.repository)
+    } else {
+        admit_anonymous(state, org_slug, repo_name).await
+    }
+}
+
+/// The requester of a fetch: a signed-in account (whose facts were already
+/// loaded) or an anonymous visitor.
+#[derive(Clone, Copy)]
+enum Requester<'a> {
+    Account(&'a crate::facts::Facts),
+    Anonymous,
+}
+
+/// Outcome of the shared fetch authorization, neutral about the caller's error
+/// shape so the authenticated and anonymous paths map refusals their own way.
+enum FetchAuth {
+    Admitted(RepositoryRow),
+    /// Missing, inactive, or not readable.
+    Denied,
+    /// Readable but not clonable (only produced when a clone is requested).
+    NotClonable,
+}
+
+/// Loads the organization and repository for a fetch and runs the read (and,
+/// when `clone` is set, the clone) authorization checks. Shared by the
+/// authenticated ([`admit_account`]) and anonymous ([`admit_anonymous`]) paths
+/// so the lookup and permission checks cannot drift apart. A database failure
+/// surfaces as `SERVICE_UNAVAILABLE`; every refusal is reported through the
+/// returned enum so each caller maps it to its own status code.
+async fn authorize_fetch(
+    state: &AppState,
+    requester: Requester<'_>,
+    org_slug: &str,
+    repo_name: &str,
+    clone: bool,
+) -> Result<FetchAuth, AuthError> {
+    let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    let mut conn = state.pool.acquire().await.map_err(unavailable)?;
+
+    // The account path already loaded its facts, and therefore the organization;
+    // the anonymous path looks the organization up by slug.
+    let organization = match requester {
+        Requester::Account(facts) => facts.organization.clone(),
+        Requester::Anonymous => {
+            let row: Option<(Uuid, bool)> =
+                sqlx::query_as("SELECT id, suspended FROM organizations WHERE slug = $1")
+                    .bind(org_slug)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(unavailable)?;
+            match row {
+                Some((id, suspended)) => Organization { id, suspended },
+                None => return Ok(FetchAuth::Denied),
+            }
+        }
+    };
+
+    let Some(repo) = repositories::find_by_name(&mut conn, organization.id, repo_name)
+        .await
+        .map_err(unavailable)?
+    else {
+        return Ok(FetchAuth::Denied);
+    };
+    if repo.status != githearth_core::RepositoryStatus::Active {
+        return Ok(FetchAuth::Denied);
+    }
+
+    let authz_repo = repositories::authz_repository(&repo);
+    let read = match requester {
+        Requester::Account(facts) => facts.request(
+            Action::RepositoryRead,
+            Resource::Repository(&authz_repo),
+            Some(Duration::from_secs(0)),
+        ),
+        Requester::Anonymous => Request {
+            principal: Principal::Anonymous,
+            teams: &[],
+            grants: &[],
+            action: Action::RepositoryRead,
+            organization: &organization,
+            resource: Resource::Repository(&authz_repo),
+            merge: None,
+            auth_age: None,
+            read_only: false,
+        },
+    };
+    if !state.authz.authorize(&read).is_allowed() {
+        return Ok(FetchAuth::Denied);
+    }
+
+    if clone {
+        let clone_req = match requester {
+            Requester::Account(facts) => facts.request(
+                Action::RepositoryClone,
+                Resource::Repository(&authz_repo),
+                Some(Duration::from_secs(0)),
+            ),
+            Requester::Anonymous => Request {
+                principal: Principal::Anonymous,
+                teams: &[],
+                grants: &[],
+                action: Action::RepositoryClone,
+                organization: &organization,
+                resource: Resource::Repository(&authz_repo),
+                merge: None,
+                auth_age: None,
+                read_only: false,
+            },
+        };
+        if !state.authz.authorize(&clone_req).is_allowed() {
+            return Ok(FetchAuth::NotClonable);
+        }
+    }
+
+    Ok(FetchAuth::Admitted(repo))
+}
+
+/// An anonymous visitor may fetch a public repository only; push is never
+/// anonymous.
+///
+/// Every denial fails with 401 rather than 404: an unauthenticated client must
+/// be challenged for credentials (and a missing repository must not be
+/// distinguishable from a private one).
+async fn admit_anonymous(
+    state: &AppState,
+    org_slug: &str,
+    repo_name: &str,
+) -> Result<RepositoryRow, AuthError> {
+    let unauthorized = || AuthError(StatusCode::UNAUTHORIZED, "invalid or expired credentials");
+    match authorize_fetch(state, Requester::Anonymous, org_slug, repo_name, true).await? {
+        FetchAuth::Admitted(repo) => Ok(repo),
+        FetchAuth::Denied | FetchAuth::NotClonable => Err(unauthorized()),
+    }
+}
+
+/// Loads a repository an anonymous visitor may read, returning `None` for
+/// anything not publicly readable (or when the database is unavailable) so the
+/// web UI can fall back to a sign-in prompt without revealing the repository's
+/// existence. This read authorization is the single source of the anonymous
+/// public-read rule, shared with the git fetch path ([`admit_anonymous`]),
+/// which additionally requires the clone action.
+pub(crate) async fn anonymous_readable_repository(
+    state: &AppState,
+    org_slug: &str,
+    repo_name: &str,
+) -> Option<RepositoryRow> {
+    match authorize_fetch(state, Requester::Anonymous, org_slug, repo_name, false).await {
+        Ok(FetchAuth::Admitted(repo)) => Some(repo),
+        _ => None,
+    }
+}
+
 /// Authorization after authentication, shared by HTTP and SSH transports (ADR 0005).
 pub async fn admit_account(
     state: &AppState,
@@ -171,59 +335,42 @@ pub async fn admit_account(
     repo_name: &str,
     want: Want,
 ) -> Result<Admitted, AuthError> {
-    let mut conn = state
-        .pool
-        .acquire()
-        .await
-        .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?;
+    let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    let mut conn = state.pool.acquire().await.map_err(unavailable)?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
         .bind(org_slug)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?
+        .map_err(unavailable)?
         .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
 
     let Some(facts) = crate::facts::load_scoped(&mut conn, account_id, org_id, read_only)
         .await
-        .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?
+        .map_err(unavailable)?
     else {
         return Err(AuthError(StatusCode::NOT_FOUND, "not found"));
     };
-
-    let repo = repositories::find_by_name(&mut conn, org_id, repo_name)
-        .await
-        .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?
-        .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    drop(conn);
 
     // Archived repositories stay readable; the engine refuses their ref updates.
-    if repo.status != githearth_core::RepositoryStatus::Active {
-        return Err(AuthError(StatusCode::NOT_FOUND, "not found"));
-    }
+    let repo = match authorize_fetch(
+        state,
+        Requester::Account(&facts),
+        org_slug,
+        repo_name,
+        want == Want::Fetch,
+    )
+    .await?
+    {
+        FetchAuth::Admitted(repo) => repo,
+        FetchAuth::Denied => return Err(AuthError(StatusCode::NOT_FOUND, "not found")),
+        FetchAuth::NotClonable => return Err(AuthError(StatusCode::FORBIDDEN, "not permitted")),
+    };
 
-    let authz_repo = repositories::authz_repository(&repo);
-    let read_decision = state.authz.authorize(&facts.request(
-        Action::RepositoryRead,
-        Resource::Repository(&authz_repo),
-        Some(Duration::from_secs(0)),
-    ));
-    if !read_decision.is_allowed() {
-        return Err(AuthError(StatusCode::NOT_FOUND, "not found"));
-    }
-
-    if want == Want::Fetch {
-        let clone_decision = state.authz.authorize(&facts.request(
-            Action::RepositoryClone,
-            Resource::Repository(&authz_repo),
-            Some(Duration::from_secs(0)),
-        ));
-        if !clone_decision.is_allowed() {
-            return Err(AuthError(StatusCode::FORBIDDEN, "not permitted"));
-        }
-    }
-
+    let mut conn = state.pool.acquire().await.map_err(unavailable)?;
     let rules = crate::protection::load_rules(&mut conn, repo.id)
         .await
-        .map_err(|_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?;
+        .map_err(unavailable)?;
 
     Ok(Admitted {
         account: account_id,
@@ -408,6 +555,7 @@ mod tests {
                 status: RepositoryStatus::Active,
                 operation_id: uuid::Uuid::new_v4(),
                 created_by: uuid::Uuid::new_v4(),
+                object_format: "sha1".into(),
             },
             facts: crate::facts::Facts {
                 account,

@@ -273,6 +273,46 @@ async fn creating_row_no_directory_becomes_active_and_repo_exists() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn creating_sha256_row_becomes_active_with_sha256_repo() {
+    let env = setup(30).await; // minimum valid grace; rows are backdated past it
+    let mut conn = env.pool.acquire().await.unwrap();
+
+    let op_id = Uuid::new_v4();
+    let row = repositories::insert_creating_with_format(
+        &mut conn,
+        env.org,
+        "reconcile-sha256",
+        env.owner,
+        op_id,
+        "private",
+        "",
+        "sha256",
+    )
+    .await
+    .unwrap();
+    assert_eq!(row.status, RepositoryStatus::Creating);
+    backdate(&env.pool, row.id).await;
+    drop(conn);
+
+    let mut attempts = HashMap::new();
+    let summary = reconcile::reconcile_once(&env.state, &mut attempts)
+        .await
+        .unwrap();
+    assert_eq!(summary.activated, 1);
+    assert_eq!(summary.errors, 0);
+
+    let path = repo_path(&env.storage_root, row.id);
+    assert!(path.is_dir());
+    assert_eq!(
+        githearth_git::layout::detect_object_format(&path).unwrap(),
+        githearth_git::layout::ObjectFormat::Sha256
+    );
+
+    teardown(env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn creating_row_with_existing_directory_becomes_active() {
     let env = setup(30).await; // minimum valid grace; rows are backdated past it
     let mut conn = env.pool.acquire().await.unwrap();

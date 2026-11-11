@@ -37,6 +37,10 @@ class HarnessError(Exception):
     pass
 
 
+class Skipped(Exception):
+    """Raised by a scenario to signal it should be recorded as SKIP, not FAIL."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -379,6 +383,9 @@ class Harness:
             fn()
             result = "PASS"
             detail = ""
+        except Skipped as error:
+            result = "SKIP"
+            detail = str(error)
         except HarnessError as error:
             result = "FAIL"
             detail = str(error)
