@@ -15,14 +15,18 @@ declares.
 ## Regenerating the notices
 
 ```
+cargo fetch
 scripts/generate-third-party-notices.py
 ```
 
 The script resolves the dependency graph offline from `Cargo.lock` (via
 `cargo metadata --locked --offline`), so it needs no network access and is
-deterministic for a given `Cargo.lock`. It uses the registry cache, which any
-prior `cargo build` or `cargo check` populates. Regenerate the file after any
-dependency change; keep it committed alongside `Cargo.lock`.
+deterministic for a given `Cargo.lock`. It reads crate manifests from the
+registry cache, so run `cargo fetch` first: the notices list the union over
+all target platforms, and `cargo fetch` downloads manifests for every target,
+whereas `cargo build` or `cargo check` on Linux only populate the cache for
+the current platform's dependencies. Regenerate the file after any dependency
+change; keep it committed alongside `Cargo.lock`.
 
 `cargo deny check licenses` (in `scripts/ci.sh`) independently enforces the
 allow-list of acceptable licenses in `deny.toml`, so a dependency with an

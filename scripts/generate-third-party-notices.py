@@ -65,6 +65,10 @@ def load_metadata() -> dict:
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
+        if "offline" in proc.stderr.lower():
+            sys.stderr.write(
+                "hint: run `cargo fetch` first to warm the registry cache.\n"
+            )
         sys.exit(proc.returncode)
     return json.loads(proc.stdout)
 
