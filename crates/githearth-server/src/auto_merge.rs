@@ -113,6 +113,15 @@ pub(crate) async fn may_enable(
         crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
     drop(conn);
 
+    // A deleted source branch has no head; enabling auto-merge would refuse
+    // with 422 "branch not found", so the form must not offer it.
+    if pulls::branch_tip(state, loaded.repo.id, &pull.source_branch)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+
     let target_ref = format!("refs/heads/{}", pull.target_branch);
     let protection = crate::protection::matching(&rules, &target_ref);
     let required = protection.as_ref().map_or(0, |p| p.required_approvals);
