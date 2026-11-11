@@ -213,11 +213,11 @@ async fn create_list_update_delete_with_generation_bumps() {
         &format!("{base}/{rule_id}"),
         Some(&token),
         None,
-        json!({"require_checks": true, "allow_force_push": false}),
+        json!({"required_status_checks": ["ci"], "allow_force_push": false}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["require_checks"], true);
+    assert_eq!(body["required_status_checks"], json!(["ci"]));
     assert_eq!(body["allow_force_push"], false);
 
     let generation: i64 = sqlx::query_scalar(
@@ -449,6 +449,69 @@ async fn invalid_pattern_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn invalid_required_status_checks_422_on_create_and_patch() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    fixture_repository(&pool, org_id, "c", owner).await;
+    let base = protection_path(&slug, "c");
+
+    // Reserved context, duplicates and surrounding whitespace are 422 on create.
+    for checks in [
+        json!(["githearth/legacy-require-checks"]),
+        json!(["ci", "ci"]),
+        json!(["ci", "lint", "ci"]),
+        json!([" ci"]),
+        json!(["ci "]),
+        json!([" ci "]),
+    ] {
+        let (status, body) = request(
+            &app,
+            "POST",
+            &base,
+            Some(&token),
+            None,
+            json!({"pattern": "main", "required_status_checks": checks}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
+    // A valid rule is created, then patched with each invalid list.
+    let (status, body) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"pattern": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rule_id = body["id"].as_str().unwrap().to_string();
+
+    for checks in [
+        json!(["githearth/legacy-require-checks"]),
+        json!(["ci", "ci"]),
+        json!([" ci"]),
+    ] {
+        let (status, body) = request(
+            &app,
+            "PATCH",
+            &format!("{base}/{rule_id}"),
+            Some(&token),
+            None,
+            json!({"required_status_checks": checks}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
 
     cleanup(&storage);
     pool.close().await;

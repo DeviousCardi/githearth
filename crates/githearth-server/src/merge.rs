@@ -214,7 +214,7 @@ pub async fn execute_intent(
 
     // 5. Revalidate every fact the intent recorded. The intent row is never
     // written here except through `record_merge_result`.
-    let (pull, rules, approvals) = {
+    let (pull, rules, approvals, checks_passed) = {
         let mut conn = state.pool.acquire().await?;
         let Some(pull) = pulls::fetch_pull(&mut conn, intent.pull_request_id).await? else {
             return Ok(MergeOutcome::Stale {
@@ -251,7 +251,25 @@ pub async fn execute_intent(
             &intent.source_oid,
         )
         .await?;
-        let digest = crate::merge_intents::checks_approvals_digest(&intent.source_oid, &review_ids);
+        // Required checks are re-read at the intent's exact source oid, so a
+        // status posted for any other commit cannot satisfy them, and a status
+        // changed since the intent was recorded makes the digest stale.
+        let required_checks = crate::protection::required_status_checks(
+            &rules,
+            &format!("refs/heads/{}", intent.target_ref),
+        );
+        let check_states = crate::statuses::latest_required_states(
+            &mut conn,
+            repository_id,
+            &intent.source_oid,
+            &required_checks,
+        )
+        .await?;
+        let digest = crate::merge_intents::checks_approvals_digest(
+            &intent.source_oid,
+            &review_ids,
+            &check_states,
+        );
         if digest != intent.checks_approvals_digest {
             return Ok(MergeOutcome::Stale {
                 reason: "approvals or checks changed".into(),
@@ -264,8 +282,9 @@ pub async fn execute_intent(
             &intent.source_oid,
         )
         .await? as u32;
+        let checks_passed = crate::statuses::all_success(&required_checks, &check_states);
 
-        (pull, rules, approvals)
+        (pull, rules, approvals, checks_passed)
     };
 
     let target_ref = format!("refs/heads/{}", intent.target_ref);
@@ -310,7 +329,14 @@ pub async fn execute_intent(
         };
         let protection = crate::protection::matching(&rules, &target_ref);
         if !crate::merge_intents::merge_allowed(
-            state, &facts, &repo, &pull, protection, approvals, false, None,
+            state,
+            &facts,
+            &repo,
+            &pull,
+            protection,
+            approvals,
+            checks_passed,
+            None,
         ) {
             return Ok(MergeOutcome::Stale {
                 reason: "actor no longer authorized".into(),

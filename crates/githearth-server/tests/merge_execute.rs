@@ -1015,3 +1015,66 @@ async fn ff_only_on_diverged_branches_is_stale() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_required_check_flipping_after_the_intent_is_stale() {
+    let f = build_fixture(false).await;
+
+    // Require "ci" on main, and post a passing status at the head.
+    request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/protection",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        None,
+        json!({"pattern": "main", "required_status_checks": ["ci"]}),
+    )
+    .await;
+    let statuses = format!(
+        "/api/v1/organizations/{}/repositories/{}/commits/{}/statuses",
+        f.org_slug, f.repo_name, f.feature_head
+    );
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &statuses,
+        Some(&f.token),
+        None,
+        json!({"context": "ci", "state": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+
+    // The check flips to failure before the worker revalidates the intent.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &statuses,
+        Some(&f.token),
+        None,
+        json!({"context": "ci", "state": "failure"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let before = main_tip(&f).await;
+    let outcome = execute_intent(&f.state, op).await.unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::Stale {
+            reason: "approvals or checks changed".into()
+        }
+    );
+    assert_eq!(main_tip(&f).await, before);
+
+    finish(f).await;
+}

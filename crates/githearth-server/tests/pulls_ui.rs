@@ -951,6 +951,39 @@ async fn merge_form_shows_only_for_permitted_viewers_on_an_open_pull_request() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn merge_form_hidden_when_the_source_branch_is_deleted() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // The owner sees the merge form while the source branch exists.
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Merge pull request"), "{page}");
+
+    // Delete the source branch; the merge would fail with 422 branch_missing,
+    // so the page must no longer offer it.
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        ":feature",
+    ]))
+    .await;
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("name=\"method\""), "{page}");
+    assert!(!page.contains("Merge pull request"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn submitting_the_merge_form_queues_an_intent_and_redirects() {
     let f = fixture().await;
     open_pull(&f).await;

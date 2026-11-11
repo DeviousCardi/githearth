@@ -84,6 +84,7 @@ actions! {
     RefPush => "ref.push", routine,
     RefForcePush => "ref.force_push", sensitive,
     RefDelete => "ref.delete", sensitive,
+    StatusCreate => "status.create", routine,
     IssueCreate => "issue.create", routine,
     IssueRead => "issue.read", routine,
     IssueComment => "issue.comment", routine,
@@ -137,6 +138,7 @@ impl Action {
             IssueRead | IssueComment | IssueLabel | IssueAssign | IssueClose => Kind::Issue,
             PullRequestRead | PullRequestComment | PullRequestClose | PullRequestApprove
             | PullRequestMerge => Kind::PullRequest,
+            StatusCreate => Kind::Repository,
         }
     }
 }

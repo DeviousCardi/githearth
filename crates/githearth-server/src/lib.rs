@@ -28,6 +28,7 @@ pub mod repository_api;
 mod settings_ui;
 pub mod ssh;
 pub mod ssh_keys;
+pub mod statuses;
 mod tokens;
 pub mod ui;
 
@@ -254,6 +255,7 @@ pub fn router(state: AppState) -> Router {
         .merge(pulls::router())
         .merge(merge_intents::router())
         .merge(protection::router())
+        .merge(statuses::router())
         .merge(audit::router())
         .merge(ui::router())
         .merge(browse::router())
