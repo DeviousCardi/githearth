@@ -75,6 +75,23 @@ async fn fixture_session(pool: &PgPool, account: Uuid) -> String {
     token
 }
 
+async fn fixture_read_only_token(pool: &PgPool, account: Uuid) -> String {
+    let token = format!("gth_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO access_tokens (id, account_id, name, token_hash, scopes) \
+         VALUES ($1, $2, $3, sha256($4::bytea), $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(account)
+    .bind("read-only")
+    .bind(&token)
+    .bind(vec!["repo:read".to_owned()])
+    .execute(pool)
+    .await
+    .unwrap();
+    token
+}
+
 async fn fixture_organization(pool: &PgPool, owner: Uuid) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let slug = tag("org");
@@ -389,6 +406,35 @@ async fn invalid_statuses_are_rejected() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn read_only_token_cannot_post_status() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    fixture_repository(&pool, org_id, "ro", owner).await;
+    let base = statuses_path(&slug, "ro", &"e".repeat(40));
+
+    let token = fixture_read_only_token(&pool, owner).await;
+
+    // A read-only scoped token can still list statuses.
+    let (status, _) = request(&app, "GET", &base, Some(&token), None, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Posting a status (status.create) is a write and must be refused.
+    let (status, body) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"context": "ci", "state": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
     cleanup(&storage);
     pool.close().await;
