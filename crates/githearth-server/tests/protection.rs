@@ -549,3 +549,77 @@ async fn duplicate_pattern_409() {
     cleanup(&storage);
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn stale_and_signed_flags_default_and_round_trip() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let token = fixture_session(&pool, owner).await;
+    fixture_repository(&pool, org_id, "f", owner).await;
+    let base = protection_path(&slug, "f");
+
+    // A rule without the new flags defaults to dismissing stale approvals and
+    // not requiring signed commits.
+    let (status, body) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"pattern": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["dismiss_stale_approvals"], true);
+    assert_eq!(body["require_signed_commits"], false);
+    let main_id = body["id"].as_str().unwrap().to_string();
+
+    // A rule can opt out and require signed commits.
+    let (status, body) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({
+            "pattern": "release/*",
+            "dismiss_stale_approvals": false,
+            "require_signed_commits": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["dismiss_stale_approvals"], false);
+    assert_eq!(body["require_signed_commits"], true);
+    let release_id = body["id"].as_str().unwrap().to_string();
+
+    // Patching flips each flag independently.
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("{base}/{release_id}"),
+        Some(&token),
+        None,
+        json!({"require_signed_commits": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["dismiss_stale_approvals"], false);
+    assert_eq!(body["require_signed_commits"], false);
+
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("{base}/{main_id}"),
+        Some(&token),
+        None,
+        json!({"dismiss_stale_approvals": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["dismiss_stale_approvals"], false);
+    assert_eq!(body["require_signed_commits"], false);
+
+    cleanup(&storage);
+    pool.close().await;
+}

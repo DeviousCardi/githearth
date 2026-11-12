@@ -47,11 +47,26 @@ pub(crate) async fn apply_merge_record(
 /// variant; only infrastructure failures use [`MergeError`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum MergeOutcome {
-    Merged { oid: String },
-    AlreadyMerged { oid: String },
-    Conflicted { paths: Vec<String> },
-    Stale { reason: String },
-    Failed { reason: String },
+    Merged {
+        oid: String,
+    },
+    AlreadyMerged {
+        oid: String,
+    },
+    Conflicted {
+        paths: Vec<String>,
+    },
+    Stale {
+        reason: String,
+    },
+    /// A merge-queue intent's target moved; the worker re-targets it and
+    /// retries instead of failing it.
+    Retarget {
+        new_target: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 /// Infrastructure failures only: database, storage and join errors. Every
@@ -123,12 +138,13 @@ struct Intent {
     checks_approvals_digest: String,
     actor_id: Uuid,
     state: String,
+    in_queue: bool,
     result_oid: Option<String>,
 }
 
 const INTENT_FIELDS: &str = "pull_request_id, source_ref, source_oid, \
  target_ref, expected_target_oid, method, candidate_oid, policy_generation, \
- checks_approvals_digest, actor_id, state, result_oid";
+ checks_approvals_digest, actor_id, state, in_queue, result_oid";
 
 async fn load_intent(
     pool: &sqlx::PgPool,
@@ -245,10 +261,16 @@ pub async fn execute_intent(
             });
         }
 
-        let review_ids = crate::merge_intents::latest_review_ids(
+        let target_ref = format!("refs/heads/{}", intent.target_ref);
+        let protection = crate::protection::matching(&rules, &target_ref);
+        let dismiss = protection
+            .as_ref()
+            .is_none_or(|p| p.dismiss_stale_approvals);
+        let facts = crate::merge_intents::approval_facts(
             &mut conn,
             intent.pull_request_id,
             &intent.source_oid,
+            dismiss,
         )
         .await?;
         // Required checks are re-read at the intent's exact source oid, so a
@@ -267,7 +289,7 @@ pub async fn execute_intent(
         .await?;
         let digest = crate::merge_intents::checks_approvals_digest(
             &intent.source_oid,
-            &review_ids,
+            &facts.review_ids,
             &check_states,
         );
         if digest != intent.checks_approvals_digest {
@@ -276,12 +298,7 @@ pub async fn execute_intent(
             });
         }
 
-        let approvals = crate::merge_intents::approvals_at(
-            &mut conn,
-            intent.pull_request_id,
-            &intent.source_oid,
-        )
-        .await? as u32;
+        let approvals = facts.approvals as u32;
         let checks_passed = crate::statuses::all_success(&required_checks, &check_states);
 
         (pull, rules, approvals, checks_passed)
@@ -289,9 +306,16 @@ pub async fn execute_intent(
 
     let target_ref = format!("refs/heads/{}", intent.target_ref);
     let source_ref = format!("refs/heads/{}", intent.source_ref);
-    if read_ref(&repo_path, &target_ref, timeout).await?.as_deref()
-        != Some(intent.expected_target_oid.as_str())
-    {
+    let current_target = read_ref(&repo_path, &target_ref, timeout).await?;
+    if current_target.as_deref() != Some(intent.expected_target_oid.as_str()) {
+        // A merge-queue entry whose target was moved by an earlier entry is
+        // re-targeted to the current tip and retried; a direct merge stays
+        // terminal (`stale`) so the enabler can re-create it deliberately.
+        if intent.in_queue
+            && let Some(new_target) = current_target
+        {
+            return Ok(MergeOutcome::Retarget { new_target });
+        }
         return Ok(MergeOutcome::Stale {
             reason: "target moved".into(),
         });
@@ -499,6 +523,7 @@ pub async fn execute_intent(
             &expected_old,
             operation_id,
             actor_id,
+            githearth_git::journal::Origin::Merge,
             timeout,
         )
     })

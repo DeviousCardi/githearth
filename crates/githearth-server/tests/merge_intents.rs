@@ -348,6 +348,56 @@ async fn create_merge_intent(f: &Fixture, method: &str, head: &str) -> (StatusCo
     .await
 }
 
+/// Adds a commit to the feature branch (bypassing the hooks) and returns its
+/// oid, moving the pull request's head.
+async fn advance_feature(f: &Fixture) -> String {
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let tw = f.work.to_str().unwrap();
+    std::fs::write(f.work.join("feat2.txt"), "more\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "feat2.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "advance feature",
+    ]))
+    .await;
+    let oid = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+    oid
+}
+
+async fn add_rule(f: &Fixture, body: Value) {
+    let (status, resp) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/protection",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        None,
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{resp}");
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn create_refuses_closed_head_moved_no_permission_few_approvals_checks_and_duplicate() {
@@ -935,6 +985,33 @@ async fn a_status_for_a_different_sha_never_authorizes_the_merge() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn stale_approval_does_not_count_by_default() {
+    let f = build_fixture().await;
+
+    // A rule requiring one approval dismisses stale approvals by default.
+    add_rule(&f, json!({"pattern": "main", "required_approvals": 1})).await;
+    let reviewer = add_member(&f.pool, f.org_id, "write").await;
+    let reviewer_token = fixture_session(&f.pool, reviewer).await;
+    let (status, _) = approve(&f, f.number, "approved", &f.feature_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The head moves: the approval was given on the older commit, so it no
+    // longer counts and the merge is refused.
+    let new_head = advance_feature(&f).await;
+    let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Re-approving at the new head satisfies the rule.
+    let (status, _) = approve(&f, f.number, "approved", &new_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn pull_detail_reports_the_latest_status_per_context() {
     let f = build_fixture().await;
     let statuses = format!(
@@ -972,6 +1049,34 @@ async fn pull_detail_reports_the_latest_status_per_context() {
         .collect();
     assert_eq!(by_context.get("ci"), Some(&"success"));
     assert_eq!(by_context.get("lint"), Some(&"failure"));
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn stale_approval_counts_when_dismissal_is_off() {
+    let f = build_fixture().await;
+
+    // The rule keeps older approvals: it opts out of dismissing stale ones.
+    add_rule(
+        &f,
+        json!({
+            "pattern": "main",
+            "required_approvals": 1,
+            "dismiss_stale_approvals": false
+        }),
+    )
+    .await;
+    let reviewer = add_member(&f.pool, f.org_id, "write").await;
+    let reviewer_token = fixture_session(&f.pool, reviewer).await;
+    let (status, _) = approve(&f, f.number, "approved", &f.feature_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The approval on the older commit still counts after the head moves.
+    let new_head = advance_feature(&f).await;
+    let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
+    assert_eq!(status, StatusCode::CREATED);
 
     finish(f).await;
 }

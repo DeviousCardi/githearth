@@ -29,9 +29,9 @@ This runs seven read-only checks:
 - **lifecycle** — warns about repositories stuck in `creating` or `deleting` past the reconcile grace period (the reconciler retries them)
 - **jobs** — warns about dead jobs; warns about late pending jobs; fails when running jobs have an expired lease, meaning the runner isn't running
 
-When the database cannot be reached the `schema` and `lifecycle` checks are
-skipped (`skip <name>: database unavailable`) rather than counted as failures,
-so one outage counts as one failure, not three.
+When the database cannot be reached the `schema`, `lifecycle` and `jobs`
+checks are skipped (`skip <name>: database unavailable`) rather than counted
+as failures, so one outage counts as one failure, not three.
 
 Exit code is 0 when all checks pass (warnings and skips are allowed), 1 otherwise.
 The last line prints a summary: `N checks, F failed, W warnings, S skipped`.

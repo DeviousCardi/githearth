@@ -1291,3 +1291,524 @@ async fn unrelated_user_404_everywhere() {
 
     finish(f).await;
 }
+
+/// Pushes a new empty commit onto `branch` directly into storage, returning
+/// the new head.
+async fn advance_branch(f: &Fixture, branch: &str) -> String {
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", branch])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "advance",
+    ]))
+    .await;
+    let oid = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        branch,
+    ]))
+    .await;
+    oid
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn inline_comments_carry_side_and_turn_outdated() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (status, c) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\nfeature!\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{c}");
+    assert_eq!(c["side"], "new");
+    assert_eq!(c["outdated"], false);
+    assert_eq!(c["resolved"], false);
+    assert_eq!(c["suggestion"], "feature!\n");
+
+    // A comment without an explicit side is null (treated as new).
+    let (status, c2) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "plain", "commit_id": f.feature_head, "path": "feat.txt", "line": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(c2["side"], Value::Null);
+
+    // Pushing a new commit makes the anchored comment outdated.
+    advance_branch(&f, "feature").await;
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{number}/comments", repo_href(&f.org_slug, &f.repo_name)),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["outdated"], true);
+    assert_eq!(items[0]["suggestion"], "feature!\n");
+    assert_eq!(items[1]["outdated"], true);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn old_side_comments_do_not_expose_a_suggestion() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    // A suggestion on the base (old) side must not expose an applyable
+    // suggestion, because the server always refuses to apply it.
+    let (status, old) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\nx\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "old",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{old}");
+    assert_eq!(old["side"], "old");
+    assert_eq!(old["suggestion"], Value::Null);
+
+    // The same suggestion on the new side is exposed.
+    let (status, new) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\nx\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(new["suggestion"], "x\n");
+
+    // An unspecified side is treated as new and also exposes the suggestion.
+    let (status, unspecified) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({
+            "body": "```suggestion\ny\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(unspecified["suggestion"], "y\n");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn threads_resolve_and_unresolve() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+    let (_, reply) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "reply", "in_reply_to": root_id}),
+    )
+    .await;
+    let reply_id = reply["id"].as_str().unwrap();
+
+    // Resolving the reply resolves the whole thread.
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{reply_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["resolved"], true);
+    assert!(body["resolved_at"].is_string());
+
+    // The list shows both the root and the reply resolved.
+    let (_, list) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{number}/comments", repo_href(&f.org_slug, &f.repo_name)),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["resolved"], true);
+    assert_eq!(items[1]["resolved"], true);
+
+    // Unresolving the root clears the thread.
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["resolved"], false);
+
+    // A comment on another pull request is not found.
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "checkout",
+        "-q",
+        "-b",
+        "other2",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "other2",
+    ]))
+    .await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "other2",
+    ]))
+    .await;
+    let (_, other) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.org_slug, &f.repo_name),
+        Some(&f.token),
+        None,
+        json!({"title": "other2", "source_branch": "other2", "target_branch": "main"}),
+    )
+    .await;
+    let other_number = other["number"].as_i64().unwrap();
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{other_number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_requires_the_author_or_an_approver() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+
+    // A read-only member can read and comment, but cannot resolve a thread.
+    let reader = add_member(&f.pool, f.org_id, "read").await;
+    let reader_token = fixture_session(&f.pool, reader).await;
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&reader_token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The author can resolve the thread.
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resolved"], true);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replies_attach_to_the_root_not_to_another_reply() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+    let (_, reply) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "reply", "in_reply_to": root_id}),
+    )
+    .await;
+    let reply_id = reply["id"].as_str().unwrap();
+
+    // Replying to a reply is rejected so the display nests one root with its
+    // direct replies and a reply's resolution is its root's.
+    let (status, body) = comment(
+        &f,
+        number,
+        &f.token,
+        json!({"body": "nested", "in_reply_to": reply_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_on_a_closed_pull_request_is_refused() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+
+    // Close the pull request; resolving and unresolving must both be refused.
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &format!("{}/{number}", repo_href(&f.org_slug, &f.repo_name)),
+        Some(&f.token),
+        None,
+        json!({"state": "closed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for resolved in [true, false] {
+        let (status, body) = request(
+            &f.app,
+            "PATCH",
+            &format!(
+                "{}/{number}/comments/{root_id}",
+                repo_href(&f.org_slug, &f.repo_name)
+            ),
+            Some(&f.token),
+            None,
+            json!({"resolved": resolved}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "pull request is not open");
+    }
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_through_a_renamed_away_name_is_404() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap();
+
+    // Rename the repository: the old name still reads, but a mutation captured
+    // against it must not change data.
+    let (status, _) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.token),
+        None,
+        json!({"name": format!("{}-renamed", f.repo_name)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{number}/comments/{root_id}",
+            repo_href(&f.org_slug, &f.repo_name)
+        ),
+        Some(&f.token),
+        None,
+        json!({"resolved": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "repository not found");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_rechecks_open_state_under_the_repository_lock() {
+    let f = build_fixture().await;
+    let (_, pull) = create_pull(&f).await;
+    let number = pull["number"].as_i64().unwrap();
+
+    let (_, root) = comment(&f, number, &f.token, json!({"body": "root"})).await;
+    let root_id = root["id"].as_str().unwrap().to_owned();
+
+    // Hold the repository row exclusively so a concurrent resolve blocks at
+    // `lock_active` — after its early open check, but before it resolves.
+    let mut blocker = f.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM repositories WHERE id = $1 FOR UPDATE")
+        .bind(f.repo_id)
+        .fetch_optional(&mut *blocker)
+        .await
+        .unwrap();
+
+    let app = f.app.clone();
+    let path = format!(
+        "{}/{number}/comments/{root_id}",
+        repo_href(&f.org_slug, &f.repo_name)
+    );
+    let token = f.token.clone();
+    let resolve = tokio::spawn(async move {
+        request(
+            &app,
+            "PATCH",
+            &path,
+            Some(&token),
+            None,
+            json!({"resolved": true}),
+        )
+        .await
+    });
+
+    // Wait for the resolve to block on the repository lock, so it has already
+    // read the pull request as open.
+    for _ in 0..500 {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND state = 'active')",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Close the pull request on another connection, then release the lock so
+    // the resolve's under-lock re-check observes the close.
+    let pull_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM pull_requests WHERE repository_id = $1 AND number = $2")
+            .bind(f.repo_id)
+            .bind(number as i32)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE pull_requests SET state = 'closed', closed_at = now() WHERE id = $1")
+        .bind(pull_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    blocker.commit().await.unwrap();
+
+    let (status, body) = resolve.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "pull request is not open");
+
+    finish(f).await;
+}

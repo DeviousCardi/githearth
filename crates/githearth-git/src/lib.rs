@@ -4,6 +4,8 @@ pub mod browse;
 pub mod journal;
 pub mod layout;
 pub mod merge;
+pub mod signature;
+pub mod suggestion;
 
 use std::{
     error::Error,

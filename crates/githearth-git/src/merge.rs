@@ -11,6 +11,7 @@ use crate::browse::{
     MAX_OUTPUT_BYTES, MergeTree, cmd, nul_fields, parse_merge_tree, run_bounded, run_bounded_input,
     stderr_error, utf8,
 };
+use crate::journal::Origin;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -59,11 +60,11 @@ fn valid_oid(oid: &str) -> bool {
     (oid.len() == 40 || oid.len() == 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn valid_identity(value: &str) -> bool {
+pub(crate) fn valid_identity(value: &str) -> bool {
     !value.bytes().any(|b| matches!(b, b'<' | b'>' | b'\n' | 0))
 }
 
-fn valid_offset(value: &str) -> bool {
+pub(crate) fn valid_offset(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 5
         && matches!(bytes[0], b'+' | b'-')
@@ -71,7 +72,9 @@ fn valid_offset(value: &str) -> bool {
 }
 
 /// Compare-and-swap a branch through `git update-ref --stdin`, journaled by the
-/// `reference-transaction` hook exactly as a push would be (ADR 0004).
+/// `reference-transaction` hook exactly as a push would be (ADR 0004). The
+/// `origin` tags the journal record (`Merge` or `Suggestion`) so replay routes
+/// it to the right metadata handler.
 #[allow(clippy::too_many_arguments)]
 pub fn update_ref_expected(
     repo: &Path,
@@ -81,6 +84,7 @@ pub fn update_ref_expected(
     expected_old_oid: &str,
     operation: Uuid,
     actor: Uuid,
+    origin: Origin,
     timeout: Duration,
 ) -> Result<(), StorageError> {
     // The name goes into `update-ref --stdin`, so whitespace or a newline
@@ -108,8 +112,15 @@ pub fn update_ref_expected(
         .arg("update-ref")
         .arg("--stdin")
         .env("GITHEARTH_OPERATION", operation.to_string())
-        .env("GITHEARTH_ACTOR", actor.to_string())
-        .env("GITHEARTH_MERGE", "1");
+        .env("GITHEARTH_ACTOR", actor.to_string());
+    match origin {
+        Origin::Merge => {
+            command.env("GITHEARTH_MERGE", "1");
+        }
+        Origin::Suggestion => {
+            command.env("GITHEARTH_SUGGESTION", "1");
+        }
+    }
     let input = format!("update {reference} {new_oid} {expected_old_oid}\n");
     let result = run_bounded_input(command, input.as_bytes(), MAX_OUTPUT_BYTES, timeout)?;
     if result.success {
@@ -284,7 +295,7 @@ fn run_merge_tree(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn commit_tree(
+pub(crate) fn commit_tree(
     repo: &Path,
     scratch: Option<&Path>,
     tree: &str,

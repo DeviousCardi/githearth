@@ -21,6 +21,7 @@ const HOOK_TOKEN: &str = "GITHEARTH_HOOK_TOKEN";
 const HOOK_OPERATION: &str = "GITHEARTH_OPERATION";
 const HOOK_ACTOR: &str = "GITHEARTH_ACTOR";
 const HOOK_MERGE: &str = "GITHEARTH_MERGE";
+const HOOK_SUGGESTION: &str = "GITHEARTH_SUGGESTION";
 const HOOK_QUOTA_BYTES: &str = "GITHEARTH_QUOTA_BYTES";
 const REFUSE: &str = "ref updates must go through GitHearth";
 const RESPONSE_LIMIT: u64 = 4096;
@@ -97,6 +98,12 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
     }
     let socket = env[HOOK_SOCKET].as_str();
     let token = env[HOOK_TOKEN].as_str();
+    // The quarantine object directory (unset for a delete-only push): forwarded
+    // so the server can verify commits that exist only in the incoming pack.
+    let object_dir = env
+        .get("GIT_OBJECT_DIRECTORY")
+        .map(String::as_str)
+        .unwrap_or("");
     let mut input = String::new();
     if stdin.read_to_string(&mut input).is_err() {
         let _ = writeln!(stderr, "cannot read ref updates from stdin");
@@ -118,7 +125,7 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
         let ff = !is_zero(old) && !is_zero(new) && fast_forward(old, new);
         updates.push((old.to_owned(), new.to_owned(), reference.to_owned(), ff));
     }
-    match query_policy(socket, token, &updates) {
+    match query_policy(socket, token, object_dir, &updates) {
         Ok(()) => 0,
         Err(reason) => {
             let _ = writeln!(stderr, "{reason}");
@@ -166,6 +173,7 @@ fn check_quota(env: &HashMap<String, String>) -> Result<(), String> {
 fn query_policy(
     socket: &str,
     token: &str,
+    object_dir: &str,
     updates: &[(String, String, String, bool)],
 ) -> Result<(), String> {
     use std::io::ErrorKind;
@@ -182,6 +190,8 @@ fn query_policy(
 
     let mut request = String::with_capacity(64 + 64 * updates.len());
     request.push_str(token);
+    request.push('\n');
+    request.push_str(object_dir);
     request.push('\n');
     for (old, new, reference, ff) in updates {
         request.push_str(old);
@@ -332,6 +342,8 @@ fn append_prepared(
     let actor = Uuid::parse_str(&env[HOOK_ACTOR]).map_err(|e| format!("invalid actor: {e}"))?;
     let origin = if env.get(HOOK_MERGE).is_some_and(|v| v == "1") {
         Some(Origin::Merge)
+    } else if env.get(HOOK_SUGGESTION).is_some_and(|v| v == "1") {
+        Some(Origin::Suggestion)
     } else {
         None
     };
