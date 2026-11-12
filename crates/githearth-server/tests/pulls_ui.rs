@@ -913,6 +913,81 @@ async fn open_pull(f: &Fixture) {
     assert_eq!(status, StatusCode::CREATED);
 }
 
+/// Adds a commit to the feature branch (bypassing the hooks), moving the pull
+/// request's head.
+async fn advance_feature(f: &Fixture) {
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    std::fs::write(f.work.join("more.txt"), "more\n").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "add",
+        "more.txt",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "more",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        f.work.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn approving_an_older_commit_is_marked_on_the_page() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // A write member approves at the current head.
+    let reviewer = member_cookie(&f, "write").await;
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reviewer)).await;
+    let commit_id = hidden(&page, "commit_id");
+    assert_eq!(commit_id, f.feature_head);
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/reviews", f.base),
+        &reviewer,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("verdict", "approved"),
+            ("body", ""),
+            ("commit_id", &commit_id),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Before the head moves, the approval is not marked stale.
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reviewer)).await;
+    assert!(!page.contains("approved an older commit"), "{page}");
+
+    // After the head moves, the earlier approval is on an older commit.
+    advance_feature(&f).await;
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reviewer)).await;
+    assert!(page.contains("approved an older commit"), "{page}");
+
+    finish(f).await;
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn merge_form_shows_only_for_permitted_viewers_on_an_open_pull_request() {

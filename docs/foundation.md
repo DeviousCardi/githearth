@@ -179,6 +179,8 @@ At push admission the server loads the repository's rules once and passes them t
 
 Protection applies to a branch only once it exists. Creating a branch (old value all zeros) that matches a rule is an ordinary `ref.push`, so `require_pull_request` does not block it; the rule applies to every later push. As a result, anyone who can push can create a protected name from any commit, for example `main` in an empty repository, or recreate it after a delete the rule allows. GitHub behaves the same way by default.
 
+A rule's `require_signed_commits` flag (default off) refuses a push unless every new commit carries an SSH signature that verifies against a key registered to the committer's account. It governs client pushes only: server-created merges are exempt (see ADR 0007 "Merge exception"), so a merge into a protected branch is not re-verified and a branch can still gain server-created merge history.
+
 ## SSH keys
 
 Signed-in sessions manage SSH public keys for Git transport over the embedded SSH server ([ADR 0005](decisions/0005-ssh-transport.md)). The API is session-authenticated only; a personal access token can never create, list or revoke keys. The server is built without RSA, so only Ed25519 and ECDSA (nistp256/384/521) keys are accepted — RSA, DSA, `sk-*` and certificate lines are refused with 400.
