@@ -42,8 +42,8 @@ For a small installation (a few repositories, each a few tens of MiB, default
 For comfortable operation and headroom, and required as soon as you host a
 repository larger than a few hundred MiB:
 
-- **CPU: 2 cores or more.** A single clone of a small repository took ≈ 0.56 s;
-  8 concurrent clones raised p50 to ≈ 1.1 s and 64 clients to ≈ 4.9 s on one
+- **CPU: 2 cores or more.** A single clone of a small repository took ≈ 0.55 s;
+  8 concurrent clones raised p50 to ≈ 1.0 s and 64 clients to ≈ 4.5 s on one
   machine. Extra cores shorten those tail latencies.
 - **RAM: 2 GiB, scaled to the largest repository you expect to clone.** Plan for
   roughly `postgres (≈ 100 MiB) + server (≈ 100 MiB) + git_concurrency × 25 MiB

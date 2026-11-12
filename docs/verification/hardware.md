@@ -47,8 +47,8 @@ All synthetic data lives under `./.scratch/` (see the `--workdir` flag).
 
 | # | Scenario | What it verifies | Result | Wall time |
 | --- | --- | --- | --- | --- |
-| 1 | Large repository | Generates a 50 000-commit / ≈1.44 GiB repository, then measures clone, push and browse latency and the server's RSS/CPU throughout. | PASS | 1300 s |
-| 2 | Concurrency sweep | 1, 8, 32 and 64 simultaneous clones; asserts concurrent `upload-pack`/`receive-pack` children never exceed `git_concurrency` (8) and records p50/p95/p99 latency and peak RSS. | PASS | 10.7 s |
+| 1 | Large repository | Generates a 50 000-commit / ≈1.44 GiB repository, then measures clone, push and browse latency and the server's RSS/CPU throughout. | PASS | 1100 s |
+| 2 | Concurrency sweep | 1, 8, 32 and 64 simultaneous clones; asserts concurrent `upload-pack`/`receive-pack` children never exceed `git_concurrency` (8) and that no clone errors, and records p50/p95/p99 latency and peak RSS. | PASS | 8.4 s |
 | 3 | Soak | 20 minutes of push + clone + browse (959 iterations); asserts zero errors, zero leaked `git` children, and RSS growth under a 32 MiB ceiling. | PASS | 1204 s |
 
 ## Measured resource use
@@ -78,16 +78,18 @@ needs roughly 1.7 GiB of process memory. The server process itself stays below
 
 | Clients | Succeeded | Busy | p50 | p95 | Max concurrent git children | Server + git peak RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 1 | 0 | 559 ms | 559 ms | 1 | 83 MiB |
-| 8 | 8 | 0 | 1073 ms | 1084 ms | 8 | 229 MiB |
-| 32 | 16 | 16 | 2691 ms | 2700 ms | 8 | 233 MiB |
-| 64 | 26 | 38 | 4948 ms | 4965 ms | 8 | 247 MiB |
+| 1 | 1 | 0 | 549 ms | 549 ms | 1 | 83 MiB |
+| 8 | 8 | 0 | 1038 ms | 1048 ms | 8 | 233 MiB |
+| 32 | 16 | 16 | 2537 ms | 2544 ms | 8 | 231 MiB |
+| 64 | 26 | 38 | 4457 ms | 4462 ms | 8 | 244 MiB |
 
-Concurrent git children never exceeded the configured 8. Excess clones get an
-immediate busy response rather than queueing, so the "busy" column is the
-admission throttle working. Latency climbs with concurrency because clone bursts
-are CPU-bound in `pack-objects`; each concurrent `upload-pack`/`pack-objects`
-costs about 25 MiB.
+Concurrent git children never exceeded the configured 8, and no clone errored;
+the harness asserts both (the sweep fails if `max_children > GITHEARTH_GIT_CONCURRENCY`
+or if any clone exits neither successfully nor with a busy response). Excess
+clones get an immediate busy response rather than queueing, so the "busy" column
+is the admission throttle working. Latency climbs with concurrency because clone
+bursts are CPU-bound in `pack-objects`; each concurrent
+`upload-pack`/`pack-objects` costs about 25 MiB.
 
 ### Soak (20 minutes, 959 push + clone + browse iterations)
 
@@ -104,7 +106,9 @@ costs about 25 MiB.
 The 22 MiB growth over 959 iterations is within the 32 MiB ceiling and is
 consistent with allocator arena growth in a multi-threaded process, not a
 confirmed leak. A longer soak and allocator profiling are listed as not measured
-below.
+below. A review re-run of the sweep at 5 minutes (281 iterations) recorded the
+same 39 → 60 MiB profile (21 MiB growth) and 0 errors, so the picture is stable
+across shorter soaks.
 
 ## Derived hardware
 
