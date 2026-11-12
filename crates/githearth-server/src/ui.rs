@@ -152,7 +152,7 @@ pub(crate) fn render_page(
     let nav = if let Some(name) = username {
         if let Some(token) = csrf {
             format!(
-                "<nav><a href=\"/\">GitHearth</a><span class=\"muted\" style=\"color:#ccc\">{}</span>\
+                "<nav aria-label=\"Primary\"><a href=\"/\">GitHearth</a><span class=\"muted\" style=\"color:#ccc\">{}</span>\
 <a href=\"/notifications\" style=\"margin-left:auto\">Notifications</a>\
 <a href=\"/settings\">Settings</a>\
 <form method=\"post\" action=\"/logout\" style=\"display:inline\">\
@@ -163,12 +163,12 @@ pub(crate) fn render_page(
             )
         } else {
             format!(
-                "<nav><a href=\"/\">GitHearth</a><span class=\"muted\" style=\"color:#ccc\">{}</span></nav>",
+                "<nav aria-label=\"Primary\"><a href=\"/\">GitHearth</a><span class=\"muted\" style=\"color:#ccc\">{}</span></nav>",
                 esc(name)
             )
         }
     } else {
-        "<nav><a href=\"/\">GitHearth</a><a href=\"/login\" style=\"margin-left:auto\">Sign in</a></nav>"
+        "<nav aria-label=\"Primary\"><a href=\"/\">GitHearth</a><a href=\"/login\" style=\"margin-left:auto\">Sign in</a></nav>"
             .to_string()
     };
     format!(
@@ -187,7 +187,10 @@ button{{padding:.5rem 1rem;cursor:pointer}}\
 .muted{{color:#666;font-size:.9rem}}\
 ul{{list-style:none;padding:0}}\
 li{{padding:.4rem 0;border-bottom:1px solid #eee}}\
-</style></head><body>{nav}<main>{body}</main></body></html>",
+a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{{outline:3px solid #005fcc;outline-offset:2px}}\
+.skip-link{{position:absolute;top:-3rem;left:0;background:#111;color:#fff;padding:.5rem 1rem;z-index:1000}}\
+.skip-link:focus-visible{{top:0}}\
+</style></head><body><a class=\"skip-link\" href=\"#main\">Skip to content</a>{nav}<main id=\"main\" tabindex=\"-1\">{body}</main></body></html>",
         title = esc(title),
         nav = nav,
         body = body,
@@ -304,12 +307,20 @@ async fn login_page(
         }
         Err(_) => {}
     }
-    let error = if q.error.as_deref() == Some("1") {
-        "<p class=\"error\" role=\"alert\">Invalid username or password.</p>"
+    let (error, credential_invalid, form_describedby) = if q.error.as_deref() == Some("1") {
+        (
+            "<p class=\"error\" role=\"alert\" id=\"login-error\">Invalid username or password.</p>",
+            " aria-invalid=\"true\" aria-describedby=\"login-error\"",
+            "",
+        )
     } else if q.error.as_deref() == Some("csrf") {
-        "<p class=\"error\" role=\"alert\">Invalid CSRF token.</p>"
+        (
+            "<p class=\"error\" role=\"alert\" id=\"csrf-error\">Invalid CSRF token.</p>",
+            "",
+            " aria-describedby=\"csrf-error\"",
+        )
     } else {
-        ""
+        ("", "", "")
     };
     // Reuse a well-formed token so a second sign-in tab does not invalidate the first.
     let token = csrf_cookie(&headers)
@@ -320,13 +331,14 @@ async fn login_page(
             hex::encode(bytes)
         });
     let body = format!(
-        "<h1>Sign in</h1><div class=\"card\">{error}<form method=\"post\" action=\"/login\">\
+        "<h1>Sign in</h1><div class=\"card\">{error}<form method=\"post\" action=\"/login\"{form_describedby}>\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-<label for=\"username\">Username</label><input id=\"username\" name=\"username\" autocomplete=\"username\" required>\
-<label for=\"password\">Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required>\
+<label for=\"username\">Username</label><input id=\"username\" name=\"username\" autocomplete=\"username\" required{credential_invalid}>\
+<label for=\"password\">Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required{credential_invalid}>\
 <button type=\"submit\">Sign in</button></form></div>",
         error = error,
-        csrf = esc(&token)
+        csrf = esc(&token),
+        form_describedby = form_describedby
     );
     let secure = if state.config.secure_cookies {
         "; Secure"
@@ -896,4 +908,38 @@ pub fn router() -> Router<AppState> {
         .merge(crate::settings_ui::router())
         .merge(crate::notifications_ui::router())
         .layer(axum::middleware::map_response(page_headers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_page;
+
+    #[test]
+    fn render_page_declares_lang_skip_link_and_landmarks() {
+        let html = render_page("Sign in", None, None, "<h1>Sign in</h1>");
+        assert!(
+            html.contains("<html lang=\"en\">"),
+            "missing lang attribute"
+        );
+        assert!(
+            html.contains("<a class=\"skip-link\" href=\"#main\">Skip to content</a>"),
+            "missing skip link"
+        );
+        assert!(
+            html.contains("<main id=\"main\" tabindex=\"-1\">"),
+            "missing labelled main landmark"
+        );
+        assert!(
+            html.contains("<nav aria-label=\"Primary\">"),
+            "missing labelled primary navigation"
+        );
+    }
+
+    #[test]
+    fn render_page_ships_focus_visible_styles() {
+        let html = render_page("Sign in", None, None, "");
+        assert!(html.contains("a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible"));
+        assert!(html.contains("outline:3px solid #005fcc"));
+        assert!(html.contains(".skip-link:focus-visible"));
+    }
 }

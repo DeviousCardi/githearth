@@ -15,15 +15,19 @@ use axum::{
 use githearth_authz::{Action, PullRequest, Ref, Resource};
 use githearth_core::RepositoryStatus;
 use githearth_git::browse as git_browse;
+use githearth_git::journal::{Origin, Record};
+use githearth_git::merge::Identity;
+use githearth_git::suggestion;
 use serde::{Deserialize, Serialize};
-use sqlx::PgConnection;
-use std::time::Duration;
+use sqlx::{Connection, PgConnection};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, authenticate, browse, event, event_with, facts, idempotency, invalid,
     issues::{allocate_number, not_active, require_readable_repo},
-    repositories,
+    protection, repositories,
     repository_api::{self, Loaded},
 };
 
@@ -40,6 +44,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/comments",
             axum::routing::post(create_comment).get(list_comments),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/comments/{comment_id}",
+            axum::routing::patch(resolve_comment),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/comments/{comment_id}/apply",
+            axum::routing::post(apply_suggestion),
         )
         .route(
             "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/reviews",
@@ -146,9 +158,14 @@ const PULL_COLUMNS: &str = "id, number, title, body, state, author_id, source_br
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at, \
  to_char(closed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS closed_at";
 
-const COMMENT_COLUMNS: &str = "id, author_id, body, seq, commit_id, path, line, in_reply_to, \
- to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
- to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
+/// Comment columns with the `c.` alias the thread-resolution join needs.
+const COMMENT_ROW_COLUMNS: &str = "c.id, c.author_id, c.body, c.seq, c.commit_id, c.path, c.line, \
+ c.side, c.in_reply_to, \
+ to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
+ to_char(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at, \
+ to_char(COALESCE(parent.resolved_at, c.resolved_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS resolved_at, \
+ COALESCE(parent.resolved_by, c.resolved_by) AS resolved_by, \
+ COALESCE(parent.resolved_at, c.resolved_at) IS NOT NULL AS resolved";
 
 const REVIEW_COLUMNS: &str = "id, seq, reviewer_id, verdict, commit_id, body, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at";
@@ -191,7 +208,27 @@ pub(crate) struct PullDetail {
     pub(crate) code_owner_errors: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, sqlx::FromRow)]
+/// A comment's stored columns, including the thread resolution computed by the
+/// query that loaded it (the root's `resolved_at`, via a self join).
+#[derive(sqlx::FromRow)]
+struct CommentRow {
+    id: Uuid,
+    author_id: Uuid,
+    body: String,
+    seq: i32,
+    commit_id: Option<String>,
+    path: Option<String>,
+    line: Option<i32>,
+    side: Option<String>,
+    in_reply_to: Option<Uuid>,
+    created_at: String,
+    updated_at: String,
+    resolved_at: Option<String>,
+    resolved_by: Option<Uuid>,
+    resolved: bool,
+}
+
+#[derive(Serialize, Deserialize)]
 pub(crate) struct CommentJson {
     pub(crate) id: Uuid,
     pub(crate) author_id: Uuid,
@@ -200,9 +237,70 @@ pub(crate) struct CommentJson {
     pub(crate) commit_id: Option<String>,
     pub(crate) path: Option<String>,
     pub(crate) line: Option<i32>,
+    pub(crate) side: Option<String>,
     pub(crate) in_reply_to: Option<Uuid>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    pub(crate) resolved_at: Option<String>,
+    pub(crate) resolved_by: Option<Uuid>,
+    pub(crate) resolved: bool,
+    pub(crate) outdated: bool,
+    pub(crate) suggestion: Option<String>,
+}
+
+/// Enriches a stored row with the live head and its suggestion text. `head` is
+/// the current head commit id (None when the source branch is gone).
+fn comment_json(row: CommentRow, head: Option<&str>) -> CommentJson {
+    let outdated = match (&row.commit_id, head) {
+        (Some(commit), Some(head)) => commit != head,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    // A suggestion applies to the head (new) side only; an "old"-side comment
+    // may carry a ```suggestion block, but the server always refuses to apply
+    // it, so no Apply button must be offered for it.
+    let suggestion = (row.commit_id.is_some()
+        && !row.side.as_deref().is_some_and(|side| side == "old"))
+    .then(|| suggestion::suggestion_replacement(&row.body))
+    .flatten();
+    CommentJson {
+        id: row.id,
+        author_id: row.author_id,
+        body: row.body,
+        seq: row.seq,
+        commit_id: row.commit_id,
+        path: row.path,
+        line: row.line,
+        side: row.side,
+        in_reply_to: row.in_reply_to,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        resolved_at: row.resolved_at,
+        resolved_by: row.resolved_by,
+        resolved: row.resolved,
+        outdated,
+        suggestion,
+    }
+}
+
+/// Loads one comment on `pull_request_id` with its thread's resolution (a
+/// reply's parent carries the resolution; a root resolves itself). Scoping to
+/// the pull request means a comment id from another pull request (or
+/// repository) reads as missing, the same 404 as a nonexistent one.
+async fn fetch_comment_row(
+    conn: &mut PgConnection,
+    pull_request_id: Uuid,
+    comment_id: Uuid,
+) -> Result<Option<CommentRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {COMMENT_ROW_COLUMNS} FROM pull_request_comments c \
+         LEFT JOIN pull_request_comments parent ON parent.id = c.in_reply_to \
+         WHERE c.id = $1 AND c.pull_request_id = $2"
+    ))
+    .bind(comment_id)
+    .bind(pull_request_id)
+    .fetch_optional(&mut *conn)
+    .await
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow)]
@@ -298,6 +396,27 @@ pub(crate) fn require_pull(
     } else {
         Err(not_found())
     }
+}
+
+/// Whether `actor_id` may close this pull request right now. The browser page
+/// uses it to hide the "Disable auto-merge" form (whose submit requires
+/// `PullRequestClose`) from read-only viewers.
+pub(crate) async fn may_close(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<bool, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    require_readable_repo(&loaded)?;
+    let mut conn = state.pool.acquire().await?;
+    let pull = find_pull(&mut conn, loaded.repo.id, number)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    Ok(require_pull(state, &loaded, &pull, Action::PullRequestClose).is_ok())
 }
 
 /// The commit `branch` points at, or None when the branch does not exist.
@@ -849,6 +968,15 @@ async fn update(
                 .bind(locked.id)
                 .execute(&mut *tx)
                 .await?;
+                // Closing also cancels any pending auto-merge.
+                crate::auto_merge::cancel_in_tx(
+                    &mut tx,
+                    loaded.org_id,
+                    actor.id,
+                    locked.id,
+                    Some("pull request closed"),
+                )
+                .await?;
             }
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
@@ -877,6 +1005,8 @@ struct NewComment {
     #[serde(default)]
     line: Option<i32>,
     #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
     in_reply_to: Option<Uuid>,
 }
 
@@ -892,6 +1022,12 @@ fn new_comment(body: &[u8]) -> Result<NewComment, ApiError> {
         || input.commit_id.as_deref().is_some_and(|c| !valid_commit_id(c))
         || input.path.as_deref().is_some_and(|p| !git_browse::valid_path(p))
         || input.line.is_some_and(|l| l < 1)
+        // A side names which half of the diff the line is on, only for anchors.
+        || input
+            .side
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "old" | "new"))
+        || (input.side.is_some() && !anchored)
     {
         return Err(invalid());
     }
@@ -915,7 +1051,7 @@ async fn create_comment(
 }
 
 /// Comments on a pull request as `actor_id`. An anchored comment must name
-/// the current head; a reply must name a comment on the same pull request.
+/// the current head; a reply must name a root comment on the same pull request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_pull_comment(
     state: &AppState,
@@ -988,16 +1124,27 @@ pub(crate) async fn create_pull_comment(
                 return Err(not_active());
             }
             if let Some(parent) = input.in_reply_to {
-                let same_pull: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM pull_request_comments \
-                     WHERE id = $1 AND pull_request_id = $2)",
+                let parent_in_reply_to: Option<Option<Uuid>> = sqlx::query_scalar(
+                    "SELECT in_reply_to FROM pull_request_comments \
+                     WHERE id = $1 AND pull_request_id = $2",
                 )
                 .bind(parent)
                 .bind(pull.id)
-                .fetch_one(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await?;
-                if !same_pull {
-                    return Err(invalid());
+                match parent_in_reply_to {
+                    // The parent must be a comment on this pull request.
+                    None => return Err(invalid()),
+                    // Replies attach to the thread root, never another reply,
+                    // so the display groups one root with its direct replies
+                    // and a reply's resolution is its root's.
+                    Some(Some(_)) => {
+                        return Err(ApiError(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "replies attach to the thread root",
+                        ))
+                    }
+                    Some(None) => {}
                 }
             }
             let seq: i32 = sqlx::query_scalar(
@@ -1011,8 +1158,8 @@ pub(crate) async fn create_pull_comment(
             let id = Uuid::new_v4();
             sqlx::query(
                 "INSERT INTO pull_request_comments \
-                 (id, pull_request_id, author_id, body, seq, commit_id, path, line, in_reply_to) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                 (id, pull_request_id, author_id, body, seq, commit_id, path, line, side, in_reply_to) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             )
             .bind(id)
             .bind(pull.id)
@@ -1022,6 +1169,7 @@ pub(crate) async fn create_pull_comment(
             .bind(&input.commit_id)
             .bind(&input.path)
             .bind(input.line)
+            .bind(&input.side)
             .bind(input.in_reply_to)
             .execute(&mut *tx)
             .await?;
@@ -1037,12 +1185,10 @@ pub(crate) async fn create_pull_comment(
             )
             .await?;
 
-            let comment: CommentJson = sqlx::query_as(&format!(
-                "SELECT {COMMENT_COLUMNS} FROM pull_request_comments WHERE id = $1"
-            ))
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let comment = fetch_comment_row(&mut tx, pull.id, id)
+                .await?
+                .expect("just inserted");
+            let comment = comment_json(comment, input.commit_id.as_deref());
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&comment).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
@@ -1079,7 +1225,7 @@ async fn seq_page_start(
     repo_name: &str,
     number: i32,
     query: &SeqQuery,
-) -> Result<(PullJson, i64), ApiError> {
+) -> Result<(PullJson, Uuid, i64), ApiError> {
     let limit = query.limit.unwrap_or(30);
     if !(1..=100).contains(&limit) || query.after.is_some_and(|a| a < 1) {
         return Err(invalid());
@@ -1087,7 +1233,7 @@ async fn seq_page_start(
     let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
-    Ok((pull, limit))
+    Ok((pull, loaded.repo.id, limit))
 }
 
 fn page<T>(mut rows: Vec<T>, limit: i64, seq: impl Fn(&T) -> i64) -> Page<T> {
@@ -1111,7 +1257,9 @@ async fn list_comments(
     .map(Json)
 }
 
-/// Oldest first, threads flattened; a reply names its parent.
+/// Oldest first, threads flattened; a reply names its parent. Each comment is
+/// enriched with its side, its thread's resolution, whether it is outdated
+/// (anchored to a commit older than the current head), and its suggestion text.
 pub(crate) async fn list_pull_comments(
     state: &AppState,
     actor_id: Uuid,
@@ -1121,21 +1269,69 @@ pub(crate) async fn list_pull_comments(
     number: i32,
     query: SeqQuery,
 ) -> Result<Page<CommentJson>, ApiError> {
-    let (pull, limit) = seq_page_start(
+    let (pull, repo_id, limit) = seq_page_start(
         state, actor_id, auth_age, org_slug, repo_name, number, &query,
     )
     .await?;
+    let head = branch_tip(state, repo_id, &pull.source_branch).await?;
+    let head = head.as_deref();
     let mut conn = state.pool.acquire().await?;
-    let rows = sqlx::query_as::<_, CommentJson>(&format!(
-        "SELECT {COMMENT_COLUMNS} FROM pull_request_comments WHERE pull_request_id = $1 \
-         AND ($2::bigint IS NULL OR seq > $2) ORDER BY seq LIMIT $3"
+    let rows = sqlx::query_as::<_, CommentRow>(&format!(
+        "SELECT {COMMENT_ROW_COLUMNS} FROM pull_request_comments c \
+         LEFT JOIN pull_request_comments parent ON parent.id = c.in_reply_to \
+         WHERE c.pull_request_id = $1 AND ($2::bigint IS NULL OR c.seq > $2) \
+         ORDER BY c.seq LIMIT $3"
     ))
     .bind(pull.id)
     .bind(query.after)
     .bind(limit + 1)
     .fetch_all(&mut *conn)
     .await?;
+    let rows = rows
+        .into_iter()
+        .map(|row| comment_json(row, head))
+        .collect::<Vec<_>>();
     Ok(page(rows, limit, |c| c.seq.into()))
+}
+
+/// The `seq` of each named comment that belongs to this pull request, so a reply
+/// can link to the page its root falls on. Ids from another pull request are
+/// absent rather than an error.
+pub(crate) async fn comment_seqs(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, i64>, ApiError> {
+    let mut seqs = HashMap::new();
+    if ids.is_empty() {
+        return Ok(seqs);
+    }
+    let (pull, _repo_id, _limit) = seq_page_start(
+        state,
+        actor_id,
+        auth_age,
+        org_slug,
+        repo_name,
+        number,
+        &SeqQuery::default(),
+    )
+    .await?;
+    let mut conn = state.pool.acquire().await?;
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT id, seq FROM pull_request_comments WHERE pull_request_id = $1 AND id = ANY($2)",
+    )
+    .bind(pull.id)
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (id, seq) in rows {
+        seqs.insert(id, seq.into());
+    }
+    Ok(seqs)
 }
 
 #[derive(Deserialize)]
@@ -1285,6 +1481,8 @@ pub(crate) async fn create_pull_review(
                 return Err(idempotency::claim_lost());
             }
             tx.commit().await?;
+            // A new review may have just satisfied a pending auto-merge.
+            let _ = crate::auto_merge::maybe_auto_merge(state, actor_id, pull.id).await;
             Ok((status, body))
         },
     )
@@ -1316,7 +1514,7 @@ pub(crate) async fn list_pull_reviews(
     number: i32,
     query: SeqQuery,
 ) -> Result<Page<ReviewJson>, ApiError> {
-    let (pull, limit) = seq_page_start(
+    let (pull, _repo_id, limit) = seq_page_start(
         state, actor_id, auth_age, org_slug, repo_name, number, &query,
     )
     .await?;
@@ -1473,10 +1671,11 @@ async fn list_review_requests(
     Ok(Json(list_review_requests_query(&mut conn, pull.id).await?))
 }
 
-/// Permission shared by POST and DELETE: the caller must be allowed
-/// `PullRequestComment` on the pull, and be either the author or allowed
-/// `PullRequestApprove`.
-fn require_request_permission(
+/// Permission shared by review requests and thread resolution: the caller
+/// must be allowed `PullRequestComment` on the pull, and be either the author
+/// or allowed `PullRequestApprove`. A reader who can merely comment is not
+/// enough to resolve a thread or to request a reviewer.
+pub(crate) fn require_review_permission(
     state: &AppState,
     loaded: &Loaded,
     pull: &PullJson,
@@ -1509,7 +1708,7 @@ async fn add_review_request(
     let loaded =
         repository_api::load_current(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
     let pull = load_pull(&state, &loaded, number, Action::PullRequestComment).await?;
-    require_request_permission(&state, &loaded, &pull)?;
+    require_review_permission(&state, &loaded, &pull)?;
     if loaded.repo.status != RepositoryStatus::Active {
         return Err(not_active());
     }
@@ -1577,7 +1776,7 @@ async fn remove_review_request(
     let loaded =
         repository_api::load_current(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
     let pull = load_pull(&state, &loaded, number, Action::PullRequestComment).await?;
-    require_request_permission(&state, &loaded, &pull)?;
+    require_review_permission(&state, &loaded, &pull)?;
 
     let mut tx = state.pool.begin().await?;
     let reviewer_id: Option<Uuid> =
@@ -1610,6 +1809,590 @@ async fn remove_review_request(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvePatch {
+    resolved: bool,
+}
+
+async fn resolve_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, repo_name, number, comment_id)): Path<(String, String, i32, Uuid)>,
+    body: Bytes,
+) -> Result<Json<CommentJson>, ApiError> {
+    let input: ResolvePatch = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    set_thread_resolved(
+        &state,
+        actor.id,
+        auth_age,
+        &org_slug,
+        &repo_name,
+        number,
+        comment_id,
+        input.resolved,
+    )
+    .await
+    .map(Json)
+}
+
+/// Resolves or unresolves the thread `comment_id` belongs to, returning the
+/// target comment enriched like a list entry. Resolution lives on the thread
+/// root; a reply's parent carries it. The caller must be the pull request
+/// author or able to approve.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn set_thread_resolved(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    comment_id: Uuid,
+    resolved: bool,
+) -> Result<CommentJson, ApiError> {
+    let loaded =
+        repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name).await?;
+    require_readable_repo(&loaded)?;
+    let pull = load_pull(state, &loaded, number, Action::PullRequestComment).await?;
+    // Resolving a thread is a review action: the author or an approver, not a
+    // member who can merely read and comment.
+    require_review_permission(state, &loaded, &pull)?;
+    if loaded.repo.status != RepositoryStatus::Active {
+        return Err(not_active());
+    }
+    if pull.state != "open" {
+        return Err(not_open());
+    }
+    let head = branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+    let head = head.as_deref();
+
+    let mut tx = state.pool.begin().await?;
+    if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
+        return Err(not_active());
+    }
+    // The early `pull.state != "open"` check above races a concurrent close;
+    // re-check under the row lock the close/reopen path takes.
+    require_open(&mut tx, pull.id).await?;
+    // The comment must be on this pull request; the thread root is its
+    // topmost ancestor (walking `in_reply_to` up).
+    let root_id: Option<Uuid> = sqlx::query_scalar(
+        "WITH RECURSIVE thread AS ( \
+           SELECT id, in_reply_to FROM pull_request_comments \
+           WHERE id = $1 AND pull_request_id = $2 \
+           UNION ALL \
+           SELECT c.id, c.in_reply_to FROM pull_request_comments c \
+           JOIN thread t ON c.id = t.in_reply_to \
+         ) \
+         SELECT id FROM thread WHERE in_reply_to IS NULL",
+    )
+    .bind(comment_id)
+    .bind(pull.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(root_id) = root_id else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "comment not found"));
+    };
+    if resolved {
+        // The first resolution wins; resolving again keeps the original actor.
+        sqlx::query(
+            "UPDATE pull_request_comments \
+             SET resolved_at = COALESCE(resolved_at, now()), resolved_by = COALESCE(resolved_by, $1) \
+             WHERE id = $2 AND in_reply_to IS NULL",
+        )
+        .bind(actor_id)
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE pull_request_comments SET resolved_at = NULL, resolved_by = NULL \
+             WHERE id = $1 AND in_reply_to IS NULL",
+        )
+        .bind(root_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE pull_requests SET updated_at = now() WHERE id = $1")
+        .bind(pull.id)
+        .execute(&mut *tx)
+        .await?;
+    event(
+        &mut tx,
+        Some(loaded.org_id),
+        actor_id,
+        if resolved {
+            "pull_request.comment_resolved"
+        } else {
+            "pull_request.comment_unresolved"
+        },
+    )
+    .await?;
+
+    let row = fetch_comment_row(&mut tx, pull.id, comment_id)
+        .await?
+        .expect("the target comment exists");
+    tx.commit().await?;
+    Ok(comment_json(row, head))
+}
+
+/// Whether `actor_id` may apply a suggestion: anyone allowed `ref.push` on the
+/// source branch (including branch protection, exactly as a push would be
+/// judged). The pull request author has no special path — an author who cannot
+/// push to the head branch (read-only access, or a protected branch) may not
+/// apply.
+/// The shared authorization check for applying a suggestion: `ref.push` on the
+/// source branch with its matching protection. A denial maps to 403 when the
+/// viewer can still read the repository and to 404 otherwise.
+fn apply_permission_decision(
+    state: &AppState,
+    facts: &facts::Facts,
+    repo: &repositories::RepositoryRow,
+    pull: &PullJson,
+    rules: &[protection::ProtectionRule],
+    auth_age: u64,
+) -> Result<(), ApiError> {
+    let ref_name = format!("refs/heads/{}", pull.source_branch);
+    let reference = Ref {
+        repository: repo.id,
+        name: ref_name.clone(),
+        protection: protection::matching(rules, &ref_name),
+        exists: true,
+    };
+    let authz_repo = repositories::authz_repository(repo);
+    let decision = state.authz.authorize(&facts.request(
+        Action::RefPush,
+        Resource::Ref(&authz_repo, &reference),
+        Some(Duration::from_secs(auth_age)),
+    ));
+    if decision.is_allowed() {
+        return Ok(());
+    }
+    let read_ok = state
+        .authz
+        .authorize(&facts.request(
+            Action::RepositoryRead,
+            Resource::Repository(&authz_repo),
+            Some(Duration::from_secs(auth_age)),
+        ))
+        .is_allowed();
+    if read_ok {
+        Err(ApiError(StatusCode::FORBIDDEN, "not permitted"))
+    } else {
+        Err(not_found())
+    }
+}
+
+pub(crate) async fn require_apply_permission(
+    state: &AppState,
+    loaded: &Loaded,
+    pull: &PullJson,
+) -> Result<(), ApiError> {
+    let mut conn = state.pool.acquire().await?;
+    let rules = protection::load_rules(&mut conn, loaded.repo.id).await?;
+    drop(conn);
+    apply_permission_decision(
+        state,
+        &loaded.facts,
+        &loaded.repo,
+        pull,
+        &rules,
+        loaded.auth_age,
+    )
+}
+
+/// Re-checks apply permission under the repository lock, reloading facts and
+/// rules so a protection rule added or a grant revoked between the early check
+/// and the ref update is not missed.
+pub(crate) async fn require_apply_permission_locked(
+    state: &AppState,
+    loaded: &Loaded,
+    pull: &PullJson,
+) -> Result<(), ApiError> {
+    let mut conn = state.pool.acquire().await?;
+    let rules = protection::load_rules(&mut conn, loaded.repo.id).await?;
+    let facts = facts::load(&mut conn, loaded.actor_id, loaded.org_id)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    apply_permission_decision(state, &facts, &loaded.repo, pull, &rules, loaded.auth_age)
+}
+
+/// What the pull request page may render for the current viewer, mirroring the
+/// permission each matching handler checks, so a control is never shown for an
+/// action the server would refuse with 403.
+pub(crate) struct ViewerAbilities {
+    pub(crate) may_comment: bool,
+    pub(crate) may_resolve: bool,
+    pub(crate) may_apply: bool,
+}
+
+/// Loads the viewer's abilities for the browser pull page. Commenting maps to
+/// [`Action::PullRequestComment`], resolving to [`require_review_permission`]
+/// and applying to [`require_apply_permission`].
+pub(crate) async fn viewer_abilities(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<ViewerAbilities, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    require_readable_repo(&loaded)?;
+    let mut conn = state.pool.acquire().await?;
+    let pull = find_pull(&mut conn, loaded.repo.id, number)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    let may_comment = require_pull(state, &loaded, &pull, Action::PullRequestComment).is_ok();
+    let open = pull.state == "open";
+    let may_resolve = open && require_review_permission(state, &loaded, &pull).is_ok();
+    let may_apply = open
+        && require_apply_permission(state, &loaded, &pull)
+            .await
+            .is_ok();
+    Ok(ViewerAbilities {
+        may_comment,
+        may_resolve,
+        may_apply,
+    })
+}
+
+fn suggestion_not_applyable(message: &'static str) -> ApiError {
+    ApiError(StatusCode::UNPROCESSABLE_ENTITY, message)
+}
+
+/// Maps the git errors of building a suggestion commit to API errors; the ref
+/// compare-and-swap's `RefMoved` is handled separately as [`head_moved`].
+fn suggestion_storage_error(error: githearth_git::StorageError) -> ApiError {
+    match error {
+        githearth_git::StorageError::Invalid(_) => {
+            suggestion_not_applyable("the suggestion no longer applies to the file")
+        }
+        githearth_git::StorageError::TooLarge { .. } => {
+            ApiError(StatusCode::PAYLOAD_TOO_LARGE, "suggestion is too large")
+        }
+        githearth_git::StorageError::Timeout => {
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, "git operation timed out")
+        }
+        _ => ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage operation failed",
+        ),
+    }
+}
+
+async fn apply_suggestion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, repo_name, number, comment_id)): Path<(String, String, i32, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let value = apply_pull_suggestion(
+        &state, actor.id, auth_age, &org_slug, &repo_name, number, comment_id,
+    )
+    .await?;
+    Ok(Json(value))
+}
+
+/// Applies the ```suggestion block of `comment_id` as a commit on the pull
+/// request's head branch, through the journaled compare-and-swap ref update.
+/// Fails cleanly (409) if the head moved. Returns the new commit id.
+pub(crate) async fn apply_pull_suggestion(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    comment_id: Uuid,
+) -> Result<serde_json::Value, ApiError> {
+    let loaded =
+        repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name).await?;
+    require_readable_repo(&loaded)?;
+    if loaded.repo.status != RepositoryStatus::Active {
+        return Err(not_active());
+    }
+    let mut conn = state.pool.acquire().await?;
+    let pull = find_pull(&mut conn, loaded.repo.id, number)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    if pull.state != "open" {
+        return Err(not_open());
+    }
+    // A viewer who cannot read the pull request must not learn anything about
+    // the comment: authorize read access before touching it, so a member with
+    // no access to a private repository gets the same 404 whether or not the
+    // comment exists.
+    require_pull(state, &loaded, &pull, Action::PullRequestRead)?;
+
+    let mut conn = state.pool.acquire().await?;
+    let comment = fetch_comment_row(&mut conn, pull.id, comment_id)
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "comment not found"))?;
+    drop(conn);
+    let (Some(commit_id), Some(path), Some(line)) =
+        (&comment.commit_id, &comment.path, comment.line)
+    else {
+        return Err(suggestion_not_applyable(
+            "comment is not anchored to a line",
+        ));
+    };
+    // Only a new-side comment can carry an applied suggestion.
+    if comment.side.as_deref().is_some_and(|side| side == "old") {
+        return Err(suggestion_not_applyable(
+            "a suggestion cannot apply to the base side",
+        ));
+    }
+    let Some(replacement) = suggestion::suggestion_replacement(&comment.body) else {
+        return Err(suggestion_not_applyable("comment has no suggestion"));
+    };
+
+    require_apply_permission(state, &loaded, &pull).await?;
+
+    // Serialize with every other ref writer on this repository, held for the
+    // whole mutation.
+    let _guard = state
+        .storage
+        .repository_lock(loaded.repo.id)
+        .lock_owned()
+        .await;
+    // Re-check under the lock: a protection rule added or a grant revoked
+    // between the early check and now must not let a stale permission through.
+    require_apply_permission_locked(state, &loaded, &pull).await?;
+    let repo_path = state.storage.repository_path(loaded.repo.id);
+    let hooks_dir = state.config.storage_root.join("hooks");
+    let timeout = Duration::from_secs(state.config.git_timeout_seconds);
+
+    // The expected old oid is the current head; the compare-and-swap refuses
+    // the update if it moves between this read and the ref update.
+    let head = branch_tip(state, loaded.repo.id, &pull.source_branch)
+        .await?
+        .ok_or_else(branch_missing)?;
+    // A suggestion applies to the exact commit it commented; once the head has
+    // moved the comment is outdated and must not rewrite the current line.
+    if commit_id.as_str() != head.as_str() {
+        return Err(head_moved());
+    }
+
+    let (actor_username, comment_author_username) = {
+        let mut conn = state.pool.acquire().await?;
+        let actor_username: String =
+            sqlx::query_scalar("SELECT username FROM accounts WHERE id = $1")
+                .bind(actor_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        let comment_author_username: String =
+            sqlx::query_scalar("SELECT username FROM accounts WHERE id = $1")
+                .bind(comment.author_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        (actor_username, comment_author_username)
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let identity = Identity {
+        name: actor_username.clone(),
+        email: format!("{actor_username}@users.noreply.githearth.invalid"),
+        time: now,
+        offset: "+0000".into(),
+    };
+    let message = format!("Apply suggestion from @{comment_author_username}\n");
+
+    let operation = Uuid::new_v4();
+    let build = {
+        let repo = repo_path.clone();
+        let head = head.clone();
+        let path = path.clone();
+        let replacement = replacement.into_bytes();
+        let message = message.into_bytes();
+        let identity = identity.clone();
+        tokio::task::spawn_blocking(move || {
+            suggestion::apply_suggestion(
+                &repo,
+                &head,
+                &path,
+                line as usize,
+                &replacement,
+                &message,
+                &identity,
+                &identity,
+                timeout,
+            )
+        })
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage operation failed",
+            )
+        })?
+    };
+    let new_oid = build.map_err(suggestion_storage_error)?;
+
+    let update = {
+        let repo = repo_path.clone();
+        let reference = format!("refs/heads/{}", pull.source_branch);
+        let new_oid = new_oid.clone();
+        let head = head.clone();
+        tokio::task::spawn_blocking(move || {
+            githearth_git::merge::update_ref_expected(
+                &repo,
+                &hooks_dir,
+                &reference,
+                &new_oid,
+                &head,
+                operation,
+                actor_id,
+                Origin::Suggestion,
+                timeout,
+            )
+        })
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage operation failed",
+            )
+        })?
+    };
+    match update {
+        Ok(()) => {}
+        Err(githearth_git::StorageError::RefMoved(_)) => return Err(head_moved()),
+        Err(error) => return Err(suggestion_storage_error(error)),
+    }
+
+    // Record the push + audit event from the journal; the reconciler retries.
+    if let Err(error) = crate::pushes::replay(state, loaded.repo.id).await {
+        tracing::warn!(
+            repository_id = %loaded.repo.id,
+            error = %error,
+            "post-suggestion journal replay failed; reconciler will retry"
+        );
+    }
+
+    Ok(serde_json::json!({ "commit_id": new_oid }))
+}
+
+/// Records an applied suggestion whose ref move was journaled with
+/// `Origin::Suggestion`. Idempotent by `(repository_id, journal_sequence)`.
+pub(crate) async fn apply_suggestion_record(
+    conn: &mut PgConnection,
+    repository: Uuid,
+    prepared: &Record,
+) -> Result<(), crate::pushes::ReplayError> {
+    use crate::pushes::ReplayError;
+    let [update] = prepared.updates.as_slice() else {
+        return Err(ReplayError::Invalid(
+            "suggestion record must contain exactly one ref update",
+        ));
+    };
+    let actor = prepared
+        .actor
+        .ok_or(ReplayError::Invalid("suggestion record actor is required"))?;
+    if !crate::pushes::valid_oid(&update.old) || !crate::pushes::valid_oid(&update.new) {
+        return Err(ReplayError::Invalid("invalid OID in suggestion record"));
+    }
+    if update.old.len() != update.new.len() {
+        return Err(ReplayError::Invalid("old and new OIDs differ in length"));
+    }
+    if !crate::pushes::valid_ref_name(&update.reference) {
+        return Err(ReplayError::Invalid(
+            "ref must start with refs/heads/ or refs/tags/",
+        ));
+    }
+
+    let sequence = prepared.sequence as i64;
+    let mut tx = conn.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO repository_pushes (repository_id, journal_sequence, operation_id, actor_id) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+    )
+    .bind(repository)
+    .bind(sequence)
+    .bind(prepared.operation)
+    .bind(actor)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if inserted {
+        sqlx::query(
+            "INSERT INTO ref_updates (repository_id, journal_sequence, ref_name, old_oid, new_oid) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(repository)
+        .bind(sequence)
+        .bind(&update.reference)
+        .bind(&update.old)
+        .bind(&update.new)
+        .execute(&mut *tx)
+        .await?;
+        let organization_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id = $1")
+                .bind(repository)
+                .fetch_one(&mut *tx)
+                .await?;
+        event_with(
+            &mut tx,
+            organization_id,
+            actor,
+            "pull_request.suggestion_applied",
+            serde_json::json!({
+                "repository_id": repository,
+                "journal_sequence": sequence,
+                "operation_id": prepared.operation,
+                "ref": update.reference,
+                "old": update.old,
+                "new": update.new,
+            }),
+        )
+        .await?;
+        // A suggestion commit is also a push: emit the same `repository.pushed`
+        // audit + outbox pair a normal push emits, so push webhooks fire.
+        let audit_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO audit_events (id, organization_id, actor_id, kind) \
+             SELECT $1, r.organization_id, $2, 'repository.pushed' \
+             FROM repositories r WHERE r.id = $3",
+        )
+        .bind(audit_id)
+        .bind(actor)
+        .bind(repository)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO outbox_events (id, organization_id, kind, payload) \
+             SELECT $1, r.organization_id, 'repository.pushed', $2 \
+             FROM repositories r WHERE r.id = $3",
+        )
+        .bind(audit_id)
+        .bind(serde_json::json!({
+            "repository_id": repository,
+            "journal_sequence": sequence,
+            "operation_id": prepared.operation,
+            "actor_id": actor,
+            "credential_kind": null,
+            "credential_id": null,
+            "updates": [{
+                "ref": update.reference,
+                "old": update.old,
+                "new": update.new,
+            }],
+        }))
+        .bind(repository)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1690,6 +2473,24 @@ mod tests {
     }
 
     #[test]
+    fn comment_side_is_old_or_new_and_anchored_only() {
+        let id = "a".repeat(40);
+        let ok = |v: serde_json::Value| new_comment(v.to_string().as_bytes()).is_ok();
+        assert!(ok(
+            serde_json::json!({"body": "x", "commit_id": id, "path": "a.rs", "line": 3, "side": "new"})
+        ));
+        assert!(ok(
+            serde_json::json!({"body": "x", "commit_id": id, "path": "a.rs", "line": 3, "side": "old"})
+        ));
+        // A side without an anchor is invalid.
+        assert!(!ok(serde_json::json!({"body": "x", "side": "new"})));
+        // An unknown side is invalid.
+        assert!(!ok(
+            serde_json::json!({"body": "x", "commit_id": id, "path": "a.rs", "line": 3, "side": "both"})
+        ));
+    }
+
+    #[test]
     fn comment_reviews_need_a_body() {
         let id = "b".repeat(64);
         let ok = |v: serde_json::Value| new_review(v.to_string().as_bytes()).is_ok();
@@ -1711,6 +2512,27 @@ mod tests {
         assert!(!ok(
             serde_json::json!({"verdict": "approved", "commit_id": "main"})
         ));
+    }
+
+    #[test]
+    fn suggestion_storage_errors_map_to_api_statuses() {
+        use githearth_git::StorageError;
+
+        let invalid = suggestion_storage_error(StorageError::Invalid("x".into()));
+        assert_eq!(invalid.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            invalid.message(),
+            "the suggestion no longer applies to the file"
+        );
+
+        let too_large = suggestion_storage_error(StorageError::TooLarge { size: 1, limit: 0 });
+        assert_eq!(too_large.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let timeout = suggestion_storage_error(StorageError::Timeout);
+        assert_eq!(timeout.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let other = suggestion_storage_error(StorageError::Git("boom".into()));
+        assert_eq!(other.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -1785,6 +2607,138 @@ mod tests {
 
         // close() waits for every checked-out connection, so return ours first.
         drop(conn);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn apply_permission_is_rechecked_under_the_lock() {
+        use sqlx::{ConnectOptions, postgres::PgPoolOptions};
+        use std::str::FromStr;
+
+        let url =
+            std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .disable_statement_logging();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused')")
+            .bind(account)
+            .bind(format!("al-{}", Uuid::new_v4().simple()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let org = Uuid::new_v4();
+        let org_slug = format!("o-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')",
+        )
+        .bind(org)
+        .bind(&org_slug)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+        )
+        .bind(org)
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let grant_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) \
+             VALUES ($1,'write','account',$2,'organization',$3,$2)",
+        )
+        .bind(grant_id)
+        .bind(account)
+        .bind(org)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'r',$3,$4,'active','private')",
+        )
+        .bind(repo)
+        .bind(org)
+        .bind(account)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pull = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+        )
+        .bind(pull)
+        .bind(repo)
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let storage_root =
+            std::env::temp_dir().join(format!("githearth-apply-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let config = crate::Config {
+            database_url: url,
+            database_max_connections: 4,
+            database_timeout_seconds: 3,
+            storage_root: storage_root.clone(),
+            ..crate::Config::default()
+        };
+        let state = crate::AppState::new(pool.clone(), config).await.unwrap();
+
+        let loaded = repository_api::load_repo(&state, account, 0, &org_slug, "r")
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let pull = find_pull(&mut conn, repo, 1).await.unwrap().unwrap();
+        drop(conn);
+
+        // The write grant admits the early check.
+        require_apply_permission(&state, &loaded, &pull)
+            .await
+            .unwrap();
+
+        // Revoke the write grant and leave only read access. The early check's
+        // facts are stale, but the under-lock re-check reloads them and refuses.
+        sqlx::query(
+            "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 WHERE id = $2",
+        )
+        .bind(account)
+        .bind(grant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) \
+             VALUES ($1,'read','account',$2,'organization',$3,$2)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(account)
+        .bind(org)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = require_apply_permission_locked(&state, &loaded, &pull)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+
+        std::fs::remove_dir_all(&storage_root).unwrap();
         pool.close().await;
     }
 }

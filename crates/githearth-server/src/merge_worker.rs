@@ -32,8 +32,10 @@ struct Claim {
     organization_id: Uuid,
 }
 
-/// Claims one intent, atomically: `FOR UPDATE SKIP LOCKED`, oldest `created_at`
-/// first. Claimable means `state = 'queued'`, or a `validating`/`executing`
+/// Claims one intent, atomically: `FOR UPDATE SKIP LOCKED`, oldest
+/// `(created_at, operation_id)` first — the same ordering `queue_position`
+/// shows, so a same-instant tie-breaks deterministically. Claimable means
+/// `state = 'queued'`, or a `validating`/`executing`
 /// intent whose `lease_expires_at` has passed. The claim sets a fresh holder,
 /// increments `lease_attempt`, and sets `lease_expires_at` to now() plus
 /// 6 x `git_timeout_seconds`. A `queued` intent becomes `validating`; a
@@ -53,10 +55,10 @@ async fn claim_intent(
          WHERE operation_id = ( \
            SELECT operation_id FROM merge_intents \
            WHERE ($3::uuid IS NULL OR repository_id = $3) \
-             AND (state = 'queued' \
+              AND (state = 'queued' \
                OR (state IN ('validating','executing') AND lease_expires_at < now())) \
-           ORDER BY created_at \
-           FOR UPDATE SKIP LOCKED \
+            ORDER BY created_at, operation_id \
+            FOR UPDATE SKIP LOCKED \
            LIMIT 1) \
          RETURNING operation_id, repository_id, state, lease_attempt, actor_id",
     )
@@ -115,19 +117,42 @@ async fn apply_outcome(
     claim: &Claim,
     outcome: MergeOutcome,
 ) -> Result<(), sqlx::Error> {
+    // A merge-queue entry whose target moved is re-targeted to the new tip and
+    // returned to `queued`, so the next claim re-validates and merges it. The
+    // fence is the same as any other outcome apply; only the claim's holder may
+    // move it. `lease_attempt` is preserved so the attempt cap still bounds a
+    // pathological re-target loop.
+    if let MergeOutcome::Retarget { new_target } = outcome {
+        let mut tx = state.pool.begin().await?;
+        sqlx::query(
+            "UPDATE merge_intents SET expected_target_oid = $1, state = 'queued', \
+             lease_holder = NULL, lease_expires_at = NULL, updated_at = now() \
+             WHERE operation_id = $2 AND state = 'executing' \
+             AND lease_holder = $3 AND lease_attempt = $4",
+        )
+        .bind(new_target)
+        .bind(claim.operation_id)
+        .bind(holder())
+        .bind(claim.attempt)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
     let (new_state, failure_reason, kind) = match outcome {
         MergeOutcome::Merged { .. } | MergeOutcome::AlreadyMerged { .. } => {
             // No transition: `record_merge_result` owns `merged`. If replay
             // failed the row stays `executing` and a later reclaim converges.
             return Ok(());
         }
+        MergeOutcome::Retarget { .. } => unreachable!("handled above"),
         MergeOutcome::Conflicted { paths } => (
             "conflicted",
             Some(paths.join(", ")),
             "pull_request.merge_intent_conflicted",
         ),
         MergeOutcome::Stale { reason } => {
-            // shortcut: ADR 0004 re-drives a target-moved intent; stale is terminal until the merge queue increment.
             ("stale", Some(reason), "pull_request.merge_intent_stale")
         }
         MergeOutcome::Failed { reason } => {
@@ -257,4 +282,124 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{ConnectOptions, postgres::PgPoolOptions};
+    use std::str::FromStr;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+    async fn claim_intent_tie_breaks_same_timestamp_entries_by_operation_id() {
+        let url =
+            std::env::var("GITHEARTH_TEST_DATABASE_URL").expect("set GITHEARTH_TEST_DATABASE_URL");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .disable_statement_logging();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        crate::MIGRATOR.run(&pool).await.unwrap();
+
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,'unused')")
+            .bind(account)
+            .bind(format!("cw-{}", Uuid::new_v4().simple()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let org = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Fixture Organization')",
+        )
+        .bind(org)
+        .bind(format!("o-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'r',$3,$4,'active','private')",
+        )
+        .bind(repo)
+        .bind(org)
+        .bind(account)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        async fn pull(pool: &sqlx::PgPool, repo: Uuid, account: Uuid, number: i32) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
+                 VALUES ($1,$2,$3,'t','',$4,$5,'main')",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(number)
+            .bind(account)
+            .bind(format!("src-{number}"))
+            .execute(pool)
+            .await
+            .unwrap();
+            id
+        }
+
+        // Two claimable intents created in the same instant, on two different
+        // pull requests (the per-pull non-terminal index allows only one live
+        // intent each). The larger `operation_id` is inserted first, so a
+        // created_at-only claim (which falls back to insertion order for equal
+        // keys) would pick it first; the tie-break must claim the smaller id
+        // first instead. Postgres orders `uuid` by its 16-byte value, which is
+        // exactly `as_bytes()` lexicographic order.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let (smaller, larger) = if a.as_bytes() < b.as_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let pulls = [
+            pull(&pool, repo, account, 1).await,
+            pull(&pool, repo, account, 2).await,
+        ];
+        for (operation_id, pull) in [(larger, pulls[0]), (smaller, pulls[1])] {
+            sqlx::query(
+                "INSERT INTO merge_intents (operation_id, repository_id, pull_request_id, source_ref, \
+                 source_oid, target_ref, expected_target_oid, method, policy_generation, \
+                 checks_approvals_digest, actor_id, state, in_queue, created_at) \
+                 VALUES ($1,$2,$3,'src',$4,'main',$4,'merge',0,'d',$5,'queued',true, \
+                         '2024-01-01T00:00:00Z'::timestamptz)",
+            )
+            .bind(operation_id)
+            .bind(repo)
+            .bind(pull)
+            .bind("a".repeat(40))
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut conn = pool.acquire().await.unwrap();
+        let lease = Duration::from_secs(60);
+        let first = claim_intent(&mut conn, holder(), lease, Some(repo))
+            .await
+            .unwrap()
+            .expect("first claim");
+        assert_eq!(first.operation_id, smaller);
+        let second = claim_intent(&mut conn, holder(), lease, Some(repo))
+            .await
+            .unwrap()
+            .expect("second claim");
+        assert_eq!(second.operation_id, larger);
+
+        drop(conn);
+        pool.close().await;
+    }
 }

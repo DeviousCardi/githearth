@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod audit_retention;
+pub mod auto_merge;
 pub mod browse;
 mod browse_ui;
 pub mod client_ip;
@@ -258,6 +259,7 @@ pub fn router(state: AppState) -> Router {
         .merge(forks::router())
         .merge(pulls::router())
         .merge(merge_intents::router())
+        .merge(auto_merge::router())
         .merge(protection::router())
         .merge(statuses::router())
         .merge(audit::router())
