@@ -104,7 +104,7 @@ Items previously listed here that are now verified elsewhere:
 Still genuinely open:
 
 - **Independent installation.** The harness automates the runbook. An install by a person who has not seen the code, on a clean Linux host, is still to be done; the sign-off checklist is in [m4-signoff.md](m4-signoff.md).
-- **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are not measured.
+- **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are now measured by the separate [hardware drill](hardware.md) and published in [hardware.md](../operations/hardware.md).
 - **Online (non-maintenance-window) backup.** Not implemented; backup/restore is maintenance-window-only (s4). This is documented precisely below.
 
 ## Online backup: maintenance-window-only
