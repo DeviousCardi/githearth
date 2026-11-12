@@ -57,6 +57,7 @@ pub enum Kind {
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     Merge,
+    Suggestion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

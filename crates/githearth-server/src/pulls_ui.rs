@@ -13,10 +13,13 @@ use axum::{
     routing::get,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use uuid::Uuid;
 
-use crate::{AppState, auto_merge, idempotency, merge_intents, pulls, ui};
+use crate::{
+    AppState, auto_merge, browse_ui, idempotency, merge_intents, pulls, repository_api, ui,
+};
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -39,6 +42,18 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/organizations/{slug}/repositories/{name}/pulls/{number}/reviews",
             axum::routing::post(review_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/comments/{comment_id}/resolve",
+            axum::routing::post(resolve_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/comments/{comment_id}/unresolve",
+            axum::routing::post(unresolve_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/comments/{comment_id}/apply",
+            axum::routing::post(apply_submit),
         )
         .route(
             "/organizations/{slug}/repositories/{name}/pulls/{number}/merge",
@@ -627,6 +642,13 @@ async fn render_pull(
     let can_merge = merge_intents::may_merge(state, s.account.id, s.auth_age, slug, name, number)
         .await
         .unwrap_or(false);
+    let abilities = pulls::viewer_abilities(state, s.account.id, s.auth_age, slug, name, number)
+        .await
+        .unwrap_or(pulls::ViewerAbilities {
+            may_comment: false,
+            may_resolve: false,
+            may_apply: false,
+        });
 
     let auto_merge_row: Option<auto_merge::AutoMergeJson> = match state.pool.acquire().await {
         Ok(mut conn) => auto_merge::find_auto_merge(&mut conn, detail.pull.id)
@@ -707,14 +729,88 @@ async fn render_pull(
         format!("<ul>{review_list}</ul>")
     };
 
-    let mut comment_list = String::new();
+    // Group comments into threads: a root (no parent) with its direct replies.
+    let mut roots: Vec<&pulls::CommentJson> = Vec::new();
+    let mut replies: HashMap<Uuid, Vec<&pulls::CommentJson>> = HashMap::new();
     for c in &comments.items {
+        match c.in_reply_to {
+            Some(parent) => replies.entry(parent).or_default().push(c),
+            None => roots.push(c),
+        }
+    }
+    let mut comment_list = String::new();
+    for c in &roots {
+        comment_list.push_str(&render_comment(
+            s,
+            &names,
+            &base,
+            number,
+            c,
+            false,
+            abilities.may_resolve,
+            abilities.may_apply,
+        ));
+        if let Some(thread_replies) = replies.get(&c.id) {
+            for reply in thread_replies {
+                comment_list.push_str(&render_comment(
+                    s,
+                    &names,
+                    &base,
+                    number,
+                    reply,
+                    true,
+                    abilities.may_resolve,
+                    abilities.may_apply,
+                ));
+            }
+        }
+    }
+    // A reply whose root is on an earlier comment page is orphaned here:
+    // pagination is by seq and rendering iterates roots only, so without this
+    // it would be silently dropped. Render it under a marker linking the root
+    // on the page that holds it.
+    let root_ids: HashSet<Uuid> = roots.iter().map(|c| c.id).collect();
+    let orphan_roots: Vec<Uuid> = comments
+        .items
+        .iter()
+        .filter_map(|c| c.in_reply_to)
+        .filter(|parent| !root_ids.contains(parent))
+        .collect();
+    let orphan_seqs = pulls::comment_seqs(
+        state,
+        s.account.id,
+        s.auth_age,
+        slug,
+        name,
+        number,
+        &orphan_roots,
+    )
+    .await
+    .map_err(|e| api_error(s, e))?;
+    for reply in &comments.items {
+        let Some(parent) = reply.in_reply_to.filter(|p| !root_ids.contains(p)) else {
+            continue;
+        };
+        // The list query filters `seq > after`, so `after = seq - 1` puts the
+        // root first on its page; the anchor names the root element.
+        let href = match orphan_seqs.get(&parent) {
+            Some(&seq) if seq > 1 => {
+                format!("{base}/pulls/{number}?after={}#comment-{parent}", seq - 1)
+            }
+            _ => format!("{base}/pulls/{number}#comment-{parent}"),
+        };
         comment_list.push_str(&format!(
-            "<li><article aria-label=\"Comment {seq}\"><p class=\"muted\">{} commented at {}</p><div style=\"white-space:pre-wrap\">{}</div></article></li>",
-            who(&names, &c.author_id),
-            ui::esc(&c.created_at),
-            ui::esc(&c.body),
-            seq = c.seq,
+            "<li class=\"muted\">reply to <a href=\"{href}\">an earlier comment</a></li>"
+        ));
+        comment_list.push_str(&render_comment(
+            s,
+            &names,
+            &base,
+            number,
+            reply,
+            true,
+            abilities.may_resolve,
+            abilities.may_apply,
         ));
     }
     let comment_list = if comment_list.is_empty() {
@@ -847,6 +943,22 @@ async fn render_pull(
     } else {
         String::new()
     };
+    let files_html = files_changed(state, s, slug, name, &detail).await;
+    let inline_form = if detail.head_id.is_some() && abilities.may_comment {
+        format!(
+            "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/comments\">{}\
+<label for=\"path\">File path</label><input id=\"path\" name=\"path\" required>\
+<label for=\"line\">Line number</label><input id=\"line\" name=\"line\" type=\"number\" min=\"1\" required>\
+<label for=\"side\">Side</label><select id=\"side\" name=\"side\"><option value=\"new\">New (head)</option><option value=\"old\">Old (base)</option></select>\
+<label for=\"comment\">Comment on this line</label><textarea id=\"comment\" name=\"body\" rows=\"3\" required style=\"width:100%;box-sizing:border-box\"></textarea>\
+<input type=\"hidden\" name=\"commit_id\" value=\"{}\">\
+<p><button type=\"submit\">Add inline comment</button></p></form>",
+            form_fields(s, &new_key()),
+            ui::esc(head_id),
+        )
+    } else {
+        String::new()
+    };
     // The latest status per context at the current head, newest first.
     let mut status_rows = String::new();
     for st in &detail.statuses {
@@ -924,7 +1036,9 @@ async fn render_pull(
 {status_section}{queue_notice}\
 {conflict_section}\
 <h2>Reviews</h2>{review_list} \
-<h2>Comments</h2>{comment_list}<p>{pager}</p>{error}{review_error}{merge_error}\
+<h2>Comments</h2>{comment_list}<p>{pager}</p>\
+<h2>Files changed</h2><div class=\"card\">{files_html}</div>{inline_form}\
+{error}{review_error}{merge_error}\
 {merge_form}{auto_merge_section}\
 <form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/comments\">{}\
 <label for=\"comment\">Add a comment</label><textarea id=\"comment\" name=\"body\" rows=\"5\" required style=\"width:100%;box-sizing:border-box\">{}</textarea>\
@@ -956,6 +1070,230 @@ async fn render_pull(
     Ok(page(s, status, "Pull request", &body))
 }
 
+/// Renders one comment, with its anchor (path, line and side), an outdated
+/// badge when the head moved, its suggestion block, and the resolve and apply
+/// actions available to a viewer with the matching permission.
+#[allow(clippy::too_many_arguments)]
+fn render_comment(
+    s: &Session,
+    names: &HashMap<Uuid, String>,
+    base: &str,
+    number: i32,
+    c: &pulls::CommentJson,
+    is_reply: bool,
+    may_resolve: bool,
+    may_apply: bool,
+) -> String {
+    let mut anchor = String::new();
+    if let (Some(path), Some(line)) = (&c.path, c.line) {
+        let side = c.side.as_deref().unwrap_or("new");
+        anchor.push_str(&format!(
+            "<p class=\"muted\">on <code>{}</code> line {} ({})",
+            ui::esc(path),
+            line,
+            ui::esc(side)
+        ));
+        if c.outdated {
+            anchor.push_str(" · <span class=\"muted\">outdated</span>");
+        }
+        anchor.push_str("</p>");
+    }
+    let mut body = format!(
+        "<div style=\"white-space:pre-wrap\">{}</div>",
+        ui::esc(&c.body)
+    );
+    if let Some(suggestion) = &c.suggestion {
+        body.push_str(&format!(
+            "<pre class=\"card\">{}</pre>",
+            ui::esc(suggestion)
+        ));
+    }
+    let mut actions = String::new();
+    if !is_reply && may_resolve {
+        let resolve_action = if c.resolved {
+            format!(
+                "<form method=\"post\" action=\"{base}/pulls/{number}/comments/{id}/unresolve\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+<button type=\"submit\">Unresolve</button></form>",
+                id = c.id,
+                csrf = ui::esc(&s.csrf)
+            )
+        } else {
+            format!(
+                "<form method=\"post\" action=\"{base}/pulls/{number}/comments/{id}/resolve\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+<button type=\"submit\">Resolve</button></form>",
+                id = c.id,
+                csrf = ui::esc(&s.csrf)
+            )
+        };
+        actions.push_str(&resolve_action);
+    }
+    if c.suggestion.is_some() && !c.outdated && may_apply {
+        actions.push_str(&format!(
+            "<form method=\"post\" action=\"{base}/pulls/{number}/comments/{id}/apply\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+<button type=\"submit\">Apply suggestion</button></form>",
+            id = c.id,
+            csrf = ui::esc(&s.csrf)
+        ));
+    }
+    let resolved_mark = if c.resolved && !is_reply {
+        " <span class=\"muted\">(resolved)</span>"
+    } else {
+        ""
+    };
+    format!(
+        "<li><article id=\"comment-{id}\" aria-label=\"Comment {seq}\"><p class=\"muted\">{} commented at {}{}</p>{anchor}{body}{actions}</article></li>",
+        who(names, &c.author_id),
+        ui::esc(&c.created_at),
+        resolved_mark,
+        seq = c.seq,
+        id = c.id,
+    )
+}
+
+/// The diff between the pull request's base and head, rendered exactly like the
+/// compare page's "Files changed". Empty when either branch is missing or the
+/// read fails.
+async fn files_changed(
+    state: &AppState,
+    s: &Session,
+    slug: &str,
+    name: &str,
+    detail: &pulls::PullDetail,
+) -> String {
+    let (Some(base), Some(head)) = (detail.base_id.as_deref(), detail.head_id.as_deref()) else {
+        return "<p class=\"muted\">Files changed are unavailable while a branch is missing.</p>"
+            .to_owned();
+    };
+    let Ok(loaded) = repository_api::load_repo(state, s.account.id, s.auth_age, slug, name).await
+    else {
+        return String::new();
+    };
+    let repo_id = loaded.repo.id;
+    let base = base.to_owned();
+    let head = head.to_owned();
+    let Ok(permit) = state.git_slots.clone().try_acquire_owned() else {
+        return String::new();
+    };
+    let storage = state.storage.clone();
+    let timeout = Duration::from_secs(state.config.git_timeout_seconds);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let path = storage.read_path(repo_id)?;
+        let scratch = storage.scratch_dir()?;
+        githearth_git::browse::compare(&path, scratch.path(), &base, &head, timeout)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(comparison))) => browse_ui::render_diff(&comparison.files, comparison.truncated),
+        _ => String::new(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolveForm {
+    #[serde(default)]
+    csrf_token: String,
+}
+
+async fn resolve_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number, comment_id)): Path<(String, String, String, Uuid)>,
+    Form(form): Form<ResolveForm>,
+) -> Result<Response, ui::UiError> {
+    set_resolved(
+        &state,
+        &headers,
+        &slug,
+        &name,
+        &number,
+        comment_id,
+        &form.csrf_token,
+        true,
+    )
+    .await
+}
+
+async fn unresolve_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number, comment_id)): Path<(String, String, String, Uuid)>,
+    Form(form): Form<ResolveForm>,
+) -> Result<Response, ui::UiError> {
+    set_resolved(
+        &state,
+        &headers,
+        &slug,
+        &name,
+        &number,
+        comment_id,
+        &form.csrf_token,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_resolved(
+    state: &AppState,
+    headers: &HeaderMap,
+    slug: &str,
+    name: &str,
+    number: &str,
+    comment_id: Uuid,
+    csrf_token: &str,
+    resolved: bool,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(state, headers, csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    if let Err(e) = pulls::set_thread_resolved(
+        state,
+        s.account.id,
+        s.auth_age,
+        slug,
+        name,
+        number,
+        comment_id,
+        resolved,
+    )
+    .await
+    {
+        return Err(api_error(&s, e));
+    }
+    Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(slug, name))).into_response())
+}
+
+async fn apply_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number, comment_id)): Path<(String, String, String, Uuid)>,
+    Form(form): Form<ResolveForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    if let Err(e) = pulls::apply_pull_suggestion(
+        &state,
+        s.account.id,
+        s.auth_age,
+        &slug,
+        &name,
+        number,
+        comment_id,
+    )
+    .await
+    {
+        return Err(api_error(&s, e));
+    }
+    Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
+}
+
 #[derive(Deserialize)]
 struct CommentForm {
     #[serde(default)]
@@ -964,6 +1302,14 @@ struct CommentForm {
     idempotency_key: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    commit_id: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    line: Option<i32>,
+    #[serde(default)]
+    side: String,
 }
 
 async fn comment_submit(
@@ -1008,7 +1354,16 @@ async fn comment_submit(
         )
         .await;
     }
-    let payload = serde_json::json!({ "body": &form.body }).to_string();
+    let mut payload = serde_json::json!({ "body": &form.body });
+    if !form.commit_id.is_empty() {
+        payload["commit_id"] = serde_json::json!(&form.commit_id);
+        payload["path"] = serde_json::json!(&form.path);
+        payload["line"] = serde_json::json!(form.line);
+        if !form.side.is_empty() {
+            payload["side"] = serde_json::json!(&form.side);
+        }
+    }
+    let payload = payload.to_string();
     if let Err(e) = pulls::create_pull_comment(
         &state,
         s.account.id,

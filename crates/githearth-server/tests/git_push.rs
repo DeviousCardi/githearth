@@ -2371,6 +2371,7 @@ async fn update_ref_expected_journals_merge_origin_and_replay_records_merge_resu
             &expected_old,
             op,
             actor,
+            githearth_git::journal::Origin::Merge,
             Duration::from_secs(30),
         )
     })
@@ -2576,6 +2577,7 @@ async fn push_and_merge_serialize_on_the_repository_lock() {
             &expected_old,
             op,
             actor,
+            githearth_git::journal::Origin::Merge,
             Duration::from_secs(30),
         )
     })

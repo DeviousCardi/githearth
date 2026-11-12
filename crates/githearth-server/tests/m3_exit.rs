@@ -792,6 +792,7 @@ async fn lost_metadata_after_git_commit_is_reconciled_exactly_once() {
             &old,
             op_for_hook,
             actor,
+            githearth_git::journal::Origin::Merge,
             Duration::from_secs(30),
         )
     })
@@ -903,6 +904,7 @@ async fn duplicate_delivery_merges_once_with_one_journal_entry_and_one_event() {
             &old,
             op_for_hook,
             actor,
+            githearth_git::journal::Origin::Merge,
             Duration::from_secs(30),
         )
     })
