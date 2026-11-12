@@ -32,9 +32,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Third-party notices are up to date
+        run: python3 scripts/generate-third-party-notices.py --check
 
   test:
     runs-on: ubuntu-24.04

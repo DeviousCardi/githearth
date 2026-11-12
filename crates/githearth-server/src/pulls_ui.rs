@@ -77,6 +77,32 @@ fn intent_state_label(state: &str) -> &str {
     }
 }
 
+/// A mergeability status that means the selected method cannot run, with the
+/// reason shown next to the disabled merge button. `clean` (and the un-checked
+/// `ff_only` method) map to `None` — the form stays live.
+fn merge_block_reason(status: &str) -> Option<&'static str> {
+    match status {
+        "conflicts" => Some("This branch has conflicts that must be resolved."),
+        "unrelated" => Some("These branches have no common history."),
+        "up_to_date" => Some("This branch is already up to date with the target."),
+        "unmergeable" => Some("This branch cannot be rebased because it contains merge commits."),
+        _ => None,
+    }
+}
+
+/// The reason the selected merge method cannot run, if any. Computed from the
+/// selected method only: a conflicting or unmergeable rebase must not disable
+/// the form for a clean merge/squash, whose statuses agree with each other.
+fn selected_block_reason(
+    mergeability: &[crate::mergeability::Check],
+    method: &str,
+) -> Option<&'static str> {
+    mergeability
+        .iter()
+        .find(|c| c.method == method)
+        .and_then(|c| merge_block_reason(&c.status))
+}
+
 struct Session {
     account: crate::Account,
     auth_age: u64,
@@ -628,6 +654,36 @@ async fn render_pull(
         None
     };
 
+    let mut conflict_paths: Vec<String> = Vec::new();
+    for check in &detail.mergeability {
+        if check.status == "conflicts" {
+            for path in &check.conflicts {
+                if !conflict_paths.iter().any(|p| p == path) {
+                    conflict_paths.push(path.clone());
+                }
+            }
+        }
+    }
+    let has_conflicts = !conflict_paths.is_empty();
+    let conflict_section = if has_conflicts {
+        let mut html = String::from(
+            "<p class=\"error\" role=\"alert\">This branch has conflicts that must be resolved</p><ul>",
+        );
+        for path in &conflict_paths {
+            html.push_str(&format!("<li>{}</li>", ui::esc(path)));
+        }
+        html.push_str("</ul>");
+        html.push_str(&format!(
+            "<h2>Resolve conflicts locally</h2>\
+<pre><code>git fetch origin\ngit checkout {}\ngit merge origin/{}</code></pre>",
+            ui::esc(&detail.pull.source_branch),
+            ui::esc(&detail.pull.target_branch),
+        ));
+        html
+    } else {
+        String::new()
+    };
+
     let mut review_list = String::new();
     for r in &reviews.items {
         review_list.push_str(&format!(
@@ -719,6 +775,9 @@ async fn render_pull(
         }
         (None, _) => String::new(),
     };
+    // Methods whose mergeability says they cannot run are dropped from the
+    // selector, and the selected method's own status disables the button with
+    // its reason. `ff_only` has no mergeability entry, so it always stays live.
     let merge_options = MERGE_METHODS
         .iter()
         .map(|(value, label)| {
@@ -727,20 +786,64 @@ async fn render_pull(
             } else {
                 ""
             };
-            format!("<option value=\"{value}\"{sel}>{label}</option>")
+            let dis = if detail
+                .mergeability
+                .iter()
+                .find(|c| c.method == *value)
+                .is_some_and(|c| merge_block_reason(&c.status).is_some())
+            {
+                " disabled"
+            } else {
+                ""
+            };
+            format!("<option value=\"{value}\"{sel}{dis}>{label}</option>")
         })
         .collect::<String>();
+    let code_owners_section = if detail.required_code_owners.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for owner in &detail.required_code_owners {
+            let status = if owner.approved {
+                "approved"
+            } else {
+                "required"
+            };
+            rows.push_str(&format!(
+                "<li>{} <span class=\"muted\">({status})</span></li>",
+                ui::esc(&owner.name)
+            ));
+        }
+        format!("<h2>Code owners</h2><div class=\"card\"><ul>{rows}</ul></div>")
+    };
+    let code_owner_errors_section = if detail.code_owner_errors.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for error in &detail.code_owner_errors {
+            rows.push_str(&format!("<li>{}</li>", ui::esc(error)));
+        }
+        format!("<h2>Code owner errors</h2><div class=\"card\"><ul>{rows}</ul></div>")
+    };
     let show_merge_form = detail.pull.state == "open" && !non_terminal && can_merge;
+    let blocked_reason = selected_block_reason(&detail.mergeability, merge.method);
     let merge_form = if show_merge_form {
-        format!(
-            "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/merge\">{}\
+        if let Some(reason) = blocked_reason {
+            format!(
+                "<p><button type=\"submit\" disabled>Merge pull request</button> \
+<span class=\"muted\">{reason}</span></p>"
+            )
+        } else {
+            format!(
+                "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/merge\">{}\
 <label for=\"method\">Merge method</label><select id=\"method\" name=\"method\">{}</select>\
 <input type=\"hidden\" name=\"expected_head_oid\" value=\"{}\">\
 <p><button type=\"submit\">Merge pull request</button></p></form>",
-            form_fields(s, merge.key),
-            merge_options,
-            ui::esc(head_id),
-        )
+                form_fields(s, merge.key),
+                merge_options,
+                ui::esc(head_id),
+            )
+        }
     } else {
         String::new()
     };
@@ -817,8 +920,9 @@ async fn render_pull(
 <dt>Changes requested</dt><dd>{}</dd>\
 </dl></div>\
 <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
-{intent_section}\
+{code_owners_section}{code_owner_errors_section}{intent_section}\
 {status_section}{queue_notice}\
+{conflict_section}\
 <h2>Reviews</h2>{review_list} \
 <h2>Comments</h2>{comment_list}<p>{pager}</p>{error}{review_error}{merge_error}\
 {merge_form}{auto_merge_section}\
@@ -1263,4 +1367,55 @@ async fn auto_merge_cancel_submit(
         return Err(api_error(&s, e));
     }
     Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_notice_reports_a_generic_conflict_and_forbidden() {
+        // An unrelated conflict keeps its generic text.
+        let other = crate::ApiError(StatusCode::CONFLICT, "an open merge intent already exists");
+        assert_eq!(
+            merge_notice(&other),
+            "This pull request cannot be merged right now."
+        );
+        // A forbidden merge reports the permission message.
+        let forbidden = crate::ApiError(StatusCode::FORBIDDEN, "not permitted");
+        assert_eq!(
+            merge_notice(&forbidden),
+            "You may not merge this pull request."
+        );
+    }
+
+    #[test]
+    fn selected_block_reason_uses_only_the_selected_method() {
+        let checks = vec![
+            crate::mergeability::Check {
+                method: "merge".into(),
+                status: "clean".into(),
+                conflicts: vec![],
+            },
+            crate::mergeability::Check {
+                method: "squash".into(),
+                status: "clean".into(),
+                conflicts: vec![],
+            },
+            crate::mergeability::Check {
+                method: "rebase".into(),
+                status: "conflicts".into(),
+                conflicts: vec!["a.txt".into()],
+            },
+        ];
+        // A conflicting rebase must not block the clean merge and squash methods.
+        assert_eq!(selected_block_reason(&checks, "merge"), None);
+        assert_eq!(selected_block_reason(&checks, "squash"), None);
+        assert_eq!(
+            selected_block_reason(&checks, "rebase"),
+            Some("This branch has conflicts that must be resolved.")
+        );
+        // A method with no mergeability entry is always live.
+        assert_eq!(selected_block_reason(&checks, "ff_only"), None);
+    }
 }

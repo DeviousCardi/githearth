@@ -133,6 +133,7 @@ pub(crate) async fn may_enable(
         protection,
         required,
         true,
+        true,
         Some(Duration::from_secs(auth_age)),
     ))
 }
@@ -154,6 +155,7 @@ fn require_enable_permission(
         pull,
         protection,
         required,
+        true,
         true,
         Some(Duration::from_secs(loaded.auth_age)),
     ) {
@@ -535,7 +537,7 @@ pub(crate) async fn maybe_auto_merge(
 
     // Lost permission (independent of approvals/checks): cancel.
     if !merge_intents::merge_allowed(
-        state, &facts, &repo, &pull, protection, required, true, None,
+        state, &facts, &repo, &pull, protection, required, true, true, None,
     ) {
         let mut tx = state.pool.begin().await?;
         cancel_in_tx(

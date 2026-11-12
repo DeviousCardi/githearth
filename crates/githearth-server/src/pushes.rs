@@ -122,6 +122,40 @@ pub async fn apply_committed(
                     .await?,
             );
         }
+
+        // A branch push may move the source branch of open pull requests, so
+        // re-request reviews from the changed files' code owners.
+        let branches: Vec<&str> = prepared
+            .updates
+            .iter()
+            .filter_map(|u| u.reference.strip_prefix("refs/heads/"))
+            .collect();
+        if !branches.is_empty() {
+            let org_id: Option<Uuid> =
+                sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id = $1")
+                    .bind(repository_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let pulls: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM pull_requests \
+                 WHERE repository_id = $1 AND state = 'open' AND source_branch = ANY($2)",
+            )
+            .bind(repository_id)
+            .bind(&branches)
+            .fetch_all(&mut *tx)
+            .await?;
+            for pull_id in pulls {
+                crate::jobs::enqueue(
+                    &mut tx,
+                    org_id,
+                    "codeowners.request_reviews",
+                    serde_json::json!({ "pull_request_id": pull_id }),
+                    &pull_id.to_string(),
+                    None,
+                )
+                .await?;
+            }
+        }
         let audit_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO audit_events (id, organization_id, actor_id, kind)

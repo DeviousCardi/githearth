@@ -641,6 +641,7 @@ mod tests {
             required_approvals: 0,
             required_status_checks: Vec::new(),
             require_merge_queue: false,
+            require_code_owner_review: false,
             created_at: String::new(),
             updated_at: String::new(),
         }

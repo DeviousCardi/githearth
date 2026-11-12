@@ -17,6 +17,7 @@ use axum::{
 };
 use githearth_authz::{Action, Merge, PullRequest, Ref, Resource};
 use githearth_core::RepositoryStatus;
+use githearth_git::merge::Method;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection};
@@ -177,8 +178,9 @@ pub(crate) async fn approvals_at(
 
 /// Builds and evaluates the `pull_request.merge` request shared by the API
 /// handler and [`crate::merge::execute_intent`]. The merge facts are the
-/// approvals at the head and whether every required status check is `success`
-/// at the head, with the matching target-branch protection.
+/// approvals at the head, whether every required status check is `success`
+/// at the head, and code-owner review, with the matching target-branch
+/// protection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_allowed(
     state: &AppState,
@@ -188,6 +190,7 @@ pub(crate) fn merge_allowed(
     protection: Option<githearth_authz::Protection>,
     approvals: u32,
     checks_passed: bool,
+    code_owner_review_ok: bool,
     auth_age: Option<Duration>,
 ) -> bool {
     let authz_repo = repositories::authz_repository(repo);
@@ -212,6 +215,7 @@ pub(crate) fn merge_allowed(
         merge: Some(Merge {
             approvals,
             checks_passed,
+            code_owner_review_ok,
         }),
         auth_age,
         read_only: facts.read_only,
@@ -220,8 +224,8 @@ pub(crate) fn merge_allowed(
 }
 
 /// Authorize the merge with the matching target-branch protection as merge
-/// facts: approvals at the head and whether every required status check is
-/// `success` at the head.
+/// facts: approvals at the head, whether every required status check is
+/// `success` at the head, and code-owner review.
 fn require_merge(
     state: &AppState,
     loaded: &Loaded,
@@ -229,6 +233,7 @@ fn require_merge(
     protection: Option<githearth_authz::Protection>,
     approvals: u32,
     checks_passed: bool,
+    code_owner_review_ok: bool,
 ) -> Result<(), ApiError> {
     if merge_allowed(
         state,
@@ -238,6 +243,7 @@ fn require_merge(
         protection,
         approvals,
         checks_passed,
+        code_owner_review_ok,
         Some(Duration::from_secs(loaded.auth_age)),
     ) {
         return Ok(());
@@ -291,11 +297,28 @@ pub(crate) async fn may_merge(
     let Some(head) = head.as_deref() else {
         return Ok(false);
     };
+    let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
     let mut conn = state.pool.acquire().await?;
     let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
     let checks_passed =
         statuses::checks_passed(&mut conn, loaded.repo.id, head, &required_checks).await?;
     drop(conn);
+    let code_owner_review_ok = match base.as_deref() {
+        Some(base) => {
+            crate::codeowners::review(
+                state,
+                loaded.repo.id,
+                loaded.org_id,
+                org_slug,
+                pull.id,
+                head,
+                base,
+            )
+            .await?
+            .satisfied
+        }
+        None => false,
+    };
     let protection = crate::protection::matching(&rules, &target_ref);
     Ok(merge_allowed(
         state,
@@ -305,6 +328,7 @@ pub(crate) async fn may_merge(
         protection,
         approvals,
         checks_passed,
+        code_owner_review_ok,
         Some(Duration::from_secs(auth_age)),
     ))
 }
@@ -402,6 +426,17 @@ pub(crate) async fn create_intent(
 
             let protection = crate::protection::matching(&rules, &target_ref);
             let checks_passed = statuses::all_success(&required_checks, &check_states);
+            let code_owner_review_ok = crate::codeowners::review(
+                state,
+                loaded.repo.id,
+                loaded.org_id,
+                org_slug,
+                pull.id,
+                &head,
+                &base,
+            )
+            .await?
+            .satisfied;
             require_merge(
                 state,
                 &loaded,
@@ -409,6 +444,7 @@ pub(crate) async fn create_intent(
                 protection,
                 approvals as u32,
                 checks_passed,
+                code_owner_review_ok,
             )?;
 
             // A branch behind a merge queue enqueues its intent instead of
@@ -416,6 +452,79 @@ pub(crate) async fn create_intent(
             let in_queue = crate::protection::requires_queue(&rules, &target_ref);
 
             let digest = checks_approvals_digest(&head, &review_ids, &check_states);
+
+            // M3 conflicts: a conflicting merge is refused up front — nothing is
+            // queued and no ref moves — but the reason is recorded on a
+            // conflicted intent so the pull request page can show it.
+            if let Some(method) = match input.method.as_str() {
+                "merge" => Some(Method::Merge),
+                "squash" => Some(Method::Squash),
+                "rebase" => Some(Method::Rebase),
+                _ => None,
+            } {
+                let check = crate::mergeability::check_method(
+                    state,
+                    loaded.repo.id,
+                    method,
+                    &input.method,
+                    &base,
+                    &head,
+                )
+                .await?;
+                if check.status == "conflicts" {
+                    let operation_id = Uuid::new_v4();
+                    let mut tx = state.pool.begin().await?;
+                    if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
+                        return Err(issues::not_active());
+                    }
+                    pulls::require_open(&mut tx, pull.id).await?;
+                    sqlx::query(
+                        "INSERT INTO merge_intents \
+                         (operation_id, repository_id, pull_request_id, source_ref, source_oid, \
+                          target_ref, expected_target_oid, method, policy_generation, \
+                          checks_approvals_digest, actor_id, state, failure_reason) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'conflicted', $12)",
+                    )
+                    .bind(operation_id)
+                    .bind(loaded.repo.id)
+                    .bind(pull.id)
+                    .bind(&pull.source_branch)
+                    .bind(&head)
+                    .bind(&pull.target_branch)
+                    .bind(&base)
+                    .bind(&input.method)
+                    .bind(generation)
+                    .bind(&digest)
+                    .bind(actor_id)
+                    .bind(format!("merge conflicts: {}", check.conflicts.join(", ")))
+                    .execute(&mut *tx)
+                    .await?;
+                    crate::event(
+                        &mut tx,
+                        Some(loaded.org_id),
+                        actor_id,
+                        "pull_request.merge_intent_conflicted",
+                    )
+                    .await?;
+                    // The refusal is stored under the idempotency key so a retry
+                    // replays this exact conflicted intent instead of inserting a
+                    // second row and audit event.
+                    let intent: MergeIntentJson = sqlx::query_as(&format!(
+                        "SELECT {INTENT_COLUMNS} FROM merge_intents WHERE operation_id = $1"
+                    ))
+                    .bind(operation_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let status = StatusCode::CONFLICT;
+                    let body = serde_json::to_value(&intent).unwrap();
+                    if !idem.store(&mut tx, status, &body).await? {
+                        return Err(idempotency::claim_lost());
+                    }
+                    tx.commit().await?;
+                    return Ok((status, body));
+                }
+            }
+
             let operation_id = Uuid::new_v4();
 
             let mut tx = state.pool.begin().await?;
