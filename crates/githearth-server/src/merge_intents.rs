@@ -1044,8 +1044,8 @@ mod tests {
         ) -> Uuid {
             let id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-                 VALUES ($1,$2,$3,'t','',$4,$5,'main')",
+                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+                 VALUES ($1,$2,$3,'t','',$4,$5,'main',$2)",
             )
             .bind(id)
             .bind(repo)
@@ -1167,8 +1167,8 @@ mod tests {
         async fn pull(pool: &sqlx::PgPool, repo: Uuid, account: Uuid, number: i32) -> Uuid {
             let id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-                 VALUES ($1,$2,$3,'t','',$4,$5,'main')",
+                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+                 VALUES ($1,$2,$3,'t','',$4,$5,'main',$2)",
             )
             .bind(id)
             .bind(repo)

@@ -1867,3 +1867,277 @@ async fn fork_rejects_an_invalid_idempotency_key_header() {
 
     finish(f).await;
 }
+
+/// A cross-repository pull's `source_branch` becomes a Git refspec in the
+/// server's own `git fetch`. A branch name that could escape `refs/heads/` or
+/// be read as a fetch argument must be refused before any head is read, and a
+/// malformed `source_repository` spec must be refused too.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_pull_rejects_untrusted_source_branch_and_spec() {
+    let f = build_fixture().await;
+    let href = repo_href(&f.parent_org_slug, &f.parent_repo_name);
+    let source = format!("{}/{}", f.contrib_org_slug, f.fork_name);
+
+    for branch in [
+        "../main",
+        "refs/heads/main",
+        "main..x",
+        "-x",
+        "a b",
+        ".hidden",
+        "x/",
+        "a//b",
+    ] {
+        let (status, body) = request(
+            &f.app,
+            "POST",
+            &href,
+            Some(&f.contributor_token),
+            json!({
+                "title": "t",
+                "source_branch": branch,
+                "target_branch": "main",
+                "source_repository": source,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "branch {branch}: {body}");
+    }
+
+    for spec in ["", "no-slash", "a/b/c", "org/", "/repo"] {
+        let (status, body) = request(
+            &f.app,
+            "POST",
+            &href,
+            Some(&f.contributor_token),
+            json!({
+                "title": "t",
+                "source_branch": "feature",
+                "target_branch": "main",
+                "source_repository": spec,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "spec {spec}: {body}");
+    }
+
+    finish(f).await;
+}
+
+/// A fork of a SHA-256 parent keeps the object format, copies the parent's refs
+/// and HEAD, and can be merged back across repositories (ADR 0008's full copy).
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn sha256_fork_copies_objects_and_cross_repo_merges() {
+    let f = build_fixture().await;
+
+    let parent_name = tag("sha256-parent");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!("/api/v1/organizations/{}/repositories", f.parent_org_slug),
+        Some(&f.owner_token),
+        json!({"name": parent_name, "visibility": "private", "object_format": "sha256"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let parent_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let parent_path = state_repo_path(&f.storage_root, parent_id);
+    // The server installs a pre-receive hook; the test pushes directly to the
+    // bare repository, so bypass it as the other fixtures do.
+    git_ok(git_cmd(&[
+        "--git-dir",
+        parent_path.to_str().unwrap(),
+        "config",
+        "core.hooksPath",
+        "/dev/null",
+    ]))
+    .await;
+
+    let work = std::env::temp_dir().join(format!("git-forks-sha256-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "init",
+        "--object-format=sha256",
+        "-b",
+        "main",
+    ]))
+    .await;
+    std::fs::write(work.join("a.txt"), "a\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "a.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "root",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        parent_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+    let parent_head = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+
+    let fork_name = tag("sha256-fork");
+    let (status, fork) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{parent_name}/forks",
+            f.parent_org_slug
+        ),
+        Some(&f.contributor_token),
+        json!({"organization": f.contrib_org_slug, "name": fork_name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fork}");
+    let fork_id: Uuid = fork["id"].as_str().unwrap().parse().unwrap();
+    let format: String = sqlx::query_scalar("SELECT object_format FROM repositories WHERE id = $1")
+        .bind(fork_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        format, "sha256",
+        "the fork inherits the parent object format"
+    );
+
+    let fork_path = state_repo_path(&f.storage_root, fork_id);
+    git_ok(git_cmd(&[
+        "--git-dir",
+        fork_path.to_str().unwrap(),
+        "config",
+        "core.hooksPath",
+        "/dev/null",
+    ]))
+    .await;
+    let head = std::fs::read_to_string(fork_path.join("HEAD")).unwrap();
+    assert_eq!(head, "ref: refs/heads/main\n");
+    let fork_main = git_output(git_cmd(&[
+        "--git-dir",
+        fork_path.to_str().unwrap(),
+        "rev-parse",
+        "refs/heads/main",
+    ]))
+    .await;
+    assert_eq!(fork_main, parent_head, "the fork copied the parent's main");
+
+    // Advance the fork, then merge it back across repositories.
+    std::fs::write(work.join("b.txt"), "b\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "b.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=C",
+        "-c",
+        "user.email=c@c",
+        "commit",
+        "-m",
+        "fork change",
+    ]))
+    .await;
+    let fork_head = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        fork_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+
+    let (status, pull) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.parent_org_slug, &parent_name),
+        Some(&f.contributor_token),
+        json!({
+            "title": "sha256 contribution",
+            "source_branch": "main",
+            "target_branch": "main",
+            "source_repository": format!("{}/{}", f.contrib_org_slug, fork_name),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{pull}");
+    let number = pull["number"].as_i64().unwrap();
+
+    let (status, intent) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{parent_name}/pulls/{number}/merge",
+            f.parent_org_slug
+        ),
+        Some(&f.owner_token),
+        json!({"method": "merge", "expected_head_oid": fork_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+    let merged = expect_merged(execute_intent(&f.state, op).await.unwrap());
+    let new_main = git_output(git_cmd(&[
+        "--git-dir",
+        parent_path.to_str().unwrap(),
+        "rev-parse",
+        "refs/heads/main",
+    ]))
+    .await;
+    assert_eq!(new_main, merged, "the sha256 parent's main advanced");
+
+    std::fs::remove_dir_all(&work).ok();
+    finish(f).await;
+}
+
+/// A fork whose declared object format differs from the target is refused when
+/// a cross-repository pull is opened, so the head fetch can never run across
+/// object formats.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_pull_rejects_object_format_mismatch() {
+    let f = build_fixture().await;
+
+    sqlx::query("UPDATE repositories SET object_format = 'sha256' WHERE id = $1")
+        .bind(f.fork_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({
+            "title": "mismatch",
+            "source_branch": "feature",
+            "target_branch": "main",
+            "source_repository": format!("{}/{}", f.contrib_org_slug, f.fork_name),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    finish(f).await;
+}

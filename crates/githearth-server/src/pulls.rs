@@ -598,6 +598,12 @@ async fn resolve_source_repository(
             "source repository is not a fork of the target",
         ));
     }
+    if source_repo.object_format != target.repo.object_format {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "source repository uses a different object format",
+        ));
+    }
     if source_repo.status != RepositoryStatus::Active {
         return Err(not_active());
     }
@@ -1269,11 +1275,13 @@ pub(crate) async fn list_pull_comments(
     number: i32,
     query: SeqQuery,
 ) -> Result<Page<CommentJson>, ApiError> {
-    let (pull, repo_id, limit) = seq_page_start(
+    let (pull, _repo_id, limit) = seq_page_start(
         state, actor_id, auth_age, org_slug, repo_name, number, &query,
     )
     .await?;
-    let head = branch_tip(state, repo_id, &pull.source_branch).await?;
+    // The head branch lives in the pull's source repository (the fork for a
+    // cross-repository pull), so comment staleness is judged against its tip.
+    let head = branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
     let head = head.as_deref();
     let mut conn = state.pool.acquire().await?;
     let rows = sqlx::query_as::<_, CommentRow>(&format!(
@@ -1867,7 +1875,7 @@ pub(crate) async fn set_thread_resolved(
     if pull.state != "open" {
         return Err(not_open());
     }
-    let head = branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+    let head = branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
     let head = head.as_deref();
 
     let mut tx = state.pool.begin().await?;
@@ -2051,7 +2059,11 @@ pub(crate) async fn viewer_abilities(
     let may_comment = require_pull(state, &loaded, &pull, Action::PullRequestComment).is_ok();
     let open = pull.state == "open";
     let may_resolve = open && require_review_permission(state, &loaded, &pull).is_ok();
+    // A suggestion commits to the head branch, which lives in the fork for a
+    // cross-repository pull; applying it is refused (see `apply_pull_suggestion`),
+    // so the control must not be offered.
     let may_apply = open
+        && pull.source_repository_id == loaded.repo.id
         && require_apply_permission(state, &loaded, &pull)
             .await
             .is_ok();
@@ -2130,6 +2142,17 @@ pub(crate) async fn apply_pull_suggestion(
     // no access to a private repository gets the same 404 whether or not the
     // comment exists.
     require_pull(state, &loaded, &pull, Action::PullRequestRead)?;
+
+    // A suggestion commits to the pull's head branch. For a cross-repository
+    // pull that branch lives in the fork, but this path's authorization and ref
+    // write are scoped to the target repository, so applying it here could
+    // rewrite a same-named target branch. Refuse rather than write to the wrong
+    // repository (M3 fork contributions).
+    if pull.source_repository_id != loaded.repo.id {
+        return Err(suggestion_not_applyable(
+            "suggestions on a cross-repository pull request are not supported",
+        ));
+    }
 
     let mut conn = state.pool.acquire().await?;
     let comment = fetch_comment_row(&mut conn, pull.id, comment_id)
@@ -2678,8 +2701,8 @@ mod tests {
         .unwrap();
         let pull = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst',$2)",
         )
         .bind(pull)
         .bind(repo)
