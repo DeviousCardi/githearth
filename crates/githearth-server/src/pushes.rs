@@ -33,7 +33,7 @@ impl From<sqlx::Error> for PushError {
     }
 }
 
-fn valid_oid(s: &str) -> bool {
+pub(crate) fn valid_oid(s: &str) -> bool {
     matches!(s.len(), 40 | 64)
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -56,7 +56,7 @@ pub async fn apply_committed(
     conn: &mut PgConnection,
     repository_id: Uuid,
     prepared: &Record,
-) -> Result<bool, PushError> {
+) -> Result<(bool, Vec<Uuid>), PushError> {
     if prepared.kind != Kind::Prepared {
         return Err(PushError::Invalid("kind must be Prepared"));
     }
@@ -97,6 +97,7 @@ pub async fn apply_committed(
     .await?
     .rows_affected();
     let inserted = rows_affected > 0;
+    let mut retargeted = Vec::new();
 
     if inserted {
         for u in &prepared.updates {
@@ -112,6 +113,16 @@ pub async fn apply_committed(
             .execute(&mut *tx)
             .await?;
         }
+        // A push to a pull request's source branch re-targets or cancels any
+        // auto-merge on it (see `auto_merge::on_push`). The re-targeted ids are
+        // returned so the caller can re-drive their auto-merge afterward.
+        for u in &prepared.updates {
+            retargeted.extend(
+                crate::auto_merge::on_push(&mut tx, repository_id, &u.reference, &u.new, actor)
+                    .await?,
+            );
+        }
+
         // A branch push may move the source branch of open pull requests, so
         // re-request reviews from the changed files' code owners.
         let branches: Vec<&str> = prepared
@@ -191,7 +202,7 @@ pub async fn apply_committed(
     }
 
     tx.commit().await?;
-    Ok(inserted)
+    Ok((inserted, retargeted))
 }
 
 /// Declares every journal record up to `sequence` resolved. Reconciler only, in journal order.
@@ -329,6 +340,7 @@ pub async fn replay(
     .map_err(|_| ReplayError::Invalid("journal task panicked"))??;
 
     let mut summary = ReplaySummary::default();
+    let mut retargeted: Vec<(Uuid, Uuid)> = Vec::new();
     let mut conn = state.pool.acquire().await?;
     let mut i = 0;
     while i < records.len() {
@@ -347,10 +359,21 @@ pub async fn replay(
         };
         match classify(&prepared, marker, &refs_now) {
             githearth_git::journal::Outcome::Committed => {
-                if prepared.origin == Some(Origin::Merge) {
-                    crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
-                } else {
-                    apply_committed(&mut conn, repository, &prepared).await?;
+                match prepared.origin {
+                    Some(Origin::Merge) => {
+                        crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                    }
+                    Some(Origin::Suggestion) => {
+                        crate::pulls::apply_suggestion_record(&mut conn, repository, &prepared)
+                            .await?;
+                    }
+                    None => {
+                        collect_retargeted(
+                            &mut retargeted,
+                            prepared.actor,
+                            apply_committed(&mut conn, repository, &prepared).await?,
+                        );
+                    }
                 }
                 let seq = marker
                     .map(|_| records[i + 1].sequence)
@@ -371,10 +394,21 @@ pub async fn replay(
                     Kind::Committed,
                 )
                 .await?;
-                if prepared.origin == Some(Origin::Merge) {
-                    crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
-                } else {
-                    apply_committed(&mut conn, repository, &prepared).await?;
+                match prepared.origin {
+                    Some(Origin::Merge) => {
+                        crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                    }
+                    Some(Origin::Suggestion) => {
+                        crate::pulls::apply_suggestion_record(&mut conn, repository, &prepared)
+                            .await?;
+                    }
+                    None => {
+                        collect_retargeted(
+                            &mut retargeted,
+                            prepared.actor,
+                            apply_committed(&mut conn, repository, &prepared).await?,
+                        );
+                    }
                 }
                 advance(&mut conn, repository, prepared.sequence).await?;
                 summary.committed += 1;
@@ -410,7 +444,30 @@ pub async fn replay(
             }
         }
     }
+    drop(conn);
+
+    // A push that re-targeted an auto-merge (the enabler's own push) must
+    // re-drive it so a now-mergeable pull request raises its intent right away
+    // instead of waiting for the next review or manual re-enable. Best-effort:
+    // the merge worker re-checks everything anyway.
+    for (actor, pull_request_id) in retargeted {
+        let _ = crate::auto_merge::maybe_auto_merge(state, actor, pull_request_id).await;
+    }
+
     Ok(summary)
+}
+
+/// Folds the pull request ids re-targeted by one applied push into `out`,
+/// paired with the push's actor (validated by [`apply_committed`]).
+fn collect_retargeted(
+    out: &mut Vec<(Uuid, Uuid)>,
+    actor: Option<Uuid>,
+    applied: (bool, Vec<Uuid>),
+) {
+    let (_inserted, ids) = applied;
+    if let Some(actor) = actor {
+        out.extend(ids.into_iter().map(|id| (actor, id)));
+    }
 }
 
 async fn append_marker(

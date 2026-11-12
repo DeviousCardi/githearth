@@ -2607,6 +2607,7 @@ async fn update_ref_expected_journals_merge_origin_and_replay_records_merge_resu
             &expected_old,
             op,
             actor,
+            githearth_git::journal::Origin::Merge,
             Duration::from_secs(30),
         )
     })
@@ -2812,6 +2813,7 @@ async fn push_and_merge_serialize_on_the_repository_lock() {
             &expected_old,
             op,
             actor,
+            githearth_git::journal::Origin::Merge,
             Duration::from_secs(30),
         )
     })
@@ -3254,7 +3256,7 @@ async fn apply_record(pool: &PgPool, repo_id: Uuid, operation: Uuid, actor: Uuid
         }],
     };
     let mut conn = pool.acquire().await.unwrap();
-    let inserted = pushes::apply_committed(&mut conn, repo_id, &record)
+    let (inserted, _) = pushes::apply_committed(&mut conn, repo_id, &record)
         .await
         .unwrap();
     assert!(inserted, "apply_committed must insert the push");

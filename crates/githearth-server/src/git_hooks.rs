@@ -21,6 +21,7 @@ const HOOK_TOKEN: &str = "GITHEARTH_HOOK_TOKEN";
 const HOOK_OPERATION: &str = "GITHEARTH_OPERATION";
 const HOOK_ACTOR: &str = "GITHEARTH_ACTOR";
 const HOOK_MERGE: &str = "GITHEARTH_MERGE";
+const HOOK_SUGGESTION: &str = "GITHEARTH_SUGGESTION";
 const HOOK_QUOTA_BYTES: &str = "GITHEARTH_QUOTA_BYTES";
 const REFUSE: &str = "ref updates must go through GitHearth";
 const RESPONSE_LIMIT: u64 = 4096;
@@ -341,6 +342,8 @@ fn append_prepared(
     let actor = Uuid::parse_str(&env[HOOK_ACTOR]).map_err(|e| format!("invalid actor: {e}"))?;
     let origin = if env.get(HOOK_MERGE).is_some_and(|v| v == "1") {
         Some(Origin::Merge)
+    } else if env.get(HOOK_SUGGESTION).is_some_and(|v| v == "1") {
+        Some(Origin::Suggestion)
     } else {
         None
     };

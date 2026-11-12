@@ -73,7 +73,7 @@ async fn apply_once_true_and_rows_created() {
             reference: "refs/heads/main".into(),
         }],
     };
-    let applied = pushes::apply_committed(&mut conn, repo_id, &record)
+    let (applied, _) = pushes::apply_committed(&mut conn, repo_id, &record)
         .await
         .unwrap();
     assert!(applied);
@@ -153,11 +153,13 @@ async fn apply_twice_no_duplicates() {
         pushes::apply_committed(&mut conn, repo_id, &record)
             .await
             .unwrap()
+            .0
     );
     assert!(
         !pushes::apply_committed(&mut conn, repo_id, &record)
             .await
             .unwrap()
+            .0
     );
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
@@ -203,11 +205,13 @@ async fn out_of_order_keeps_highest_watermark() {
         pushes::apply_committed(&mut conn, repo_id, &r5)
             .await
             .unwrap()
+            .0
     );
     assert!(
         pushes::apply_committed(&mut conn, repo_id, &r3)
             .await
             .unwrap()
+            .0
     );
     let ja: i64 = sqlx::query_scalar("SELECT journal_applied FROM repositories WHERE id=$1")
         .bind(repo_id)
@@ -411,6 +415,7 @@ async fn sha256_oid_accepted() {
         pushes::apply_committed(&mut conn, repo_id, &record)
             .await
             .unwrap()
+            .0
     );
     pool.close().await;
 }
