@@ -17,6 +17,7 @@ namespace GitHearth {
     fresh_auth_seconds: Long,
     approvals: Long,
     checks_passed: Bool,
+    code_owner_review_ok: Bool,
   };
 
   // Unauthenticated visitor: no attributes, no parents.
@@ -49,6 +50,7 @@ namespace GitHearth {
     require_pull_request: Bool,
     required_approvals: Long,
     require_checks: Bool,
+    require_code_owner_review: Bool,
     exists: Bool,
   };
   entity Issue in [Repository] = {

@@ -134,6 +134,7 @@ pub fn apply_suggestion(
     let tree_oid = build_tree(repo, head_commit, path, &mode, &blob_oid, timeout)?;
     crate::merge::commit_tree(
         repo,
+        None,
         &tree_oid,
         &[head_commit],
         message,

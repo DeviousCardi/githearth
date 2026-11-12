@@ -181,6 +181,7 @@ fn build(
     let committer = identity();
     build_candidate(
         repo,
+        None,
         &Request {
             method,
             target,
@@ -617,6 +618,7 @@ fn identity_validation_rejects_forbidden_fields() {
     for (author, committer) in cases {
         let result = build_candidate(
             Path::new("/nonexistent"),
+            None,
             &Request {
                 method: Method::Merge,
                 target: &"a".repeat(40),
@@ -664,6 +666,7 @@ fn a_zero_timeout_is_reported_as_timeout() {
     let committer = identity();
     let result = build_candidate(
         &f.repo(),
+        None,
         &Request {
             method: Method::Merge,
             target: &target,

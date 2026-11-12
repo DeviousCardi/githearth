@@ -14,6 +14,7 @@ pub struct RepositoryRow {
     pub status: RepositoryStatus,
     pub operation_id: Uuid,
     pub created_by: Uuid,
+    pub object_format: String,
 }
 
 fn row_to_repository(row: &sqlx::postgres::PgRow) -> RepositoryRow {
@@ -28,10 +29,11 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> RepositoryRow {
         status: raw.parse().expect("database status is always valid"),
         operation_id: row.get("operation_id"),
         created_by: row.get("created_by"),
+        object_format: row.get("object_format"),
     }
 }
 
-const REPO_COLS: &str = "id, organization_id, name, description, visibility, archived, status, operation_id, created_by";
+const REPO_COLS: &str = "id, organization_id, name, description, visibility, archived, status, operation_id, created_by, object_format";
 
 pub async fn insert_creating(
     conn: &mut PgConnection,
@@ -42,10 +44,34 @@ pub async fn insert_creating(
     visibility: &str,
     description: &str,
 ) -> Result<RepositoryRow, sqlx::Error> {
+    insert_creating_with_format(
+        conn,
+        organization_id,
+        name,
+        created_by,
+        operation_id,
+        visibility,
+        description,
+        "sha1",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_creating_with_format(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+    created_by: Uuid,
+    operation_id: Uuid,
+    visibility: &str,
+    description: &str,
+    object_format: &str,
+) -> Result<RepositoryRow, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query(
         "WITH retired AS (DELETE FROM repository_redirects WHERE organization_id=$2 AND lower(name)=lower($3)) \
-         INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, description) VALUES ($1,$2,$3,$4,$5,'creating',$6,$7)",
+         INSERT INTO repositories (id, organization_id, name, created_by, operation_id, status, visibility, description, object_format) VALUES ($1,$2,$3,$4,$5,'creating',$6,$7,$8)",
     )
     .bind(id)
     .bind(organization_id)
@@ -54,6 +80,7 @@ pub async fn insert_creating(
     .bind(operation_id)
     .bind(visibility)
     .bind(description)
+    .bind(object_format)
     .execute(&mut *conn)
     .await?;
     find_by_operation(conn, operation_id)
@@ -148,7 +175,7 @@ pub async fn find_by_name(
         return Ok(row);
     }
     sqlx::query(
-        "SELECT r.id, r.organization_id, r.name, r.description, r.visibility, r.archived, r.status, r.operation_id, r.created_by FROM repository_redirects d JOIN repositories r ON r.id = d.repository_id WHERE d.organization_id=$1 AND lower(d.name)=lower($2) AND r.status <> 'deleted'",
+        "SELECT r.id, r.organization_id, r.name, r.description, r.visibility, r.archived, r.status, r.operation_id, r.created_by, r.object_format FROM repository_redirects d JOIN repositories r ON r.id = d.repository_id WHERE d.organization_id=$1 AND lower(d.name)=lower($2) AND r.status <> 'deleted'",
     )
     .bind(organization_id)
     .bind(name)
@@ -255,6 +282,16 @@ pub async fn rename(
     Ok(result.rows_affected() > 0)
 }
 
+/// Maps the stored `object_format` text to the storage object format, failing
+/// closed to SHA-1 for any unknown value (the CHECK constraint admits only
+/// 'sha1' and 'sha256').
+pub fn object_format(value: &str) -> githearth_git::layout::ObjectFormat {
+    match value {
+        "sha256" => githearth_git::layout::ObjectFormat::Sha256,
+        _ => githearth_git::layout::ObjectFormat::Sha1,
+    }
+}
+
 pub fn authz_repository(row: &RepositoryRow) -> Repository {
     Repository {
         id: row.id,
@@ -332,6 +369,15 @@ mod tests {
         let pool = PgPool::connect_with(cfg).await.unwrap();
         crate::MIGRATOR.run(&pool).await.unwrap();
         pool
+    }
+
+    #[test]
+    fn object_format_maps_stored_text() {
+        use githearth_git::layout::ObjectFormat;
+        assert_eq!(object_format("sha256"), ObjectFormat::Sha256);
+        assert_eq!(object_format("sha1"), ObjectFormat::Sha1);
+        // Unknown values fail closed to SHA-1.
+        assert_eq!(object_format("nonsense"), ObjectFormat::Sha1);
     }
 
     #[tokio::test]

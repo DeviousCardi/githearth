@@ -727,6 +727,55 @@ fn diff_between(
     Ok((files, truncated))
 }
 
+/// The files changed between `base` and `head`, using the same three-dot diff
+/// as [`compare`] (merge base to head; unrelated histories diff base..head).
+/// Cheaper than `compare`: it skips commit listing and merge-tree. `None` means
+/// one of the revisions was not found. The inner `bool` reports whether the
+/// diff listing was truncated, so callers can fail closed.
+pub fn changed_files(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    timeout: Duration,
+) -> Result<Option<(Vec<FileDiff>, bool)>, StorageError> {
+    changed_files_impl(repo, base, head, timeout, MAX_OUTPUT_BYTES)
+}
+
+fn changed_files_impl(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Option<(Vec<FileDiff>, bool)>, StorageError> {
+    if !valid_rev(base) || !valid_rev(head) {
+        return Err(StorageError::Invalid("invalid revision".into()));
+    }
+    let Some(base_id) = resolve(repo, base, timeout)? else {
+        return Ok(None);
+    };
+    let Some(head_id) = resolve(repo, head, timeout)? else {
+        return Ok(None);
+    };
+
+    let merge_base = {
+        let mut command = cmd(repo);
+        command.args(["merge-base", &base_id, &head_id]);
+        let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
+        if result.success {
+            Some(String::from_utf8_lossy(&result.stdout).trim().to_owned())
+        } else if result.code == Some(1) {
+            None
+        } else {
+            return Err(stderr_error(&result.stderr));
+        }
+    };
+
+    let diff_left = merge_base.as_deref().unwrap_or(&base_id);
+    let (files, truncated) = diff_between(repo, Some(diff_left), &head_id, timeout, max_output)?;
+    Ok(Some((files, truncated)))
+}
+
 /// Mergeability of a comparison's head into its base.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mergeability {
@@ -1444,6 +1493,144 @@ mod tests {
             parse_left_right(b"x\ty"),
             Err(StorageError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn changed_files_reports_the_three_dot_diff() {
+        let dir = std::env::temp_dir().join(format!("browse-changed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        run_git(&["init", "-q", "-b", "main", d]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "root",
+        ]);
+        let root = run_git(&["-C", d, "rev-parse", "HEAD"]);
+        run_git(&["-C", d, "checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("feat.txt"), "feature\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "F",
+        ]);
+        run_git(&["-C", d, "checkout", "-q", "main"]);
+        std::fs::write(dir.join("main.txt"), "main\n").unwrap();
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "M",
+        ]);
+        let repo = dir.join(".git");
+        let timeout = Duration::from_secs(10);
+
+        // Three-dot diff (merge base to head) excludes main-only changes.
+        let (files, truncated) = changed_files(&repo, "main", "feature", timeout)
+            .unwrap()
+            .unwrap();
+        assert!(!truncated);
+        let names: Vec<&str> = files.iter().map(|f| f.new_path.as_str()).collect();
+        assert!(names.contains(&"feat.txt"), "{names:?}");
+        assert!(!names.contains(&"main.txt"), "{names:?}");
+
+        // The root's own files appear when the merge base is the root itself.
+        let (files, _truncated) = changed_files(&repo, "main", &root, timeout)
+            .unwrap()
+            .unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.new_path.as_str()).collect();
+        assert!(!names.contains(&"main.txt"), "{names:?}");
+
+        // Unknown revision is None.
+        assert!(
+            changed_files(&repo, "main", "nope", timeout)
+                .unwrap()
+                .is_none()
+        );
+        // Invalid revision is an error.
+        assert!(matches!(
+            changed_files(&repo, "a..b", "main", timeout),
+            Err(StorageError::Invalid(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_files_reports_a_truncated_diff() {
+        let dir =
+            std::env::temp_dir().join(format!("browse-changed-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        run_git(&["init", "-q", "-b", "main", d]);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), "x\n").unwrap();
+        }
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "root",
+        ]);
+        run_git(&["-C", d, "checkout", "-q", "-b", "feature"]);
+        for name in ["d.txt", "e.txt", "f.txt"] {
+            std::fs::write(dir.join(name), "y\n").unwrap();
+        }
+        run_git(&["-C", d, "add", "-A"]);
+        run_git(&[
+            "-C",
+            d,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "feature",
+        ]);
+        let repo = dir.join(".git");
+        // A listing cap too small for three records keeps only the complete
+        // ones and flags the result as truncated instead of failing.
+        let (files, truncated) =
+            changed_files_impl(&repo, "main", "feature", Duration::from_secs(10), 15)
+                .unwrap()
+                .unwrap();
+        assert!(truncated);
+        assert!(!files.is_empty());
+        assert!(files.len() < 3);
+        assert!(files.iter().all(|f| f.status == "A"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

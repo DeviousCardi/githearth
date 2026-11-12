@@ -1,8 +1,10 @@
 //! Merge candidate construction without a work tree (ADR 0004).
 //!
 //! Builds the result commit (or conflict/refusal outcome) for the four merge
-//! methods using `git merge-tree --write-tree` and `git commit-tree`, writing
-//! objects into the repository's object store but never moving a ref.
+//! methods using `git merge-tree --write-tree` and `git commit-tree`. When a
+//! scratch directory is supplied the written tree and commit objects go there
+//! (with the repository object store as an alternate) instead of the repository
+//! itself, so a read-only check never leaves unreferenced objects behind.
 
 use crate::StorageError;
 use crate::browse::{
@@ -136,6 +138,7 @@ pub fn update_ref_expected(
 
 pub fn build_candidate(
     repo: &Path,
+    scratch: Option<&Path>,
     request: &Request,
     timeout: Duration,
 ) -> Result<Candidate, StorageError> {
@@ -184,16 +187,19 @@ pub fn build_candidate(
             if merge_base(repo, request.target, request.source, timeout)?.is_none() {
                 return Ok(Candidate::Unrelated);
             }
-            let tree = match run_merge_tree(repo, None, request.target, request.source, timeout)? {
-                MergeTree::Clean(tree) => tree,
-                MergeTree::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
-            };
+            let tree =
+                match run_merge_tree(repo, scratch, None, request.target, request.source, timeout)?
+                {
+                    MergeTree::Clean(tree) => tree,
+                    MergeTree::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
+                };
             let parents: &[&str] = match request.method {
                 Method::Merge => &[request.target, request.source],
                 _ => &[request.target],
             };
             let oid = commit_tree(
                 repo,
+                scratch,
                 &tree,
                 parents,
                 request.message.as_bytes(),
@@ -207,7 +213,7 @@ pub fn build_candidate(
             if merge_base(repo, request.target, request.source, timeout)?.is_none() {
                 return Ok(Candidate::Unrelated);
             }
-            rebase(repo, request, timeout)
+            rebase(repo, scratch, request, timeout)
         }
     }
 }
@@ -260,12 +266,14 @@ fn merge_base(
 
 fn run_merge_tree(
     repo: &Path,
+    scratch: Option<&Path>,
     merge_base: Option<&str>,
     a: &str,
     b: &str,
     timeout: Duration,
 ) -> Result<MergeTree, StorageError> {
     let mut command = cmd(repo);
+    with_scratch(&mut command, repo, scratch);
     command.args([
         "merge-tree",
         "--write-tree",
@@ -286,8 +294,10 @@ fn run_merge_tree(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_tree(
     repo: &Path,
+    scratch: Option<&Path>,
     tree: &str,
     parents: &[&str],
     message: &[u8],
@@ -296,6 +306,7 @@ pub(crate) fn commit_tree(
     timeout: Duration,
 ) -> Result<String, StorageError> {
     let mut command = cmd(repo);
+    with_scratch(&mut command, repo, scratch);
     command.arg("commit-tree").arg(tree);
     for parent in parents {
         command.arg("-p").arg(parent);
@@ -313,6 +324,17 @@ pub(crate) fn commit_tree(
         });
     }
     Ok(String::from_utf8_lossy(&result.stdout).trim().to_owned())
+}
+
+/// Direct a write command's new objects into `scratch` (when supplied) with the
+/// repository object store as an alternate, so the repository itself gains no
+/// unreferenced objects. Reads resolve against both, matching `browse::compare`.
+fn with_scratch(command: &mut Command, repo: &Path, scratch: Option<&Path>) {
+    if let Some(scratch) = scratch {
+        command
+            .env("GIT_OBJECT_DIRECTORY", scratch)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", repo.join("objects"));
+    }
 }
 
 fn with_identities(command: &mut Command, author: &Identity, committer: &Identity) {
@@ -388,7 +410,12 @@ fn check_commit_count(count: usize) -> Result<(), StorageError> {
 /// A commit whose result tree equals its new parent's is dropped, like
 /// `git rebase` does for already-applied changes; this also drops commits that
 /// were intentionally empty.
-fn rebase(repo: &Path, request: &Request, timeout: Duration) -> Result<Candidate, StorageError> {
+fn rebase(
+    repo: &Path,
+    scratch: Option<&Path>,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Candidate, StorageError> {
     let commits = list_rebase_commits(repo, request, timeout)?;
     check_commit_count(commits.len())?;
 
@@ -399,15 +426,17 @@ fn rebase(repo: &Path, request: &Request, timeout: Duration) -> Result<Candidate
             return Ok(Candidate::RebaseMergeCommit);
         }
         let base = format!("{}^", commit.oid);
-        let tree = match run_merge_tree(repo, Some(&base), &previous, &commit.oid, timeout)? {
-            MergeTree::Clean(tree) => tree,
-            MergeTree::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
-        };
-        if tree == tree_of(repo, &previous, timeout)? {
+        let tree =
+            match run_merge_tree(repo, scratch, Some(&base), &previous, &commit.oid, timeout)? {
+                MergeTree::Clean(tree) => tree,
+                MergeTree::Conflicts(paths) => return Ok(Candidate::Conflicts(paths)),
+            };
+        if tree == tree_of(repo, scratch, &previous, timeout)? {
             continue;
         }
         let oid = commit_tree(
             repo,
+            scratch,
             &tree,
             &[&previous],
             &commit.message,
@@ -453,8 +482,14 @@ fn list_rebase_commits(
     parse_rebase_commits(&result.stdout)
 }
 
-fn tree_of(repo: &Path, oid: &str, timeout: Duration) -> Result<String, StorageError> {
+fn tree_of(
+    repo: &Path,
+    scratch: Option<&Path>,
+    oid: &str,
+    timeout: Duration,
+) -> Result<String, StorageError> {
     let mut command = cmd(repo);
+    with_scratch(&mut command, repo, scratch);
     command.args(["rev-parse", "--verify", &format!("{oid}^{{tree}}")]);
     let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
     if !result.success {
@@ -495,7 +530,7 @@ mod tests {
             Err(StorageError::Git(_))
         ));
         assert!(matches!(
-            run_merge_tree(&missing, None, &oid, &oid, timeout),
+            run_merge_tree(&missing, None, None, &oid, &oid, timeout),
             Err(StorageError::Git(_))
         ));
     }

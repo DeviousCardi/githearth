@@ -291,6 +291,7 @@ pub struct Protection {
     pub require_pull_request: bool,
     pub required_approvals: u32,
     pub require_checks: bool,
+    pub require_code_owner_review: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -345,6 +346,7 @@ impl Resource<'_> {
 pub struct Merge {
     pub approvals: u32,
     pub checks_passed: bool,
+    pub code_owner_review_ok: bool,
 }
 
 /// The requesting principal: a signed-in account, or an unauthenticated
@@ -547,6 +549,10 @@ impl Engine {
             context_pairs.push((
                 "checks_passed".to_owned(),
                 RestrictedExpression::new_bool(merge.checks_passed),
+            ));
+            context_pairs.push((
+                "code_owner_review_ok".to_owned(),
+                RestrictedExpression::new_bool(merge.code_owner_review_ok),
             ));
         }
         let context = Context::from_pairs(context_pairs).map_err(|_| "invalid context")?;
@@ -772,6 +778,10 @@ fn build_entities(request: &Request<'_>) -> (EntityUid, Vec<Entity>) {
                     RestrictedExpression::new_long(i64::from(p.required_approvals)),
                 ),
                 ("require_checks", bool_(p.require_checks)),
+                (
+                    "require_code_owner_review",
+                    bool_(p.require_code_owner_review),
+                ),
                 ("exists", bool_(r.exists)),
             ],
             [repo_uid],

@@ -147,6 +147,7 @@ async fn run(args: Args) -> Result<()> {
             let jobs_shutdown = tokio_util::sync::CancellationToken::new();
             let mut registry = jobs::Registry::new();
             githearth_server::notifications::register(&mut registry);
+            githearth_server::codeowners::register(&mut registry);
             let jobs = jobs::spawn(state.clone(), registry, jobs_shutdown.clone());
             let _ssh = if config.ssh_enabled {
                 ssh::load_host_key(&config.ssh_host_key_path)?;
