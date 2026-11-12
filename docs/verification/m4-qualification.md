@@ -100,7 +100,7 @@ The harness does **not** cover the following M4 exit items:
 - **Disk-full on the host filesystem.** s8 fills a tmpfs inside the container; a full host disk under PostgreSQL is not exercised.
 - **The `compose.yaml` file itself.** Covered by s13, which runs the real compose file with ephemeral ports.
 - **Off-host backup.** The backup and restore run on the same host.
-- **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are not measured.
+- **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are now measured by the separate [hardware drill](hardware.md) and published in [hardware.md](../operations/hardware.md).
 - **License files and notices, and accessibility review.** Not part of this harness.
 - **SHA-256 repositories and public/internal visibility.** Covered by s11 and s12 (and by the Rust integration tests in `tests/visibility.rs` and `tests/repository_api.rs`).
 - **Online (non-maintenance-window) backup.** Not implemented; backup/restore is maintenance-window-only (s4). This is documented precisely below.

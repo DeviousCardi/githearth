@@ -2,7 +2,8 @@
 
 See [upgrade.md](upgrade.md) for the upgrade runbook,
 [uninstall.md](uninstall.md) for removal, [tls.md](tls.md) for TLS setup,
-and [audit-retention.md](audit-retention.md) for audit IP retention.
+[audit-retention.md](audit-retention.md) for audit IP retention, and
+[hardware.md](hardware.md) for the measured minimum and recommended hardware.
 
 ## Preflight check
 
