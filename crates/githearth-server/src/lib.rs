@@ -8,6 +8,7 @@ pub mod codeowners;
 pub mod config;
 pub mod doctor;
 pub mod facts;
+pub mod forks;
 pub mod git_admission;
 pub mod git_hooks;
 pub mod git_http;
@@ -255,6 +256,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
         .merge(issues::router())
+        .merge(forks::router())
         .merge(pulls::router())
         .merge(merge_intents::router())
         .merge(auto_merge::router())

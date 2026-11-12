@@ -556,6 +556,7 @@ mod tests {
                 operation_id: uuid::Uuid::new_v4(),
                 created_by: uuid::Uuid::new_v4(),
                 object_format: "sha1".into(),
+                parent_repository_id: None,
             },
             facts: crate::facts::Facts {
                 account,

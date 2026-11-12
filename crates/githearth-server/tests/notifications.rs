@@ -603,8 +603,8 @@ async fn insert_reviewed_rows(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
     .unwrap();
     let pull_request_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-         VALUES ($1,$2,1,'t','',$3,'src','dst')",
+        "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+         VALUES ($1,$2,1,'t','',$3,'src','dst',$2)",
     )
     .bind(pull_request_id)
     .bind(repo_id)
@@ -810,8 +810,8 @@ async fn notify_fixture(pool: &PgPool) -> (Uuid, Uuid, String, Uuid, Uuid) {
     .unwrap();
     let pr_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-         VALUES ($1,$2,1,'t','',$3,'src','dst')",
+        "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+         VALUES ($1,$2,1,'t','',$3,'src','dst',$2)",
     )
     .bind(pr_id)
     .bind(repo_id)

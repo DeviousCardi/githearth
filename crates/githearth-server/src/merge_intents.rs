@@ -357,7 +357,7 @@ pub(crate) async fn may_merge(
     let dismiss = protection
         .as_ref()
         .is_none_or(|p| p.dismiss_stale_approvals);
-    let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+    let head = pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
     let target_ref = format!("refs/heads/{}", pull.target_branch);
     let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
     // A deleted source branch has no head; create_intent would refuse this
@@ -366,6 +366,13 @@ pub(crate) async fn may_merge(
         return Ok(false);
     };
     let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
+    pulls::fetch_cross_repo_head(
+        state,
+        loaded.repo.id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await?;
     let mut conn = state.pool.acquire().await?;
     let facts = approval_facts(&mut conn, pull.id, head, dismiss).await?;
     let checks_passed =
@@ -466,7 +473,8 @@ pub(crate) async fn create_intent(
                 crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
             drop(conn);
 
-            let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+            let head =
+                pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
             let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
             let (Some(head), Some(base)) = (head, base) else {
                 return Err(branch_missing());
@@ -474,6 +482,16 @@ pub(crate) async fn create_intent(
             if head != input.expected_head_oid {
                 return Err(head_moved());
             }
+            // A cross-repository pull takes its head from a fork: bring the
+            // fork's objects into the target so the mergeability and code-owner
+            // checks below can resolve the head there (ADR 0008).
+            pulls::fetch_cross_repo_head(
+                state,
+                loaded.repo.id,
+                pull.source_repository_id,
+                &pull.source_branch,
+            )
+            .await?;
 
             let target_ref = format!("refs/heads/{}", pull.target_branch);
             let protection = crate::protection::matching(&rules, &target_ref);
@@ -1004,8 +1022,8 @@ mod tests {
         .unwrap();
         let pull = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-             VALUES ($1,$2,1,'t','',$3,'src','dst')",
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+             VALUES ($1,$2,1,'t','',$3,'src','dst',$2)",
         )
         .bind(pull)
         .bind(repo)
@@ -1098,8 +1116,8 @@ mod tests {
         ) -> Uuid {
             let id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-                 VALUES ($1,$2,$3,'t','',$4,$5,'main')",
+                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+                 VALUES ($1,$2,$3,'t','',$4,$5,'main',$2)",
             )
             .bind(id)
             .bind(repo)
@@ -1221,8 +1239,8 @@ mod tests {
         async fn pull(pool: &sqlx::PgPool, repo: Uuid, account: Uuid, number: i32) -> Uuid {
             let id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch) \
-                 VALUES ($1,$2,$3,'t','',$4,$5,'main')",
+                "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id) \
+                 VALUES ($1,$2,$3,'t','',$4,$5,'main',$2)",
             )
             .bind(id)
             .bind(repo)

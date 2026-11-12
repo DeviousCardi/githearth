@@ -637,6 +637,7 @@ fn payload_uuid(payload: &serde_json::Value, key: &str) -> Result<Uuid, jobs::Jo
 struct JobPull {
     id: Uuid,
     repository_id: Uuid,
+    source_repository_id: Uuid,
     author_id: Uuid,
     source_branch: String,
     target_branch: String,
@@ -651,7 +652,7 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
 
     // A deleted or closed pull request needs no code-owner requests.
     let pull = match sqlx::query_as::<_, JobPull>(
-        "SELECT id, repository_id, author_id, source_branch, target_branch, state \
+        "SELECT id, repository_id, source_repository_id, author_id, source_branch, target_branch, state \
          FROM pull_requests WHERE id = $1",
     )
     .bind(pull_id)
@@ -685,7 +686,8 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Err(_) => return retry(),
     };
 
-    let head = match pulls::branch_tip(state, pull.repository_id, &pull.source_branch).await {
+    let head = match pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await
+    {
         Ok(Some(head)) => head,
         Ok(None) => return jobs::JobOutcome::Done,
         Err(_) => return retry(),
@@ -695,6 +697,21 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Ok(None) => return jobs::JobOutcome::Done,
         Err(_) => return retry(),
     };
+
+    // A cross-repository pull takes its head from a fork; bring its objects
+    // into the target so the changed-file diff below can resolve the head there
+    // (ADR 0008). Same-repository pulls already have the head.
+    if pulls::fetch_cross_repo_head(
+        state,
+        pull.repository_id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await
+    .is_err()
+    {
+        return retry();
+    }
 
     let loaded = match load(state, pull.repository_id, &base, &head).await {
         Ok(v) => v,
@@ -719,6 +736,8 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         author_id: pull.author_id,
         source_branch: pull.source_branch.clone(),
         target_branch: pull.target_branch.clone(),
+        source_repository_id: pull.source_repository_id,
+        closed_reason: None,
         created_at: String::new(),
         updated_at: String::new(),
         closed_at: None,

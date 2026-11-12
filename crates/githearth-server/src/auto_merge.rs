@@ -115,7 +115,7 @@ pub(crate) async fn may_enable(
 
     // A deleted source branch has no head; enabling auto-merge would refuse
     // with 422 "branch not found", so the form must not offer it.
-    if pulls::branch_tip(state, loaded.repo.id, &pull.source_branch)
+    if pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch)
         .await?
         .is_none()
     {
@@ -242,7 +242,8 @@ pub(crate) async fn enable_auto_merge(
             let protection = crate::protection::matching(&rules, &target_ref);
             require_enable_permission(state, &loaded, &pull, protection)?;
 
-            let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
+            let head =
+                pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
             let Some(head) = head else {
                 return Err(branch_missing());
             };
@@ -494,7 +495,7 @@ pub(crate) async fn maybe_auto_merge(
     // a push by someone other than the enabler) cancels the auto-merge. The
     // enabler's own push re-targets the row in `on_push`, so it never lands
     // here as a mismatch.
-    let head = pulls::branch_tip(state, repository_id, &pull.source_branch).await?;
+    let head = pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
     if head.as_deref() != Some(source_oid.as_str()) {
         let mut tx = state.pool.begin().await?;
         cancel_in_tx(
@@ -628,7 +629,7 @@ pub(crate) async fn on_push(
     let retargeted: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE auto_merges SET source_oid = $1, updated_at = now() \
          WHERE pull_request_id IN (SELECT id FROM pull_requests \
-             WHERE repository_id = $2 AND source_branch = $3 AND state = 'open') \
+             WHERE source_repository_id = $2 AND source_branch = $3 AND state = 'open') \
            AND enabled_by = $4 \
          RETURNING pull_request_id",
     )
@@ -642,7 +643,7 @@ pub(crate) async fn on_push(
     let cancelled: Vec<Uuid> = sqlx::query_scalar(
         "DELETE FROM auto_merges \
          WHERE pull_request_id IN (SELECT id FROM pull_requests \
-             WHERE repository_id = $1 AND source_branch = $2 AND state = 'open') \
+             WHERE source_repository_id = $1 AND source_branch = $2 AND state = 'open') \
            AND enabled_by <> $3 \
          RETURNING pull_request_id",
     )
@@ -653,12 +654,17 @@ pub(crate) async fn on_push(
     .await?;
 
     if !cancelled.is_empty() {
-        let org_id: Uuid =
-            sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id = $1")
-                .bind(repository_id)
-                .fetch_one(&mut **tx)
-                .await?;
         for pull_request_id in cancelled {
+            // Audit under the pull request's own (target) repository's
+            // organization: for a cross-repository pull the push lands on the
+            // fork, a different organization than the pull belongs to.
+            let org_id: Uuid = sqlx::query_scalar(
+                "SELECT r.organization_id FROM pull_requests pr \
+                 JOIN repositories r ON r.id = pr.repository_id WHERE pr.id = $1",
+            )
+            .bind(pull_request_id)
+            .fetch_one(&mut **tx)
+            .await?;
             crate::event_with(
                 tx,
                 Some(org_id),

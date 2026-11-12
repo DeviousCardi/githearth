@@ -884,3 +884,49 @@ async fn a_comment_from_another_pull_request_cannot_be_applied() {
 
     finish(f).await;
 }
+
+/// An anchored, new-side comment that carries no suggestion block is refused as
+/// "no suggestion" rather than rewriting the line it points at.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn apply_rejects_an_anchored_comment_without_a_suggestion() {
+    let f = build_fixture().await;
+    let head = current_head(&f).await;
+
+    let (status, comment) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "{}/{}/comments",
+            repo_href(&f.org_slug, &f.repo_name),
+            f.number
+        ),
+        Some(&f.token),
+        json!({
+            "body": "just a note",
+            "commit_id": head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{comment}");
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "{}/{}/comments/{}/apply",
+            repo_href(&f.org_slug, &f.repo_name),
+            f.number,
+            comment["id"].as_str().unwrap()
+        ),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    finish(f).await;
+}

@@ -131,23 +131,24 @@ pub async fn apply_committed(
             .filter_map(|u| u.reference.strip_prefix("refs/heads/"))
             .collect();
         if !branches.is_empty() {
-            let org_id: Option<Uuid> =
-                sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id = $1")
-                    .bind(repository_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            let pulls: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM pull_requests \
-                 WHERE repository_id = $1 AND state = 'open' AND source_branch = ANY($2)",
+            // The source branch lives in `source_repository_id` (the repository
+            // itself for a same-repository pull, the fork for a cross-repository
+            // one), so a push there is what can move an open pull's head. Each
+            // pull is scoped to its own (target) repository's organization, not
+            // the repository that received the push.
+            let pulls: Vec<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT pr.id, r.organization_id FROM pull_requests pr \
+                 JOIN repositories r ON r.id = pr.repository_id \
+                 WHERE pr.source_repository_id = $1 AND pr.state = 'open' AND pr.source_branch = ANY($2)",
             )
             .bind(repository_id)
             .bind(&branches)
             .fetch_all(&mut *tx)
             .await?;
-            for pull_id in pulls {
+            for (pull_id, org_id) in pulls {
                 crate::jobs::enqueue(
                     &mut tx,
-                    org_id,
+                    Some(org_id),
                     "codeowners.request_reviews",
                     serde_json::json!({ "pull_request_id": pull_id }),
                     &pull_id.to_string(),
