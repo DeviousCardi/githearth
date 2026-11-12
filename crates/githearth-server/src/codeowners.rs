@@ -719,6 +719,8 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         author_id: pull.author_id,
         source_branch: pull.source_branch.clone(),
         target_branch: pull.target_branch.clone(),
+        source_repository_id: pull.repository_id,
+        closed_reason: None,
         created_at: String::new(),
         updated_at: String::new(),
         closed_at: None,

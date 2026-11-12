@@ -313,6 +313,34 @@ pub(crate) async fn branch_tip(
     .await
 }
 
+/// For a cross-repository pull request, brings the fork's head-branch objects
+/// into the target repository so mergeability and code-owner computations can
+/// resolve the head there (only objects are fetched; no target ref is written).
+/// Same-repository pulls already have the head and need no fetch.
+pub(crate) async fn fetch_cross_repo_head(
+    state: &AppState,
+    repository_id: Uuid,
+    source_repository_id: Uuid,
+    source_branch: &str,
+) -> Result<(), ApiError> {
+    if source_repository_id == repository_id {
+        return Ok(());
+    }
+    let storage = state.storage.clone();
+    let reference = format!("refs/heads/{source_branch}");
+    tokio::task::spawn_blocking(move || {
+        storage.fetch_ref(repository_id, source_repository_id, &reference)
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage operation failed",
+        )
+    })?
+    .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "repository storage unavailable"))
+}
+
 async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, ApiError> {
     Ok((
         branch_tip(state, pull.source_repository_id, &pull.source_branch).await?,
@@ -671,6 +699,13 @@ pub(crate) async fn read_pull(
     let tips = tips(state, loaded.repo.id, &pull).await?;
     let mergeability = match &tips {
         (Some(head), Some(base)) => {
+            fetch_cross_repo_head(
+                state,
+                loaded.repo.id,
+                pull.source_repository_id,
+                &pull.source_branch,
+            )
+            .await?;
             crate::mergeability::for_pull(state, loaded.repo.id, head, base).await?
         }
         _ => Vec::new(),

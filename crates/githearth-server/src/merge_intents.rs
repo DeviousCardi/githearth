@@ -297,6 +297,13 @@ pub(crate) async fn may_merge(
         return Ok(false);
     };
     let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
+    pulls::fetch_cross_repo_head(
+        state,
+        loaded.repo.id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await?;
     let mut conn = state.pool.acquire().await?;
     let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
     let checks_passed =
@@ -406,6 +413,16 @@ pub(crate) async fn create_intent(
             if head != input.expected_head_oid {
                 return Err(head_moved());
             }
+            // A cross-repository pull takes its head from a fork: bring the
+            // fork's objects into the target so the mergeability and code-owner
+            // checks below can resolve the head there (ADR 0008).
+            pulls::fetch_cross_repo_head(
+                state,
+                loaded.repo.id,
+                pull.source_repository_id,
+                &pull.source_branch,
+            )
+            .await?;
 
             // Approvals, required-check results and the digest are computed at
             // the exact source oid, so a status for a different commit can
