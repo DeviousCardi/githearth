@@ -126,8 +126,10 @@ class HardwareHarness(M4Harness):
         self.large_commits = commits
         self.big_file_count = big_files
         self.big_file_bytes = big_file_bytes
-        self.name = "githearth-hw-" + uuid.uuid4().hex[:12]
         super().__init__(report_path)
+        # Set after super().__init__: M4Harness then _m2.Harness overwrite the
+        # container name, so assigning here keeps the intended "hw" prefix.
+        self.name = "githearth-hw-" + uuid.uuid4().hex[:12]
         self.admin_username = self._hw_admin_username
         self.admin_password = self._hw_admin_password
         self.org_slug = "hw-org"
@@ -221,19 +223,19 @@ class HardwareHarness(M4Harness):
         pid = self.server.proc.pid
         start_jiffies = _tree_jiffies(pid)
         start = time.time()
+        deadline = start + timeout
         proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         peak_tree = peak_server = 0
         while proc.poll() is None:
             peak_tree = max(peak_tree, _tree_rss_kib(pid))
             peak_server = max(peak_server, _proc_rss_kib(pid))
+            if time.time() > deadline:
+                proc.kill()
+                proc.wait()
+                raise HarnessError(f"{label or argv[0]} timed out after {timeout}s")
             time.sleep(0.05)
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise HarnessError(f"{label or argv[0]} timed out after {timeout}s")
+        proc.wait()
         wall = time.time() - start
         end_jiffies = _tree_jiffies(pid)
         cpu = (end_jiffies - start_jiffies) / _clk_tck()
@@ -452,6 +454,14 @@ class HardwareHarness(M4Harness):
             else:
                 errors += 1
         latencies.sort()
+        cap = int(os.environ.get("GITHEARTH_GIT_CONCURRENCY", "8"))
+        if max_children > cap:
+            raise HarnessError(
+                f"sweep {n} clients: {max_children} concurrent git children "
+                f"> git_concurrency cap {cap}")
+        if errors:
+            raise HarnessError(
+                f"sweep {n} clients: {errors} clone errors (not busy/refused)")
         st, _ = self.api_json("GET", "/health/ready")
         if st != 200:
             raise HarnessError(f"sweep: server not ready after {n} clients")
