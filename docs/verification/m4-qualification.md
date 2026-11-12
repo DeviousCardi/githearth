@@ -99,6 +99,7 @@ Items previously listed here that are now verified elsewhere:
 - **Disk-full on the host filesystem under PostgreSQL.** Verified by [db-disk-full.md](db-disk-full.md); repository storage running out of space is drilled separately (s8).
 - **Off-host backup.** Verified by [offhost-backup.md](offhost-backup.md); the runbook's off-host copy procedure restores a lost primary.
 - **License files and notices, and accessibility review.** In review as PR #109, which adds `docs/verification/accessibility.md` (WCAG 2.2 AA basics) and `docs/operations/third-party-notices.md` (the `LICENSE` file, a generated `THIRD_PARTY_NOTICES`, and a stale check in `scripts/ci.sh`).
+- **SHA-256 repositories, public/internal visibility, and compose.yaml.** Covered by s11 (SHA-256 repositories), s12 (public/internal visibility) and s13 (compose.yaml) in [Scenario results](#scenario-results).
 
 Still genuinely open:
 

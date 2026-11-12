@@ -13,11 +13,11 @@ Status is one of **verified** (evidence recorded), **pending person** (needs a h
 | 3 | Disk-full behavior | [m4-qualification.md](m4-qualification.md) s8 (repository storage) and [db-disk-full.md](db-disk-full.md) (PostgreSQL disk full) | `scripts/verify-m4.py`, `scripts/verify-db-disk-full.py` | 2026-11-08, 2026-11-09 | verified |
 | 4 | Bounded resources | [m4-qualification.md](m4-qualification.md) s10 (concurrency, memory, request limits) and "Measured resource use" | `scripts/verify-m4.py` | 2026-11-08 | verified |
 | 5 | Off-host backup | [offhost-backup.md](offhost-backup.md) (copy to a separate host and restore a lost primary) | `scripts/verify-offhost-backup.py` | 2026-11-09 | verified |
-| 6 | Fresh restore | [m4-qualification.md](m4-qualification.md) s4 and [offhost-backup.md](offhost-backup.md) s4 | `scripts/verify-m4.py`, `scripts/verify-offhost-backup.py` | 2026-11-08, 2026-11-09 | verified |
+| 6 | Fresh restore | [m4-qualification.md](m4-qualification.md) s4 and [offhost-backup.md](offhost-backup.md) scenario 4 | `scripts/verify-m4.py`, `scripts/verify-offhost-backup.py` | 2026-11-08, 2026-11-09 | verified |
 | 7 | Upgrade | [m4-qualification.md](m4-qualification.md) s5 (forward-only upgrade drill) | `scripts/verify-m4.py` | 2026-11-08 | verified |
 | 8 | Controlled uninstall | [m4-qualification.md](m4-qualification.md) s9 (keep-data and full removal) | `scripts/verify-m4.py` | 2026-11-08 | verified |
 | 9 | HTTP/SSH authorization agrees | [m4-qualification.md](m4-qualification.md) s2 and the authorization matrix | `scripts/verify-m4.py` | 2026-11-08 | verified |
-| 10 | Publish minimum hardware only after measurement | [m4-qualification.md](m4-qualification.md) "Proposed minimum hardware" (RAM 1 GiB, 1 core) | measurement from s10 on one host | 2026-11-08 | verified |
+| 10 | Publish minimum hardware only after measurement | [m4-qualification.md](m4-qualification.md) "Proposed minimum hardware" (RAM 1 GiB, 1 core) — measurement gate met; actual publication still pending | measurement from s10 on one host | 2026-11-08 | verified |
 | 11 | Resolve license files/notices before external distribution | `docs/operations/third-party-notices.md`, `THIRD_PARTY_NOTICES`, `LICENSE` (PR #109) | `scripts/generate-third-party-notices.py` + stale check in `scripts/ci.sh` | — | pending PR #109 |
 | 12 | Review TLS/session defaults | [tls.md](tls.md) and [tls.md](../operations/tls.md#session-and-tls-defaults) | `scripts/verify-tls.py` | 2026-11-08 | verified |
 | 13 | Accessibility | `docs/verification/accessibility.md` (PR #109) | WCAG 2.2 AA basics audit and fixes | — | pending PR #109 |
@@ -26,7 +26,7 @@ Items 1, 11 and 13 are the only open exits. Everything else has recorded evidenc
 
 ## Independent installation checklist
 
-A person who has never seen the code follows this on a clean Linux host using only the runbooks in `docs/operations/` ([install.md](../operations/install.md), [backup-restore.md](../operations/backup-restore.md), [upgrade.md](../operations/upgrade.md), [uninstall.md](../operations/uninstall.md), [tls.md](../operations/tls.md), [quota.md](../operations/quota.md), [audit-retention.md](../operations/audit-retention.md)). Record `Result` (PASS/FAIL), `Time` (wall clock) and any `Problems` per step. Config keys and their environment overrides are listed in `githearth.example.toml` and [foundation.md](../foundation.md).
+A person who has never seen the code follows this on a clean Linux host using only the runbooks in `docs/operations/` ([install.md](../operations/install.md), [backup-restore.md](../operations/backup-restore.md), [upgrade.md](../operations/upgrade.md), [uninstall.md](../operations/uninstall.md), [tls.md](../operations/tls.md), [quota.md](../operations/quota.md), [audit-retention.md](../operations/audit-retention.md)). Record `Result` (PASS/FAIL), `Time` (wall clock) and any `Problems` per step. Config keys and their environment overrides are in `githearth.example.toml` (and summarised in [foundation.md](../foundation.md)).
 
 | Step | Action (commands from the runbooks) | Result | Time | Problems |
 | --- | --- | --- | --- | --- |
