@@ -1207,3 +1207,430 @@ async fn merging_a_pull_with_an_open_intent_shows_a_conflict_notice() {
 
     finish(f).await;
 }
+
+/// Returns the id of the first comment in the pull request's comment list.
+async fn first_comment_id(f: &Fixture) -> String {
+    let (status, list) = api(
+        &f.app,
+        "GET",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    list["items"][0]["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn inline_comment_renders_and_applies_a_suggestion() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Files changed"), "{page}");
+    assert!(page.contains("name=\"path\""), "{page}");
+    assert!(page.contains("name=\"side\""), "{page}");
+
+    // Add an anchored comment carrying a suggestion.
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("commit_id", &f.feature_head),
+            ("path", "feat.txt"),
+            ("line", "1"),
+            ("side", "new"),
+            ("body", "```suggestion\nFEATURE\n```"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &location.unwrap(), Some(&f.cookie)).await;
+    assert!(
+        page.contains("on <code>feat.txt</code> line 1 (new)"),
+        "{page}"
+    );
+    assert!(page.contains("<pre class=\"card\">FEATURE"), "{page}");
+    assert!(page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(page.contains(">Resolve</button>"), "{page}");
+
+    let comment_id = first_comment_id(&f).await;
+
+    // Apply the suggestion: the head moves and the comment turns outdated.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments/{comment_id}/apply", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let new_head = git_output(git_cmd(&[
+        "--git-dir",
+        repo_path.to_str().unwrap(),
+        "rev-parse",
+        "feature",
+    ]))
+    .await;
+    assert_ne!(new_head, f.feature_head);
+    let content = git_output(git_cmd(&[
+        "--git-dir",
+        repo_path.to_str().unwrap(),
+        "cat-file",
+        "blob",
+        &format!("{new_head}:feat.txt"),
+    ]))
+    .await;
+    assert_eq!(content, "FEATURE");
+
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("outdated"), "{page}");
+    assert!(!page.contains(">Apply suggestion</button>"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn replies_to_earlier_comments_are_rendered_with_a_marker() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let root_body = format!("root-{}", Uuid::new_v4().simple());
+    let reply_body = format!("reply-{}", Uuid::new_v4().simple());
+
+    // Enough filler that the root lands on the second page while a reply to it
+    // lands on the third, so the reply's page no longer holds its root.
+    for i in 0..30 {
+        let (status, _) = api(
+            &f.app,
+            "POST",
+            &format!("{}/pulls/1/comments", f.api_base),
+            &f.token,
+            json!({"body": format!("filler-{i}")}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, root) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!({"body": root_body}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let root_id = root["id"].as_str().unwrap().to_owned();
+
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!({"body": reply_body, "in_reply_to": root_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The reply sits on the page after its root: the root is the first item of
+    // `?after=30`, so the marker must point there rather than at the first page.
+    let (status, page) = get(
+        &f.app,
+        &format!("{}/pulls/1?after=31", f.base),
+        Some(&f.cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains(&reply_body), "{page}");
+    assert!(
+        page.contains(&format!(
+            "reply to <a href=\"{}/pulls/1?after=30#comment-{root_id}\">an earlier comment</a>",
+            f.base
+        )),
+        "{page}"
+    );
+    assert!(!page.contains(&root_body), "root stays on its own page");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_and_unresolve_through_forms() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("body", "a thread"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let comment_id = first_comment_id(&f).await;
+
+    // Resolve the thread through the form.
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments/{comment_id}/resolve", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("(resolved)"), "{page}");
+    assert!(page.contains(">Unresolve</button>"), "{page}");
+    assert!(!page.contains(">Resolve</button>"), "{page}");
+
+    // Unresolve it again.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/comments/{comment_id}/unresolve", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(!page.contains("(resolved)"), "{page}");
+    assert!(page.contains(">Resolve</button>"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn resolve_apply_and_inline_controls_require_permission() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // An anchored comment carrying a suggestion gives the page resolve and
+    // apply controls to render (or hide) for each viewer.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/comments", f.api_base),
+        &f.token,
+        json!({
+            "body": "```suggestion\nFEATURE\n```",
+            "commit_id": f.feature_head,
+            "path": "feat.txt",
+            "line": 1,
+            "side": "new",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The owner can resolve, apply and comment inline.
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains(">Resolve</button>"), "{page}");
+    assert!(page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(page.contains("name=\"path\""), "{page}");
+
+    // A read-only member may comment inline, but may not resolve or apply.
+    let reader = member_cookie(&f, "read").await;
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains(">Resolve</button>"), "{page}");
+    assert!(!page.contains(">Unresolve</button>"), "{page}");
+    assert!(!page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(
+        page.contains("name=\"path\""),
+        "read members can comment inline"
+    );
+
+    // A closed pull request still accepts comments, but resolve and apply are
+    // refused (409), so their controls must not render either.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'closed', closed_at = now() \
+         WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains(">Resolve</button>"), "{page}");
+    assert!(!page.contains(">Unresolve</button>"), "{page}");
+    assert!(!page.contains(">Apply suggestion</button>"), "{page}");
+    assert!(
+        page.contains("name=\"path\""),
+        "closed pull requests still accept inline comments"
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn auto_merge_button_enables_and_cancels_through_the_form() {
+    let f = fixture().await;
+    open_pull(&f).await;
+    // Require an approval so enabling auto-merge does not immediately raise a
+    // merge intent (which would otherwise keep the enable form hidden).
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/protection", f.api_base),
+        &f.token,
+        json!({"pattern": "main", "required_approvals": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Enable auto-merge"), "{page}");
+
+    // Enable auto-merge through the form (its own CSRF token and a fresh key).
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/auto_merge", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", "auto-merge-key-1"),
+            ("method", "squash"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("{}/pulls/1", f.base).as_str())
+    );
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Auto-merge enabled"), "{page}");
+
+    // Cancel auto-merge through the form.
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/auto_merge/cancel", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", "auto-merge-cancel-key-1"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Enable auto-merge"), "{page}");
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM auto_merges WHERE pull_request_id IN \
+            (SELECT id FROM pull_requests WHERE repository_id = $1 AND number = 1)",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn disable_auto_merge_form_is_only_shown_to_closers() {
+    let f = fixture().await;
+    open_pull(&f).await;
+    // Require an approval so enabling auto-merge does not immediately raise a
+    // merge intent, keeping the auto-merge pending for the page.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/protection", f.api_base),
+        &f.token,
+        json!({"pattern": "main", "required_approvals": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The owner enables auto-merge.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/auto_merge", f.api_base),
+        &f.token,
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The owner (who may close) sees the disable form.
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Auto-merge enabled"), "{page}");
+    assert!(page.contains("Disable auto-merge"), "{page}");
+
+    // A read-only member sees auto-merge is on, but no disable form.
+    let reader = member_cookie(&f, "read").await;
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Auto-merge enabled"), "{page}");
+    assert!(!page.contains("Disable auto-merge"), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn queue_position_is_shown_on_the_pull_request_page() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // Require a merge queue on main, then enqueue the pull request.
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/protection", f.api_base),
+        &f.token,
+        json!({"pattern": "main", "require_merge_queue": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, intent) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/merge", f.api_base),
+        &f.token,
+        json!({"method": "merge", "expected_head_oid": f.feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    assert_eq!(intent["in_queue"], true);
+
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Merge queue position: 1"), "{page}");
+
+    finish(f).await;
+}

@@ -46,13 +46,15 @@ pub struct ProtectionRule {
     pub require_pull_request: bool,
     pub required_approvals: i32,
     pub required_status_checks: Vec<String>,
+    pub require_merge_queue: bool,
     pub require_code_owner_review: bool,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const RULE_COLUMNS: &str = "id, repository_id, pattern, allow_force_push, allow_deletion, \
- require_pull_request, required_approvals, required_status_checks, require_code_owner_review, \
+ require_pull_request, required_approvals, required_status_checks, \
+ require_merge_queue, require_code_owner_review, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
 
@@ -102,7 +104,8 @@ pub(crate) fn matching(rules: &[ProtectionRule], ref_name: &str) -> Option<Prote
 
 /// The most specific rule matching `ref_name`, using the same ranking as
 /// [`matching`]. The rule (not just its protection payload) is exposed so
-/// callers can read its `required_status_checks`.
+/// callers can read fields beyond the Cedar `Protection` payload, such as
+/// `required_status_checks` or `require_merge_queue`.
 pub(crate) fn matching_rule<'a>(
     rules: &'a [ProtectionRule],
     ref_name: &str,
@@ -135,6 +138,12 @@ pub(crate) fn required_status_checks(rules: &[ProtectionRule], ref_name: &str) -
     matching_rule(rules, ref_name)
         .map(|rule| rule.required_status_checks.clone())
         .unwrap_or_default()
+}
+
+/// Whether the branch named by `ref_name` is behind a merge queue: the
+/// matching rule, if any, demands `require_merge_queue`.
+pub(crate) fn requires_queue(rules: &[ProtectionRule], ref_name: &str) -> bool {
+    matching_rule(rules, ref_name).is_some_and(|rule| rule.require_merge_queue)
 }
 
 fn protection_of(rule: &ProtectionRule) -> Protection {
@@ -254,6 +263,8 @@ struct NewRule {
     #[serde(default)]
     required_status_checks: Vec<String>,
     #[serde(default)]
+    require_merge_queue: bool,
+    #[serde(default)]
     require_code_owner_review: bool,
 }
 
@@ -336,8 +347,8 @@ async fn create(
                 "INSERT INTO branch_protection_rules \
                  (id, repository_id, pattern, allow_force_push, allow_deletion, \
                   require_pull_request, required_approvals, required_status_checks, \
-                  require_code_owner_review, created_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  require_merge_queue, require_code_owner_review, created_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             )
             .bind(id)
             .bind(loaded.repo.id)
@@ -347,6 +358,7 @@ async fn create(
             .bind(input.require_pull_request)
             .bind(input.required_approvals)
             .bind(&input.required_status_checks)
+            .bind(input.require_merge_queue)
             .bind(input.require_code_owner_review)
             .bind(actor.id)
             .execute(&mut *tx)
@@ -403,6 +415,8 @@ struct PatchRule {
     #[serde(default)]
     required_status_checks: Option<Vec<String>>,
     #[serde(default)]
+    require_merge_queue: Option<bool>,
+    #[serde(default)]
     require_code_owner_review: Option<bool>,
 }
 
@@ -433,6 +447,7 @@ async fn update(
                 && input.require_pull_request.is_none()
                 && input.required_approvals.is_none()
                 && input.required_status_checks.is_none()
+                && input.require_merge_queue.is_none()
                 && input.require_code_owner_review.is_none()
             {
                 return Err(invalid());
@@ -483,8 +498,8 @@ async fn update(
                 "UPDATE branch_protection_rules SET pattern = $1, \
                  allow_force_push = $2, allow_deletion = $3, require_pull_request = $4, \
                  required_approvals = $5, required_status_checks = $6, \
-                 require_code_owner_review = $7, updated_at = now() \
-                 WHERE id = $8",
+                 require_merge_queue = $7, require_code_owner_review = $8, \
+                 updated_at = now() WHERE id = $9",
             )
             .bind(updated_pattern)
             .bind(input.allow_force_push.unwrap_or(locked.allow_force_push))
@@ -503,6 +518,11 @@ async fn update(
                 input
                     .required_status_checks
                     .unwrap_or(locked.required_status_checks),
+            )
+            .bind(
+                input
+                    .require_merge_queue
+                    .unwrap_or(locked.require_merge_queue),
             )
             .bind(
                 input
@@ -623,6 +643,7 @@ mod tests {
             require_pull_request: false,
             required_approvals: 0,
             required_status_checks: Vec::new(),
+            require_merge_queue: false,
             require_code_owner_review: false,
             created_at: String::new(),
             updated_at: String::new(),
@@ -702,6 +723,18 @@ mod tests {
         assert!(validate_required_status_checks(&["界".repeat(100)]).is_ok());
         let overlong = validate_required_status_checks(&["界".repeat(256)]).unwrap_err();
         assert_eq!(overlong.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn requires_queue_reads_the_matching_rule() {
+        let main = rule("main", &|r| r.require_merge_queue = true);
+        let release = rule("release/*", &|r| r.require_merge_queue = false);
+        let rules = [main, release];
+
+        assert!(requires_queue(&rules, "refs/heads/main"));
+        assert!(!requires_queue(&rules, "refs/heads/release/v1"));
+        assert!(!requires_queue(&rules, "refs/heads/other"));
+        assert!(!requires_queue(&[], "refs/heads/main"));
     }
 
     #[tokio::test]
