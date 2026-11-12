@@ -3020,7 +3020,7 @@ async fn apply_record(pool: &PgPool, repo_id: Uuid, operation: Uuid, actor: Uuid
         }],
     };
     let mut conn = pool.acquire().await.unwrap();
-    let inserted = pushes::apply_committed(&mut conn, repo_id, &record)
+    let (inserted, _) = pushes::apply_committed(&mut conn, repo_id, &record)
         .await
         .unwrap();
     assert!(inserted, "apply_committed must insert the push");

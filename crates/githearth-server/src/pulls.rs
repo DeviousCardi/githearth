@@ -395,6 +395,27 @@ pub(crate) fn require_pull(
     }
 }
 
+/// Whether `actor_id` may close this pull request right now. The browser page
+/// uses it to hide the "Disable auto-merge" form (whose submit requires
+/// `PullRequestClose`) from read-only viewers.
+pub(crate) async fn may_close(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<bool, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    require_readable_repo(&loaded)?;
+    let mut conn = state.pool.acquire().await?;
+    let pull = find_pull(&mut conn, loaded.repo.id, number)
+        .await?
+        .ok_or_else(not_found)?;
+    drop(conn);
+    Ok(require_pull(state, &loaded, &pull, Action::PullRequestClose).is_ok())
+}
+
 /// The commit `branch` points at, or None when the branch does not exist.
 pub(crate) async fn branch_tip(
     state: &AppState,
@@ -830,6 +851,15 @@ async fn update(
                 )
                 .bind(locked.id)
                 .execute(&mut *tx)
+                .await?;
+                // Closing also cancels any pending auto-merge.
+                crate::auto_merge::cancel_in_tx(
+                    &mut tx,
+                    loaded.org_id,
+                    actor.id,
+                    locked.id,
+                    Some("pull request closed"),
+                )
                 .await?;
             }
 
@@ -1335,6 +1365,8 @@ pub(crate) async fn create_pull_review(
                 return Err(idempotency::claim_lost());
             }
             tx.commit().await?;
+            // A new review may have just satisfied a pending auto-merge.
+            let _ = crate::auto_merge::maybe_auto_merge(state, actor_id, pull.id).await;
             Ok((status, body))
         },
     )
