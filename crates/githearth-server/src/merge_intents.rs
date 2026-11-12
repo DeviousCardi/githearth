@@ -176,6 +176,69 @@ pub(crate) async fn approvals_at(
     .await
 }
 
+/// The number of approvals across every commit, using each reviewer's latest
+/// non-comment verdict. Used when stale approvals are not dismissed.
+pub(crate) async fn approvals_latest(
+    conn: &mut PgConnection,
+    pull_request_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM (\
+           SELECT DISTINCT ON (reviewer_id) verdict FROM pull_request_reviews \
+           WHERE pull_request_id = $1 AND verdict <> 'commented' \
+           ORDER BY reviewer_id, seq DESC\
+         ) latest WHERE verdict = 'approved'",
+    )
+    .bind(pull_request_id)
+    .fetch_one(&mut *conn)
+    .await
+}
+
+/// The reviewer ids whose latest non-comment review is on any commit, sorted by
+/// id, so the digest is independent of insertion order.
+pub(crate) async fn latest_review_ids_any(
+    conn: &mut PgConnection,
+    pull_request_id: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM (\
+           SELECT DISTINCT ON (reviewer_id) id FROM pull_request_reviews \
+           WHERE pull_request_id = $1 AND verdict <> 'commented' \
+           ORDER BY reviewer_id, seq DESC\
+         ) latest ORDER BY id",
+    )
+    .bind(pull_request_id)
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// The approvals that count for a merge and the reviewer ids they came from, at
+/// `source_oid` when stale approvals are dismissed and across every commit when
+/// they are not.
+pub(crate) struct ApprovalFacts {
+    pub approvals: i64,
+    pub review_ids: Vec<Uuid>,
+}
+
+pub(crate) async fn approval_facts(
+    conn: &mut PgConnection,
+    pull_request_id: Uuid,
+    source_oid: &str,
+    dismiss_stale_approvals: bool,
+) -> Result<ApprovalFacts, sqlx::Error> {
+    if dismiss_stale_approvals {
+        Ok(ApprovalFacts {
+            approvals: approvals_at(conn, pull_request_id, source_oid).await?,
+            review_ids: latest_review_ids(conn, pull_request_id, source_oid).await?,
+        })
+    } else {
+        Ok(ApprovalFacts {
+            approvals: approvals_latest(conn, pull_request_id).await?,
+            review_ids: latest_review_ids_any(conn, pull_request_id).await?,
+        })
+    }
+}
+
 /// Builds and evaluates the `pull_request.merge` request shared by the API
 /// handler and [`crate::merge::execute_intent`]. The merge facts are the
 /// approvals at the head, whether every required status check is `success`
@@ -289,6 +352,11 @@ pub(crate) async fn may_merge(
         crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
     drop(conn);
 
+    let protection =
+        crate::protection::matching(&rules, &format!("refs/heads/{}", pull.target_branch));
+    let dismiss = protection
+        .as_ref()
+        .is_none_or(|p| p.dismiss_stale_approvals);
     let head = pulls::branch_tip(state, loaded.repo.id, &pull.source_branch).await?;
     let target_ref = format!("refs/heads/{}", pull.target_branch);
     let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
@@ -299,7 +367,7 @@ pub(crate) async fn may_merge(
     };
     let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
     let mut conn = state.pool.acquire().await?;
-    let approvals = approvals_at(&mut conn, pull.id, head).await? as u32;
+    let facts = approval_facts(&mut conn, pull.id, head, dismiss).await?;
     let checks_passed =
         statuses::checks_passed(&mut conn, loaded.repo.id, head, &required_checks).await?;
     drop(conn);
@@ -326,7 +394,7 @@ pub(crate) async fn may_merge(
         &loaded.repo,
         &pull,
         protection,
-        approvals,
+        facts.approvals as u32,
         checks_passed,
         code_owner_review_ok,
         Some(Duration::from_secs(auth_age)),
@@ -407,14 +475,19 @@ pub(crate) async fn create_intent(
                 return Err(head_moved());
             }
 
-            // Approvals, required-check results and the digest are computed at
-            // the exact source oid, so a status for a different commit can
-            // never authorize this merge.
             let target_ref = format!("refs/heads/{}", pull.target_branch);
+            let protection = crate::protection::matching(&rules, &target_ref);
+            let dismiss = protection
+                .as_ref()
+                .is_none_or(|p| p.dismiss_stale_approvals);
+
+            // Approvals, required-check results and the digest are computed at
+            // the exact source oid (or across every commit when stale approvals
+            // are not dismissed), so a status for a different commit can never
+            // authorize this merge.
             let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
             let mut conn = state.pool.acquire().await?;
-            let approvals = approvals_at(&mut conn, pull.id, &head).await?;
-            let review_ids = latest_review_ids(&mut conn, pull.id, &head).await?;
+            let facts = approval_facts(&mut conn, pull.id, &head, dismiss).await?;
             let check_states = statuses::latest_required_states(
                 &mut conn,
                 loaded.repo.id,
@@ -424,7 +497,6 @@ pub(crate) async fn create_intent(
             .await?;
             drop(conn);
 
-            let protection = crate::protection::matching(&rules, &target_ref);
             let checks_passed = statuses::all_success(&required_checks, &check_states);
             let code_owner_review_ok = crate::codeowners::review(
                 state,
@@ -442,7 +514,7 @@ pub(crate) async fn create_intent(
                 &loaded,
                 &pull,
                 protection,
-                approvals as u32,
+                facts.approvals as u32,
                 checks_passed,
                 code_owner_review_ok,
             )?;
@@ -451,7 +523,7 @@ pub(crate) async fn create_intent(
             // merging directly; the worker re-targets it as earlier entries merge.
             let in_queue = crate::protection::requires_queue(&rules, &target_ref);
 
-            let digest = checks_approvals_digest(&head, &review_ids, &check_states);
+            let digest = checks_approvals_digest(&head, &facts.review_ids, &check_states);
 
             // M3 conflicts: a conflicting merge is refused up front — nothing is
             // queued and no ref moves — but the reason is recorded on a

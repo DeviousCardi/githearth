@@ -261,10 +261,16 @@ pub async fn execute_intent(
             });
         }
 
-        let review_ids = crate::merge_intents::latest_review_ids(
+        let target_ref = format!("refs/heads/{}", intent.target_ref);
+        let protection = crate::protection::matching(&rules, &target_ref);
+        let dismiss = protection
+            .as_ref()
+            .is_none_or(|p| p.dismiss_stale_approvals);
+        let facts = crate::merge_intents::approval_facts(
             &mut conn,
             intent.pull_request_id,
             &intent.source_oid,
+            dismiss,
         )
         .await?;
         // Required checks are re-read at the intent's exact source oid, so a
@@ -283,7 +289,7 @@ pub async fn execute_intent(
         .await?;
         let digest = crate::merge_intents::checks_approvals_digest(
             &intent.source_oid,
-            &review_ids,
+            &facts.review_ids,
             &check_states,
         );
         if digest != intent.checks_approvals_digest {
@@ -292,12 +298,7 @@ pub async fn execute_intent(
             });
         }
 
-        let approvals = crate::merge_intents::approvals_at(
-            &mut conn,
-            intent.pull_request_id,
-            &intent.source_oid,
-        )
-        .await? as u32;
+        let approvals = facts.approvals as u32;
         let checks_passed = crate::statuses::all_success(&required_checks, &check_states);
 
         (pull, rules, approvals, checks_passed)

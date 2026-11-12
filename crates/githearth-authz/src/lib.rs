@@ -291,6 +291,13 @@ pub struct Protection {
     pub require_pull_request: bool,
     pub required_approvals: u32,
     pub require_checks: bool,
+    /// Approvals count only at the current head; a moved head dismisses older
+    /// approvals. Evaluated by the service when it counts approvals, not by the
+    /// policy engine (which only compares the resulting count).
+    pub dismiss_stale_approvals: bool,
+    /// Pushes must carry verified signatures for every new commit. Evaluated by
+    /// the service against Git, not by the policy engine.
+    pub require_signed_commits: bool,
     pub require_code_owner_review: bool,
 }
 
