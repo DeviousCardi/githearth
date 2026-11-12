@@ -1060,21 +1060,14 @@ async fn each_supported_merge_method_merges_successfully() {
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn a_conflicting_merge_is_refused_without_moving_the_ref() {
     let f = build_fixture(true).await;
-    let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
-
     let before = main_tip(&f).await;
-    let ran = githearth_server::merge_worker::run_once(&f.state, Some(f.repo_id))
-        .await
-        .unwrap();
-    assert_eq!(ran, 1);
-    assert_eq!(intent_state(&f, op).await, "conflicted");
-    let reason = intent_failure_reason(&f, op).await.unwrap();
-    assert!(
-        reason.contains("README"),
-        "conflict path reported: {reason}"
-    );
+
+    // A conflicting merge is refused up front: the API records a `conflicted`
+    // intent and returns 409, moving no ref. The worker's `Conflicted` safety
+    // net is covered directly in `tests/merge_execute.rs`.
+    let (status, body) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["state"], "conflicted");
     assert_eq!(main_tip(&f).await, before, "the ref must not move");
 
     finish(f).await;

@@ -113,7 +113,7 @@ where
 
 /// Like [`git_read`], but also creates a scratch directory (removed when the
 /// worker returns) for Git commands that must write objects off-repository.
-async fn git_compare<T>(
+pub(crate) async fn git_compare<T>(
     state: &AppState,
     repo_id: Uuid,
     work: impl FnOnce(&FsPath, &FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
