@@ -33,7 +33,7 @@ impl From<sqlx::Error> for PushError {
     }
 }
 
-fn valid_oid(s: &str) -> bool {
+pub(crate) fn valid_oid(s: &str) -> bool {
     matches!(s.len(), 40 | 64)
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -347,10 +347,17 @@ pub async fn replay(
         };
         match classify(&prepared, marker, &refs_now) {
             githearth_git::journal::Outcome::Committed => {
-                if prepared.origin == Some(Origin::Merge) {
-                    crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
-                } else {
-                    apply_committed(&mut conn, repository, &prepared).await?;
+                match prepared.origin {
+                    Some(Origin::Merge) => {
+                        crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                    }
+                    Some(Origin::Suggestion) => {
+                        crate::pulls::apply_suggestion_record(&mut conn, repository, &prepared)
+                            .await?;
+                    }
+                    None => {
+                        apply_committed(&mut conn, repository, &prepared).await?;
+                    }
                 }
                 let seq = marker
                     .map(|_| records[i + 1].sequence)
@@ -371,10 +378,17 @@ pub async fn replay(
                     Kind::Committed,
                 )
                 .await?;
-                if prepared.origin == Some(Origin::Merge) {
-                    crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
-                } else {
-                    apply_committed(&mut conn, repository, &prepared).await?;
+                match prepared.origin {
+                    Some(Origin::Merge) => {
+                        crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                    }
+                    Some(Origin::Suggestion) => {
+                        crate::pulls::apply_suggestion_record(&mut conn, repository, &prepared)
+                            .await?;
+                    }
+                    None => {
+                        apply_committed(&mut conn, repository, &prepared).await?;
+                    }
                 }
                 advance(&mut conn, repository, prepared.sequence).await?;
                 summary.committed += 1;

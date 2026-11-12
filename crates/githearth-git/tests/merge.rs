@@ -1,4 +1,5 @@
 use githearth_git::StorageError;
+use githearth_git::journal::Origin;
 use githearth_git::merge::{
     Candidate, Identity, Method, Request, build_candidate, update_ref_expected,
 };
@@ -744,6 +745,7 @@ fn update_ref_expected_moves_branch_and_journals_through_hooks() {
         &base,
         op,
         actor,
+        Origin::Merge,
         Duration::from_secs(10),
     )
     .unwrap();
@@ -781,6 +783,7 @@ fn update_ref_expected_mismatch_returns_ref_moved_and_leaves_ref() {
         &base,
         Uuid::new_v4(),
         Uuid::new_v4(),
+        Origin::Merge,
         Duration::from_secs(10),
     );
     assert!(matches!(result, Err(StorageError::RefMoved(_))));
@@ -801,6 +804,7 @@ fn update_ref_expected_on_a_deleted_branch_returns_ref_moved() {
         &base,
         Uuid::new_v4(),
         Uuid::new_v4(),
+        Origin::Merge,
         Duration::from_secs(10),
     );
     assert!(
@@ -844,6 +848,7 @@ fn update_ref_expected_rejects_invalid_ref_and_oid_before_git() {
                     old,
                     op,
                     actor,
+                    Origin::Merge,
                     Duration::from_secs(10),
                 ),
                 Err(StorageError::Invalid(_))
