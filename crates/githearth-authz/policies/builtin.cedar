@@ -124,6 +124,14 @@ when {
   !context.checks_passed
 };
 
+@id("merge-requires-code-owner-review")
+forbid (principal, action == GitHearth::Action::"pull_request.merge", resource)
+when {
+  resource.target.protected &&
+  resource.target.require_code_owner_review &&
+  !context.code_owner_review_ok
+};
+
 @id("no-self-approval")
 forbid (principal, action == GitHearth::Action::"pull_request.approve", resource)
 when { resource.author == principal };

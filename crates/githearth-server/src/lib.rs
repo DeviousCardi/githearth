@@ -3,6 +3,7 @@ pub mod audit_retention;
 pub mod browse;
 mod browse_ui;
 pub mod client_ip;
+pub mod codeowners;
 pub mod config;
 pub mod doctor;
 pub mod facts;

@@ -765,6 +765,32 @@ async fn render_pull(
             format!("<option value=\"{value}\"{sel}{dis}>{label}</option>")
         })
         .collect::<String>();
+    let code_owners_section = if detail.required_code_owners.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for owner in &detail.required_code_owners {
+            let status = if owner.approved {
+                "approved"
+            } else {
+                "required"
+            };
+            rows.push_str(&format!(
+                "<li>{} <span class=\"muted\">({status})</span></li>",
+                ui::esc(&owner.name)
+            ));
+        }
+        format!("<h2>Code owners</h2><div class=\"card\"><ul>{rows}</ul></div>")
+    };
+    let code_owner_errors_section = if detail.code_owner_errors.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for error in &detail.code_owner_errors {
+            rows.push_str(&format!("<li>{}</li>", ui::esc(error)));
+        }
+        format!("<h2>Code owner errors</h2><div class=\"card\"><ul>{rows}</ul></div>")
+    };
     let show_merge_form = detail.pull.state == "open" && !non_terminal && can_merge;
     let blocked_reason = selected_block_reason(&detail.mergeability, merge.method);
     let merge_form = if show_merge_form {
@@ -826,7 +852,7 @@ async fn render_pull(
 <dt>Changes requested</dt><dd>{}</dd>\
 </dl></div>\
 <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
-{intent_section}\
+{code_owners_section}{code_owner_errors_section}{intent_section}\
 {status_section}\
 {conflict_section}\
 <h2>Reviews</h2>{review_list} \
