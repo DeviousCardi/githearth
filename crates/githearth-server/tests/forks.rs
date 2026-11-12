@@ -2141,3 +2141,240 @@ async fn cross_repo_pull_rejects_object_format_mismatch() {
 
     finish(f).await;
 }
+
+/// The GET and DELETE halves of the `/merge` route: a reader can read the
+/// latest intent (or learn there is none), and a DELETE with no live intent is
+/// a 404 rather than a silent success.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn merge_intent_get_and_cancel_without_an_intent() {
+    let f = build_fixture().await;
+    let href = merge_href(&f, f.number).await;
+
+    // No intent yet: both a GET and a DELETE are 404.
+    let (status, body) = request(&f.app, "GET", &href, Some(&f.owner_token), Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = request(&f.app, "DELETE", &href, Some(&f.owner_token), Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // A GET for a pull request that does not exist is also 404.
+    let missing = format!(
+        "/api/v1/organizations/{}/repositories/{}/pulls/999999/merge",
+        f.parent_org_slug, f.parent_repo_name
+    );
+    let (status, _) = request(&f.app, "GET", &missing, Some(&f.owner_token), Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Once an intent exists, a GET returns it.
+    let (status, intent) = create_merge_intent(&f, "merge", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let (status, body) = request(&f.app, "GET", &href, Some(&f.owner_token), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["operation_id"], intent["operation_id"]);
+
+    finish(f).await;
+}
+
+/// Opening a cross-repository pull request rejects a source repository that is
+/// not a fork of the target, and a fork that is no longer active, before any
+/// head is read.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_pull_source_resolution_errors() {
+    let f = build_fixture().await;
+
+    // A repository the contributor can read, but which is not a fork.
+    let other = tag("not-a-fork");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!("/api/v1/organizations/{}/repositories", f.contrib_org_slug),
+        Some(&f.contributor_token),
+        json!({"name": other, "visibility": "private"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({
+            "title": "not a fork",
+            "source_branch": "feature",
+            "target_branch": "main",
+            "source_repository": format!("{}/{}", f.contrib_org_slug, other),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The fork itself still exists but is no longer active.
+    sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+        .bind(f.fork_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &repo_href(&f.parent_org_slug, &f.parent_repo_name),
+        Some(&f.contributor_token),
+        json!({
+            "title": "inactive fork",
+            "source_branch": "feature",
+            "target_branch": "main",
+            "source_repository": format!("{}/{}", f.contrib_org_slug, f.fork_name),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    finish(f).await;
+}
+
+/// A suggestion cannot be applied to a cross-repository pull request: the apply
+/// path is scoped to the target repository and could rewrite a same-named
+/// target branch, so it is refused before the comment is even loaded.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_suggestion_apply_is_refused() {
+    let f = build_fixture().await;
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "{}/{}/comments/{}/apply",
+            repo_href(&f.parent_org_slug, &f.parent_repo_name),
+            f.number,
+            Uuid::new_v4()
+        ),
+        Some(&f.owner_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    finish(f).await;
+}
+
+/// Auto-merge on a cross-repository pull reads the head from the fork, and a
+/// deleted fork head is reported as a missing branch for both enabling
+/// auto-merge and creating a merge intent.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_auto_merge_enable_then_missing_head() {
+    let f = build_fixture().await;
+    let am_href = format!(
+        "/api/v1/organizations/{}/repositories/{}/pulls/{}/auto_merge",
+        f.parent_org_slug, f.parent_repo_name, f.number
+    );
+
+    // Enabling reads the head from the fork and succeeds.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &am_href,
+        Some(&f.owner_token),
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Delete the fork's head branch: enabling again cannot find the head.
+    git_ok(git_cmd(&[
+        "-c",
+        "core.hooksPath=/dev/null",
+        "--git-dir",
+        f.fork_path.to_str().unwrap(),
+        "update-ref",
+        "-d",
+        "refs/heads/feature",
+    ]))
+    .await;
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &am_href,
+        Some(&f.owner_token),
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Creating a merge intent now reports the same missing head.
+    let (status, body) = create_merge_intent(&f, "merge", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    finish(f).await;
+}
+
+/// Re-executing an intent revalidates the refs it recorded: a source or target
+/// branch that no longer matches the pull request is stale.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn merge_intent_revalidates_recorded_refs() {
+    let f = build_fixture().await;
+    let (status, intent) = create_merge_intent(&f, "merge", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+
+    // The intent's recorded source ref no longer matches the pull request.
+    sqlx::query("UPDATE merge_intents SET source_ref = 'elsewhere' WHERE operation_id = $1")
+        .bind(op)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        execute_intent(&f.state, op).await.unwrap(),
+        MergeOutcome::Stale {
+            reason: "source branch changed".into()
+        }
+    );
+
+    // Restore the source and drift the target ref instead.
+    sqlx::query(
+        "UPDATE merge_intents SET source_ref = 'feature', target_ref = 'elsewhere' \
+         WHERE operation_id = $1",
+    )
+    .bind(op)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        execute_intent(&f.state, op).await.unwrap(),
+        MergeOutcome::Stale {
+            reason: "target branch changed".into()
+        }
+    );
+
+    finish(f).await;
+}
+
+/// A squash merge folds a non-empty pull request body into the commit message.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn cross_repo_squash_merge_includes_the_pull_body() {
+    let f = build_fixture().await;
+
+    sqlx::query(
+        "UPDATE pull_requests SET body = 'details here' WHERE repository_id = $1 AND number = $2",
+    )
+    .bind(f.parent_repo_id)
+    .bind(f.number as i32)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let (status, intent) = create_merge_intent(&f, "squash", &f.fork_feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+    let oid = expect_merged(execute_intent(&f.state, op).await.unwrap());
+    assert_eq!(main_tip(&f).await, oid);
+
+    finish(f).await;
+}
