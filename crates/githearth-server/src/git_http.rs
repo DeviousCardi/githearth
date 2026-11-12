@@ -753,8 +753,8 @@ async fn verify_signed_commits(
         return Ok(());
     }
 
-    // One connection and one allowed-signers file for the whole push, instead
-    // of opening a connection and writing a fresh file per commit.
+    // One database connection for the whole push; one allowed-signers file per
+    // committer, so each commit is checked only against its own committer's keys.
     let mut conn = state
         .pool
         .acquire()
@@ -763,35 +763,49 @@ async fn verify_signed_commits(
     let signers_dir = std::env::temp_dir().join(format!("githearth-signers-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&signers_dir)
         .map_err(|_| "signature verification failed".to_owned())?;
-    let signers_file = signers_dir.join("allowed_signers");
+    // RAII: the temporary signers directory is removed even if this future is
+    // cancelled (for example by `HOOK_TIMEOUT`), not just on the happy path.
+    let _signers_guard = SignersDirGuard(signers_dir.clone());
 
-    let result = verify_all(
+    verify_all(
         &repo_path,
         quarantine.as_deref(),
         &oids,
         &mut conn,
-        &signers_file,
+        &signers_dir,
         timeout,
     )
-    .await;
+    .await
+}
 
-    let _ = std::fs::remove_dir_all(&signers_dir);
-    result
+/// Removes the temporary allowed-signers directory when dropped, so a cancelled
+/// hook (e.g. `HOOK_TIMEOUT`) does not leave it behind.
+struct SignersDirGuard(std::path::PathBuf);
+
+impl Drop for SignersDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Resolves every commit's committer, collects the SSH keys registered to each
-/// committer's account, and verifies each commit's signature against the single
-/// allowed-signers file. A committer email must map to an account named
-/// `<username>@users.noreply.githearth.invalid`.
+/// committer's account, and verifies each commit's signature against an
+/// allowed-signers file containing only that committer's keys. `git
+/// verify-commit` accepts a signature from any key in its allowed-signers file,
+/// so a shared file would let a pusher sign a commit that names someone else's
+/// email with the pusher's own key. A committer email must map to an account
+/// named `<username>@users.noreply.githearth.invalid`.
 async fn verify_all(
     repo_path: &std::path::Path,
     quarantine: Option<&std::path::Path>,
     oids: &[String],
     conn: &mut sqlx::PgConnection,
-    signers_file: &std::path::Path,
+    signers_dir: &std::path::Path,
     timeout: Duration,
 ) -> Result<(), String> {
-    let mut signers = String::new();
+    // Group the new commits by committer email, so each committer gets a file
+    // holding only that committer's keys.
+    let mut by_email: Vec<(String, Vec<String>)> = Vec::new();
     for oid in oids {
         let email = tokio::task::spawn_blocking({
             let repo = repo_path.to_path_buf();
@@ -810,40 +824,51 @@ async fn verify_all(
         .map_err(|_| "signature verification failed".to_owned())?
         .map_err(|e| format!("cannot inspect commit {oid}: {e}"))?;
 
-        let keys = registered_keys(conn, &email, oid).await?;
+        match by_email.iter().position(|(existing, _)| existing == &email) {
+            Some(index) => by_email[index].1.push(oid.clone()),
+            None => by_email.push((email, vec![oid.clone()])),
+        }
+    }
+
+    for (index, (email, commits)) in by_email.iter().enumerate() {
+        let keys = registered_keys(conn, email, &commits[0]).await?;
+        // One allowed-signers file per committer: a shared file would accept a
+        // signature from any key in it, regardless of the committer.
+        let mut signers = String::new();
         for key in &keys {
-            signers.push_str(&email);
+            signers.push_str(email);
             signers.push(' ');
             signers.push_str(key);
             signers.push('\n');
         }
-    }
-    std::fs::write(signers_file, signers)
-        .map_err(|_| "signature verification failed".to_owned())?;
+        let signers_file = signers_dir.join(format!("allowed_signers_{index}"));
+        std::fs::write(&signers_file, signers)
+            .map_err(|_| "signature verification failed".to_owned())?;
 
-    for oid in oids {
-        let ok = tokio::task::spawn_blocking({
-            let repo = repo_path.to_path_buf();
-            let quarantine = quarantine.map(std::path::Path::to_path_buf);
-            let oid = oid.to_owned();
-            let signers = signers_file.to_path_buf();
-            move || {
-                githearth_git::signature::verify_ssh_signature(
-                    &repo,
-                    &oid,
-                    quarantine.as_deref(),
-                    &signers,
-                    timeout,
-                )
+        for oid in commits {
+            let ok = tokio::task::spawn_blocking({
+                let repo = repo_path.to_path_buf();
+                let quarantine = quarantine.map(std::path::Path::to_path_buf);
+                let oid = oid.clone();
+                let signers = signers_file.clone();
+                move || {
+                    githearth_git::signature::verify_ssh_signature(
+                        &repo,
+                        &oid,
+                        quarantine.as_deref(),
+                        &signers,
+                        timeout,
+                    )
+                }
+            })
+            .await
+            .map_err(|_| "signature verification failed".to_owned())?
+            .map_err(|e| format!("cannot verify commit {oid}: {e}"))?;
+            if !ok {
+                return Err(format!(
+                    "commit {oid} is not signed by a registered committer"
+                ));
             }
-        })
-        .await
-        .map_err(|_| "signature verification failed".to_owned())?
-        .map_err(|e| format!("cannot verify commit {oid}: {e}"))?;
-        if !ok {
-            return Err(format!(
-                "commit {oid} is not signed by a registered committer"
-            ));
         }
     }
     Ok(())

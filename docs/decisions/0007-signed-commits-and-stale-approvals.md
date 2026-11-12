@@ -7,7 +7,7 @@ Status: **accepted for M3**.
 ## Scope
 
 Two branch-protection flags land in M3, both stored on `branch_protection_rules`
-(migration `0031`):
+(migration `0037`):
 
 - `require_signed_commits` — refuse pushes to a protected branch unless every
   commit the push introduces carries an SSH signature that verifies against a

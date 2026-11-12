@@ -2286,6 +2286,99 @@ async fn require_signed_commits_refuses_unsigned_and_accepts_signed_push() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn require_signed_commits_refuses_commit_signed_by_another_committers_key() {
+    let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
+    add_signed_commits_rule(&fx.pool, fx.repo_id, owner, "main").await;
+
+    // The pusher (owner) registers a key; a second account registers a
+    // different key. The pusher then forges a commit that names the second
+    // account as committer but is signed with the pusher's own key.
+    let (pusher_key, pusher_public) = generate_ssh_key();
+    register_ssh_key(&fx.pool, owner, &pusher_public).await;
+    let victim = fixture_account(&fx.pool, &tag("user")).await;
+    let (victim_key, victim_public) = generate_ssh_key();
+    register_ssh_key(&fx.pool, victim, &victim_public).await;
+
+    let pusher_email = format!("{}@users.noreply.githearth.invalid", fx.username);
+    let victim_username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(victim)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    let victim_email = format!("{victim_username}@users.noreply.githearth.invalid");
+
+    let clone = std::env::temp_dir().join(format!("git-signed-forge-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    // Commit 1: the pusher's own signed commit, so the pusher's key legitimately
+    // belongs in this push's set of keys.
+    std::fs::write(clone.join("a"), "a").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "a"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        &format!("user.email={pusher_email}"),
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        &format!("user.signingkey={}", pusher_key.display()),
+        "commit",
+        "-S",
+        "-m",
+        "pusher",
+    ]))
+    .await;
+
+    // Commit 2: names the victim as committer but is signed with the pusher's
+    // key. A shared allowed-signers file would accept it because the pusher's
+    // key is present for commit 1.
+    std::fs::write(clone.join("b"), "b").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "b"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        &format!("user.email={victim_email}"),
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        &format!("user.signingkey={}", pusher_key.display()),
+        "commit",
+        "-S",
+        "-m",
+        "forged",
+    ]))
+    .await;
+
+    // Both commits are pushed together; the forged one must be refused even
+    // though the pusher's own signed commit is in the same push.
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+    assert!(
+        !out.status.success(),
+        "a commit naming another account as committer but signed with the pusher's key must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not signed by a registered committer"),
+        "forged signed push reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    let _ = std::fs::remove_dir_all(pusher_key.parent().unwrap());
+    let _ = std::fs::remove_dir_all(victim_key.parent().unwrap());
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn replay_skips_merge_record_and_applies_following_push() {
     let fx = setup(1 << 30).await;
     let owner = owner_id(&fx).await;
