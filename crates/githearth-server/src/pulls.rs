@@ -179,6 +179,13 @@ pub(crate) struct PullDetail {
     pub(crate) approvals: i64,
     pub(crate) changes_requested: i64,
     pub(crate) statuses: Vec<crate::statuses::StatusJson>,
+    pub(crate) mergeability: Vec<crate::mergeability::Check>,
+    #[serde(default)]
+    pub(crate) required_code_owners: Vec<crate::codeowners::RequiredOwner>,
+    #[serde(default)]
+    pub(crate) code_owner_review_satisfied: bool,
+    #[serde(default)]
+    pub(crate) code_owner_errors: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, sqlx::FromRow)]
@@ -350,6 +357,10 @@ async fn detail(
         approvals,
         changes_requested,
         statuses,
+        mergeability: Vec::new(),
+        required_code_owners: Vec::new(),
+        code_owner_review_satisfied: true,
+        code_owner_errors: Vec::new(),
     })
 }
 
@@ -458,6 +469,17 @@ pub(crate) async fn create_pull(
                 Some(loaded.org_id),
                 actor_id,
                 "pull_request.created",
+            )
+            .await?;
+            // Request reviews from the changed files' code owners (a durable
+            // job; it reads CODEOWNERS from the target branch and the diff).
+            crate::jobs::enqueue(
+                &mut tx,
+                Some(loaded.org_id),
+                "codeowners.request_reviews",
+                serde_json::json!({ "pull_request_id": id }),
+                &id.to_string(),
+                None,
             )
             .await?;
 
@@ -575,8 +597,32 @@ pub(crate) async fn read_pull(
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
     let tips = tips(state, loaded.repo.id, &pull).await?;
+    let mergeability = match &tips {
+        (Some(head), Some(base)) => {
+            crate::mergeability::for_pull(state, loaded.repo.id, head, base).await?
+        }
+        _ => Vec::new(),
+    };
     let mut conn = state.pool.acquire().await?;
-    detail(&mut conn, loaded.repo.id, pull, tips).await
+    let mut detail = detail(&mut conn, loaded.repo.id, pull, tips).await?;
+    detail.mergeability = mergeability;
+    // Attach the live code-owner requirements for the pull request page.
+    if let (Some(head), Some(base)) = (detail.head_id.as_deref(), detail.base_id.as_deref()) {
+        let review = crate::codeowners::review(
+            state,
+            loaded.repo.id,
+            loaded.org_id,
+            org_slug,
+            detail.pull.id,
+            head,
+            base,
+        )
+        .await?;
+        detail.required_code_owners = review.required;
+        detail.code_owner_review_satisfied = review.satisfied;
+        detail.code_owner_errors = review.errors;
+    }
+    Ok(detail)
 }
 
 #[derive(Deserialize)]
@@ -1216,13 +1262,25 @@ fn reviewer_allowed(
     let Some(facts) = facts else {
         return false;
     };
-    let authz_repo = repositories::authz_repository(&loaded.repo);
+    reviewer_can_approve(action, state, &loaded.repo, pull, facts)
+}
+
+/// Whether `facts` allow `action` on the pull request, for the automatic
+/// code-owner review path which has a repository row instead of a `Loaded`.
+pub(crate) fn reviewer_can_approve(
+    action: Action,
+    state: &AppState,
+    repo: &repositories::RepositoryRow,
+    pull: &PullJson,
+    facts: &facts::Facts,
+) -> bool {
+    let authz_repo = repositories::authz_repository(repo);
     let entity = PullRequest {
         id: pull.id,
-        repository: loaded.repo.id,
+        repository: repo.id,
         author: pull.author_id,
         target: Ref {
-            repository: loaded.repo.id,
+            repository: repo.id,
             name: format!("refs/heads/{}", pull.target_branch),
             protection: None,
             exists: true,
@@ -1232,6 +1290,56 @@ fn reviewer_allowed(
         .authz
         .authorize(&facts.request(action, Resource::PullRequest(&authz_repo, &entity), None))
         .is_allowed()
+}
+
+/// Inserts a review request for `reviewer_id` requested by `requested_by`,
+/// idempotently (`ON CONFLICT DO NOTHING`). A newly inserted request emits the
+/// audit/outbox event and enqueues the review-requested notification, exactly
+/// like the JSON endpoint. Returns whether a new request was created.
+pub(crate) async fn insert_review_request(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org_id: Uuid,
+    pull_id: Uuid,
+    reviewer_id: Uuid,
+    requested_by: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let request_id = Uuid::new_v4();
+    let inserted = sqlx::query(
+        "INSERT INTO pull_request_review_requests (pull_request_id, reviewer_id, requested_by, id) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (pull_request_id, reviewer_id) DO NOTHING",
+    )
+    .bind(pull_id)
+    .bind(reviewer_id)
+    .bind(requested_by)
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await?;
+
+    if inserted.rows_affected() > 0 {
+        event_with(
+            tx,
+            Some(org_id),
+            requested_by,
+            "pull_request.review_requested",
+            serde_json::json!({ "pull_request_id": pull_id, "reviewer_id": reviewer_id }),
+        )
+        .await?;
+        crate::jobs::enqueue(
+            tx,
+            Some(org_id),
+            "notification.pull_request_review_requested",
+            serde_json::json!({
+                "request_id": request_id,
+                "pull_request_id": pull_id,
+                "reviewer_id": reviewer_id,
+                "requested_by": requested_by,
+            }),
+            &request_id.to_string(),
+            None,
+        )
+        .await?;
+    }
+    Ok(inserted.rows_affected() > 0)
 }
 
 async fn list_review_requests(
@@ -1336,42 +1444,7 @@ async fn add_review_request(
     }
     require_open(&mut tx, pull.id).await?;
 
-    let request_id = Uuid::new_v4();
-    let inserted = sqlx::query(
-        "INSERT INTO pull_request_review_requests (pull_request_id, reviewer_id, requested_by, id) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (pull_request_id, reviewer_id) DO NOTHING",
-    )
-    .bind(pull.id)
-    .bind(reviewer_id)
-    .bind(actor.id)
-    .bind(request_id)
-    .execute(&mut *tx)
-    .await?;
-
-    if inserted.rows_affected() > 0 {
-        event_with(
-            &mut tx,
-            Some(loaded.org_id),
-            actor.id,
-            "pull_request.review_requested",
-            serde_json::json!({ "pull_request_id": pull.id, "reviewer_id": reviewer_id }),
-        )
-        .await?;
-        crate::jobs::enqueue(
-            &mut tx,
-            Some(loaded.org_id),
-            "notification.pull_request_review_requested",
-            serde_json::json!({
-                "request_id": request_id,
-                "pull_request_id": pull.id,
-                "reviewer_id": reviewer_id,
-                "requested_by": actor.id,
-            }),
-            &request_id.to_string(),
-            None,
-        )
-        .await?;
-    }
+    insert_review_request(&mut tx, loaded.org_id, pull.id, reviewer_id, actor.id).await?;
 
     let list = list_review_requests_query(&mut tx, pull.id).await?;
     tx.commit().await?;

@@ -257,6 +257,7 @@ impl Site<'_> {
         let merge = (action == Action::PullRequestMerge).then_some(Merge {
             approvals: 1,
             checks_passed: true,
+            code_owner_review_ok: true,
         });
         use Action::*;
         let repository = self.repository;
@@ -336,14 +337,17 @@ fn decision_table() {
     let approved = Some(Merge {
         approvals: 2,
         checks_passed: true,
+        code_owner_review_ok: true,
     });
     let unapproved = Some(Merge {
         approvals: 1,
         checks_passed: true,
+        code_owner_review_ok: true,
     });
     let failing = Some(Merge {
         approvals: 2,
         checks_passed: false,
+        code_owner_review_ok: true,
     });
     use Action::*;
     #[rustfmt::skip]
@@ -408,6 +412,56 @@ fn decision_table() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn code_owner_review_requirement_blocks_merge_until_satisfied() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let protected = Ref {
+        protection: Some(Protection {
+            require_code_owner_review: true,
+            ..Protection::default()
+        }),
+        ..w.main.clone()
+    };
+    let pr = PullRequest {
+        target: protected.clone(),
+        ..w.pr.clone()
+    };
+    let ok = Some(Merge {
+        approvals: 0,
+        checks_passed: true,
+        code_owner_review_ok: true,
+    });
+    let missing = Some(Merge {
+        approvals: 0,
+        checks_passed: true,
+        code_owner_review_ok: false,
+    });
+
+    let satisfied = w.decide(
+        &engine,
+        &w.owner,
+        Action::PullRequestMerge,
+        &w.acme,
+        Resource::PullRequest(&w.private, &pr),
+        ok,
+    );
+    assert!(satisfied.is_allowed(), "{satisfied:?}");
+
+    let refused = w.decide(
+        &engine,
+        &w.owner,
+        Action::PullRequestMerge,
+        &w.acme,
+        Resource::PullRequest(&w.private, &pr),
+        missing,
+    );
+    assert_eq!(
+        refused,
+        Decision::Deny(vec!["merge-requires-code-owner-review".into()])
+    );
 }
 
 #[test]
@@ -506,6 +560,7 @@ fn hostile_custom_role_cannot_override_built_in_forbids() {
     let unapproved = Some(Merge {
         approvals: 0,
         checks_passed: false,
+        code_owner_review_ok: false,
     });
     use Action::*;
     #[rustfmt::skip]
@@ -550,6 +605,7 @@ fn inconsistent_or_incomplete_facts_fail_closed() {
     let approved = Some(Merge {
         approvals: 9,
         checks_passed: true,
+        code_owner_review_ok: true,
     });
     let invalid = |d: Decision| assert!(matches!(d, Decision::Invalid(_)), "{d:?}");
     // Repository claimed to be in the wrong organization.

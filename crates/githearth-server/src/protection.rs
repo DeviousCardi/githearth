@@ -48,13 +48,14 @@ pub struct ProtectionRule {
     pub required_status_checks: Vec<String>,
     pub dismiss_stale_approvals: bool,
     pub require_signed_commits: bool,
+    pub require_code_owner_review: bool,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const RULE_COLUMNS: &str = "id, repository_id, pattern, allow_force_push, allow_deletion, \
  require_pull_request, required_approvals, required_status_checks, \
- dismiss_stale_approvals, require_signed_commits, \
+ dismiss_stale_approvals, require_signed_commits, require_code_owner_review, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at";
 
@@ -148,6 +149,7 @@ fn protection_of(rule: &ProtectionRule) -> Protection {
         require_checks: !rule.required_status_checks.is_empty(),
         dismiss_stale_approvals: rule.dismiss_stale_approvals,
         require_signed_commits: rule.require_signed_commits,
+        require_code_owner_review: rule.require_code_owner_review,
     }
 }
 
@@ -268,6 +270,8 @@ struct NewRule {
     /// still gain server-created merge history.
     #[serde(default)]
     require_signed_commits: bool,
+    #[serde(default)]
+    require_code_owner_review: bool,
 }
 
 fn default_true() -> bool {
@@ -353,8 +357,9 @@ async fn create(
                 "INSERT INTO branch_protection_rules \
                  (id, repository_id, pattern, allow_force_push, allow_deletion, \
                   require_pull_request, required_approvals, required_status_checks, \
-                  dismiss_stale_approvals, require_signed_commits, created_by) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                  dismiss_stale_approvals, require_signed_commits, \
+                  require_code_owner_review, created_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(id)
             .bind(loaded.repo.id)
@@ -366,6 +371,7 @@ async fn create(
             .bind(&input.required_status_checks)
             .bind(input.dismiss_stale_approvals)
             .bind(input.require_signed_commits)
+            .bind(input.require_code_owner_review)
             .bind(actor.id)
             .execute(&mut *tx)
             .await;
@@ -424,6 +430,8 @@ struct PatchRule {
     dismiss_stale_approvals: Option<bool>,
     #[serde(default)]
     require_signed_commits: Option<bool>,
+    #[serde(default)]
+    require_code_owner_review: Option<bool>,
 }
 
 async fn update(
@@ -455,6 +463,7 @@ async fn update(
                 && input.required_status_checks.is_none()
                 && input.dismiss_stale_approvals.is_none()
                 && input.require_signed_commits.is_none()
+                && input.require_code_owner_review.is_none()
             {
                 return Err(invalid());
             }
@@ -504,8 +513,9 @@ async fn update(
                 "UPDATE branch_protection_rules SET pattern = $1, \
                  allow_force_push = $2, allow_deletion = $3, require_pull_request = $4, \
                  required_approvals = $5, required_status_checks = $6, \
-                 dismiss_stale_approvals = $7, require_signed_commits = $8, updated_at = now() \
-                 WHERE id = $9",
+                 dismiss_stale_approvals = $7, require_signed_commits = $8, \
+                 require_code_owner_review = $9, updated_at = now() \
+                 WHERE id = $10",
             )
             .bind(updated_pattern)
             .bind(input.allow_force_push.unwrap_or(locked.allow_force_push))
@@ -534,6 +544,11 @@ async fn update(
                 input
                     .require_signed_commits
                     .unwrap_or(locked.require_signed_commits),
+            )
+            .bind(
+                input
+                    .require_code_owner_review
+                    .unwrap_or(locked.require_code_owner_review),
             )
             .bind(id)
             .execute(&mut *tx)
@@ -651,6 +666,7 @@ mod tests {
             required_status_checks: Vec::new(),
             dismiss_stale_approvals: true,
             require_signed_commits: false,
+            require_code_owner_review: false,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -786,8 +802,8 @@ mod tests {
         // Create a rule and bump the generation exactly as create/update/delete do.
         sqlx::query(
             "INSERT INTO branch_protection_rules \
-             (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, required_status_checks, created_by) \
-             VALUES ($1, $2, 'main', false, false, true, 2, '{}', $3)",
+             (id, repository_id, pattern, allow_force_push, allow_deletion, require_pull_request, required_approvals, required_status_checks, require_code_owner_review, created_by) \
+             VALUES ($1, $2, 'main', false, false, true, 2, '{}', false, $3)",
         )
         .bind(Uuid::new_v4())
         .bind(repo)
@@ -861,6 +877,7 @@ mod tests {
             r.require_pull_request = true;
             r.required_approvals = 7;
             r.required_status_checks = vec!["ci".to_owned()];
+            r.require_code_owner_review = true;
         });
         let rules2 = [force];
         let p = matching(&rules2, "refs/heads/force/x").unwrap();
@@ -868,6 +885,7 @@ mod tests {
         assert!(p.require_pull_request);
         assert_eq!(p.required_approvals, 7);
         assert!(p.require_checks);
+        assert!(p.require_code_owner_review);
         assert_eq!(
             required_status_checks(&rules2, "refs/heads/force/x"),
             vec!["ci".to_owned()]

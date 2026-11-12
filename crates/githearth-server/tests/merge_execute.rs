@@ -643,24 +643,26 @@ async fn second_call_returns_already_merged_without_a_second_ref_update() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn conflicting_branches_return_conflicted_and_leave_the_ref() {
+async fn execute_intent_conflicts_and_leaves_the_ref() {
     let f = build_fixture(true).await;
-    let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    let before = main_tip(&f).await;
+
+    // The API refuses a conflicting merge up front and records a `conflicted`
+    // intent. Drive that row to `executing` so the worker's own safety-net path
+    // (`execute_intent` -> `MergeOutcome::Conflicted`) stays covered.
+    let (status, body) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["state"], "conflicted");
+    let op: Uuid = body["operation_id"].as_str().unwrap().parse().unwrap();
     set_intent_executing(&f.pool, op).await;
 
-    let before = main_tip(&f).await;
     let outcome = execute_intent(&f.state, op).await.unwrap();
-    match outcome {
-        MergeOutcome::Conflicted { paths } => {
-            assert!(
-                paths.iter().any(|p| p.contains("README")),
-                "conflicting path reported: {paths:?}"
-            );
+    assert_eq!(
+        outcome,
+        MergeOutcome::Conflicted {
+            paths: vec!["README.md".to_owned()]
         }
-        other => panic!("expected Conflicted, got {other:?}"),
-    }
+    );
     assert_eq!(main_tip(&f).await, before, "the ref must not move");
 
     finish(f).await;
