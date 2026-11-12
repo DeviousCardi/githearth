@@ -93,16 +93,17 @@ Larger repositories, more concurrency or more users need their own measurement.
 
 ## Remaining scope
 
-The harness does **not** cover the following M4 exit items:
+Items previously listed here that are now verified elsewhere:
 
-- **Independent installation.** The harness automates the runbook. An install by a person who has not seen the code, on a clean Linux host, is still to be done.
-- **TLS ingress and session/TLS defaults.** The harness uses plain HTTP on loopback.
-- **Disk-full on the host filesystem.** s8 fills a tmpfs inside the container; a full host disk under PostgreSQL is not exercised.
-- **The `compose.yaml` file itself.** Covered by s13, which runs the real compose file with ephemeral ports.
-- **Off-host backup.** The backup and restore run on the same host.
+- **TLS ingress and session/TLS defaults.** Verified by [tls.md](tls.md); the runbook's nginx configuration works end to end for the UI, the API and Smart HTTP Git, and the session and cookie defaults are tabulated in [tls.md](../operations/tls.md#session-and-tls-defaults).
+- **Disk-full on the host filesystem under PostgreSQL.** Verified by [db-disk-full.md](db-disk-full.md); repository storage running out of space is drilled separately (s8).
+- **Off-host backup.** Verified by [offhost-backup.md](offhost-backup.md); the runbook's off-host copy procedure restores a lost primary.
+- **License files and notices, and accessibility review.** In review as PR #109, which adds `docs/verification/accessibility.md` (WCAG 2.2 AA basics) and `docs/operations/third-party-notices.md` (the `LICENSE` file, a generated `THIRD_PARTY_NOTICES`, and a stale check in `scripts/ci.sh`).
+
+Still genuinely open:
+
+- **Independent installation.** The harness automates the runbook. An install by a person who has not seen the code, on a clean Linux host, is still to be done; the sign-off checklist is in [m4-signoff.md](m4-signoff.md).
 - **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are not measured.
-- **License files and notices, and accessibility review.** Not part of this harness.
-- **SHA-256 repositories and public/internal visibility.** Covered by s11 and s12 (and by the Rust integration tests in `tests/visibility.rs` and `tests/repository_api.rs`).
 - **Online (non-maintenance-window) backup.** Not implemented; backup/restore is maintenance-window-only (s4). This is documented precisely below.
 
 ## Online backup: maintenance-window-only
