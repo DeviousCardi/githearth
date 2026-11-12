@@ -338,7 +338,12 @@ pub(crate) async fn fetch_cross_repo_head(
             "storage operation failed",
         )
     })?
-    .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "repository storage unavailable"))
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository storage unavailable",
+        )
+    })
 }
 
 async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, ApiError> {
