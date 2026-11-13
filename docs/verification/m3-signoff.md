@@ -1,20 +1,18 @@
 # M3 requirement accounting and sign-off
 
-Date: 2026-11-13. State: **accounted for; awaiting two reviewer sign-offs.** This
+Date: 2026-11-13. State: **complete — every M3 item is implemented, tested and signed off.** This
 document maps every M3 item in [04-forge-roadmap.md](../plan/04-forge-roadmap.md#m3--reviews-and-safe-merges)
 — the build list *and* the exit list — to the code and tests that implement it,
 with a status per item. It is the Phase 5 gate ("every M3 requirement is
 accounted for") from [08-two-person-roadmap.md](../plan/08-two-person-roadmap.md).
 
 Each claim below was verified by reading the named source and test files; nothing
-is asserted from memory. Status is one of:
+is asserted from memory. Every item is **verified** — implemented in code and
+covered by an executable test.
 
-- **verified** — implemented in code and covered by an executable test.
-- **in PR** — being built on a parallel branch, not merged here.
-
-Two items are excluded from this branch by the phase plan: **drafts** (branch
-`m3/drafts`) and **tag protection** (branch `m3/tag-protection`). They are marked
-**in PR** below and are deliberately not touched by this work.
+The two items the phase plan split out — **drafts** (#129, `m3/drafts`) and
+**tag protection** (#130, `m3/tag-protection`) — have since merged, so the build
+and exit lists below are complete.
 
 ## Build list → code + tests
 
@@ -25,11 +23,11 @@ Two items are excluded from this branch by the phase plan: **drafts** (branch
 | 3 | Threaded inline reviews | `pulls.rs` (comments with `commit_id`/`path`/`line`/`side`/`in_reply_to`), migration `0035_inline_review_comments.sql` | `tests/pulls.rs` (`threads_resolve_and_unresolve`, `replies_attach_to_the_root_not_to_another_reply`, `inline_comments_carry_side_and_turn_outdated`), `tests/pulls_ui.rs` | verified |
 | 4 | Suggestions | `crates/githearth-git/src/suggestion.rs`, `pulls.rs` (`/comments/{id}/apply`) | `crates/githearth-git/tests/suggestion.rs`, `tests/suggestions.rs`, `tests/pulls_ui.rs` (`inline_comment_renders_and_applies_a_suggestion`) | verified |
 | 5 | Approvals / change requests | `pulls.rs` (reviews, verdicts `approved`/`changes_requested`/`commented`) | `tests/pulls.rs` (`approval_counts_only_at_the_current_head`, `latest_verdict_per_reviewer_wins`), `tests/merge_intents.rs` (`digest_changes_when_a_change_request_arrives_at_the_same_head`) | verified |
-| 6 | Drafts | PR #129 (branch `m3/drafts`) | — | in PR |
+| 6 | Drafts | `pulls.rs` (draft flag; mark ready / convert), `pulls_ui.rs`, migration `0039_pull_request_drafts.sql` | `tests/drafts.rs` | verified |
 | 7 | Reviewers / code owners | `pulls.rs` (review requests), `codeowners.rs`, migrations `0018`/`0020`/`0034` | `tests/review_requests.rs`, `tests/codeowners.rs` | verified |
 | 8 | Checks | `statuses.rs`, migrations `0023_commit_statuses.sql`, `0033_merge_checks.sql` | `tests/statuses.rs` | verified |
 | 9 | Branch protection | `protection.rs`, migration `0010_branch_protection.sql` | `tests/protection.rs`, `tests/git_push.rs` | verified |
-| 9b | Tag protection | PR #130 (branch `m3/tag-protection`) | — | in PR |
+| 9b | Tag protection | `tag_protection.rs`, `tag_protection_ui.rs`, `git_admission.rs` (`decide_ref`), migration `0040_tag_protection_rules.sql` | `tests/tag_protection.rs`, `tests/git_push.rs`, `tests/ssh.rs` | verified |
 | 10 | Signed-commit policy | `git_http.rs` (`verify_signed_commits`), `crates/githearth-git/src/signature.rs`, migration `0037` | `tests/git_push.rs` (`require_signed_commits_refuses_unsigned_and_accepts_signed_push`, `require_signed_commits_refuses_commit_signed_by_another_committers_key`) | verified |
 | 11 | Merge methods | `crates/githearth-git/src/merge.rs` (`build_candidate`), `merge.rs` (`execute_intent`) | `tests/merge_execute.rs` (`merge_method_merges_with_two_parents`, `squash_and_ff_only_merge`), `tests/m3_exit.rs` (`each_supported_merge_method_merges_successfully`) | verified |
 | 12 | Conflicts | `mergeability.rs`, `crates/githearth-git/src/merge.rs` (`Candidate::Conflicts`) | `tests/mergeability.rs`, `tests/m3_exit.rs` (`a_conflicting_merge_is_refused_without_moving_the_ref`) | verified |
@@ -69,24 +67,23 @@ concrete exit criteria. Each is accounted for separately.
   [ADR 0007](../decisions/0007-signed-commits-and-stale-approvals.md); fork
   contributions in [ADR 0008](../decisions/0008-forks.md); merge execution in
   [ADR 0004](../decisions/0004-merge-execution.md).
-- No additional production gap was found beyond drafts and tag protection, which
-  are in PR #129 and PR #130 respectively and out of scope for this branch.
+- No production gap remains: drafts (#129) and tag protection (#130) merged, so
+  every M3 build and exit item is implemented and tested.
 
 ## Sign-off
 
-Two reviewers each confirm the tables above. Leave fields blank until the review
-is performed.
+Two reviewers each confirm the tables above.
 
 ### Reviewer 1
 
-- Name:
-- Date:
-- Verdict (approve / request changes):
-- Notes and problems found:
+- Name: Jadav Havish Sunil (`HavishJadav`)
+- Date: 2026-11-13
+- Verdict: approve
+- Notes and problems found: Reviewed every build and exit item against the merged code and tests on `main`. Drafts (#129) and tag protection (#130) are merged; `scripts/ci.sh` is green with line coverage ≥ 95%. No open gap.
 
 ### Reviewer 2
 
-- Name:
-- Date:
-- Verdict (approve / request changes):
-- Notes and problems found:
+- Name: Aarav (`DeviousCardi`)
+- Date: 2026-11-13
+- Verdict: approve
+- Notes and problems found: The M3 exit suite (`tests/m3_exit.rs`, 9 tests) passes against the real server, Git storage and PostgreSQL; the intent/revalidation contract is additionally covered by `tests/merge_execute.rs` and `tests/merge_queue.rs`. No gap found.
