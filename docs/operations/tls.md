@@ -7,10 +7,12 @@ TLS terminates at a reverse proxy on the same host.
 - **GitHearth** binds `127.0.0.1:8080` (plain HTTP, loopback only).
 - **SSH (2222)** is served directly by GitHearth — not proxied.
 - The reverse proxy handles TLS, HSTS, and forwards requests to `127.0.0.1:8080`.
-- The app currently does **not** consume `X-Forwarded-For`, `X-Forwarded-Proto`, or
-  `X-Forwarded-Host` headers. It performs no IP-based rate limiting, audit
-  logging of client IPs, cookie domain filtering, or host header validation.
-  These headers are included in the recommended config for future use.
+- `X-Forwarded-For` is consumed when the proxy address is listed in
+  `trusted_proxies`: the resolved client IP is written to audit events. The app
+  does not consume `X-Forwarded-Proto` or `X-Forwarded-Host`, performs no
+  IP-based rate limiting, and does not filter cookie domains or validate the
+  Host header; set `trusted_proxies` to the proxy's address (not a public
+  range).
 
 ## nginx configuration
 
@@ -115,19 +117,19 @@ GitHearth does not need to be restarted — it never sees the certificate.
 | CSRF token size | 128 bits (16 bytes hex → 32 chars) | `ui.rs:317` |
 | Auth concurrency (login throttling) | 2 concurrent argon2 verifications; queue 2 s timeout | `config.rs:64`, `lib.rs:506` |
 | `Cache-Control: no-store` (API) | all JSON + git responses | `lib.rs:347` |
-| `Cache-Control: no-store` (UI) | all browser pages | `ui.rs:687` |
-| `Cache-Control: no-cache` (Git) | info_refs, upload-pack, receive-pack | `git_http.rs:158,301,517` |
-| `X-Frame-Options: DENY` | all browser pages | `ui.rs:688` |
-| `X-Content-Type-Options: nosniff` | **missing** | — |
-| `Referrer-Policy` | **missing** | — |
-| `Content-Security-Policy` | **missing** | listed as future M2 work in `docs/plan/07-qualification-and-decisions.md:72` |
-| `X-Forwarded-*` consumption | **none** — no IP-based rate limiting, audit, cookie domain, or host validation | `config.rs`, `lib.rs`, `ui.rs` |
+| `Cache-Control: no-store` (UI) | all browser pages | `ui.rs` `page_headers` |
+| `Cache-Control: no-cache` (Git) | info_refs, upload-pack, receive-pack | `git_http.rs` |
+| `X-Frame-Options: DENY` | all browser pages | `ui.rs` `page_headers` |
+| `X-Content-Type-Options: nosniff` | all responses | `lib.rs` `security_headers` |
+| `Referrer-Policy: same-origin` | all responses | `lib.rs` `security_headers` |
+| `Content-Security-Policy` | all browser pages (`default-src 'none'`, inline styles only, `frame-ancestors 'none'`) | `ui.rs` `PAGE_CSP` |
+| `X-Forwarded-For` consumption | trusted proxies only (`trusted_proxies`), used for the audit client IP | `client_ip.rs`, `lib.rs` |
+| `X-Forwarded-Proto` / `X-Forwarded-Host` | not consumed; no IP-based rate limiting, cookie-domain filtering or Host validation | `client_ip.rs` |
 
-### Gaps (filed as issues)
+### Remaining gaps
 
-1. **`X-Content-Type-Options: nosniff`** (#87) — not set on any response.
-2. **`Referrer-Policy`** (#87) — not set (suggest `strict-origin-when-cross-origin`).
-3. **`Content-Security-Policy`** (#87) — not set. Listed as planned pre-M2 work in
-   `docs/plan/07-qualification-and-decisions.md` but never implemented.
-4. **No consumption of `X-Forwarded-*` headers** (#88) — client IP is not available
-   for audit logs or rate limiting behind a proxy.
+1. **`X-Forwarded-Proto` / `X-Forwarded-Host`** are not consumed, and there is no
+   IP-based rate limiting or Host-header validation. The proxy is expected to
+   enforce the public hostname and TLS; set `secure_cookies = true` behind TLS.
+2. **HSTS** is set by the reverse proxy, not the app (the app may serve plain
+   loopback HTTP). The nginx example below sets it.

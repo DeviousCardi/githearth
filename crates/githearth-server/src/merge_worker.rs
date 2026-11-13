@@ -211,8 +211,23 @@ async fn run_intent(state: &AppState, claim: &Claim) -> Result<(), MergeError> {
     let outcome = match execute_intent(state, claim.operation_id).await {
         Ok(outcome) => outcome,
         // 3. Err(MergeError): log and leave the row; the lease expires and it
-        // is retried later.
+        // is retried later. A deterministic storage/join failure does not
+        // benefit from waiting out the lease, so release it to retry on the
+        // next pass; attempts stay bounded by MAX_ATTEMPTS. A database error
+        // keeps the lease so an outage does not burn attempts.
         Err(error) => {
+            if !matches!(error, MergeError::Database(_)) {
+                let _ = sqlx::query(
+                    "UPDATE merge_intents SET lease_expires_at = now() - interval '1 second', \
+                     updated_at = now() \
+                     WHERE operation_id = $1 AND lease_holder = $2 AND lease_attempt = $3",
+                )
+                .bind(claim.operation_id)
+                .bind(holder())
+                .bind(claim.attempt)
+                .execute(&state.pool)
+                .await;
+            }
             tracing::warn!(
                 operation_id = %claim.operation_id,
                 error = %error,

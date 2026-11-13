@@ -164,11 +164,11 @@ fn checked_key<'a>(s: &Session, key: &'a str) -> Result<&'a str, ui::UiError> {
 }
 
 fn title_ok(title: &str) -> bool {
-    !title.trim().is_empty() && title.chars().count() <= 256
+    !crate::issues::blank_text(title) && title.chars().count() <= 256
 }
 
 fn comment_ok(body: &str) -> bool {
-    !body.trim().is_empty() && body.chars().count() <= 65536
+    !crate::issues::blank_text(body) && body.chars().count() <= 65536
 }
 
 /// Usernames for the given account ids; unknown ids are simply absent.

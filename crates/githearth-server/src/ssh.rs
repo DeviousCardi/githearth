@@ -6,7 +6,7 @@ use crate::{
     git_admission::{self, Want},
     pushes,
 };
-use anyhow::{Context, bail};
+use anyhow::Context;
 use futures_util::future::BoxFuture;
 use githearth_git::layout;
 use std::{
@@ -55,10 +55,12 @@ pub fn generate_host_key(path: &Path) -> anyhow::Result<()> {
         .mode(0o600)
         .open(path)
     {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!(
-            "host key already exists at {}; refusing to overwrite",
-            path.display()
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Idempotent: the Compose one-shot service runs this on every
+            // `docker compose up`, and a persisted volume already has a key.
+            tracing::info!(path = %path.display(), "SSH host key already exists; keeping it");
+            return Ok(());
+        }
         other => other.context("cannot write host key")?,
     };
     file.write_all(&pem).context("cannot write host key")?;
@@ -392,6 +394,14 @@ impl russh::server::Handler for SshHandler {
         {
             Ok(c) => c,
             Err(e) => {
+                // The credential was recorded before spawning; a push that
+                // never starts must not leave it dangling (issue #143).
+                if let Some(op_id) = operation {
+                    let _ = sqlx::query("DELETE FROM push_credentials WHERE operation_id = $1")
+                        .bind(op_id)
+                        .execute(&state.pool)
+                        .await;
+                }
                 tracing::error!(category = "git", repository_id = %repo_id, "cannot spawn git: {e}");
                 return refuse(
                     session,
@@ -433,6 +443,25 @@ impl russh::server::Handler for SshHandler {
                     drop(repo_guard);
                     if let Err(e) = pushes::replay(&state, repo_id).await {
                         tracing::warn!(repository_id = %repo_id, error = %e, "post-push journal replay failed; reconciler will retry");
+                    }
+                    // A refused push leaves no `repository_pushes` row; remove
+                    // the credential recorded before spawning so it does not
+                    // overstate push activity (issue #143, SSH path).
+                    if let Some(op_id) = operation
+                        && let Err(e) = sqlx::query(
+                            "DELETE FROM push_credentials \
+                             WHERE operation_id = $1 AND NOT EXISTS (\
+                               SELECT 1 FROM repository_pushes p WHERE p.operation_id = $1)",
+                        )
+                        .bind(op_id)
+                        .execute(&state.pool)
+                        .await
+                    {
+                        tracing::warn!(
+                            repository_id = %repo_id,
+                            error = %e,
+                            "cannot remove the credential of a refused push"
+                        );
                     }
                 }
 
@@ -853,14 +882,16 @@ mod tests {
     }
 
     #[test]
-    fn generate_key_refuses_overwrite() {
+    fn generate_key_keeps_an_existing_key() {
         let dir = std::env::temp_dir().join(format!("githearth-ssh-key-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let key_path = dir.join("host_key");
         std::fs::write(&key_path, "existing").unwrap();
-        assert!(
-            generate_host_key(&key_path).is_err(),
-            "must refuse overwrite"
+        generate_host_key(&key_path).expect("an existing key is not an error");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            "existing",
+            "must not overwrite"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

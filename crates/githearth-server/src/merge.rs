@@ -297,6 +297,13 @@ pub async fn execute_intent(
             dismiss,
         )
         .await?;
+        let outstanding = crate::merge_intents::outstanding_change_requests(
+            &mut conn,
+            intent.pull_request_id,
+            &intent.source_oid,
+            dismiss,
+        )
+        .await?;
         // Required checks are re-read at the intent's exact source oid, so a
         // status posted for any other commit cannot satisfy them, and a status
         // changed since the intent was recorded makes the digest stale.
@@ -319,6 +326,11 @@ pub async fn execute_intent(
         if digest != intent.checks_approvals_digest {
             return Ok(MergeOutcome::Stale {
                 reason: "approvals or checks changed".into(),
+            });
+        }
+        if outstanding > 0 {
+            return Ok(MergeOutcome::Stale {
+                reason: "an outstanding change request blocks the merge".into(),
             });
         }
 

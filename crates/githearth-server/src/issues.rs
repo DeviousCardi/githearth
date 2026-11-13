@@ -184,10 +184,25 @@ async fn create(
     Ok((status, Json(serde_json::from_value(value).unwrap())))
 }
 
+/// Characters that render as blank but are not Unicode whitespace (for
+/// example a zero-width space), so text made only of them is refused like an
+/// empty string.
+pub(crate) fn blank_text(value: &str) -> bool {
+    value
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+                )
+        })
+        .is_empty()
+}
+
 fn new_issue(body: &[u8]) -> Result<NewIssue, ApiError> {
     let input: NewIssue = serde_json::from_slice(body).map_err(|_| invalid())?;
     // Blank titles and comments are refused by the API and the pages alike.
-    if input.title.trim().is_empty()
+    if blank_text(&input.title)
         || input.title.chars().count() > 256
         || input.body.chars().count() > 65536
     {
@@ -400,7 +415,7 @@ fn validate_patch(input: &PatchIssue) -> Result<(), ApiError> {
         return Err(invalid());
     }
     if let Some(ref t) = input.title
-        && (t.trim().is_empty() || !(1..=256).contains(&t.chars().count()))
+        && (blank_text(t) || !(1..=256).contains(&t.chars().count()))
     {
         return Err(invalid());
     }
@@ -553,7 +568,7 @@ async fn create_comment(
 
 fn new_comment(body: &[u8]) -> Result<NewComment, ApiError> {
     let input: NewComment = serde_json::from_slice(body).map_err(|_| invalid())?;
-    if input.body.trim().is_empty() || input.body.chars().count() > 65536 {
+    if blank_text(&input.body) || input.body.chars().count() > 65536 {
         return Err(invalid());
     }
     Ok(input)

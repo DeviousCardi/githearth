@@ -212,6 +212,11 @@ async fn review_requested(state: &AppState, job: &Job) -> JobOutcome {
         Ok(id) => id,
         Err(failed) => return failed,
     };
+    // Requesting yourself is not a notification (the other handlers skip
+    // self-notifications too).
+    if reviewer_id == requested_by {
+        return JobOutcome::Done;
+    }
 
     insert_notification(
         state,

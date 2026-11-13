@@ -207,7 +207,7 @@ pub(crate) async fn create(
 
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
-    if !valid_repo_name(&input.name) || input.description.len() > 1000 {
+    if !valid_repo_name(&input.name) || input.description.chars().count() > 1000 {
         return Err(invalid());
     }
     if let Some(ref v) = input.visibility
@@ -496,7 +496,7 @@ pub(crate) async fn update(
                 return Err(invalid());
             }
             if let Some(ref desc) = input.description
-                && desc.len() > 1000
+                && desc.chars().count() > 1000
             {
                 return Err(invalid());
             }

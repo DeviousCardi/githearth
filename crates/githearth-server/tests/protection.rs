@@ -206,19 +206,32 @@ async fn create_list_update_delete_with_generation_bumps() {
     assert_eq!(body["generation"], 1);
     assert_eq!(body["items"][0]["pattern"], "main");
 
-    // Update.
+    // Update: `pattern` is the documented field (a `path` alias is accepted).
     let (status, body) = request(
         &app,
         "PATCH",
         &format!("{base}/{rule_id}"),
         Some(&token),
         None,
-        json!({"required_status_checks": ["ci"], "allow_force_push": false}),
+        json!({"pattern": "release/*", "required_status_checks": ["ci"], "allow_force_push": false}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pattern"], "release/*");
     assert_eq!(body["required_status_checks"], json!(["ci"]));
     assert_eq!(body["allow_force_push"], false);
+
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("{base}/{rule_id}"),
+        Some(&token),
+        None,
+        json!({"path": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pattern"], "main", "legacy `path` alias still works");
 
     let generation: i64 = sqlx::query_scalar(
         "SELECT generation FROM protection_generations WHERE repository_id = $1",
@@ -227,7 +240,7 @@ async fn create_list_update_delete_with_generation_bumps() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(generation, 2);
+    assert_eq!(generation, 3, "each update bumps the generation");
 
     // Delete.
     let (status, _) = request(
@@ -248,7 +261,7 @@ async fn create_list_update_delete_with_generation_bumps() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(generation, 3);
+    assert_eq!(generation, 4);
 
     let (_, body) = request(&app, "GET", &base, Some(&token), None, Value::Null).await;
     assert_eq!(body["items"].as_array().unwrap().len(), 0);

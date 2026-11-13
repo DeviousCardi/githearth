@@ -1,6 +1,6 @@
 # M1: experimental server foundation
 
-The `githearth-server` binary runs independently of the existing local `githearth` Git prototype. M1 provides PostgreSQL migrations, one-time administrator bootstrap, password login, expiring/revocable bearer sessions, and membership-scoped organizations. It has no public account registration, Git HTTP/SSH transport, issue/review workflow, CI, UI, or replicated storage.
+The `githearth-server` binary runs independently of the existing local `githearth` Git prototype. M1 provides PostgreSQL migrations, one-time administrator bootstrap, password login, expiring/revocable bearer sessions, and membership-scoped organizations. Git HTTP/SSH hosting, issues, pull requests and reviews, the server-rendered UI, forks, protection rules and single-node operations are implemented and documented in the sections below. It has no public account registration, CI execution, packaging/security scanning, or replicated storage.
 
 ## Local Docker Compose
 
@@ -163,7 +163,7 @@ The server-rendered UI is available at `http://127.0.0.1:8080/`. Sign in with th
 
 ## Issue pages (M2)
 
-Signed-in browsers can list a repository's issues (open, closed or all, 30 per page, newest first), open an issue with its comments (30 per page, oldest first), create an issue and add a comment at `/organizations/{org}/repositories/{repo}/issues`. The pages use the browser session cookie; every form carries the session's CSRF token (a bad token gets 403) and a fresh idempotency key, so a double submit or a resent POST replays the first result instead of creating a duplicate. Blank titles and comments are refused by both the pages and the API. They call the same functions as the JSON issue API, so authorization, validation, idempotency storage and audit and outbox events are identical. Closing, reopening and editing issues are API-only.
+Signed-in browsers can list a repository's issues (open, closed or all, 30 per page, newest first), open an issue with its comments (30 per page, oldest first), create an issue and add a comment at `/organizations/{org}/repositories/{repo}/issues`. The pages use the browser session cookie; every form carries the session's CSRF token (a bad token gets 403) and a fresh idempotency key, so a double submit or a resent POST replays the first result instead of creating a duplicate. Blank titles and comments are refused by both the pages and the API. They call the same functions as the JSON issue API, so authorization, validation, idempotency storage and audit and outbox events are identical. Closing, reopening and editing issues work from the browser pages as well as the JSON API.
 
 ## Pull requests (M3 step 1)
 

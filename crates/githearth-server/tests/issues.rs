@@ -804,6 +804,23 @@ async fn invalid_input_400() {
             format!("{}/1/comments", issues_path(&slug, "v")),
             json!({"body": ""}),
         ),
+        // Zero-width-only titles and comments render blank and must be refused
+        // like ordinary whitespace.
+        (
+            "POST",
+            issues_path(&slug, "v"),
+            json!({"title": "\u{200b}"}),
+        ),
+        (
+            "PATCH",
+            format!("{}/1", issues_path(&slug, "v")),
+            json!({"title": "\u{feff}"}),
+        ),
+        (
+            "POST",
+            format!("{}/1/comments", issues_path(&slug, "v")),
+            json!({"body": "\u{200b}"}),
+        ),
     ];
 
     for (method, path, body) in cases {

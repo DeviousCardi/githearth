@@ -591,7 +591,10 @@ pub(crate) async fn maybe_auto_merge(
         "expected_head_oid": &input.expected_head_oid,
     })
     .to_string();
-    match merge_intents::create_intent(
+    // A conflicting merge is recorded once as a `conflicted` intent and later
+    // triggers reuse it (see `create_intent`); the auto-merge row stays
+    // enabled so a push that resolves the conflict raises a fresh intent.
+    let _ = merge_intents::create_intent(
         state,
         enabled_by,
         0,
@@ -602,25 +605,7 @@ pub(crate) async fn maybe_auto_merge(
         None,
         &input,
     )
-    .await
-    {
-        // A permanently conflicting pull request can never merge: cancel the
-        // auto-merge so later triggers (a status, a review, a push) don't keep
-        // raising fresh `conflicted` intents and audit events for it.
-        Ok((_, intent)) if intent.state == "conflicted" => {
-            let mut tx = state.pool.begin().await?;
-            cancel_in_tx(
-                &mut tx,
-                repo.organization_id,
-                actor,
-                pull_request_id,
-                Some("merge conflicts"),
-            )
-            .await?;
-            tx.commit().await?;
-        }
-        _ => {}
-    }
+    .await;
     Ok(())
 }
 

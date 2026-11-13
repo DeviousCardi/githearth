@@ -52,6 +52,12 @@ fn already_queued() -> ApiError {
         "an open merge intent already exists for this pull request",
     )
 }
+fn changes_requested() -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        "the pull request has an outstanding change request",
+    )
+}
 fn executing() -> ApiError {
     ApiError(StatusCode::CONFLICT, "merge intent is already executing")
 }
@@ -192,6 +198,43 @@ pub(crate) async fn approvals_latest(
     .bind(pull_request_id)
     .fetch_one(&mut *conn)
     .await
+}
+
+/// The number of reviewers whose latest non-comment verdict is
+/// `changes_requested`, in the same scope approvals use: at `source_oid` when
+/// stale reviews are dismissed, across every commit otherwise. An outstanding
+/// change request blocks a merge (GitHub semantics), even if other reviewers
+/// have approved.
+pub(crate) async fn outstanding_change_requests(
+    conn: &mut PgConnection,
+    pull_request_id: Uuid,
+    source_oid: &str,
+    dismiss_stale_approvals: bool,
+) -> Result<i64, sqlx::Error> {
+    if dismiss_stale_approvals {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM (\
+               SELECT DISTINCT ON (reviewer_id) verdict FROM pull_request_reviews \
+               WHERE pull_request_id = $1 AND commit_id = $2 AND verdict <> 'commented' \
+               ORDER BY reviewer_id, seq DESC\
+             ) latest WHERE verdict = 'changes_requested'",
+        )
+        .bind(pull_request_id)
+        .bind(source_oid)
+        .fetch_one(&mut *conn)
+        .await
+    } else {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM (\
+               SELECT DISTINCT ON (reviewer_id) verdict FROM pull_request_reviews \
+               WHERE pull_request_id = $1 AND verdict <> 'commented' \
+               ORDER BY reviewer_id, seq DESC\
+             ) latest WHERE verdict = 'changes_requested'",
+        )
+        .bind(pull_request_id)
+        .fetch_one(&mut *conn)
+        .await
+    }
 }
 
 /// The reviewer ids whose latest non-comment review is on any commit, sorted by
@@ -378,9 +421,15 @@ pub(crate) async fn may_merge(
     .await?;
     let mut conn = state.pool.acquire().await?;
     let facts = approval_facts(&mut conn, pull.id, head, dismiss).await?;
+    let outstanding = outstanding_change_requests(&mut conn, pull.id, head, dismiss).await?;
     let checks_passed =
         statuses::checks_passed(&mut conn, loaded.repo.id, head, &required_checks).await?;
     drop(conn);
+    // The merge form must not offer a merge an outstanding change request
+    // blocks, so it agrees with `create_intent`.
+    if outstanding > 0 {
+        return Ok(false);
+    }
     let code_owner_review_ok = match base.as_deref() {
         Some(base) => {
             crate::codeowners::review(
@@ -513,6 +562,9 @@ pub(crate) async fn create_intent(
             let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
             let mut conn = state.pool.acquire().await?;
             let facts = approval_facts(&mut conn, pull.id, &head, dismiss).await?;
+            // An outstanding change request blocks the merge, like GitHub.
+            let outstanding =
+                outstanding_change_requests(&mut conn, pull.id, &head, dismiss).await?;
             let check_states = statuses::latest_required_states(
                 &mut conn,
                 loaded.repo.id,
@@ -521,6 +573,10 @@ pub(crate) async fn create_intent(
             )
             .await?;
             drop(conn);
+
+            if outstanding > 0 {
+                return Err(changes_requested());
+            }
 
             let checks_passed = statuses::all_success(&required_checks, &check_states);
             let code_owner_review_ok = crate::codeowners::review(
@@ -575,6 +631,36 @@ pub(crate) async fn create_intent(
                         return Err(issues::not_active());
                     }
                     pulls::require_open(&mut tx, pull.id).await?;
+                    // A repeated trigger on a permanently conflicting pull
+                    // request reuses the recorded conflict instead of piling up
+                    // duplicate rows and audit events (issue #141).
+                    let existing: Option<Uuid> = sqlx::query_scalar(
+                        "SELECT operation_id FROM merge_intents \
+                         WHERE pull_request_id = $1 AND state = 'conflicted' \
+                           AND source_oid = $2 AND method = $3 AND target_ref = $4 \
+                         ORDER BY created_at DESC LIMIT 1",
+                    )
+                    .bind(pull.id)
+                    .bind(&head)
+                    .bind(&input.method)
+                    .bind(&pull.target_branch)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some(existing_id) = existing {
+                        let intent: MergeIntentJson = sqlx::query_as(&format!(
+                            "SELECT {INTENT_COLUMNS} FROM merge_intents WHERE operation_id = $1"
+                        ))
+                        .bind(existing_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        let status = StatusCode::CONFLICT;
+                        let body = serde_json::to_value(&intent).unwrap();
+                        if !idem.store(&mut tx, status, &body).await? {
+                            return Err(idempotency::claim_lost());
+                        }
+                        tx.commit().await?;
+                        return Ok((status, body));
+                    }
                     sqlx::query(
                         "INSERT INTO merge_intents \
                          (operation_id, repository_id, pull_request_id, source_ref, source_oid, \
@@ -631,6 +717,19 @@ pub(crate) async fn create_intent(
             // Re-check under the pull request row lock that a concurrent close
             // could not slip in between the earlier read and this insert.
             pulls::require_open(&mut tx, pull.id).await?;
+            // A push by the enabler re-targets the auto-merge row and re-drives
+            // the intent; a queued intent recorded for the previous head is
+            // obsolete, so cancel it instead of refusing "already queued"
+            // (which stalled the auto-merge after the enabler's own push).
+            sqlx::query(
+                "UPDATE merge_intents SET state = 'cancelled', updated_at = now() \
+                 WHERE pull_request_id = $1 AND state IN ('queued', 'validating') \
+                   AND source_oid <> $2",
+            )
+            .bind(pull.id)
+            .bind(&head)
+            .execute(&mut *tx)
+            .await?;
             let inserted = sqlx::query(
                 "INSERT INTO merge_intents \
                  (operation_id, repository_id, pull_request_id, source_ref, source_oid, \

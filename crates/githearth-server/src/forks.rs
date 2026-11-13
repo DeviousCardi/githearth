@@ -87,7 +87,10 @@ pub(crate) async fn create_fork(
     let input: NewFork = serde_json::from_slice(body).map_err(|_| invalid())?;
     let fork_name = input.name.clone().unwrap_or_else(|| repo_name.to_owned());
     if !repository_api::valid_repo_name(&fork_name)
-        || input.description.as_deref().is_some_and(|d| d.len() > 1000)
+        || input
+            .description
+            .as_deref()
+            .is_some_and(|d| d.chars().count() > 1000)
         || input.organization.trim().is_empty()
     {
         return Err(invalid());
@@ -119,6 +122,11 @@ pub(crate) async fn create_fork(
         ))
         .is_allowed()
     {
+        // An organization member who lacks the create grant gets 403; only a
+        // stranger gets 404, matching repository creation (issue #133).
+        if target_facts.account.organizations.contains(&target_org_id) {
+            return Err(ApiError(StatusCode::FORBIDDEN, "not permitted"));
+        }
         return Err(org_not_found());
     }
     drop(conn);

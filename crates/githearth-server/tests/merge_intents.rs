@@ -899,8 +899,9 @@ async fn digest_changes_when_a_change_request_arrives_at_the_same_head() {
         .unwrap()
         .to_string();
 
-    // Cancel, then the same reviewer requests changes at the same head.
-    request(&f.app, "DELETE", &merge, Some(&f.token), None, Value::Null).await;
+    // The same reviewer requests changes at the same head: a fresh merge is
+    // refused while the request stands, even though the earlier approval is
+    // still on record.
     let (status, _) = approve(
         &f,
         f.number,
@@ -910,7 +911,18 @@ async fn digest_changes_when_a_change_request_arrives_at_the_same_head() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an outstanding change request blocks the merge"
+    );
 
+    // Cancel the first intent; the reviewer approves again, clearing the
+    // change request, and a fresh intent records a different digest.
+    request(&f.app, "DELETE", &merge, Some(&f.token), None, Value::Null).await;
+    let (status, _) = approve(&f, f.number, "approved", &f.feature_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
     let (status, second) = create_merge_intent(&f, "merge", &f.feature_head).await;
     assert_eq!(status, StatusCode::CREATED);
     let digest2 = second["checks_approvals_digest"]
@@ -920,7 +932,7 @@ async fn digest_changes_when_a_change_request_arrives_at_the_same_head() {
 
     assert_ne!(
         digest1, digest2,
-        "a new change request must change the digest"
+        "a new review at the same head must change the digest"
     );
 
     finish(f).await;
