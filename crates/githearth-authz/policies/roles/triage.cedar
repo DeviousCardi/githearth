@@ -1,7 +1,10 @@
 // Built-in role "triage". Linked per grant: ?principal is the account or team,
 // ?resource the organization or repository the grant covers.
+// `member` is deliberately excluded here: a triage grant does not carry the
+// base member privilege to create repositories (see the fork tests and
+// issue #133, which is about the higher grants losing it).
 permit (
   principal in ?principal,
-  action in [GitHearth::Action::"member", GitHearth::Action::"read", GitHearth::Action::"triage"],
+  action in [GitHearth::Action::"read", GitHearth::Action::"triage"],
   resource in ?resource
 );
