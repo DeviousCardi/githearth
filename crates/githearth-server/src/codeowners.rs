@@ -770,6 +770,22 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
             Ok(tx) => tx,
             Err(_) => return retry(),
         };
+        // Re-check inside the transaction, on the row lock, that the pull is
+        // still open and ready: a ready-to-draft toggle that commits between
+        // the check above and this insert must not notify the reviewer.
+        let ready: Option<bool> = match sqlx::query_scalar(
+            "SELECT NOT draft FROM pull_requests WHERE id = $1 AND state = 'open' FOR UPDATE",
+        )
+        .bind(pull.id)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(row) => row,
+            Err(_) => return retry(),
+        };
+        if ready != Some(true) {
+            return jobs::JobOutcome::Done;
+        }
         match pulls::insert_review_request(&mut tx, org_id, pull.id, reviewer_id, pull.author_id)
             .await
         {

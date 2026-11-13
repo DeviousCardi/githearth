@@ -10,7 +10,9 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
-use githearth_server::{AppState, MIGRATOR, config::Config, connect, router};
+use githearth_git::journal::{Kind, Record, Update};
+use githearth_server::merge::{MergeOutcome, execute_intent};
+use githearth_server::{AppState, MIGRATOR, config::Config, connect, pushes, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -174,6 +176,7 @@ async fn post_form(
 
 struct Fixture {
     app: Router,
+    state: AppState,
     pool: PgPool,
     storage_root: PathBuf,
     work: PathBuf,
@@ -182,6 +185,7 @@ struct Fixture {
     token: String,
     cookie: String,
     org_id: Uuid,
+    repo_id: Uuid,
     feature_head: String,
 }
 
@@ -246,7 +250,8 @@ async fn fixture() -> Fixture {
         .await
         .unwrap();
 
-    let app = router(AppState::new(pool.clone(), config).await.unwrap());
+    let app_state = AppState::new(pool.clone(), config).await.unwrap();
+    let app = router(app_state.clone());
 
     let repo_name = tag("repo");
     let (status, body) = api(
@@ -310,6 +315,7 @@ async fn fixture() -> Fixture {
 
     Fixture {
         app,
+        state: app_state,
         pool,
         storage_root,
         work,
@@ -318,6 +324,7 @@ async fn fixture() -> Fixture {
         cookie: format!("githearth_session={token}"),
         token,
         org_id,
+        repo_id,
         feature_head,
     }
 }
@@ -375,6 +382,38 @@ async fn codeowners_jobs(pool: &PgPool, pull_id: Uuid) -> i64 {
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+async fn set_intent_executing(pool: &PgPool, operation_id: Uuid) {
+    sqlx::query("UPDATE merge_intents SET state = 'executing' WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn main_tip(f: &Fixture) -> String {
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_output(git_cmd(&[
+        "--git-dir",
+        repo_path.to_str().unwrap(),
+        "rev-parse",
+        "main",
+    ]))
+    .await
+}
+
+/// Runs the shared job queue long enough to drain the fixture's jobs, then stops
+/// it. Registers the same handlers the server does for the paths under test.
+async fn run_jobs(state: &AppState) {
+    let mut registry = githearth_server::jobs::Registry::new();
+    githearth_server::notifications::register(&mut registry);
+    githearth_server::codeowners::register(&mut registry);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let handle = githearth_server::jobs::spawn(state.clone(), registry, shutdown.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
 }
 
 #[tokio::test]
@@ -566,6 +605,21 @@ async fn convert_to_draft_cancels_queued_intent_and_auto_merge() {
             .unwrap();
     assert_eq!(auto_merges, 1);
 
+    // The mergeable pull request raised a live intent before the conversion, so
+    // the cancellation below is not vacuous.
+    let live_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM merge_intents WHERE pull_request_id = $1 \
+         AND state IN ('queued', 'validating')",
+    )
+    .bind(pull_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        live_before, 1,
+        "auto-merge raised a live intent before the conversion"
+    );
+
     let (status, draft) = api(
         &f.app,
         "POST",
@@ -602,6 +656,262 @@ async fn convert_to_draft_cancels_queued_intent_and_auto_merge() {
     assert_eq!(
         outbox_count(&f.pool, f.org_id, "pull_request.auto_merge_cancelled").await,
         1
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn draft_refuses_merge_queue_entry() {
+    let f = fixture().await;
+
+    // Require the merge queue on main, so a merge would normally be enqueued.
+    let (status, body) = api(
+        &f.app,
+        "POST",
+        &format!("{}/protection", f.api_base),
+        &f.token,
+        json!({"pattern": "main", "require_merge_queue": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_, pull) = api(
+        &f.app,
+        "POST",
+        &pulls_href(&f.api_base),
+        &f.token,
+        json!({"title": "wip", "source_branch": "feature", "target_branch": "main", "draft": true}),
+    )
+    .await;
+    let number = pull["number"].as_i64().unwrap();
+    let pull_id: Uuid = pull["id"].as_str().unwrap().parse().unwrap();
+
+    let (status, body) = api(
+        &f.app,
+        "POST",
+        &format!("{pulls}/{number}/merge", pulls = pulls_href(&f.api_base)),
+        &f.token,
+        json!({"method": "merge", "expected_head_oid": f.feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "pull request is a draft");
+
+    // The draft was refused before the queue, so no intent was enqueued.
+    let intents: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_intents WHERE pull_request_id = $1")
+            .bind(pull_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(intents, 0, "a draft is never enqueued");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn convert_to_draft_serializes_with_the_merge_executor() {
+    let f = fixture().await;
+
+    let (_, pull) = api(
+        &f.app,
+        "POST",
+        &pulls_href(&f.api_base),
+        &f.token,
+        json!({"title": "ready", "source_branch": "feature", "target_branch": "main"}),
+    )
+    .await;
+    let number = pull["number"].as_i64().unwrap();
+
+    // Raise a merge intent and drive it to `executing`, as A's worker does.
+    let (status, intent) = api(
+        &f.app,
+        "POST",
+        &format!("{pulls}/{number}/merge", pulls = pulls_href(&f.api_base)),
+        &f.token,
+        json!({"method": "merge", "expected_head_oid": f.feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+
+    // Hold the repository lock exactly as `execute_intent` does for its whole
+    // operation, then start a convert-to-draft. It must wait for the lock
+    // instead of committing while the executor is between its draft re-read
+    // and the target ref compare-and-swap.
+    let guard = f
+        .state
+        .storage
+        .repository_lock(f.repo_id)
+        .lock_owned()
+        .await;
+    let app = f.app.clone();
+    let token = f.token.clone();
+    let href = format!("{pulls}/{number}/draft", pulls = pulls_href(&f.api_base));
+    let convert =
+        tokio::spawn(async move { api(&app, "POST", &href, &token, json!({"draft": true})).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !convert.is_finished(),
+        "convert-to-draft must wait for the repository lock"
+    );
+    drop(guard);
+    let (status, draft) = convert.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{draft}");
+    assert_eq!(draft["draft"], true);
+
+    // The executor now re-reads the draft and refuses to merge.
+    let before = main_tip(&f).await;
+    let outcome = execute_intent(&f.state, op).await.unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::Stale {
+            reason: "pull request is a draft".into()
+        }
+    );
+    assert_eq!(main_tip(&f).await, before, "the draft did not merge");
+    let intent_state: String =
+        sqlx::query_scalar("SELECT state FROM merge_intents WHERE operation_id = $1")
+            .bind(op)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_ne!(intent_state, "merged");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_push_to_a_draft_does_not_request_code_owners() {
+    let f = fixture().await;
+
+    let (_, pull) = api(
+        &f.app,
+        "POST",
+        &pulls_href(&f.api_base),
+        &f.token,
+        json!({"title": "wip", "source_branch": "feature", "target_branch": "main", "draft": true}),
+    )
+    .await;
+    let pull_id: Uuid = pull["id"].as_str().unwrap().parse().unwrap();
+    let author_id: Uuid = pull["author_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(codeowners_jobs(&f.pool, pull_id).await, 0);
+
+    // A committed push to the draft's source branch. A ready pull would enqueue
+    // the code-owner request job; a draft must not.
+    let mut conn = f.pool.acquire().await.unwrap();
+    let record = Record {
+        sequence: 1,
+        operation: Uuid::new_v4(),
+        kind: Kind::Prepared,
+        actor: Some(author_id),
+        origin: None,
+        updates: vec![Update {
+            old: f.feature_head.clone(),
+            new: "1".repeat(40),
+            reference: "refs/heads/feature".into(),
+        }],
+    };
+    assert!(
+        pushes::apply_committed(&mut conn, f.repo_id, &record)
+            .await
+            .unwrap()
+            .0,
+        "push applied"
+    );
+    drop(conn);
+
+    assert_eq!(
+        codeowners_jobs(&f.pool, pull_id).await,
+        0,
+        "a push to a draft requests no code owners"
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn code_owner_job_enqueued_while_ready_requests_nobody_after_convert_to_draft() {
+    let f = fixture().await;
+
+    // A write member owns the changed file (`feat.txt`), so the job would
+    // request them if it ran while the pull request were ready.
+    let (_writer, writer_username, _writer_token) = add_member(&f.pool, f.org_id, "write").await;
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    std::fs::write(
+        f.work.join("CODEOWNERS"),
+        format!("feat.txt @{writer_username}\n"),
+    )
+    .unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "CODEOWNERS"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "owners",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+
+    // A ready create enqueues the code-owner request job.
+    let (_, pull) = api(
+        &f.app,
+        "POST",
+        &pulls_href(&f.api_base),
+        &f.token,
+        json!({"title": "ready", "source_branch": "feature", "target_branch": "main"}),
+    )
+    .await;
+    let number = pull["number"].as_i64().unwrap();
+    let pull_id: Uuid = pull["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(codeowners_jobs(&f.pool, pull_id).await, 1);
+
+    // Convert to a draft before the queued job runs.
+    let (status, body) = api(
+        &f.app,
+        "POST",
+        &format!("{pulls}/{number}/draft", pulls = pulls_href(&f.api_base)),
+        &f.token,
+        json!({"draft": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The job re-reads the draft and requests nobody.
+    run_jobs(&f.state).await;
+    let requested: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pull_request_review_requests WHERE pull_request_id = $1",
+    )
+    .bind(pull_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        requested, 0,
+        "the job must not notify a reviewer of a draft"
     );
 
     finish(f).await;

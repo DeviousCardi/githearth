@@ -114,6 +114,27 @@ pub(crate) async fn require_open(conn: &mut PgConnection, id: Uuid) -> Result<()
         _ => Err(not_open()),
     }
 }
+
+/// Like [`require_open`], but also re-checks, on the same row lock, that the
+/// pull request is not a draft. A ready-to-draft toggle that commits between
+/// an earlier check and a review-request insert must not notify a reviewer.
+pub(crate) async fn require_ready(conn: &mut PgConnection, id: Uuid) -> Result<(), ApiError> {
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT state, draft FROM pull_requests WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(conn)
+            .await?;
+    match row {
+        Some((state, draft)) if state == "open" => {
+            if draft {
+                Err(not_ready())
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(not_open()),
+    }
+}
 fn already_open() -> ApiError {
     ApiError(
         StatusCode::CONFLICT,
@@ -1106,6 +1127,18 @@ pub(crate) async fn set_draft(
             }
             let tips = tips(state, loaded.repo.id, &pull).await?;
 
+            // Serialize against `execute_intent`, which holds this repository's
+            // storage lock across its draft re-read and target ref compare-and-
+            // swap. The lock is taken before the transaction so both paths take
+            // the storage lock before any database lock, and a convert-to-draft
+            // can neither land between the executor's re-read and its ref swap
+            // nor race a merge that is already swapping the ref (ADR 0009).
+            let _guard = state
+                .storage
+                .repository_lock(loaded.repo.id)
+                .lock_owned()
+                .await;
+
             let mut tx = state.pool.begin().await?;
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
                 return Err(not_active());
@@ -1950,7 +1983,7 @@ async fn add_review_request(
     if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
         return Err(not_active());
     }
-    require_open(&mut tx, pull.id).await?;
+    require_ready(&mut tx, pull.id).await?;
 
     insert_review_request(&mut tx, loaded.org_id, pull.id, reviewer_id, actor.id).await?;
 

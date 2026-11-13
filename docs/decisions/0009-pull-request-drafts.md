@@ -46,8 +46,13 @@ matching the other pull request mutations.
 - Converting a pull request back to a draft cancels any queued or validating
   merge intent and any pending auto-merge, exactly as closing does. An already
   `executing` intent is settled by `execute_intent`, which revalidates and
-  returns `Stale { reason: "pull request is a draft" }` — the ref compare-and-
-  swap already holds the target lock, so a draft cannot slip through a race.
+  returns `Stale { reason: "pull request is a draft" }`. The toggle and the
+  executor serialize on the repository's storage lock: `execute_intent` holds
+  it across its draft re-read and the target ref compare-and-swap, and
+  `set_draft` takes it before its transaction. A toggle therefore either lands
+  before the executor's re-read (the executor sees the draft and returns
+  `Stale`) or waits until the ref compare-and-swap has committed (the pull is
+  merged, so `require_open` refuses the toggle with 409).
 
 ### Review requests and notifications
 

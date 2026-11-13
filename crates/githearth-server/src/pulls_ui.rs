@@ -1099,7 +1099,7 @@ async fn render_pull(
 <dt>Approvals</dt><dd>{}</dd>\
 <dt>Changes requested</dt><dd>{}</dd>\
 </dl></div>\
- <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
+<div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
 {code_owners_section}{code_owner_errors_section}{intent_section}\
 {status_section}{queue_notice}\
 {draft_section}\

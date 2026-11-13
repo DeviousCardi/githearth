@@ -497,6 +497,23 @@ pub(crate) async fn maybe_auto_merge(
         return Ok(());
     }
 
+    // A draft is not ready to merge; cancel any pending auto-merge, like a
+    // close (ADR 0009). `set_draft` also cancels it, so this is a backstop for
+    // a ready-to-draft toggle that raced a trigger.
+    if pull.draft {
+        let mut tx = state.pool.begin().await?;
+        cancel_in_tx(
+            &mut tx,
+            repo.organization_id,
+            actor,
+            pull_request_id,
+            Some("pull request is a draft"),
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
     // A head that moved away from the recorded source oid (source deleted, or
     // a push by someone other than the enabler) cancels the auto-merge. The
     // enabler's own push re-targets the row in `on_push`, so it never lands
@@ -604,7 +621,8 @@ pub(crate) async fn on_status(
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "SELECT am.pull_request_id FROM auto_merges am \
          JOIN pull_requests pr ON pr.id = am.pull_request_id \
-         WHERE pr.repository_id = $1 AND pr.state = 'open' AND am.source_oid = $2",
+         WHERE pr.repository_id = $1 AND pr.state = 'open' AND NOT pr.draft \
+           AND am.source_oid = $2",
     )
     .bind(repository_id)
     .bind(oid)
@@ -634,8 +652,9 @@ pub(crate) async fn on_push(
     };
     let retargeted: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE auto_merges SET source_oid = $1, updated_at = now() \
-         WHERE pull_request_id IN (SELECT id FROM pull_requests \
-             WHERE source_repository_id = $2 AND source_branch = $3 AND state = 'open') \
+         WHERE pull_request_id IN (SELECT id FROM pull_requests pr \
+             WHERE pr.source_repository_id = $2 AND pr.source_branch = $3 \
+               AND pr.state = 'open' AND NOT pr.draft) \
            AND enabled_by = $4 \
          RETURNING pull_request_id",
     )
@@ -648,8 +667,9 @@ pub(crate) async fn on_push(
 
     let cancelled: Vec<Uuid> = sqlx::query_scalar(
         "DELETE FROM auto_merges \
-         WHERE pull_request_id IN (SELECT id FROM pull_requests \
-             WHERE source_repository_id = $1 AND source_branch = $2 AND state = 'open') \
+         WHERE pull_request_id IN (SELECT id FROM pull_requests pr \
+             WHERE pr.source_repository_id = $1 AND pr.source_branch = $2 \
+               AND pr.state = 'open' AND NOT pr.draft) \
            AND enabled_by <> $3 \
          RETURNING pull_request_id",
     )
