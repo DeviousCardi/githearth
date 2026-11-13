@@ -42,6 +42,10 @@ pub fn router() -> Router<AppState> {
             axum::routing::get(read).patch(update),
         )
         .route(
+            "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/draft",
+            axum::routing::post(set_draft_handler),
+        )
+        .route(
             "/api/v1/organizations/{org}/repositories/{repo}/pulls/{number}/comments",
             axum::routing::post(create_comment).get(list_comments),
         )
@@ -88,6 +92,9 @@ fn line_out_of_range() -> ApiError {
 pub(crate) fn not_open() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is not open")
 }
+pub(crate) fn not_ready() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "pull request is a draft")
+}
 fn already_merged() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is merged")
 }
@@ -104,6 +111,27 @@ pub(crate) async fn require_open(conn: &mut PgConnection, id: Uuid) -> Result<()
             .await?;
     match state.as_deref() {
         Some("open") => Ok(()),
+        _ => Err(not_open()),
+    }
+}
+
+/// Like [`require_open`], but also re-checks, on the same row lock, that the
+/// pull request is not a draft. A ready-to-draft toggle that commits between
+/// an earlier check and a review-request insert must not notify a reviewer.
+pub(crate) async fn require_ready(conn: &mut PgConnection, id: Uuid) -> Result<(), ApiError> {
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT state, draft FROM pull_requests WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(conn)
+            .await?;
+    match row {
+        Some((state, draft)) if state == "open" => {
+            if draft {
+                Err(not_ready())
+            } else {
+                Ok(())
+            }
+        }
         _ => Err(not_open()),
     }
 }
@@ -152,7 +180,7 @@ fn line_count(content: &[u8]) -> usize {
     }
 }
 
-const PULL_COLUMNS: &str = "id, number, title, body, state, author_id, source_branch, target_branch, \
+const PULL_COLUMNS: &str = "id, number, title, body, state, draft, author_id, source_branch, target_branch, \
  source_repository_id, closed_reason, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at, \
@@ -177,6 +205,7 @@ pub(crate) struct PullJson {
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) state: String,
+    pub(crate) draft: bool,
     pub(crate) author_id: Uuid,
     pub(crate) source_branch: String,
     pub(crate) target_branch: String,
@@ -531,6 +560,9 @@ struct NewPull {
     /// same-repository pull request.
     #[serde(default)]
     source_repository: Option<String>,
+    /// Open the pull request as a draft (not ready for review).
+    #[serde(default)]
+    draft: Option<bool>,
 }
 
 fn new_pull(body: &[u8]) -> Result<NewPull, ApiError> {
@@ -673,10 +705,11 @@ pub(crate) async fn create_pull(
             }
             let number = allocate_number(&mut tx, loaded.repo.id).await?;
             let id = Uuid::new_v4();
+            let draft = input.draft.unwrap_or(false);
             let inserted = sqlx::query(
                 "INSERT INTO pull_requests \
-                 (id, repository_id, number, title, body, author_id, source_branch, target_branch, source_repository_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 (id, repository_id, number, title, body, author_id, source_branch, target_branch, source_repository_id, draft) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT (repository_id, source_repository_id, source_branch, target_branch) WHERE state = 'open' \
                  DO NOTHING",
             )
@@ -689,6 +722,7 @@ pub(crate) async fn create_pull(
             .bind(&input.source_branch)
             .bind(&input.target_branch)
             .bind(source_repository_id)
+            .bind(draft)
             .execute(&mut *tx)
             .await?;
             if inserted.rows_affected() == 0 {
@@ -702,16 +736,20 @@ pub(crate) async fn create_pull(
             )
             .await?;
             // Request reviews from the changed files' code owners (a durable
-            // job; it reads CODEOWNERS from the target branch and the diff).
-            crate::jobs::enqueue(
-                &mut tx,
-                Some(loaded.org_id),
-                "codeowners.request_reviews",
-                serde_json::json!({ "pull_request_id": id }),
-                &id.to_string(),
-                None,
-            )
-            .await?;
+            // job; it reads CODEOWNERS from the target branch and the diff). A
+            // draft is not ready for review, so owners are requested only once
+            // the pull request is marked ready (ADR 0009).
+            if !draft {
+                crate::jobs::enqueue(
+                    &mut tx,
+                    Some(loaded.org_id),
+                    "codeowners.request_reviews",
+                    serde_json::json!({ "pull_request_id": id }),
+                    &id.to_string(),
+                    None,
+                )
+                .await?;
+            }
 
             let pull = fetch_pull(&mut tx, id).await?.unwrap();
             let status = StatusCode::CREATED;
@@ -998,6 +1036,183 @@ async fn update(
     )
     .await?;
     Ok(Json(serde_json::from_value(value).unwrap()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftPatch {
+    draft: bool,
+}
+
+async fn set_draft_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
+    body: Bytes,
+) -> Result<Json<PullDetail>, ApiError> {
+    let input: DraftPatch = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let key = idempotency::extract_key(&headers).transpose()?;
+    let detail = set_draft(
+        &state,
+        actor.id,
+        auth_age,
+        &org_slug,
+        &repo_name,
+        number,
+        input.draft,
+        key,
+    )
+    .await?;
+    Ok(Json(detail))
+}
+
+/// Whether `actor` may mark the pull request ready for review or convert it
+/// back to a draft: the pull request author, or anyone allowed
+/// `pull_request.close` (triage/write). Denials map to 403 for a reader and 404
+/// otherwise, exactly like the other pull request mutations.
+fn require_draft_permission(
+    state: &AppState,
+    loaded: &Loaded,
+    pull: &PullJson,
+) -> Result<(), ApiError> {
+    if loaded.actor_id == pull.author_id {
+        return Ok(());
+    }
+    require_pull(state, loaded, pull, Action::PullRequestClose)
+}
+
+/// Marks the pull request ready for review (`draft == false`) or converts it
+/// back to a draft (`draft == true`), idempotently. Converting to a draft
+/// cancels any queued or validating merge intent and any pending auto-merge,
+/// exactly as closing does, so a draft cannot merge. Marking ready enqueues the
+/// code-owner review-request job that a draft create skipped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn set_draft(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+    draft: bool,
+    key: Option<&str>,
+) -> Result<PullDetail, ApiError> {
+    let path_str =
+        format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/pulls/{number}/draft");
+    let body = serde_json::json!({ "draft": draft }).to_string();
+    let (_, value) = idempotency::run(
+        &state.pool,
+        actor_id,
+        "POST",
+        &path_str,
+        body.as_bytes(),
+        key,
+        |idem| async move {
+            let loaded =
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
+                    .await?;
+            require_readable_repo(&loaded)?;
+            let mut conn = state.pool.acquire().await?;
+            let pull = find_pull(&mut conn, loaded.repo.id, number)
+                .await?
+                .ok_or_else(not_found)?;
+            drop(conn);
+            require_draft_permission(state, &loaded, &pull)?;
+            if loaded.repo.status != RepositoryStatus::Active {
+                return Err(not_active());
+            }
+            if pull.state != "open" {
+                return Err(not_open());
+            }
+            let tips = tips(state, loaded.repo.id, &pull).await?;
+
+            // Serialize against `execute_intent`, which holds this repository's
+            // storage lock across its draft re-read and target ref compare-and-
+            // swap. The lock is taken before the transaction so both paths take
+            // the storage lock before any database lock, and a convert-to-draft
+            // can neither land between the executor's re-read and its ref swap
+            // nor race a merge that is already swapping the ref (ADR 0009).
+            let _guard = state
+                .storage
+                .repository_lock(loaded.repo.id)
+                .lock_owned()
+                .await;
+
+            let mut tx = state.pool.begin().await?;
+            if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
+                return Err(not_active());
+            }
+            // Re-check the open state under the row lock, then read the current
+            // draft value so a no-op transition emits no event or side effect.
+            require_open(&mut tx, pull.id).await?;
+            let locked: PullJson = sqlx::query_as(&format!(
+                "SELECT {PULL_COLUMNS} FROM pull_requests WHERE id = $1 FOR UPDATE"
+            ))
+            .bind(pull.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if locked.draft != draft {
+                sqlx::query(
+                    "UPDATE pull_requests SET draft = $1, updated_at = now() WHERE id = $2",
+                )
+                .bind(draft)
+                .bind(pull.id)
+                .execute(&mut *tx)
+                .await?;
+                let kind = if draft {
+                    "pull_request.converted_to_draft"
+                } else {
+                    "pull_request.ready_for_review"
+                };
+                event(&mut tx, Some(loaded.org_id), actor_id, kind).await?;
+                if draft {
+                    // Converting to a draft cancels any queued or validating
+                    // merge intent; an executing intent is settled by
+                    // `execute_intent`, which now refuses a draft (ADR 0009).
+                    sqlx::query(
+                        "UPDATE merge_intents SET state = 'cancelled', updated_at = now() \
+                         WHERE pull_request_id = $1 AND state IN ('queued', 'validating')",
+                    )
+                    .bind(pull.id)
+                    .execute(&mut *tx)
+                    .await?;
+                    crate::auto_merge::cancel_in_tx(
+                        &mut tx,
+                        loaded.org_id,
+                        actor_id,
+                        pull.id,
+                        Some("converted to draft"),
+                    )
+                    .await?;
+                } else {
+                    // Now ready for review: request reviews from code owners,
+                    // which a draft create skipped (ADR 0009).
+                    crate::jobs::enqueue(
+                        &mut tx,
+                        Some(loaded.org_id),
+                        "codeowners.request_reviews",
+                        serde_json::json!({ "pull_request_id": pull.id }),
+                        &pull.id.to_string(),
+                        None,
+                    )
+                    .await?;
+                }
+            }
+
+            let pull = fetch_pull(&mut tx, pull.id).await?.unwrap();
+            let status = StatusCode::OK;
+            let body =
+                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, tips).await?).unwrap();
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
+            tx.commit().await?;
+            Ok((status, body))
+        },
+    )
+    .await?;
+    Ok(serde_json::from_value(value).unwrap())
 }
 
 #[derive(Deserialize)]
@@ -1723,6 +1938,9 @@ async fn add_review_request(
     if pull.state != "open" {
         return Err(not_open());
     }
+    if pull.draft {
+        return Err(not_ready());
+    }
 
     // Resolve the reviewer by username.
     let mut conn = state.pool.acquire().await?;
@@ -1765,7 +1983,7 @@ async fn add_review_request(
     if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
         return Err(not_active());
     }
-    require_open(&mut tx, pull.id).await?;
+    require_ready(&mut tx, pull.id).await?;
 
     insert_review_request(&mut tx, loaded.org_id, pull.id, reviewer_id, actor.id).await?;
 

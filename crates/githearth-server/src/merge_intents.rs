@@ -348,6 +348,9 @@ pub(crate) async fn may_merge(
     if pull.state != "open" {
         return Ok(false);
     }
+    if pull.draft {
+        return Ok(false);
+    }
     let (rules, _generation) =
         crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
     drop(conn);
@@ -467,6 +470,10 @@ pub(crate) async fn create_intent(
             // lookups or merge authorization, with the shared "not open" error.
             if pull.state != "open" {
                 return Err(pulls::not_open());
+            }
+            // A draft is not ready to merge (ADR 0009).
+            if pull.draft {
+                return Err(pulls::not_ready());
             }
             // One snapshot, so the digest never pairs old rules with a new generation.
             let (rules, generation) =
