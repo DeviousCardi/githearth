@@ -58,7 +58,7 @@ State machine: `queued → validating → executing → merged | conflicted | st
 
 ## Supported methods (M3)
 
-The server checks Git ≥ 2.38 at startup for these (2.43 is in use). `git replay` is not used (too new).
+The server checks Git ≥ 2.40 at startup for these (2.47 ships in the image). `git replay` is not used (too new).
 
 | Method | Candidate construction |
 | --- | --- |

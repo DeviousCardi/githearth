@@ -1108,9 +1108,17 @@ fn ssh_keygen_needs_no_database_and_never_overwrites() {
     let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
     ssh::load_host_key(&key).unwrap();
+    let before = std::fs::read(&key).unwrap();
     let second = run();
-    assert!(!second.status.success());
-    assert!(String::from_utf8_lossy(&second.stderr).contains("refusing to overwrite"));
+    assert!(
+        second.status.success(),
+        "a repeated ssh-keygen is idempotent for Compose restarts"
+    );
+    assert_eq!(
+        std::fs::read(&key).unwrap(),
+        before,
+        "key is not overwritten"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

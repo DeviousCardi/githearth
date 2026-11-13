@@ -429,8 +429,9 @@ async fn create(
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct PatchRule {
-    #[serde(default)]
-    path: Option<String>,
+    /// The documented field is `pattern`; `path` is accepted as a legacy alias.
+    #[serde(default, alias = "path")]
+    pattern: Option<String>,
     #[serde(default)]
     allow_force_push: Option<bool>,
     #[serde(default)]
@@ -472,7 +473,7 @@ async fn update(
         key,
         |idem| async move {
             let input: PatchRule = serde_json::from_slice(body).map_err(|_| invalid())?;
-            if input.path.is_none()
+            if input.pattern.is_none()
                 && input.allow_force_push.is_none()
                 && input.allow_deletion.is_none()
                 && input.require_pull_request.is_none()
@@ -485,7 +486,7 @@ async fn update(
             {
                 return Err(invalid());
             }
-            if let Some(ref p) = input.path
+            if let Some(ref p) = input.pattern
                 && parse_pattern(p).is_none()
             {
                 return Err(invalid());
@@ -524,7 +525,7 @@ async fn update(
             };
 
             let mut updated_pattern = locked.pattern.clone();
-            if let Some(ref p) = input.path {
+            if let Some(ref p) = input.pattern {
                 updated_pattern = p.clone();
             }
             let res = sqlx::query(

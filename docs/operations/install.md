@@ -1,5 +1,39 @@
 # Installation
 
+## Install
+
+### Docker Compose (recommended for a first install)
+
+Follow the repository [quick start](../../README.md#quick-start-docker-compose).
+It generates `.env`, starts PostgreSQL, migrates, generates the SSH host key,
+waits for `/health/ready`, and then bootstraps the first administrator. Data
+lives in Compose volumes; `docker compose down` keeps it and
+`docker compose down --volumes` deletes it.
+
+### Direct binary on Linux
+
+Prerequisites: a Linux host, **Git ≥ 2.40**, `curl`, `openssl`, Python 3, and a
+local PostgreSQL 17 (or a reachable server). The Docker image ships Git 2.47
+and `openssh-client` (for SSH-signed commit verification).
+
+1. Install `githearth-server` somewhere on `PATH` and make it executable.
+2. Create a dedicated database and role, and note the connection URL.
+3. Write `/etc/githearth/config.toml` from `githearth.example.toml`; set
+   `database_url`, `storage_root`, `ssh_enabled = true` and
+   `ssh_host_key_path`, and keep the file mode `0600`.
+4. Preflight: `githearth-server doctor --config /etc/githearth/config.toml`.
+   Before the first migrate, `schema` fails as documented below; every other
+   check should be `ok` or `warn`.
+5. `githearth-server migrate --config /etc/githearth/config.toml`, then re-run
+   `doctor` — it must exit 0.
+6. Bootstrap the first administrator (password on stdin only, 12+ bytes):
+   `printf '%s' "$PASSWORD" | githearth-server bootstrap-admin --username admin`.
+   Repeating this command never changes an existing account.
+7. `githearth-server ssh-keygen --config /etc/githearth/config.toml`. It is
+   idempotent: an existing host key is kept and the command succeeds.
+8. `githearth-server serve --config /etc/githearth/config.toml`, then confirm
+   `curl --fail http://127.0.0.1:8080/health/ready` returns 200.
+
 See [upgrade.md](upgrade.md) for the upgrade runbook,
 [uninstall.md](uninstall.md) for removal, [tls.md](tls.md) for TLS setup,
 [audit-retention.md](audit-retention.md) for audit IP retention, and
@@ -21,7 +55,7 @@ is valid.
 
 This runs seven read-only checks:
 
-- **git** — verifies Git ≥ 2.38 is available
+- **git** — verifies Git ≥ 2.40 is available
 - **storage** — checks the storage root exists, is a writable directory, is not a symlink, is not world-writable, and every subdirectory (`repositories/`, `tmp/`, `trash/`, `orphans/`) that already exists is a real writable directory
 - **disk** — reports free space on the filesystem holding the storage root; warns below 10% free or below twice `git_push_limit_bytes`. It does not see PostgreSQL's disk: monitor that separately, because a full database disk leaves `doctor` and `/health/ready` reporting ok while writes fail (see [db-disk-full](../verification/db-disk-full.md))
 - **database** — connects to PostgreSQL and verifies connectivity

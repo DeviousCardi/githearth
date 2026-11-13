@@ -964,14 +964,15 @@ async fn merging_via_auto_merge_records_its_completion() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn a_permanently_conflicting_pull_cancels_auto_merge_instead_of_accumulating_intents() {
+async fn a_permanently_conflicting_pull_keeps_auto_merge_without_accumulating_intents() {
     let f = build_fixture().await;
 
     // Move the target so the (unchanged) head now conflicts permanently.
     conflict_by_moving_main(&f).await;
 
-    // Enabling auto-merge records the row; the immediate re-check then raises
-    // one conflicted intent and cancels the auto-merge (not just leave it on).
+    // Enabling auto-merge records the row; the immediate re-check raises one
+    // conflicted intent. The row stays enabled so a later push that resolves
+    // the conflict can raise a fresh intent.
     let (status, _) = request(
         &f.app,
         "POST",
@@ -984,8 +985,8 @@ async fn a_permanently_conflicting_pull_cancels_auto_merge_instead_of_accumulati
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(
         auto_merge_count(&f).await,
-        0,
-        "auto-merge is cancelled on conflict"
+        1,
+        "auto-merge stays enabled after a conflict"
     );
     assert_eq!(intent_count(&f).await, 1, "exactly one conflicted intent");
 
@@ -999,7 +1000,7 @@ async fn a_permanently_conflicting_pull_cancels_auto_merge_instead_of_accumulati
     assert_eq!(conflicted, 1);
 
     // Later triggers (a status, a review) must not raise fresh conflicted
-    // intents: the auto-merge is already gone.
+    // intents: they reuse the recorded conflict.
     let (status, _) = request(
         &f.app,
         "POST",
@@ -1022,6 +1023,11 @@ async fn a_permanently_conflicting_pull_cancels_auto_merge_instead_of_accumulati
         intent_count(&f).await,
         1,
         "no additional intents accumulate"
+    );
+    assert_eq!(
+        auto_merge_count(&f).await,
+        1,
+        "auto-merge stays enabled for a conflict-resolving push"
     );
 
     finish(f).await;

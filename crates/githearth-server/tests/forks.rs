@@ -1383,7 +1383,8 @@ async fn fork_rejects_unknown_or_forbidden_target_namespaces_and_bad_names() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // A namespace the contributor belongs to but cannot create repositories in
-    // (they hold only a read grant on the parent org).
+    // (they hold only a read grant on the parent org): 403, not the masked 404
+    // a stranger gets (issue #133).
     let (status, _) = request(
         &f.app,
         "POST",
@@ -1392,7 +1393,7 @@ async fn fork_rejects_unknown_or_forbidden_target_namespaces_and_bad_names() {
         json!({"organization": f.parent_org_slug}),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     // An invalid fork name is rejected before any work happens.
     let (status, _) = request(

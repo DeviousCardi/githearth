@@ -899,8 +899,9 @@ async fn digest_changes_when_a_change_request_arrives_at_the_same_head() {
         .unwrap()
         .to_string();
 
-    // Cancel, then the same reviewer requests changes at the same head.
-    request(&f.app, "DELETE", &merge, Some(&f.token), None, Value::Null).await;
+    // The same reviewer requests changes at the same head: a fresh merge is
+    // refused while the request stands, even though the earlier approval is
+    // still on record.
     let (status, _) = approve(
         &f,
         f.number,
@@ -910,7 +911,18 @@ async fn digest_changes_when_a_change_request_arrives_at_the_same_head() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an outstanding change request blocks the merge"
+    );
 
+    // Cancel the first intent; the reviewer approves again, clearing the
+    // change request, and a fresh intent records a different digest.
+    request(&f.app, "DELETE", &merge, Some(&f.token), None, Value::Null).await;
+    let (status, _) = approve(&f, f.number, "approved", &f.feature_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
     let (status, second) = create_merge_intent(&f, "merge", &f.feature_head).await;
     assert_eq!(status, StatusCode::CREATED);
     let digest2 = second["checks_approvals_digest"]
@@ -920,7 +932,7 @@ async fn digest_changes_when_a_change_request_arrives_at_the_same_head() {
 
     assert_ne!(
         digest1, digest2,
-        "a new change request must change the digest"
+        "a new review at the same head must change the digest"
     );
 
     finish(f).await;
@@ -1002,6 +1014,67 @@ async fn stale_approval_does_not_count_by_default() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Re-approving at the new head satisfies the rule.
+    let (status, _) = approve(&f, f.number, "approved", &new_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_stale_change_request_is_reported_and_blocks_when_dismissal_is_off() {
+    let f = build_fixture().await;
+    add_rule(
+        &f,
+        json!({
+            "pattern": "main",
+            "required_approvals": 1,
+            "dismiss_stale_approvals": false
+        }),
+    )
+    .await;
+    let reviewer = add_member(&f.pool, f.org_id, "write").await;
+    let reviewer_token = fixture_session(&f.pool, reviewer).await;
+
+    // A change request on the old head survives the head move when stale
+    // reviews are not dismissed, so the detail and the merge gate must agree.
+    let (status, _) = approve(
+        &f,
+        f.number,
+        "changes_requested",
+        &f.feature_head,
+        &reviewer_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let new_head = advance_feature(&f).await;
+
+    let (status, detail) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["changes_requested"], 1, "{detail}");
+
+    // An approval from a second reviewer satisfies the approval count, so the
+    // refusal that follows is the outstanding change request (409), not the
+    // approval gate (403).
+    let approver = add_member(&f.pool, f.org_id, "write").await;
+    let approver_token = fixture_session(&f.pool, approver).await;
+    let (status, _) = approve(&f, f.number, "approved", &new_head, &approver_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A fresh approval from the same reviewer clears the request.
     let (status, _) = approve(&f, f.number, "approved", &new_head, &reviewer_token).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, _) = create_merge_intent(&f, "merge", &new_head).await;

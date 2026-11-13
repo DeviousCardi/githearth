@@ -1138,6 +1138,46 @@ async fn update_description_only() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn description_limit_counts_characters_not_bytes() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let token = fixture_session(&pool, owner_id).await;
+
+    // 1000 non-ASCII characters are 2000 bytes; the limit is 1000 characters.
+    let description = "é".repeat(1000);
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "long-desc", "description": description}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["description"].as_str().unwrap().chars().count(), 1000);
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "too-long", "description": "é".repeat(1001)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn replay_delete_with_same_key() {
     let (app, pool, storage_root, _, org_slug) = setup().await;
     let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")

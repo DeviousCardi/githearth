@@ -67,8 +67,9 @@ fn tmp_dir(root: &Path, op: Uuid) -> PathBuf {
 fn version_parsing_accepts_supported_releases_and_rejects_old_or_garbage() {
     let v = parse_version("git version 2.43.0").unwrap();
     assert_eq!((v.major, v.minor), (2, 43));
-    let v = parse_version("git version 2.38.0.windows.1").unwrap();
-    assert_eq!((v.major, v.minor), (2, 38));
+    let v = parse_version("git version 2.40.0.windows.1").unwrap();
+    assert_eq!((v.major, v.minor), (2, 40));
+    assert!(parse_version("git version 2.39.5").is_err());
     assert!(parse_version("git version 2.37.9").is_err());
     assert!(parse_version("git version 2.35.9").is_err());
     assert!(parse_version("garbage").is_err());

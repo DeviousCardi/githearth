@@ -60,41 +60,50 @@ fn encode_segments(path: &str) -> String {
         .join("/")
 }
 
-fn load_error(error: crate::ApiError, username: &str) -> ui::UiError {
+fn load_error(error: crate::ApiError, username: Option<&str>) -> ui::UiError {
     if error.status_code() == StatusCode::NOT_FOUND {
-        ui::not_found_page(Some(username))
+        ui::not_found_page(username)
     } else {
-        ui::unavailable_page(Some(username))
+        ui::unavailable_page(username)
     }
 }
 
+/// Loads a repository for a UI page. A signed-in caller gets the normal
+/// authorization path; an anonymous caller may browse a public repository only,
+/// which is what the Git transport and the repository landing page already do.
 async fn load_repo_ui(
     state: &AppState,
     headers: &HeaderMap,
     slug: &str,
     name: &str,
-) -> Result<(crate::Account, repository_api::Loaded), ui::UiError> {
-    let (account, auth_age) = match ui::browser_auth(state, headers).await {
-        Ok(v) => v,
-        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(ui::auth_required()),
-        Err(_) => return Err(ui::unavailable_page(None)),
-    };
-    let loaded = repository_api::load_repo(state, account.id, auth_age, slug, name)
-        .await
-        .map_err(|error| load_error(error, &account.username))?;
-    if repository_api::require(state, &loaded, Action::RepositoryRead).is_err() {
-        return Err(ui::not_found_page(Some(&account.username)));
+) -> Result<(Option<String>, Uuid), ui::UiError> {
+    match ui::browser_auth(state, headers).await {
+        Ok((account, auth_age)) => {
+            let loaded = repository_api::load_repo(state, account.id, auth_age, slug, name)
+                .await
+                .map_err(|error| load_error(error, Some(&account.username)))?;
+            if repository_api::require(state, &loaded, Action::RepositoryRead).is_err() {
+                return Err(ui::not_found_page(Some(&account.username)));
+            }
+            if loaded.repo.status != RepositoryStatus::Active {
+                return Err(ui::not_found_page(Some(&account.username)));
+            }
+            Ok((Some(account.username), loaded.repo.id))
+        }
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
+            match repository_api::load_public_anonymous(state, slug, name).await {
+                Some(repo) => Ok((None, repo.id)),
+                None => Err(ui::auth_required()),
+            }
+        }
+        Err(_) => Err(ui::unavailable_page(None)),
     }
-    if loaded.repo.status != RepositoryStatus::Active {
-        return Err(ui::not_found_page(Some(&account.username)));
-    }
-    Ok((account, loaded))
 }
 
 async fn git_work_ui<T>(
     state: &AppState,
     repo_id: Uuid,
-    username: &str,
+    username: Option<&str>,
     work: impl FnOnce(&FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
 ) -> Result<T, ui::UiError>
 where
@@ -104,7 +113,7 @@ where
         .git_slots
         .clone()
         .try_acquire_owned()
-        .map_err(|_| ui::unavailable_page(Some(username)))?;
+        .map_err(|_| ui::unavailable_page(username))?;
     let storage = state.storage.clone();
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
     tokio::task::spawn_blocking(move || {
@@ -113,19 +122,17 @@ where
         work(&path, timeout)
     })
     .await
-    .map_err(|_| ui::unavailable_page(Some(username)))?
+    .map_err(|_| ui::unavailable_page(username))?
     .map_err(|error| map_work_error(repo_id, username, error))
 }
 
-fn map_work_error(repo_id: Uuid, username: &str, error: StorageError) -> ui::UiError {
+fn map_work_error(repo_id: Uuid, username: Option<&str>, error: StorageError) -> ui::UiError {
     match error {
-        StorageError::TooLarge { .. } | StorageError::Timeout => {
-            ui::unavailable_page(Some(username))
-        }
+        StorageError::TooLarge { .. } | StorageError::Timeout => ui::unavailable_page(username),
         _ => {
             // The error may embed Git's stderr (paths included); log only a category.
             tracing::error!(category = "git", repository_id = %repo_id, "repository read failed");
-            ui::unavailable_page(Some(username))
+            ui::unavailable_page(username)
         }
     }
 }
@@ -135,7 +142,7 @@ fn map_work_error(repo_id: Uuid, username: &str, error: StorageError) -> ui::UiE
 async fn git_compare_ui<T>(
     state: &AppState,
     repo_id: Uuid,
-    username: &str,
+    username: Option<&str>,
     work: impl FnOnce(&FsPath, &FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
 ) -> Result<T, ui::UiError>
 where
@@ -145,7 +152,7 @@ where
         .git_slots
         .clone()
         .try_acquire_owned()
-        .map_err(|_| ui::unavailable_page(Some(username)))?;
+        .map_err(|_| ui::unavailable_page(username))?;
     let storage = state.storage.clone();
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
     tokio::task::spawn_blocking(move || {
@@ -155,14 +162,14 @@ where
         work(&path, scratch.path(), timeout)
     })
     .await
-    .map_err(|_| ui::unavailable_page(Some(username)))?
+    .map_err(|_| ui::unavailable_page(username))?
     .map_err(|error| map_work_error(repo_id, username, error))
 }
 
 async fn resolve_ui(
     state: &AppState,
     repo_id: Uuid,
-    username: &str,
+    username: Option<&str>,
     rev: &str,
 ) -> Result<String, ui::UiError> {
     let rev = rev.to_owned();
@@ -170,7 +177,7 @@ async fn resolve_ui(
         browse::resolve(path, &rev, timeout)
     })
     .await?
-    .ok_or_else(|| ui::not_found_page(Some(username)))
+    .ok_or_else(|| ui::not_found_page(username))
 }
 
 async fn tree_root(
@@ -197,26 +204,25 @@ async fn render_tree(
     rev: &str,
     path: Option<&str>,
 ) -> Result<Response, ui::UiError> {
-    let (account, loaded) = load_repo_ui(state, headers, slug, name).await?;
-    let username = account.username.clone();
+    let (username, repo_id) = load_repo_ui(state, headers, slug, name).await?;
+    let username = username.as_deref();
     let path = path.filter(|p| !p.is_empty());
     if !browse::valid_rev(rev) {
-        return Err(ui::not_found_page(Some(&username)));
+        return Err(ui::not_found_page(username));
     }
     if let Some(path) = path
         && !browse::valid_path(path)
     {
-        return Err(ui::not_found_page(Some(&username)));
+        return Err(ui::not_found_page(username));
     }
 
-    let repo_id = loaded.repo.id;
-    let id = resolve_ui(state, repo_id, &username, rev).await?;
+    let id = resolve_ui(state, repo_id, username, rev).await?;
     let path_owned = path.map(str::to_owned);
-    let entries = git_work_ui(state, repo_id, &username, move |fs_path, timeout| {
+    let entries = git_work_ui(state, repo_id, username, move |fs_path, timeout| {
         browse::tree(fs_path, &id, path_owned.as_deref(), timeout)
     })
     .await?
-    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+    .ok_or_else(|| ui::not_found_page(username))?;
 
     let repo_href = format!(
         "/organizations/{}/repositories/{}",
@@ -292,13 +298,7 @@ async fn render_tree(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page(
-        "Tree",
-        Some(&username),
-        csrf.as_deref(),
-        &body,
-    ))
-    .into_response())
+    Ok(Html(ui::render_page("Tree", username, csrf.as_deref(), &body)).into_response())
 }
 
 async fn blob_page(
@@ -306,20 +306,19 @@ async fn blob_page(
     headers: HeaderMap,
     Path((slug, name, rev, path)): Path<(String, String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
-    let username = account.username.clone();
+    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = username.as_deref();
     if !browse::valid_rev(&rev) || !browse::valid_path(&path) {
-        return Err(ui::not_found_page(Some(&username)));
+        return Err(ui::not_found_page(username));
     }
 
-    let repo_id = loaded.repo.id;
-    let id = resolve_ui(&state, repo_id, &username, &rev).await?;
+    let id = resolve_ui(&state, repo_id, username, &rev).await?;
     let path_for_git = path.clone();
-    let blob = git_work_ui(&state, repo_id, &username, move |fs_path, timeout| {
+    let blob = git_work_ui(&state, repo_id, username, move |fs_path, timeout| {
         browse::blob(fs_path, &id, &path_for_git, browse::MAX_BLOB_BYTES, timeout)
     })
     .await?
-    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+    .ok_or_else(|| ui::not_found_page(username))?;
 
     let content = if blob.binary || blob.truncated {
         format!(
@@ -339,13 +338,7 @@ async fn blob_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page(
-        "File",
-        Some(&username),
-        csrf.as_deref(),
-        &body,
-    ))
-    .into_response())
+    Ok(Html(ui::render_page("File", username, csrf.as_deref(), &body)).into_response())
 }
 
 async fn commits_page(
@@ -353,16 +346,15 @@ async fn commits_page(
     headers: HeaderMap,
     Path((slug, name, rev)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
-    let username = account.username.clone();
+    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = username.as_deref();
     if !browse::valid_rev(&rev) {
-        return Err(ui::not_found_page(Some(&username)));
+        return Err(ui::not_found_page(username));
     }
 
-    let repo_id = loaded.repo.id;
-    let id = resolve_ui(&state, repo_id, &username, &rev).await?;
+    let id = resolve_ui(&state, repo_id, username, &rev).await?;
     let id_for_git = id.clone();
-    let commits = git_work_ui(&state, repo_id, &username, move |fs_path, timeout| {
+    let commits = git_work_ui(&state, repo_id, username, move |fs_path, timeout| {
         browse::log(
             fs_path,
             &id_for_git,
@@ -397,13 +389,7 @@ async fn commits_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page(
-        "Commits",
-        Some(&username),
-        csrf.as_deref(),
-        &body,
-    ))
-    .into_response())
+    Ok(Html(ui::render_page("Commits", username, csrf.as_deref(), &body)).into_response())
 }
 
 /// Render a diff exactly as the commit page does: binary notices, escaped
@@ -433,18 +419,17 @@ async fn commit_page(
     headers: HeaderMap,
     Path((slug, name, id)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
-    let username = account.username.clone();
+    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = username.as_deref();
     if !crate::browse::is_commit_id(&id) {
-        return Err(ui::not_found_page(Some(&username)));
+        return Err(ui::not_found_page(username));
     }
 
-    let repo_id = loaded.repo.id;
-    let detail = git_work_ui(&state, repo_id, &username, move |fs_path, timeout| {
+    let detail = git_work_ui(&state, repo_id, username, move |fs_path, timeout| {
         browse::commit(fs_path, &id, timeout)
     })
     .await?
-    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+    .ok_or_else(|| ui::not_found_page(username))?;
 
     let body = format!(
         "<h1>{}</h1><p class=\"muted\">{} &lt;{}&gt;</p>\
@@ -458,13 +443,7 @@ async fn commit_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page(
-        "Commit",
-        Some(&username),
-        csrf.as_deref(),
-        &body,
-    ))
-    .into_response())
+    Ok(Html(ui::render_page("Commit", username, csrf.as_deref(), &body)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -483,11 +462,11 @@ async fn compare_form(
     Path((slug, name)): Path<(String, String)>,
     Query(query): Query<CompareQuery>,
 ) -> Result<Response, ui::UiError> {
-    let (account, _loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
-    let username = account.username.clone();
+    let (username, _repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = username.as_deref();
     let spec = format!("{}...{}", query.base, query.head);
     let Some((base, head)) = crate::browse::split_spec(&spec) else {
-        return Err(ui::not_found_page(Some(&username)));
+        return Err(ui::not_found_page(username));
     };
     Ok(Redirect::to(&format!(
         "/organizations/{}/repositories/{}/compare/{}...{}",
@@ -504,23 +483,22 @@ async fn compare_page(
     headers: HeaderMap,
     Path((slug, name, spec)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (account, loaded) = load_repo_ui(&state, &headers, &slug, &name).await?;
-    let username = account.username.clone();
+    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let username = username.as_deref();
     let Some((base, head)) = crate::browse::split_spec(&spec) else {
-        return Err(ui::not_found_page(Some(&username)));
+        return Err(ui::not_found_page(username));
     };
-    let repo_id = loaded.repo.id;
     let (base_owned, head_owned) = (base.to_owned(), head.to_owned());
     let comparison = git_compare_ui(
         &state,
         repo_id,
-        &username,
+        username,
         move |fs_path, scratch, timeout| {
             browse::compare(fs_path, scratch, &base_owned, &head_owned, timeout)
         },
     )
     .await?
-    .ok_or_else(|| ui::not_found_page(Some(&username)))?;
+    .ok_or_else(|| ui::not_found_page(username))?;
 
     let repo_href = format!(
         "/organizations/{}/repositories/{}",
@@ -579,13 +557,7 @@ async fn compare_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page(
-        "Compare",
-        Some(&username),
-        csrf.as_deref(),
-        &body,
-    ))
-    .into_response())
+    Ok(Html(ui::render_page("Compare", username, csrf.as_deref(), &body)).into_response())
 }
 
 #[cfg(test)]
@@ -602,20 +574,23 @@ mod tests {
             StorageError::Git("boom".into()),
             StorageError::Invalid("boom".into()),
         ] {
-            let response = map_work_error(repo_id, "alice", error).into_response();
+            let response = map_work_error(repo_id, Some("alice"), error).into_response();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
     #[test]
     fn load_error_distinguishes_not_found_from_unavailable() {
-        let not_found = load_error(crate::ApiError(StatusCode::NOT_FOUND, "not found"), "alice")
-            .into_response();
+        let not_found = load_error(
+            crate::ApiError(StatusCode::NOT_FOUND, "not found"),
+            Some("alice"),
+        )
+        .into_response();
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 
         let unavailable = load_error(
             crate::ApiError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"),
-            "alice",
+            Some("alice"),
         )
         .into_response();
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);

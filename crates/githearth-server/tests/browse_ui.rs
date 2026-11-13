@@ -428,10 +428,26 @@ async fn compare_page_carries_u_i_headers() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn browse_pages_require_login() {
+async fn browse_pages_allow_anonymous_public_and_require_login_for_private() {
     let f = build_fixture().await;
+    // The fixture repository is private: anonymous browsing redirects to login.
     let (status, _) = get_page(&f.app, &format!("{}/tree/main", ui_base(&f)), None).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // A public repository is browsable anonymously, like its landing page and
+    // its Git transport.
+    sqlx::query(
+        "UPDATE repositories SET visibility = 'public' \
+         WHERE organization_id = (SELECT id FROM organizations WHERE slug = $1) AND name = $2",
+    )
+    .bind(&f.org_slug)
+    .bind(&f.repo_name)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let (status, body) = get_page(&f.app, &format!("{}/tree/main", ui_base(&f)), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("renamed.md"));
     finish(f).await;
 }
 
