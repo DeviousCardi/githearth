@@ -84,7 +84,7 @@ pub(crate) fn parse_pattern(pattern: &str) -> Option<(Option<&str>, Option<&str>
     }
 }
 
-fn valid_segments(segments: &str) -> bool {
+pub(crate) fn valid_segments(segments: &str) -> bool {
     !segments.is_empty()
         && segments.split('/').all(|part| {
             !part.is_empty()
@@ -204,7 +204,7 @@ async fn snapshot(
     Ok((rules, generation))
 }
 
-async fn current_generation(
+pub(crate) async fn current_generation(
     conn: &mut PgConnection,
     repository_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
@@ -217,8 +217,12 @@ async fn current_generation(
 
 /// Bump the repository's protection generation to `generation + 1`, creating
 /// the counter row on first use. Called inside the same transaction as the rule
-/// mutation so a cached ruleset can detect staleness.
-async fn bump_generation(conn: &mut PgConnection, repository_id: Uuid) -> Result<i64, sqlx::Error> {
+/// mutation so a cached ruleset can detect staleness. Shared with tag
+/// protection, whose rule changes must invalidate cached rulesets the same way.
+pub(crate) async fn bump_generation(
+    conn: &mut PgConnection,
+    repository_id: Uuid,
+) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
         "INSERT INTO protection_generations (repository_id, generation) VALUES ($1, 1) \
          ON CONFLICT (repository_id) DO UPDATE SET generation = protection_generations.generation + 1 \

@@ -1921,6 +1921,40 @@ async fn add_signed_commits_rule(pool: &PgPool, repo_id: Uuid, created_by: Uuid,
     .unwrap();
 }
 
+async fn add_tag_protection_rule(
+    pool: &PgPool,
+    repo_id: Uuid,
+    created_by: Uuid,
+    pattern: &str,
+    allowed_to_create: &str,
+    allow_update: bool,
+    allow_delete: bool,
+) {
+    sqlx::query(
+        "INSERT INTO tag_protection_rules \
+         (id, repository_id, pattern, allowed_to_create, allow_update, allow_delete, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(pattern)
+    .bind(allowed_to_create)
+    .bind(allow_update)
+    .bind(allow_delete)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO protection_generations (repository_id, generation) VALUES ($1, 1) \
+         ON CONFLICT (repository_id) DO UPDATE SET generation = protection_generations.generation + 1",
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// Generates an ed25519 key and returns `(private_key_path, public_key_line)`.
 fn generate_ssh_key() -> (PathBuf, String) {
     let dir = std::env::temp_dir().join(format!("githearth-signed-key-{}", Uuid::new_v4()));
@@ -2106,6 +2140,93 @@ async fn release_glob_applies_and_unprotected_branches_unchanged() {
     ]))
     .await;
 
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn protected_tag_create_move_delete_refused_over_http() {
+    let fx = setup(1 << 30).await;
+    let owner = owner_id(&fx).await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    // `v*` protected, creation restricted to admins, move/delete denied.
+    add_tag_protection_rule(&fx.pool, fx.repo_id, owner, "v*", "admin", false, false).await;
+
+    // A write-role member may not create a matching tag.
+    let (_writer, wuser) = member_with_repo_grant(&fx.pool, org_id, fx.repo_id, "write").await;
+    let wurl = format!(
+        "http://{wuser}:testpass@127.0.0.1:{}/{}/{}.git",
+        fx.port, fx.org_slug, fx.repo_name
+    );
+    let wclone = std::env::temp_dir().join(format!("git-tag-prot-w-{}", Uuid::new_v4()));
+    let wcd = wclone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &wurl, wcd])).await;
+    git_ok(git_cmd(&["-C", wcd, "tag", "v2.0.0"])).await;
+    let out = git_run(git_cmd(&["-C", wcd, "push", "origin", "v2.0.0"])).await;
+    assert!(
+        !out.status.success(),
+        "write role must not create a protected tag"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protected tag: ref.create"),
+        "create reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The owner (admin) creates v1.0.0, then move and delete are refused.
+    let clone = std::env::temp_dir().join(format!("git-tag-prot-o-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+    git_ok(git_cmd(&["-C", cd, "tag", "v1.0.0"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "v1.0.0"])).await;
+
+    // Move: point the tag at a new commit and force push.
+    std::fs::write(clone.join("move"), "move").unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "move"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "move",
+    ]))
+    .await;
+    git_ok(git_cmd(&["-C", cd, "tag", "-f", "v1.0.0"])).await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "--force", "origin", "v1.0.0"])).await;
+    assert!(!out.status.success(), "moving a protected tag must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protected tag: ref.update"),
+        "move reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Delete.
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "--delete", "v1.0.0"])).await;
+    assert!(!out.status.success(), "deleting a protected tag must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("protected tag: ref.delete"),
+        "delete reason: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An unprotected tag is unaffected: create, move and delete all succeed.
+    git_ok(git_cmd(&["-C", cd, "tag", "other"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "other"])).await;
+    git_ok(git_cmd(&["-C", cd, "tag", "-f", "other"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "--force", "origin", "other"])).await;
+    git_ok(git_cmd(&["-C", cd, "push", "origin", "--delete", "other"])).await;
+
+    let _ = std::fs::remove_dir_all(&wclone);
     let _ = std::fs::remove_dir_all(&clone);
     cleanup(&fx.storage_root);
     fx.pool.close().await;
