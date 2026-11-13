@@ -529,6 +529,203 @@ async fn ssh_push_works() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn ssh_protected_tag_create_move_delete_refused() {
+    if !has_ssh() {
+        eprintln!("SKIP: ssh binary not found");
+        return;
+    }
+
+    let storage_root = temp_storage_root();
+    let db_name = format!(
+        "githearth_tssh_tag_{}",
+        Uuid::new_v4().to_string().replace('-', "_")
+    );
+    let database_url = fresh_database(&db_name).await;
+    let key_dir = temp_dir("ssh-key-tag");
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    let host_key = storage_root.join("ssh_host_key");
+    ssh::generate_host_key(&host_key).unwrap();
+    let owner_key = key_dir.join("id_ed25519");
+    ssh_keygen_generate(&owner_key);
+    let owner_fp = sha256_fingerprint(&owner_key);
+    let writer_key = key_dir.join("id_ed25519_writer");
+    ssh_keygen_generate(&writer_key);
+    let writer_fp = sha256_fingerprint(&writer_key);
+
+    let config = Config {
+        database_url: database_url.clone(),
+        storage_root: storage_root.clone(),
+        ssh_enabled: true,
+        hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
+        ssh_bind: "127.0.0.1:0".parse().unwrap(),
+        ssh_host_key_path: host_key,
+        git_timeout_seconds: 120,
+        ..Config::default()
+    };
+
+    let pool = connect(&config).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let owner = fixture_account(&pool, "sshtagowner").await;
+    let (org_id, org_slug) = fixture_organization(&pool, owner).await;
+    let repo_id = create_active_repo(&pool, org_id, "tagrepo", owner).await;
+
+    // A write-role member, and an `v*` tag rule that restricts creation to admins.
+    let writer = fixture_account(&pool, "sshtagwriter").await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(writer)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,repository_id,granted_by) VALUES ($1,'write','account',$2,'repository',$3,$4,$2)")
+        .bind(Uuid::new_v4())
+        .bind(writer)
+        .bind(org_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tag_protection_rules \
+         (id, repository_id, pattern, allowed_to_create, allow_update, allow_delete, created_by) \
+         VALUES ($1, $2, 'v*', 'admin', false, false, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create through the storage layer and seed one commit.
+    let repo_path = githearth_git::layout::Storage::open(&storage_root)
+        .unwrap()
+        .create(
+            repo_id,
+            Uuid::new_v4(),
+            githearth_git::layout::ObjectFormat::Sha1,
+        )
+        .unwrap();
+    let work_dir = temp_dir("ssh-tag-w");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    git_ok(git_cmd(&["init", &work_dir.to_string_lossy()])).await;
+    std::fs::write(work_dir.join("seed.txt"), "seed\n").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        &work_dir.to_string_lossy(),
+        "add",
+        "seed.txt",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        &work_dir.to_string_lossy(),
+        "commit",
+        "-m",
+        "seed",
+    ]))
+    .await;
+    seed_bare(&repo_path.to_string_lossy(), &work_dir.to_string_lossy()).await;
+
+    let state = AppState::new(pool.clone(), config.clone()).await.unwrap();
+    let authenticate: ssh::Authenticate = Arc::new({
+        move |f: String| {
+            let identity = if f == owner_fp {
+                Some(ssh::SshIdentity {
+                    account: owner,
+                    key_id: Uuid::new_v4(),
+                    read_only: false,
+                })
+            } else if f == writer_fp {
+                Some(ssh::SshIdentity {
+                    account: writer,
+                    key_id: Uuid::new_v4(),
+                    read_only: false,
+                })
+            } else {
+                None
+            };
+            Box::pin(async move { Ok(identity) })
+        }
+    });
+    let (_ssh_handle, port_rx) = ssh::spawn(state.clone(), authenticate);
+    let ssh_port = port_rx.await.unwrap().port();
+    let ssh_url = format!("ssh://git@127.0.0.1:{ssh_port}/{org_slug}/tagrepo.git");
+
+    // Writer may not create a matching tag.
+    let wclone = temp_dir("ssh-tag-wclone");
+    let mut clone_cmd = git_cmd(&["clone", &ssh_url, &wclone.to_string_lossy()]);
+    clone_cmd.env("GIT_SSH_COMMAND", git_ssh_key_env(&writer_key, ssh_port));
+    git_ok(clone_cmd).await;
+    git_ok(git_cmd(&["-C", &wclone.to_string_lossy(), "tag", "v2.0.0"])).await;
+    let mut push_cmd = git_cmd(&["-C", &wclone.to_string_lossy(), "push", "origin", "v2.0.0"]);
+    push_cmd.env("GIT_SSH_COMMAND", git_ssh_key_env(&writer_key, ssh_port));
+    git_fail_with(push_cmd, "protected tag: ref.create").await;
+
+    // Owner may create, but move and delete are refused.
+    let oclone = temp_dir("ssh-tag-oclone");
+    let mut clone_cmd = git_cmd(&["clone", &ssh_url, &oclone.to_string_lossy()]);
+    clone_cmd.env("GIT_SSH_COMMAND", git_ssh_key_env(&owner_key, ssh_port));
+    git_ok(clone_cmd).await;
+    git_ok(git_cmd(&["-C", &oclone.to_string_lossy(), "tag", "v1.0.0"])).await;
+    let mut push_cmd = git_cmd(&["-C", &oclone.to_string_lossy(), "push", "origin", "v1.0.0"]);
+    push_cmd.env("GIT_SSH_COMMAND", git_ssh_key_env(&owner_key, ssh_port));
+    git_ok(push_cmd).await;
+
+    // Move: new commit, force the tag, refuse.
+    std::fs::write(oclone.join("move.txt"), "move\n").unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        &oclone.to_string_lossy(),
+        "add",
+        "move.txt",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        &oclone.to_string_lossy(),
+        "commit",
+        "-m",
+        "move",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        &oclone.to_string_lossy(),
+        "tag",
+        "-f",
+        "v1.0.0",
+    ]))
+    .await;
+    let mut force_cmd = git_cmd(&[
+        "-C",
+        &oclone.to_string_lossy(),
+        "push",
+        "--force",
+        "origin",
+        "v1.0.0",
+    ]);
+    force_cmd.env("GIT_SSH_COMMAND", git_ssh_key_env(&owner_key, ssh_port));
+    git_fail_with(force_cmd, "protected tag: ref.update").await;
+
+    // Delete: refuse.
+    let mut delete_cmd = git_cmd(&[
+        "-C",
+        &oclone.to_string_lossy(),
+        "push",
+        "origin",
+        "--delete",
+        "v1.0.0",
+    ]);
+    delete_cmd.env("GIT_SSH_COMMAND", git_ssh_key_env(&owner_key, ssh_port));
+    git_fail_with(delete_cmd, "protected tag: ref.delete").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn ssh_non_member_receives_not_found() {
     if !has_ssh() {
         eprintln!("SKIP: ssh binary not found");

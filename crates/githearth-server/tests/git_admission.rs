@@ -664,6 +664,87 @@ async fn reload_sees_changes_made_after_admission() {
     pool.close().await;
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn tag_policy_change_revalidates_on_reload() {
+    let (pool, owner, org_slug, tmp) = setup().await;
+    set_password(&pool, owner, "correctpass").await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let repo = create_active_repo(&pool, org_id, "live", owner).await;
+
+    // A write-role member who can normally push tags.
+    let writer = fixture_account(&pool, &tag("writer")).await;
+    set_password(&pool, writer, "correctpass").await;
+    let writer_username: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(writer)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(writer)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,repository_id,granted_by) VALUES ($1,'write','account',$2,'repository',$3,$4,$2)")
+        .bind(Uuid::new_v4())
+        .bind(writer)
+        .bind(org_id)
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = app_state_for_test(pool.clone(), &tmp).await;
+    let admitted = admit_basic(
+        &state,
+        &org_slug,
+        "live",
+        &writer_username,
+        "correctpass",
+        git_admission::Want::Push,
+    )
+    .await
+    .unwrap();
+    let update = githearth_git::journal::Update {
+        old: "0".repeat(40),
+        new: "a".repeat(40),
+        reference: "refs/tags/v1.0.0".into(),
+    };
+    // No rule yet: the writer may create the tag.
+    assert_eq!(
+        git_admission::decide_ref(&state, &admitted, &update, false),
+        Ok(())
+    );
+
+    // A `v*` rule restricted to admins is added while the pack was uploading.
+    sqlx::query(
+        "INSERT INTO tag_protection_rules \
+         (id, repository_id, pattern, allowed_to_create, allow_update, allow_delete, created_by) \
+         VALUES ($1, $2, 'v*', 'admin', false, false, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Revalidation re-reads the rule and refuses the writer.
+    let fresh = git_admission::reload(&state, &admitted).await.unwrap();
+    assert_eq!(
+        git_admission::decide_ref(&state, &fresh, &update, false),
+        Err("protected tag: ref.create")
+    );
+    pool.close().await;
+}
+
 // ---- admit_account direct tests (ADR 0005) ----
 
 #[tokio::test]

@@ -33,6 +33,8 @@ mod settings_ui;
 pub mod ssh;
 pub mod ssh_keys;
 pub mod statuses;
+pub mod tag_protection;
+mod tag_protection_ui;
 mod tokens;
 pub mod ui;
 
@@ -261,6 +263,7 @@ pub fn router(state: AppState) -> Router {
         .merge(merge_intents::router())
         .merge(auto_merge::router())
         .merge(protection::router())
+        .merge(tag_protection::router())
         .merge(statuses::router())
         .merge(audit::router())
         .merge(ui::router())

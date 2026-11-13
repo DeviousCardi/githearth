@@ -30,6 +30,7 @@ pub struct Admitted {
     pub repository: RepositoryRow,
     pub facts: crate::facts::Facts,
     pub rules: Vec<crate::protection::ProtectionRule>,
+    pub tag_rules: Vec<crate::tag_protection::TagProtectionRule>,
     /// True when the credential was a read-only scoped access token.
     pub read_only: bool,
     pub credential: CredentialRef,
@@ -371,6 +372,9 @@ pub async fn admit_account(
     let rules = crate::protection::load_rules(&mut conn, repo.id)
         .await
         .map_err(unavailable)?;
+    let tag_rules = crate::tag_protection::load_rules(&mut conn, repo.id)
+        .await
+        .map_err(unavailable)?;
 
     Ok(Admitted {
         account: account_id,
@@ -378,6 +382,7 @@ pub async fn admit_account(
         repository: repo,
         facts,
         rules,
+        tag_rules,
         read_only,
         credential,
     })
@@ -405,12 +410,16 @@ pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, A
     let rules = crate::protection::load_rules(&mut conn, admitted.repository.id)
         .await
         .map_err(unavailable)?;
+    let tag_rules = crate::tag_protection::load_rules(&mut conn, admitted.repository.id)
+        .await
+        .map_err(unavailable)?;
     Ok(Admitted {
         account: admitted.account,
         organization: admitted.organization,
         repository,
         facts,
         rules,
+        tag_rules,
         read_only: admitted.read_only,
         credential: admitted.credential.clone(),
     })
@@ -428,6 +437,21 @@ pub fn decide_ref(
 
     let is_all_zero_new = update.new.bytes().all(|b| b == b'0');
     let all_zero_old = update.old.bytes().all(|b| b == b'0');
+
+    // Tag protection (M3): a matching tag rule restricts create/update/delete.
+    // This runs before the Cedar decision so both transports (and the shared
+    // admission socket) agree on the reason.
+    if let Some(rule) = crate::tag_protection::matching_rule(&admitted.tag_rules, &update.reference)
+    {
+        crate::tag_protection::decide(
+            &admitted.facts,
+            admitted.repository.id,
+            admitted.organization,
+            rule,
+            !is_all_zero_new && all_zero_old,
+            is_all_zero_new,
+        )?;
+    }
 
     let action = if is_all_zero_new {
         Action::RefDelete
@@ -566,6 +590,7 @@ mod tests {
                 read_only: false,
             },
             rules: vec![],
+            tag_rules: vec![],
             read_only: false,
             credential: CredentialRef::Password,
         }
@@ -670,6 +695,80 @@ mod tests {
             decide_ref(&test_state(), &a, &push, true).unwrap_err(),
             "protected branch: ref.push"
         );
+    }
+
+    fn tag_rule(
+        pattern: &str,
+        allow_update: bool,
+        allow_delete: bool,
+    ) -> crate::tag_protection::TagProtectionRule {
+        crate::tag_protection::TagProtectionRule {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            pattern: pattern.to_owned(),
+            allowed_to_create: "admin".to_owned(),
+            allow_update,
+            allow_delete,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_tag_create_requires_the_configured_role() {
+        // An owner (admin) may create a protected tag; a member without a
+        // write-or-higher grant may not.
+        let mut a = admitted(true, false);
+        a.tag_rules = vec![tag_rule("v*", false, false)];
+        let create = update(ZERO, A, "refs/tags/v1.0.0");
+        assert!(decide_ref(&test_state(), &a, &create, false).is_ok());
+
+        let mut nobody = admitted(false, false);
+        nobody.tag_rules = vec![tag_rule("v*", false, false)];
+        assert_eq!(
+            decide_ref(&test_state(), &nobody, &create, false).unwrap_err(),
+            "protected tag: ref.create"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_tag_update_and_delete_are_refused_by_default() {
+        let mut a = admitted(true, false);
+        a.tag_rules = vec![tag_rule("v*", false, false)];
+
+        // Move (update): both oids non-zero.
+        let mv = update(
+            A,
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "refs/tags/v1.0.0",
+        );
+        assert_eq!(
+            decide_ref(&test_state(), &a, &mv, false).unwrap_err(),
+            "protected tag: ref.update"
+        );
+
+        // Delete: new oid all zeros.
+        let del = update(A, ZERO, "refs/tags/v1.0.0");
+        assert_eq!(
+            decide_ref(&test_state(), &a, &del, false).unwrap_err(),
+            "protected tag: ref.delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn unprotected_tags_are_unaffected() {
+        // No matching tag rule: the owner may create, move and delete a tag.
+        let a = admitted(true, false);
+        let create = update(ZERO, A, "refs/tags/v2.0.0");
+        assert!(decide_ref(&test_state(), &a, &create, false).is_ok());
+        let mv = update(
+            A,
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "refs/tags/v2.0.0",
+        );
+        assert!(decide_ref(&test_state(), &a, &mv, false).is_ok());
+        let del = update(A, ZERO, "refs/tags/v2.0.0");
+        assert!(decide_ref(&test_state(), &a, &del, false).is_ok());
     }
 
     #[test]

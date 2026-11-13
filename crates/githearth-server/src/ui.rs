@@ -684,7 +684,9 @@ async fn repository(
         }
     }
     browse_section.push_str(&format!(
-        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a></p>",
+        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a> · <a href=\"/organizations/{}/repositories/{}/settings/tags\">Tag protection</a></p>",
+        url_encode(&slug),
+        url_encode(&repo.name),
         url_encode(&slug),
         url_encode(&repo.name),
         url_encode(&slug),
@@ -906,6 +908,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::pulls_ui::router())
         .merge(crate::browse_ui::router())
         .merge(crate::settings_ui::router())
+        .merge(crate::tag_protection_ui::router())
         .merge(crate::notifications_ui::router())
         .layer(axum::middleware::map_response(page_headers))
 }
