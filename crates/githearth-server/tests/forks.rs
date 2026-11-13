@@ -838,6 +838,51 @@ async fn deleting_the_fork_closes_its_open_pull_requests() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_closed_cross_repository_pull_stays_readable_after_its_fork_is_deleted() {
+    let f = build_fixture().await;
+
+    // Delete the fork via the API; the system closes the open pull request.
+    let (status, _) = request(
+        &f.app,
+        "DELETE",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}",
+            f.contrib_org_slug, f.fork_name
+        ),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Reading the now-closed pull request must succeed (200), not fail with a
+    // storage error, and its gone source reads as a null head.
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "{}/{}",
+            repo_href(&f.parent_org_slug, &f.parent_repo_name),
+            f.number
+        ),
+        Some(&f.owner_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "closed");
+    assert_eq!(body["closed_reason"], "source repository deleted");
+    assert!(
+        body["head_id"].is_null(),
+        "a deleted fork must read as a null head: {body}"
+    );
+    assert!(body["base_id"].is_string(), "target still resolves: {body}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn source_repository_fork_status_is_not_leaked_without_read_access() {
     let f = build_fixture().await;
 

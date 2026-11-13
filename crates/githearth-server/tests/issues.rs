@@ -753,6 +753,14 @@ async fn invalid_input_400() {
     let cases: Vec<(&str, String, Value)> = vec![
         // Empty title
         ("POST", issues_path(&slug, "v"), json!({"title": ""})),
+        // Whitespace-only title (create)
+        ("POST", issues_path(&slug, "v"), json!({"title": "  "})),
+        // Whitespace-only title in a patch: the API must match create and the UI.
+        (
+            "PATCH",
+            format!("{}/1", issues_path(&slug, "v")),
+            json!({"title": " "}),
+        ),
         // Oversize title
         (
             "POST",

@@ -406,6 +406,36 @@ fn check_commit_count(count: usize) -> Result<(), StorageError> {
     }
 }
 
+/// The number of commits a rebase would replay for `target..source`, without
+/// building the candidate. Callers use it to bound a synchronous rebase
+/// mergeability dry-run (which is O(commits)) before deciding to run the full
+/// replay in a worker that has no request deadline.
+pub fn rebase_commit_count(
+    repo: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<usize, StorageError> {
+    if !valid_oid(request.target) || !valid_oid(request.source) {
+        return Err(StorageError::Invalid(
+            "object ids must be full commit ids".into(),
+        ));
+    }
+    let mut command = cmd(repo);
+    command.args([
+        "rev-list",
+        "--count",
+        &format!("{}..{}", request.target, request.source),
+    ]);
+    let result = run_bounded(command, MAX_OUTPUT_BYTES, timeout)?;
+    if !result.success {
+        return Err(stderr_error(&result.stderr));
+    }
+    let text = utf8(&result.stdout)?;
+    text.trim()
+        .parse::<usize>()
+        .map_err(|_| StorageError::Invalid("invalid rebase commit count".into()))
+}
+
 /// Replay each source commit onto the target, keeping its author and message.
 /// A commit whose result tree equals its new parent's is dropped, like
 /// `git rebase` does for already-applied changes; this also drops commits that

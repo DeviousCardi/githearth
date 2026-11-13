@@ -515,7 +515,19 @@ pub(crate) async fn compute_review(
     rules: &[Rule],
     paths: &[String],
 ) -> Result<CodeOwnerReview, sqlx::Error> {
-    let approvers = approving_reviewers(conn, pull_id, head).await?;
+    let mut approvers = approving_reviewers(conn, pull_id, head).await?;
+
+    // The author is treated as satisfying their own code ownership: a sole code
+    // owner who authored the change cannot self-review, and self-approval is
+    // forbidden, so without this the gate could never be satisfied (#137). Any
+    // other required owner must still approve as usual.
+    if let Some(author) = sqlx::query_scalar("SELECT author_id FROM pull_requests WHERE id = $1")
+        .bind(pull_id)
+        .fetch_optional(&mut *conn)
+        .await?
+    {
+        approvers.insert(author);
+    }
 
     // Collect the unique owners (in first-appearance order) across every
     // changed file that has owners, then resolve them once.

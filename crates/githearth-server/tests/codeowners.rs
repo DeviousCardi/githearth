@@ -762,6 +762,135 @@ async fn require_code_owner_review_blocks_merge_until_an_owner_approves() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn the_author_as_sole_code_owner_satisfies_the_review_gate() {
+    let db = TestDb::new().await;
+    let f = build_fixture(&db.url, "*").await;
+
+    // The PR author (the org owner) is the only account that owns feat.txt.
+    let author_username: String = sqlx::query_scalar(
+        "SELECT u.username FROM pull_requests pr JOIN accounts u ON u.id = pr.author_id \
+         WHERE pr.repository_id = $1 AND pr.number = $2",
+    )
+    .bind(f.repo_id)
+    .bind(f.number as i32)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    std::fs::write(
+        f.work.join("CODEOWNERS"),
+        format!("feat.txt @{author_username}\n"),
+    )
+    .unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "CODEOWNERS"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "owners",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+
+    // A head change moves the source branch so the PR owns feat.txt.
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "feature"])).await;
+    std::fs::write(f.work.join("feat.txt"), "feature v2\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "feat.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "v2",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+    let feature_head = git_output(git_cmd(&["-C", tw, "rev-parse", "feature"])).await;
+
+    // Require code-owner review on main.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/protection",
+            f.org_slug, f.repo_name
+        ),
+        Some(&f.owner_token),
+        json!({"pattern": "main", "require_code_owner_review": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The author is the sole code owner: their ownership satisfies the gate, so
+    // the page reports it satisfied rather than permanently blocked.
+    let (status, detail) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.owner_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["code_owner_review_satisfied"], true, "{detail}");
+    let owners = detail["required_code_owners"].as_array().unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0]["name"], format!("@{author_username}"));
+    assert_eq!(owners[0]["approved"], true, "{detail}");
+
+    // The merge is accepted: the sole-owner author does not need a self-review.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/pulls/{}/merge",
+            f.org_slug, f.repo_name, f.number
+        ),
+        Some(&f.owner_token),
+        json!({"method": "merge", "expected_head_oid": feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "queued");
+
+    finish(f).await;
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn malformed_codeowners_tokens_are_reported_on_the_pr_page() {
     let db = TestDb::new().await;
     let f = build_fixture(&db.url, "feat.txt @ @acme/ @acme/a/b").await;

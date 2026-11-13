@@ -1075,6 +1075,21 @@ async fn stale_approval_counts_when_dismissal_is_off() {
 
     // The approval on the older commit still counts after the head moves.
     let new_head = advance_feature(&f).await;
+
+    // The pull request detail must agree with the merge gate: the stale
+    // approval still counts (not 0) when dismissal is off.
+    let (status, detail) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["approvals"], 1, "{detail}");
+
     let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
     assert_eq!(status, StatusCode::CREATED);
 

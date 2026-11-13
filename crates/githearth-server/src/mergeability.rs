@@ -23,14 +23,26 @@ pub(crate) const ENABLED: [(&str, Method); 3] = [
 ];
 
 /// The mergeability of one method. `status` is `clean`, `conflicts`,
-/// `unrelated`, `up_to_date` or `unmergeable`; `conflicts` lists the conflicted
-/// paths only when `status` is `conflicts`.
+/// `unrelated`, `up_to_date`, `unmergeable` or `unchecked`; `conflicts` lists
+/// the conflicted paths only when `status` is `conflicts`.
+///
+/// `unchecked` means the synchronous dry-run could not verify the method within
+/// the request budget (see [`REBASE_DRY_RUN_LIMIT`]); the merge is not refused
+/// — the worker re-runs the full merge without a request deadline and reports a
+/// conflict asynchronously.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Check {
     pub(crate) method: String,
     pub(crate) status: String,
     pub(crate) conflicts: Vec<String>,
 }
+
+/// The most commits a synchronous rebase mergeability dry-run will replay.
+/// Replaying is O(commits) and runs inside the request path, so beyond this
+/// bound the check reports `unchecked` instead of risk exceeding the request
+/// timeout; the merge worker then validates the rebase asynchronously (its own
+/// hard cap is [`githearth_git::merge::MAX_REBASE_COMMITS`]).
+const REBASE_DRY_RUN_LIMIT: usize = 100;
 
 #[derive(sqlx::FromRow)]
 struct CachedRow {
@@ -135,6 +147,16 @@ async fn compute(
             author: &identity,
             committer: &identity,
         };
+        // Rebase replays every commit, so a very large branch would blow the
+        // request timeout before the check finishes. Bound it: beyond the limit
+        // the check reports `unchecked` and the merge worker (which has no
+        // request deadline) re-runs the full rebase and reports conflicts
+        // asynchronously.
+        if method == Method::Rebase
+            && merge::rebase_commit_count(path, &request, timeout)? > REBASE_DRY_RUN_LIMIT
+        {
+            return Ok(("unchecked".to_owned(), vec![]));
+        }
         merge::build_candidate(path, Some(scratch), &request, timeout).map(status_for)
     })
     .await
@@ -158,16 +180,21 @@ pub(crate) async fn check_method(
     }
     let (status, conflicts) =
         compute(state, repo_id, method, target.to_owned(), head.to_owned()).await?;
-    store(
-        &state.pool,
-        repo_id,
-        head,
-        target,
-        method_name,
-        &status,
-        &conflicts,
-    )
-    .await?;
+    // `unchecked` is not a merge outcome and is not cached: it depends on the
+    // branch size alone and is cheap to recompute (a single `rev-list --count`),
+    // so storing it would only risk serving a stale answer.
+    if status != "unchecked" {
+        store(
+            &state.pool,
+            repo_id,
+            head,
+            target,
+            method_name,
+            &status,
+            &conflicts,
+        )
+        .await?;
+    }
     Ok(Check {
         method: method_name.to_owned(),
         status,

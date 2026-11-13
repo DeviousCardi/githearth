@@ -111,6 +111,24 @@ where
     .map_err(|error| map_storage_error(repo_id, error))
 }
 
+/// Like [`git_read`], but a missing repository directory reads as `Ok(None)`
+/// instead of a storage error, so callers that only need a tip (e.g. a pull
+/// request whose source fork was deleted) can treat a gone repository as "no
+/// branch".
+pub(crate) async fn git_read_opt<T>(
+    state: &AppState,
+    repo_id: Uuid,
+    work: impl FnOnce(&FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
+) -> Result<Option<T>, ApiError>
+where
+    T: Send + 'static,
+{
+    if !state.storage.has_repository(repo_id) {
+        return Ok(None);
+    }
+    git_read(state, repo_id, work).await.map(Some)
+}
+
 /// Like [`git_read`], but also creates a scratch directory (removed when the
 /// worker returns) for Git commands that must write objects off-repository.
 pub(crate) async fn git_compare<T>(

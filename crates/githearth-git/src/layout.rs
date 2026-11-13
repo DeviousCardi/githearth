@@ -306,6 +306,14 @@ impl Storage {
         self.verified_dir(&self.repository_path(repository))
     }
 
+    /// Whether the repository's Git directory currently exists on disk. A
+    /// deleted (or never-created) repository has no directory, so callers that
+    /// only need a tip can treat a gone source repository as "no branch"
+    /// instead of a storage error.
+    pub fn has_repository(&self, repository: Uuid) -> bool {
+        self.repository_path(repository).is_dir()
+    }
+
     fn tmp_path(&self, operation: Uuid) -> PathBuf {
         self.root.join("tmp").join(simple(operation))
     }

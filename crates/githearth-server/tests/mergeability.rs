@@ -354,6 +354,41 @@ async fn advance_main(f: &Fixture, content: &str) -> String {
     git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await
 }
 
+/// Adds `n` empty commits to `feature` and pushes them, returning the new head.
+/// Used to grow a source branch past the synchronous rebase dry-run limit.
+async fn advance_feature_many(f: &Fixture, n: usize) -> String {
+    let tw = f.work.to_str().unwrap();
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "feature"])).await;
+    for i in 0..n {
+        git_ok(git_cmd(&[
+            "-C",
+            tw,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!("bulk {i}"),
+        ]))
+        .await;
+    }
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "feature",
+    ]))
+    .await;
+    git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await
+}
+
 /// Resolves the conflict by rewriting the head onto the current target tip: the
 /// `feature` branch is reset to `main` and a single commit applying the resolved
 /// file content is pushed. The head is now a descendant of the target, so every
@@ -887,6 +922,36 @@ async fn an_unrelated_pull_disables_the_merge_button_with_its_reason() {
         "{page}"
     );
     assert!(!page.contains("<select id=\"method\""), "{page}");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_rebase_of_a_very_large_branch_is_unchecked_instead_of_timing_out() {
+    let f = build_fixture().await;
+
+    // Grow the source branch well past the synchronous rebase dry-run limit.
+    let head = advance_feature_many(&f, 120).await;
+
+    // The detail page must still answer 200 (not time out): merge/squash are
+    // clean, while the rebase dry-run reports `unchecked` rather than replaying
+    // every commit inside the request.
+    let detail = pull_detail(&f).await;
+    assert_eq!(detail["head_id"], head.as_str());
+    assert_eq!(mergeability_of(&detail, "merge")["status"], "clean");
+    assert_eq!(mergeability_of(&detail, "squash")["status"], "clean");
+    assert_eq!(
+        mergeability_of(&detail, "rebase")["status"],
+        "unchecked",
+        "{detail}"
+    );
+
+    // A rebase merge is queued (201) instead of a bare 408: the worker re-runs
+    // the full rebase asynchronously and reports a conflict later if needed.
+    let (status, intent) = create_merge_intent(&f, "rebase", &head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    assert_eq!(intent["state"], "queued");
 
     finish(f).await;
 }
