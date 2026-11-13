@@ -477,12 +477,14 @@ async fn org_write_member_can_create_repository() {
     // A member with a write organization grant must be able to create a
     // repository (issue #133: roles are cumulative).
     let writer = fixture_account(&pool, &tag("writer")).await;
-    sqlx::query("INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')")
-        .bind(org_id)
-        .bind(writer)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(writer)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'write','account',$2,'organization',$3,$2)")
         .bind(Uuid::new_v4())
         .bind(writer)
@@ -520,12 +522,14 @@ async fn member_without_grant_gets_403_not_404() {
     // An organization member without a create-capable grant is refused with a
     // clear 403, not a misleading 404 "organization not found" (issue #133).
     let member = fixture_account(&pool, &tag("member")).await;
-    sqlx::query("INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')")
-        .bind(org_id)
-        .bind(member)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
     let member_token = fixture_session(&pool, member).await;
 
     let (status, body) = request(
