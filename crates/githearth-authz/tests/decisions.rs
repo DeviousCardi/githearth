@@ -274,7 +274,6 @@ impl Site<'_> {
             | RepositoryClone
             | RepositoryUpdate
             | RepositoryManageAccess
-            | RepositoryManageProtection
             | RepositoryArchive
             | RepositoryUnarchive
             | RepositoryDelete

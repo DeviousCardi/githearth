@@ -232,12 +232,13 @@ async fn admin_only_create_list_delete_with_generation_bumps() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn managing_rules_is_admin_only() {
+async fn maintain_manages_rules_like_branch_protection() {
     let (app, pool, storage, _owner, org_id, slug) = setup().await;
     let _ = fixture_repository(&pool, org_id, "r", _owner).await;
     let base = base_path(&slug, "r");
 
-    // maintain (org-level) may read but not manage tag protection.
+    // maintain (org-level) may create a rule: tag protection shares the
+    // `repository.update` (maintain) gate with branch protection (issue #135).
     let maintainer = add_member(&pool, org_id, "maintain").await;
     let maintainer_token = fixture_session(&pool, maintainer).await;
     let (status, _) = request(
@@ -250,7 +251,7 @@ async fn managing_rules_is_admin_only() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = request(
+    let (status, body) = request(
         &app,
         "POST",
         &base,
@@ -259,21 +260,36 @@ async fn managing_rules_is_admin_only() {
         json!({"pattern": "v*"}),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::CREATED);
+    let rule_id = body["id"].as_str().unwrap().to_string();
 
-    // admin (org-level) may manage rules.
-    let admin = add_member(&pool, org_id, "admin").await;
-    let admin_token = fixture_session(&pool, admin).await;
+    // The same maintain member may also delete it.
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{base}/{rule_id}"),
+        Some(&maintainer_token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // read (org-level) may list but not manage tag protection.
+    let reader = add_member(&pool, org_id, "read").await;
+    let reader_token = fixture_session(&pool, reader).await;
+    let (status, _) = request(&app, "GET", &base, Some(&reader_token), None, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
     let (status, _) = request(
         &app,
         "POST",
         &base,
-        Some(&admin_token),
+        Some(&reader_token),
         None,
         json!({"pattern": "v*"}),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     cleanup(&storage);
     pool.close().await;
@@ -557,10 +573,10 @@ async fn settings_page_hides_forms_from_viewers_who_cannot_manage() {
     .await
     .unwrap();
 
-    // A maintainer can read the repository and list rules, but cannot manage
+    // A reader can read the repository and list rules, but cannot manage
     // protection: the page shows the rules and hides every control.
-    let maintainer = add_member(&pool, org_id, "maintain").await;
-    let token = fixture_session(&pool, maintainer).await;
+    let reader = add_member(&pool, org_id, "read").await;
+    let token = fixture_session(&pool, reader).await;
     let cookie = format!("githearth_session={token}");
     let path = format!("/organizations/{slug}/repositories/r/settings/tags");
 
