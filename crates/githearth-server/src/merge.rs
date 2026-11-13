@@ -261,6 +261,11 @@ pub async fn execute_intent(
                 reason: "pull request not open".into(),
             });
         }
+        if pull.draft {
+            return Ok(MergeOutcome::Stale {
+                reason: "pull request is a draft".into(),
+            });
+        }
         if pull.source_branch != intent.source_ref {
             return Ok(MergeOutcome::Stale {
                 reason: "source branch changed".into(),

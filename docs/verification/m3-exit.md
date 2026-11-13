@@ -35,6 +35,7 @@ parallel with the rest of the suite.
 | 4 | Duplicate delivery cannot merge twice | `duplicate_delivery_merges_once_with_one_journal_entry_and_one_event` | PASS — re-delivering the same operation yields `merged` once, one `repository_pushes` row, one `ref_updates` row, one `pull_request.merged` outbox event. |
 | 5 | Revocation races obey documented admission semantics | `revoking_the_merger_between_intent_and_execution_goes_stale` | PASS — revoking the merger's grant between intent creation and execution ends the intent `stale` with `actor no longer authorized` (ADR 0004). |
 | 6 | UI/API exercise merge methods, conflict, cancellation | `each_supported_merge_method_merges_successfully`, `a_conflicting_merge_is_refused_without_moving_the_ref`, `a_queued_merge_can_be_cancelled_through_the_api`, `ui_merge_form_offers_methods_queues_and_cancels` | PASS — `merge`/`squash`/`rebase`/`ff_only` all merge; a conflicting candidate ends `conflicted` with the ref unmoved; a queued intent is cancelled through the API and reported on the page; the merge form offers every method and queues an intent. |
+| 7 | Draft pull requests | `tests/drafts.rs` | PASS — a PR can be created as a draft; drafts refuse merge, merge-queue and auto-merge (`409 pull request is a draft`); review requests are refused on a draft; marking ready emits `pull_request.ready_for_review` and re-requests code owners; converting back emits `pull_request.converted_to_draft` and cancels queued intents/auto-merge; author-or-triage authorization with 403/404 denial paths (ADR 0009). |
 
 ## Notes
 

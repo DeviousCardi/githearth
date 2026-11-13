@@ -109,6 +109,9 @@ pub(crate) async fn may_enable(
     if pull.state != "open" {
         return Ok(false);
     }
+    if pull.draft {
+        return Ok(false);
+    }
     let (rules, _generation) =
         crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
     drop(conn);
@@ -232,6 +235,9 @@ pub(crate) async fn enable_auto_merge(
             drop(conn);
             if pull.state != "open" {
                 return Err(pulls::not_open());
+            }
+            if pull.draft {
+                return Err(pulls::not_ready());
             }
 
             let mut conn = state.pool.acquire().await?;

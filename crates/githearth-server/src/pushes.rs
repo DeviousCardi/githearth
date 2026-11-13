@@ -139,7 +139,8 @@ pub async fn apply_committed(
             let pulls: Vec<(Uuid, Uuid)> = sqlx::query_as(
                 "SELECT pr.id, r.organization_id FROM pull_requests pr \
                  JOIN repositories r ON r.id = pr.repository_id \
-                 WHERE pr.source_repository_id = $1 AND pr.state = 'open' AND pr.source_branch = ANY($2)",
+                 WHERE pr.source_repository_id = $1 AND pr.state = 'open' AND NOT pr.draft \
+                   AND pr.source_branch = ANY($2)",
             )
             .bind(repository_id)
             .bind(&branches)

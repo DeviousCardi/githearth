@@ -67,6 +67,14 @@ pub(crate) fn router() -> Router<AppState> {
             "/organizations/{slug}/repositories/{name}/pulls/{number}/auto_merge/cancel",
             axum::routing::post(auto_merge_cancel_submit),
         )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/ready_for_review",
+            axum::routing::post(ready_for_review_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/convert_to_draft",
+            axum::routing::post(convert_to_draft_submit),
+        )
 }
 
 /// The merge form's method labels and the select the pull page renders.
@@ -313,10 +321,15 @@ async fn list_page(
         .join(" · ");
     let mut rows = String::new();
     for pull in &pull_page.items {
+        let state = if pull.draft {
+            format!("draft ({})", pull.state)
+        } else {
+            pull.state.clone()
+        };
         rows.push_str(&format!(
             "<tr><td>#{n}</td><td><a href=\"{base}/pulls/{n}\">{}</a></td><td>{}</td><td>{} → {}</td><td>{}</td><td>{}</td></tr>",
             ui::esc(&pull.title),
-            ui::esc(&pull.state),
+            ui::esc(&state),
             ui::esc(&pull.source_branch),
             ui::esc(&pull.target_branch),
             who(&names, &pull.author_id),
@@ -362,12 +375,14 @@ fn new_pull_body(
     target: &str,
     title: &str,
     text: &str,
+    draft: bool,
     key: &str,
     error: Option<&str>,
 ) -> String {
     let error = error
         .map(|e| format!("<p class=\"error\" role=\"alert\">{}</p>", ui::esc(e)))
         .unwrap_or_default();
+    let checked = if draft { " checked" } else { "" };
     format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / New</nav>\
 <h1>New pull request</h1>{error}<form class=\"card\" method=\"post\" action=\"{base}/pulls\">{}\
@@ -375,6 +390,7 @@ fn new_pull_body(
 <label for=\"target_branch\">Target branch</label><input id=\"target_branch\" name=\"target_branch\" required value=\"{}\">\
 <label for=\"title\">Title</label><input id=\"title\" name=\"title\" required maxlength=\"256\" value=\"{}\">\
 <label for=\"body\">Description</label><textarea id=\"body\" name=\"body\" rows=\"8\" style=\"width:100%;box-sizing:border-box\">{}</textarea>\
+<p><label><input type=\"checkbox\" name=\"draft\" value=\"on\"{checked}> Create as draft</label></p>\
 <p><button type=\"submit\">Create pull request</button></p></form>",
         ui::esc(name),
         form_fields(s, key),
@@ -410,7 +426,18 @@ async fn new_page(
         &s,
         StatusCode::OK,
         "New pull request",
-        &new_pull_body(&s, &base, &name, "", "main", "", "", &new_key(), None),
+        &new_pull_body(
+            &s,
+            &base,
+            &name,
+            "",
+            "main",
+            "",
+            "",
+            false,
+            &new_key(),
+            None,
+        ),
     ))
 }
 
@@ -428,6 +455,8 @@ struct PullForm {
     title: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    draft: Option<String>,
 }
 
 async fn create_submit(
@@ -439,6 +468,7 @@ async fn create_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let key = checked_key(&s, &form.idempotency_key)?;
     let base = repo_href(&slug, &name);
+    let draft = form.draft.is_some();
     if !title_ok(&form.title) || !body_ok(&form.body) {
         return Ok(page(
             &s,
@@ -452,6 +482,7 @@ async fn create_submit(
                 &form.target_branch,
                 &form.title,
                 &form.body,
+                draft,
                 key,
                 Some(
                     "A title of 1 to 256 characters is required; the description is limited to 65536 characters.",
@@ -464,6 +495,7 @@ async fn create_submit(
         "target_branch": &form.target_branch,
         "title": &form.title,
         "body": &form.body,
+        "draft": draft,
     })
     .to_string();
     let (_, value) = match pulls::create_pull(
@@ -492,6 +524,7 @@ async fn create_submit(
                         &form.target_branch,
                         &form.title,
                         &form.body,
+                        draft,
                         key,
                         Some(message),
                     ),
@@ -626,6 +659,11 @@ async fn render_pull(
 
     let state_label = if detail.pull.state == "merged" {
         "<span class=\"badge\">Merged</span>".to_owned()
+    } else if detail.pull.draft {
+        format!(
+            "<span class=\"badge\">Draft</span> <span class=\"muted\">{}</span>",
+            ui::esc(&detail.pull.state)
+        )
     } else {
         ui::esc(&detail.pull.state)
     };
@@ -663,6 +701,9 @@ async fn render_pull(
     let can_close = pulls::may_close(state, s.account.id, s.auth_age, slug, name, number)
         .await
         .unwrap_or(false);
+    // The author, or a viewer who may close (triage/write), may toggle draft
+    // state; this mirrors `pulls::require_draft_permission`.
+    let may_toggle_draft = detail.pull.author_id == s.account.id || can_close;
     let queue_position = if intended.as_ref().is_some_and(|i| {
         i.in_queue && matches!(i.state.as_str(), "queued" | "validating" | "executing")
     }) {
@@ -1029,6 +1070,25 @@ async fn render_pull(
         ),
         _ => String::new(),
     };
+    // Draft state controls, offered to the author or a viewer with triage/write
+    // permission (mirroring `pulls::require_draft_permission`).
+    let draft_section = if detail.pull.state == "open" && may_toggle_draft {
+        if detail.pull.draft {
+            format!(
+                "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/ready_for_review\">{}\
+<p><button type=\"submit\">Ready for review</button></p></form>",
+                form_fields(s, &new_key()),
+            )
+        } else {
+            format!(
+                "<form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/convert_to_draft\">{}\
+<p><button type=\"submit\">Convert to draft</button></p></form>",
+                form_fields(s, &new_key()),
+            )
+        }
+    } else {
+        String::new()
+    };
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
@@ -1039,9 +1099,10 @@ async fn render_pull(
 <dt>Approvals</dt><dd>{}</dd>\
 <dt>Changes requested</dt><dd>{}</dd>\
 </dl></div>\
-<div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
+ <div class=\"card\" style=\"white-space:pre-wrap\">{}</div>\
 {code_owners_section}{code_owner_errors_section}{intent_section}\
 {status_section}{queue_notice}\
+{draft_section}\
 {conflict_section}\
 <h2>Reviews</h2>{review_list} \
 <h2>Comments</h2>{comment_list}<p>{pager}</p>\
@@ -1730,6 +1791,63 @@ async fn auto_merge_cancel_submit(
         return Err(api_error(&s, e));
     }
     Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
+}
+
+#[derive(Deserialize)]
+struct DraftForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+}
+
+async fn ready_for_review_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<DraftForm>,
+) -> Result<Response, ui::UiError> {
+    set_draft(&state, &headers, &slug, &name, &number, &form, false).await
+}
+
+async fn convert_to_draft_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<DraftForm>,
+) -> Result<Response, ui::UiError> {
+    set_draft(&state, &headers, &slug, &name, &number, &form, true).await
+}
+
+async fn set_draft(
+    state: &AppState,
+    headers: &HeaderMap,
+    slug: &str,
+    name: &str,
+    number: &str,
+    form: &DraftForm,
+    draft: bool,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(state, headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    let key = checked_key(&s, &form.idempotency_key)?;
+    if let Err(e) = pulls::set_draft(
+        state,
+        s.account.id,
+        s.auth_age,
+        slug,
+        name,
+        number,
+        draft,
+        Some(key),
+    )
+    .await
+    {
+        return Err(api_error(&s, e));
+    }
+    Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(slug, name))).into_response())
 }
 
 #[cfg(test)]

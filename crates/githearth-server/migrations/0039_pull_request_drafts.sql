@@ -1,0 +1,12 @@
+-- Draft pull requests (M3 "drafts").
+--
+-- A draft is an open pull request that is not yet ready for review: merges,
+-- merge-queue entry, auto-merge and review requests are refused until the
+-- author (or a repo writer) marks it ready. `draft` is orthogonal to `state`:
+-- a closed or merged pull request keeps whatever draft value it had, and the
+-- "one open pull per branch pair" uniqueness is unchanged (a draft still owns
+-- its pair). No new notification kind is introduced — marking ready emits the
+-- `pull_request.ready_for_review` / `pull_request.converted_to_draft` audit and
+-- outbox events, while reviewer/code-owner notifications flow through the
+-- existing review-request and code-owner request jobs once the pull is ready.
+ALTER TABLE pull_requests ADD COLUMN draft boolean NOT NULL DEFAULT false;
