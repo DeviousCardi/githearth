@@ -642,6 +642,7 @@ struct JobPull {
     source_branch: String,
     target_branch: String,
     state: String,
+    draft: bool,
 }
 
 async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome {
@@ -650,9 +651,10 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Err(failed) => return failed,
     };
 
-    // A deleted or closed pull request needs no code-owner requests.
+    // A deleted or closed pull request needs no code-owner requests; a draft is
+    // not ready for review, so its owners are not requested yet either.
     let pull = match sqlx::query_as::<_, JobPull>(
-        "SELECT id, repository_id, source_repository_id, author_id, source_branch, target_branch, state \
+        "SELECT id, repository_id, source_repository_id, author_id, source_branch, target_branch, state, draft \
          FROM pull_requests WHERE id = $1",
     )
     .bind(pull_id)
@@ -663,7 +665,7 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Ok(None) => return jobs::JobOutcome::Done,
         Err(_) => return retry(),
     };
-    if pull.state != "open" {
+    if pull.state != "open" || pull.draft {
         return jobs::JobOutcome::Done;
     }
 
@@ -733,6 +735,7 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         title: String::new(),
         body: String::new(),
         state: pull.state.clone(),
+        draft: pull.draft,
         author_id: pull.author_id,
         source_branch: pull.source_branch.clone(),
         target_branch: pull.target_branch.clone(),
@@ -767,6 +770,22 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
             Ok(tx) => tx,
             Err(_) => return retry(),
         };
+        // Re-check inside the transaction, on the row lock, that the pull is
+        // still open and ready: a ready-to-draft toggle that commits between
+        // the check above and this insert must not notify the reviewer.
+        let ready: Option<bool> = match sqlx::query_scalar(
+            "SELECT NOT draft FROM pull_requests WHERE id = $1 AND state = 'open' FOR UPDATE",
+        )
+        .bind(pull.id)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(row) => row,
+            Err(_) => return retry(),
+        };
+        if ready != Some(true) {
+            return jobs::JobOutcome::Done;
+        }
         match pulls::insert_review_request(&mut tx, org_id, pull.id, reviewer_id, pull.author_id)
             .await
         {
