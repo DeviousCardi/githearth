@@ -168,12 +168,6 @@ namespace GitHearth {
       resource: Repository,
       context: Auth,
     };
-  action "repository.manage_protection" in ["admin", "sensitive"]
-    appliesTo {
-      principal: [Account, Anonymous],
-      resource: Repository,
-      context: Auth,
-    };
   action "repository.archive" in ["admin", "sensitive"]
     appliesTo {
       principal: [Account, Anonymous],

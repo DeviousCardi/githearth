@@ -262,9 +262,9 @@ struct TagProtectionList {
 
 /// Loads a repository's tag rules plus the current protection generation for
 /// a read-capable actor. The third element reports whether the actor may manage
-/// the rules (`RepositoryManageProtection`), so the settings page can hide
-/// controls the viewer could not submit. Shared by the JSON listing and the
-/// settings page.
+/// the rules (`RepositoryUpdate`, the same `maintain` gate as branch
+/// protection), so the settings page can hide controls the viewer could not
+/// submit. Shared by the JSON listing and the settings page.
 pub(crate) async fn list_rules(
     state: &AppState,
     actor_id: Uuid,
@@ -277,8 +277,7 @@ pub(crate) async fn list_rules(
     if loaded.repo.status != githearth_core::RepositoryStatus::Active {
         return Err(not_found());
     }
-    let can_manage =
-        repository_api::require(state, &loaded, Action::RepositoryManageProtection).is_ok();
+    let can_manage = repository_api::require(state, &loaded, Action::RepositoryUpdate).is_ok();
     let mut conn = state.pool.acquire().await?;
     let (rules, generation) = load_rules_with_generation(&mut conn, loaded.repo.id)
         .await
@@ -346,7 +345,7 @@ pub(crate) async fn create_rule(
             let loaded =
                 repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
                     .await?;
-            repository_api::require(state, &loaded, Action::RepositoryManageProtection)?;
+            repository_api::require(state, &loaded, Action::RepositoryUpdate)?;
             if loaded.repo.status != githearth_core::RepositoryStatus::Active {
                 return Err(not_active());
             }
@@ -444,7 +443,7 @@ pub(crate) async fn delete_rule(
             let loaded =
                 repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
                     .await?;
-            repository_api::require(state, &loaded, Action::RepositoryManageProtection)?;
+            repository_api::require(state, &loaded, Action::RepositoryUpdate)?;
             if loaded.repo.status != githearth_core::RepositoryStatus::Active {
                 return Err(not_active());
             }

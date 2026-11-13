@@ -693,7 +693,7 @@ async fn repository(
                     state
                         .authz
                         .authorize(&facts.request(
-                            Action::RepositoryManageProtection,
+                            Action::RepositoryUpdate,
                             Resource::Repository(&authz_repo),
                             Some(Duration::from_secs(auth_age)),
                         ))

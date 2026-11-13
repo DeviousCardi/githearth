@@ -181,6 +181,10 @@ Protection applies to a branch only once it exists. Creating a branch (old value
 
 A rule's `require_signed_commits` flag (default off) refuses a push unless every new commit carries an SSH signature that verifies against a key registered to the committer's account. It governs client pushes only: server-created merges are exempt (see ADR 0007 "Merge exception"), so a merge into a protected branch is not re-verified and a branch can still gain server-created merge history.
 
+## Tag protection (M3)
+
+Tag protection mirrors branch protection for `refs/tags/*`. Rules live under `/api/v1/organizations/{org}/repositories/{repo}/tag-protection` and each names a `pattern` (a concrete tag name or a single trailing-`*` prefix wildcard like `v*`), the `allowed_to_create` role threshold (`read`/`triage`/`write`/`maintain`/`admin`), and `allow_update`/`allow_delete` switches. A matching tag may be created only by the configured role or higher; moving and deleting are refused unless the rule explicitly allows them. Mutations are gated on `repository.update` (maintain) — the same role as branch protection — and reads on `repository.read`, so one operator manages both halves of the protection feature ([ADR 0002](decisions/0002-authorization.md), issue #135).
+
 ## SSH keys
 
 Signed-in sessions manage SSH public keys for Git transport over the embedded SSH server ([ADR 0005](decisions/0005-ssh-transport.md)). The API is session-authenticated only; a personal access token can never create, list or revoke keys. The server is built without RSA, so only Ed25519 and ECDSA (nistp256/384/521) keys are accepted — RSA, DSA, `sk-*` and certificate lines are refused with 400.

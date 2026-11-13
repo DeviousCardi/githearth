@@ -77,7 +77,6 @@ actions! {
     RepositoryClone => "repository.clone", routine,
     RepositoryUpdate => "repository.update", routine,
     RepositoryManageAccess => "repository.manage_access", sensitive,
-    RepositoryManageProtection => "repository.manage_protection", sensitive,
     RepositoryArchive => "repository.archive", sensitive,
     RepositoryUnarchive => "repository.unarchive", sensitive,
     RepositoryDelete => "repository.delete", sensitive,
@@ -128,7 +127,6 @@ impl Action {
             | RepositoryClone
             | RepositoryUpdate
             | RepositoryManageAccess
-            | RepositoryManageProtection
             | RepositoryArchive
             | RepositoryUnarchive
             | RepositoryDelete
