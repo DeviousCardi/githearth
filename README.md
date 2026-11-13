@@ -4,7 +4,7 @@ A home for your code.
 
 GitHearth is a planned source-available development platform for repositories, code review, project planning, CI/CD, packages, security, and collaboration. The long-term goal is broad GitHub/GitLab-style capability with customer control over hosting and data.
 
-**Current status: verified experimental application foundation.** The repository contains a Rust HTTP server with PostgreSQL migrations, administrator bootstrap, bearer sessions and membership-scoped organizations, alongside the local Git prototype and database comparison. Git HTTP/SSH hosting, issues/reviews, production installation, replication and CI remain planned. The repository remains private during initial development.
+**Current status: verified experimental single-node application.** The repository contains a Rust server with PostgreSQL migrations, administrator bootstrap, bearer sessions and membership-scoped organizations, Git hosting over Smart HTTP and SSH, repository browsing, issues and pull requests (threaded inline reviews, suggestions, drafts, reviewers and code owners, commit checks, branch and tag protection, signed-commit policy, merge methods, conflict handling, merge queue and auto-merge), forks, notifications, a server-rendered UI, and installation, backup/restore, upgrade and uninstall runbooks with executable drills. Replication, CI integration, packages, security scanning and production hardening remain planned. The repository remains private during initial development.
 
 ## Product commitments
 
@@ -24,6 +24,48 @@ GitHearth is source-available under the [Business Source License 1.1](LICENSE). 
 - **Later:** each version becomes available under the Apache License 2.0 four years after it is published.
 
 Contributions are covered by [CONTRIBUTING.md](CONTRIBUTING.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+## Quick start (Docker Compose)
+
+Requirements: Docker Engine with Compose, Python 3, and a terminal. Ports 8080,
+2222 and 54329 must be free. Run these from the repository root. The database and
+repository storage are persistent Docker volumes, and the generated `.env` is a
+secret (it is git-ignored).
+
+```bash
+# 1. Generate a unique local database password
+umask 077
+python3 - <<'PY'
+import pathlib, secrets
+with pathlib.Path('.env').open('x') as f:
+    f.write('POSTGRES_PASSWORD=' + secrets.token_hex(32) + '\n')
+PY
+
+# 2. Build and start PostgreSQL, migrate, generate the SSH host key, then the app
+docker compose up --build --wait
+
+# 3. Confirm the server is ready
+curl --fail http://127.0.0.1:8080/health/ready
+
+# 4. Create the first administrator (password on stdin, 12+ bytes; runs once)
+read -r -s -p 'New administrator password (12+ bytes): ' ADMIN_PASSWORD; echo
+printf '%s' "$ADMIN_PASSWORD" | docker compose exec -T app githearth-server bootstrap-admin --username admin
+unset ADMIN_PASSWORD
+```
+
+Open <http://127.0.0.1:8080/> and sign in as `admin`. Git clients use
+`http://127.0.0.1:8080/<org>/<repo>.git` or `ssh://127.0.0.1:2222/<org>/<repo>.git`.
+
+Stop while keeping data with `docker compose down`. **`docker compose down --volumes`
+permanently deletes this installation's database.** Plain HTTP is for loopback
+development only; terminate TLS at a trusted proxy before any nonlocal use
+(see [tls.md](docs/operations/tls.md)).
+
+For the direct-binary path, the full configuration reference, the API exercise
+and the real-PostgreSQL test procedure, see [foundation.md](docs/foundation.md).
+For a production installation, the preflight `doctor` check and upgrades, see
+[install.md](docs/operations/install.md), [upgrade.md](docs/operations/upgrade.md)
+and [uninstall.md](docs/operations/uninstall.md).
 
 ## Start here
 
