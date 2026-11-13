@@ -25,11 +25,11 @@ Two items are excluded from this branch by the phase plan: **drafts** (branch
 | 3 | Threaded inline reviews | `pulls.rs` (comments with `commit_id`/`path`/`line`/`side`/`in_reply_to`), migration `0035_inline_review_comments.sql` | `tests/pulls.rs` (`threads_resolve_and_unresolve`, `replies_attach_to_the_root_not_to_another_reply`, `inline_comments_carry_side_and_turn_outdated`), `tests/pulls_ui.rs` | verified |
 | 4 | Suggestions | `crates/githearth-git/src/suggestion.rs`, `pulls.rs` (`/comments/{id}/apply`) | `crates/githearth-git/tests/suggestion.rs`, `tests/suggestions.rs`, `tests/pulls_ui.rs` (`inline_comment_renders_and_applies_a_suggestion`) | verified |
 | 5 | Approvals / change requests | `pulls.rs` (reviews, verdicts `approved`/`changes_requested`/`commented`) | `tests/pulls.rs` (`approval_counts_only_at_the_current_head`, `latest_verdict_per_reviewer_wins`), `tests/merge_intents.rs` (`digest_changes_when_a_change_request_arrives_at_the_same_head`) | verified |
-| 6 | Drafts | — (parallel branch `m3/drafts`) | — | in PR |
+| 6 | Drafts | PR #129 (branch `m3/drafts`) | — | in PR |
 | 7 | Reviewers / code owners | `pulls.rs` (review requests), `codeowners.rs`, migrations `0018`/`0020`/`0034` | `tests/review_requests.rs`, `tests/codeowners.rs` | verified |
 | 8 | Checks | `statuses.rs`, migrations `0023_commit_statuses.sql`, `0033_merge_checks.sql` | `tests/statuses.rs` | verified |
 | 9 | Branch protection | `protection.rs`, migration `0010_branch_protection.sql` | `tests/protection.rs`, `tests/git_push.rs` | verified |
-| 9b | Tag protection | — (parallel branch `m3/tag-protection`) | — | in PR |
+| 9b | Tag protection | PR #130 (branch `m3/tag-protection`) | — | in PR |
 | 10 | Signed-commit policy | `git_http.rs` (`verify_signed_commits`), `crates/githearth-git/src/signature.rs`, migration `0037` | `tests/git_push.rs` (`require_signed_commits_refuses_unsigned_and_accepts_signed_push`, `require_signed_commits_refuses_commit_signed_by_another_committers_key`) | verified |
 | 11 | Merge methods | `crates/githearth-git/src/merge.rs` (`build_candidate`), `merge.rs` (`execute_intent`) | `tests/merge_execute.rs` (`merge_method_merges_with_two_parents`, `squash_and_ff_only_merge`), `tests/m3_exit.rs` (`each_supported_merge_method_merges_successfully`) | verified |
 | 12 | Conflicts | `mergeability.rs`, `crates/githearth-git/src/merge.rs` (`Candidate::Conflicts`) | `tests/mergeability.rs`, `tests/m3_exit.rs` (`a_conflicting_merge_is_refused_without_moving_the_ref`) | verified |
@@ -70,7 +70,7 @@ concrete exit criteria. Each is accounted for separately.
   contributions in [ADR 0008](../decisions/0008-forks.md); merge execution in
   [ADR 0004](../decisions/0004-merge-execution.md).
 - No additional production gap was found beyond drafts and tag protection, which
-  are in PR and out of scope for this branch.
+  are in PR #129 and PR #130 respectively and out of scope for this branch.
 
 ## Sign-off
 
