@@ -537,3 +537,96 @@ async fn settings_page_lists_creates_and_deletes_rules() {
     cleanup(&storage);
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn settings_page_hides_forms_from_viewers_who_cannot_manage() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let repo_id = fixture_repository(&pool, org_id, "r", owner).await;
+
+    // Seed a rule directly so the read-only viewer has something to list.
+    sqlx::query(
+        "INSERT INTO tag_protection_rules \
+         (id, repository_id, pattern, allowed_to_create, created_by) \
+         VALUES ($1, $2, 'v*', 'admin', $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // A maintainer can read the repository and list rules, but cannot manage
+    // protection: the page shows the rules and hides every control.
+    let maintainer = add_member(&pool, org_id, "maintain").await;
+    let token = fixture_session(&pool, maintainer).await;
+    let cookie = format!("githearth_session={token}");
+    let path = format!("/organizations/{slug}/repositories/r/settings/tags");
+
+    let (status, html) = get_html(&app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Tag protection"), "{html}");
+    assert!(html.contains("v*"), "{html}");
+    assert!(!html.contains("Add a rule"), "{html}");
+    assert!(!html.contains(">Delete</button>"), "{html}");
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn database_check_matches_parse_pattern_and_create_roles() {
+    let (_app, pool, storage, owner, org_id, _slug) = setup().await;
+    let repo_id = fixture_repository(&pool, org_id, "chk", owner).await;
+
+    // parse_pattern rejects a '.' or '..' segment; the migration CHECK must
+    // reject the same rows so a direct insert cannot create a dead rule.
+    for pattern in ["a/../b", "a/./b", ".", "..", ".*", "..*", "./*", "a/.."] {
+        assert!(
+            insert_tag_rule(&pool, repo_id, owner, pattern, "admin")
+                .await
+                .is_err(),
+            "pattern {pattern:?} passed the pattern CHECK"
+        );
+    }
+    // 'member' is no longer an accepted threshold.
+    assert!(
+        insert_tag_rule(&pool, repo_id, owner, "v2.0.0", "member")
+            .await
+            .is_err(),
+        "'member' passed the role CHECK"
+    );
+    // The patterns parse_pattern accepts are still accepted by the CHECK.
+    for pattern in ["v1.0.0", "v*", "release/*", "v1.*"] {
+        insert_tag_rule(&pool, repo_id, owner, pattern, "admin")
+            .await
+            .unwrap();
+    }
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+async fn insert_tag_rule(
+    pool: &PgPool,
+    repo_id: Uuid,
+    created_by: Uuid,
+    pattern: &str,
+    role: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO tag_protection_rules \
+         (id, repository_id, pattern, allowed_to_create, created_by) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(pattern)
+    .bind(role)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}

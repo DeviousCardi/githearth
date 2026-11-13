@@ -7,6 +7,11 @@
 //! shared ref admission path (`git_admission::decide_ref`), so Smart HTTP and
 //! SSH pushes agree, and server-side merge/suggestion ref mutation can never
 //! touch tags (it only ever writes `refs/heads/`).
+//!
+//! A tag is governed by a single most-specific rule: an exact tag name beats
+//! any glob, and among globs the longest prefix wins (`refs/tags/v1.2` picks
+//! `v1.*` over `v*`). When no rule matches, the tag is unprotected. See
+//! [`matching_rule`].
 
 use axum::{
     Json, Router,
@@ -66,8 +71,9 @@ const RULE_COLUMNS: &str = "id, repository_id, pattern, allowed_to_create, allow
 /// The roles a tag rule may name as its `allowed_to_create` threshold, ordered
 /// from least to most privileged. `owner` is deliberately absent: it is an
 /// organization-level role and satisfies `admin` through the rank comparison.
-pub(crate) const CREATE_ROLES: &[&str] =
-    &["member", "read", "triage", "write", "maintain", "admin"];
+/// `member` is also absent: it is the least restrictive threshold (any
+/// grant-holder), not a restriction, so offering it would only mislead.
+pub(crate) const CREATE_ROLES: &[&str] = &["read", "triage", "write", "maintain", "admin"];
 
 fn valid_create_role(role: &str) -> bool {
     CREATE_ROLES.contains(&role)
@@ -101,8 +107,9 @@ pub(crate) fn parse_pattern(pattern: &str) -> Option<(Option<&str>, Option<&str>
 
 /// The most specific rule matching `ref_name`: an exact tag name beats any
 /// glob, and among globs the longest prefix wins (`refs/tags/v1.2` picks
-/// `v1.*` over `v*`). A trailing `*` is a prefix match, so `release/*` also
-/// protects `release/a/b`.
+/// `v1.*` over `v*`). Only this single rule applies; if two globs share the
+/// longest prefix the first in `rules` wins. A trailing `*` is a prefix match,
+/// so `release/*` also protects `release/a/b`.
 pub(crate) fn matching_rule<'a>(
     rules: &'a [TagProtectionRule],
     ref_name: &str,
@@ -172,24 +179,27 @@ fn role_rank(role: &str) -> u8 {
     }
 }
 
-fn grant_rank(role: &Role) -> u8 {
+/// The built-in rank of a grant's role, or `None` for a custom role. A custom
+/// role has no place in the built-in hierarchy and must never satisfy a
+/// built-in role threshold, so it fails closed instead of ranking above
+/// `owner`.
+fn grant_rank(role: &Role) -> Option<u8> {
     match role {
-        Role::Builtin(BuiltinRole::Member) => 0,
-        Role::Builtin(BuiltinRole::Read) => 1,
-        Role::Builtin(BuiltinRole::Triage) => 2,
-        Role::Builtin(BuiltinRole::Write) => 3,
-        Role::Builtin(BuiltinRole::Maintain) => 4,
-        Role::Builtin(BuiltinRole::Admin) => 5,
-        Role::Builtin(BuiltinRole::Owner) => 6,
-        // A custom role has no rank in the built-in hierarchy and never
-        // satisfies a built-in role threshold.
-        Role::Custom(_) => u8::MAX,
+        Role::Builtin(BuiltinRole::Member) => Some(0),
+        Role::Builtin(BuiltinRole::Read) => Some(1),
+        Role::Builtin(BuiltinRole::Triage) => Some(2),
+        Role::Builtin(BuiltinRole::Write) => Some(3),
+        Role::Builtin(BuiltinRole::Maintain) => Some(4),
+        Role::Builtin(BuiltinRole::Admin) => Some(5),
+        Role::Builtin(BuiltinRole::Owner) => Some(6),
+        Role::Custom(_) => None,
     }
 }
 
 /// Whether the actor holds a grant of rank `>= required_role` on the repository
 /// itself or its owning organization. Team grants already resolve through
-/// [`Facts::grants`]; grants scoped to other repositories are ignored.
+/// [`Facts::grants`]; grants scoped to other repositories are ignored. A
+/// custom-role grant has no built-in rank and never satisfies a threshold.
 pub(crate) fn may_operate(
     facts: &Facts,
     repository_id: Uuid,
@@ -202,7 +212,7 @@ pub(crate) fn may_operate(
             Scope::Organization(id) => id == organization_id,
             Scope::Repository(id) => id == repository_id,
         };
-        in_scope && grant_rank(&grant.role) >= required
+        in_scope && grant_rank(&grant.role).is_some_and(|rank| rank >= required)
     })
 }
 
@@ -251,23 +261,29 @@ struct TagProtectionList {
 }
 
 /// Loads a repository's tag rules plus the current protection generation for
-/// a read-capable actor. Shared by the JSON listing and the settings page.
+/// a read-capable actor. The third element reports whether the actor may manage
+/// the rules (`RepositoryManageProtection`), so the settings page can hide
+/// controls the viewer could not submit. Shared by the JSON listing and the
+/// settings page.
 pub(crate) async fn list_rules(
     state: &AppState,
     actor_id: Uuid,
     auth_age: u64,
     org_slug: &str,
     repo_name: &str,
-) -> Result<(Vec<TagProtectionRule>, i64), ApiError> {
+) -> Result<(Vec<TagProtectionRule>, i64, bool), ApiError> {
     let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     repository_api::require(state, &loaded, Action::RepositoryRead)?;
     if loaded.repo.status != githearth_core::RepositoryStatus::Active {
         return Err(not_found());
     }
+    let can_manage =
+        repository_api::require(state, &loaded, Action::RepositoryManageProtection).is_ok();
     let mut conn = state.pool.acquire().await?;
-    load_rules_with_generation(&mut conn, loaded.repo.id)
+    let (rules, generation) = load_rules_with_generation(&mut conn, loaded.repo.id)
         .await
-        .map_err(ApiError::from)
+        .map_err(ApiError::from)?;
+    Ok((rules, generation, can_manage))
 }
 
 async fn list(
@@ -276,7 +292,8 @@ async fn list(
     Path((org_slug, repo_name)): Path<(String, String)>,
 ) -> Result<Json<TagProtectionList>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    let (items, generation) = list_rules(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    let (items, generation, _) =
+        list_rules(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
     Ok(Json(TagProtectionList { generation, items }))
 }
 
@@ -555,6 +572,40 @@ mod tests {
     }
 
     #[test]
+    fn rule_precedence_picks_one_most_specific_rule_regardless_of_order() {
+        let exact = rule("v1.2.3", &|r| r.allowed_to_create = "admin".into());
+        let long = rule("v1.2.*", &|r| r.allowed_to_create = "maintain".into());
+        let short = rule("v*", &|r| r.allowed_to_create = "write".into());
+
+        // The same three rules in every order must yield the same winner: a
+        // single rule applies, chosen by specificity rather than list order.
+        for rules in [
+            vec![exact.clone(), long.clone(), short.clone()],
+            vec![short.clone(), long.clone(), exact.clone()],
+            vec![long.clone(), short.clone(), exact.clone()],
+        ] {
+            assert_eq!(
+                matching_rule(&rules, "refs/tags/v1.2.3")
+                    .unwrap()
+                    .allowed_to_create,
+                "admin"
+            );
+            assert_eq!(
+                matching_rule(&rules, "refs/tags/v1.2.9")
+                    .unwrap()
+                    .allowed_to_create,
+                "maintain"
+            );
+            assert_eq!(
+                matching_rule(&rules, "refs/tags/v2.0.0")
+                    .unwrap()
+                    .allowed_to_create,
+                "write"
+            );
+        }
+    }
+
+    #[test]
     fn a_malformed_rule_does_not_disable_the_others() {
         let rules = [rule("bad/../x", &|_| {}), rule("v*", &|_| {})];
         assert!(matching_rule(&rules, "refs/tags/v1").is_some());
@@ -566,6 +617,8 @@ mod tests {
             assert!(valid_create_role(good), "{good}");
         }
         assert!(!valid_create_role("owner"));
+        // `member` is not a restriction (any grant-holder), so it is not offered.
+        assert!(!valid_create_role("member"));
         assert!(!valid_create_role("bogus"));
     }
 
@@ -663,6 +716,43 @@ mod tests {
             org,
             "admin"
         ));
+    }
+
+    #[test]
+    fn a_custom_role_grant_never_satisfies_a_builtin_threshold() {
+        let org = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let account_id = Uuid::new_v4();
+        let facts = Facts {
+            account: Account {
+                id: account_id,
+                suspended: false,
+                site_admin: false,
+                organizations: vec![org],
+                teams: vec![],
+            },
+            teams: vec![],
+            grants: vec![Grant {
+                role: Role::Custom("release-bot".to_owned()),
+                subject: Subject::Account(account_id),
+                scope: Scope::Organization(org),
+            }],
+            organization: Organization {
+                id: org,
+                suspended: false,
+            },
+            read_only: false,
+        };
+        // Fail closed: even the least restrictive threshold is not satisfied,
+        // so a custom grant can never create, move or delete a protected tag.
+        for threshold in [
+            "member", "read", "triage", "write", "maintain", "admin", "owner",
+        ] {
+            assert!(
+                !may_operate(&facts, repo, org, threshold),
+                "custom role satisfied {threshold}"
+            );
+        }
     }
 
     #[test]

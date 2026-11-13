@@ -19,12 +19,14 @@ CREATE TABLE tag_protection_rules (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (repository_id, pattern),
-  CHECK (allowed_to_create IN ('admin', 'maintain', 'write', 'triage', 'read', 'member')),
+  CHECK (allowed_to_create IN ('admin', 'maintain', 'write', 'triage', 'read')),
   -- A pattern is a concrete tag name, or a prefix wildcard with exactly one
   -- trailing '*' (`v1.0.0`, `v*`, `release/*`). No leading '/', no '//', no
   -- trailing '/' and no '*' anywhere but as the final character. The
-  -- authoritative (stricter) validation lives in tag_protection::parse_pattern.
+  -- authoritative validation is tag_protection::parse_pattern; the lookaheads
+  -- below additionally reject a '.' or '..' segment so a row inserted outside
+  -- the API cannot hold a pattern the engine would silently ignore.
   CHECK (
-    pattern ~ '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*((/\*)|(\*))?$'
+    pattern ~ '^(?!\.\.?(/|\*|$))[A-Za-z0-9._-]+(/(?!\.\.?(/|\*|$))[A-Za-z0-9._-]+)*((/\*)|(\*))?$'
   )
 );

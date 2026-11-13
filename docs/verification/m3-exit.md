@@ -47,3 +47,13 @@ parallel with the rest of the suite.
   rule)"): authorization is re-evaluated under the per-repository lock, and a
   revocation that commits after that point applies to later admissions, not the
   in-flight ref transaction.
+
+## Tag rule precedence
+
+A tag is governed by exactly one rule: the most specific match
+(`tag_protection::matching_rule`). An exact tag name beats any glob, and among
+globs the longest prefix wins (`refs/tags/v1.2` picks `v1.*` over `v*`). A
+trailing `*` is a prefix match, so `release/*` also covers `release/a/b`. When
+no rule matches, the tag is unprotected. Precedence is asserted by
+`tag_protection::tests::rule_precedence_picks_one_most_specific_rule_regardless_of_order`
+and `tag_protection::tests::matching_exact_beats_glob_and_longest_prefix_wins`.

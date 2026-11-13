@@ -683,14 +683,43 @@ async fn repository(
             None => {}
         }
     }
+    // Only viewers who may manage tag protection get the settings link; a
+    // read-only visitor would only reach a page whose forms return 403.
+    let can_manage_protection = match (account_id, auth_age) {
+        (Some(account_id), Some(auth_age)) => match state.pool.acquire().await {
+            Ok(mut conn) => match facts::load(&mut conn, account_id, repo.organization_id).await {
+                Ok(Some(facts)) => {
+                    let authz_repo = repositories::authz_repository(repo);
+                    state
+                        .authz
+                        .authorize(&facts.request(
+                            Action::RepositoryManageProtection,
+                            Resource::Repository(&authz_repo),
+                            Some(Duration::from_secs(auth_age)),
+                        ))
+                        .is_allowed()
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    let tag_link = if can_manage_protection {
+        format!(
+            " · <a href=\"/organizations/{}/repositories/{}/settings/tags\">Tag protection</a>",
+            url_encode(&slug),
+            url_encode(&repo.name)
+        )
+    } else {
+        String::new()
+    };
     browse_section.push_str(&format!(
-        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a> · <a href=\"/organizations/{}/repositories/{}/settings/tags\">Tag protection</a></p>",
+        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a>{tag_link}</p>",
         url_encode(&slug),
         url_encode(&repo.name),
         url_encode(&slug),
         url_encode(&repo.name),
-        url_encode(&slug),
-        url_encode(&repo.name)
     ));
     // A fork is offered to anyone who can read the repository and can create
     // repositories in at least one (non-suspended) organization they belong to.

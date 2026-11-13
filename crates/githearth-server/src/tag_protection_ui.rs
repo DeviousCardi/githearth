@@ -108,9 +108,9 @@ async fn settings_page(
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, ui::UiError> {
     let s = session(&state, &headers).await?;
-    let rules =
+    let (rules, _, can_manage) =
         match tag_protection::list_rules(&state, s.account.id, s.auth_age, &slug, &name).await {
-            Ok((rules, _)) => rules,
+            Ok(v) => v,
             Err(e) if e.status_code() == StatusCode::NOT_FOUND => {
                 return Err(ui::not_found_page(Some(&s.account.username)));
             }
@@ -119,20 +119,33 @@ async fn settings_page(
 
     let mut rows = String::new();
     for rule in &rules {
-        rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>\
-<form method=\"post\" action=\"{}/settings/tags/{}/delete\" style=\"display:inline\">\
+        // A viewer who can read but not manage sees the rule but no control
+        // that would only return 403.
+        let delete = if can_manage {
+            format!(
+                "<td><form method=\"post\" action=\"{}/settings/tags/{}/delete\" style=\"display:inline\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
-<button type=\"submit\">Delete</button></form></td></tr>",
+<button type=\"submit\">Delete</button></form></td>",
+                ui::esc(&repo_href(&slug, &name)),
+                rule.id,
+                ui::esc(&s.csrf),
+            )
+        } else {
+            String::new()
+        };
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>{delete}</tr>",
             ui::esc(&rule.pattern),
             ui::esc(&rule.allowed_to_create),
             if rule.allow_update { "yes" } else { "no" },
             if rule.allow_delete { "yes" } else { "no" },
-            ui::esc(&repo_href(&slug, &name)),
-            rule.id,
-            ui::esc(&s.csrf),
         ));
     }
+    let action_header = if can_manage {
+        "<th scope=\"col\"></th>"
+    } else {
+        ""
+    };
     let table = if rules.is_empty() {
         "<p class=\"muted\">No tag protection rules yet.</p>".to_owned()
     } else {
@@ -140,14 +153,13 @@ async fn settings_page(
             "<table><caption class=\"muted\">Tag protection rules</caption><thead><tr>\
 <th scope=\"col\">Pattern</th><th scope=\"col\">Create role</th>\
 <th scope=\"col\">Allow update</th><th scope=\"col\">Allow delete</th>\
-<th scope=\"col\"></th></tr></thead><tbody>{rows}</tbody></table>"
+{action_header}</tr></thead><tbody>{rows}</tbody></table>"
         )
     };
 
-    let body = format!(
-        "<h1>Tag protection</h1><p><a href=\"{}\">Back to the repository</a></p>\
-<div class=\"card\">{table}</div>\
-<div class=\"card\"><h2>Add a rule</h2>\
+    let add_form = if can_manage {
+        format!(
+            "<div class=\"card\"><h2>Add a rule</h2>\
 <form method=\"post\" action=\"{}/settings/tags\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
 <input type=\"hidden\" name=\"idempotency_key\" value=\"{}\">\
@@ -160,15 +172,22 @@ async fn settings_page(
 <option value=\"write\">write</option>\
 <option value=\"triage\">triage</option>\
 <option value=\"read\">read</option>\
-<option value=\"member\">member</option>\
 </select>\
 <label><input type=\"checkbox\" name=\"allow_update\" value=\"1\"> Allow update (move)</label>\
 <label><input type=\"checkbox\" name=\"allow_delete\" value=\"1\"> Allow delete</label>\
 <p><button type=\"submit\">Add rule</button></p></form></div>",
+            ui::esc(&repo_href(&slug, &name)),
+            ui::esc(&s.csrf),
+            ui::esc(&new_key()),
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        "<h1>Tag protection</h1><p><a href=\"{}\">Back to the repository</a></p>\
+<div class=\"card\">{table}</div>{add_form}",
         ui::esc(&repo_href(&slug, &name)),
-        ui::esc(&repo_href(&slug, &name)),
-        ui::esc(&s.csrf),
-        ui::esc(&new_key()),
     );
     Ok(page(&s, StatusCode::OK, "Tag protection", &body))
 }
