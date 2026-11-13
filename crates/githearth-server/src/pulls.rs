@@ -455,10 +455,15 @@ pub(crate) async fn branch_tip(
     branch: &str,
 ) -> Result<Option<String>, ApiError> {
     let rev = format!("refs/heads/{branch}");
-    browse::git_read(state, repo_id, move |path, timeout| {
+    // A missing repository directory (a deleted fork whose storage was trashed)
+    // reads as "no branch" rather than a storage error, so a closed
+    // cross-repository pull request stays readable after its source fork is
+    // deleted.
+    Ok(browse::git_read_opt(state, repo_id, move |path, timeout| {
         git_browse::resolve(path, &rev, timeout)
     })
-    .await
+    .await?
+    .flatten())
 }
 
 /// For a cross-repository pull request, brings the fork's head-branch objects
@@ -511,23 +516,39 @@ async fn detail(
     tips: Tips,
 ) -> Result<PullDetail, ApiError> {
     let (head_id, base_id) = tips;
-    let (approvals, changes_requested) = match &head_id {
-        // Each reviewer's latest verdict at this head; comment-only reviews
-        // neither grant nor withdraw approval.
+    // The approval count honours `dismiss_stale_approvals` exactly like the
+    // merge gate: at the current head when stale approvals are dismissed, and
+    // across every commit when they are not (so the page never shows 0
+    // approvals while the merge gate accepts a stale one).
+    let rules = crate::protection::load_rules(conn, repository_id).await?;
+    let dismiss =
+        crate::protection::matching_rule(&rules, &format!("refs/heads/{}", pull.target_branch))
+            .is_none_or(|rule| rule.dismiss_stale_approvals);
+    let approvals = if dismiss {
+        match &head_id {
+            Some(head) => crate::merge_intents::approvals_at(conn, pull.id, head).await?,
+            None => 0,
+        }
+    } else {
+        crate::merge_intents::approvals_latest(conn, pull.id).await?
+    };
+    // Change requests are always counted at the current head: they describe the
+    // head's own review state, not the merge gate's stale-approval policy.
+    let changes_requested = match &head_id {
         Some(head) => {
-            sqlx::query_as(
-                "SELECT count(*) FILTER (WHERE verdict = 'approved'), \
-                 count(*) FILTER (WHERE verdict = 'changes_requested') FROM ( \
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM ( \
                  SELECT DISTINCT ON (reviewer_id) verdict FROM pull_request_reviews \
                  WHERE pull_request_id = $1 AND commit_id = $2 AND verdict <> 'commented' \
-                 ORDER BY reviewer_id, seq DESC) latest",
+                 ORDER BY reviewer_id, seq DESC) latest \
+                 WHERE verdict = 'changes_requested'",
             )
             .bind(pull.id)
             .bind(head)
             .fetch_one(&mut *conn)
             .await?
         }
-        None => (0, 0),
+        None => 0,
     };
     // The latest status per context at the current head, for the pull page.
     let statuses = match &head_id {

@@ -416,6 +416,40 @@ async fn advance_feature(f: &Fixture) -> String {
     oid
 }
 
+/// Moves `main` (the target) to conflict with the unchanged `feature` head: both
+/// now add `feat.txt` with different content. The source head is untouched, so
+/// this conflicts without tripping the "head changed" auto-merge cancellation.
+async fn conflict_by_moving_main(f: &Fixture) {
+    let tw = f.work.to_str().unwrap();
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    std::fs::write(f.work.join("feat.txt"), "main\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "feat.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "main adds feat",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -924,6 +958,71 @@ async fn merging_via_auto_merge_records_its_completion() {
     .await
     .unwrap();
     assert_eq!(events, 1, "the merge records the auto-merge completion");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_permanently_conflicting_pull_cancels_auto_merge_instead_of_accumulating_intents() {
+    let f = build_fixture().await;
+
+    // Move the target so the (unchanged) head now conflicts permanently.
+    conflict_by_moving_main(&f).await;
+
+    // Enabling auto-merge records the row; the immediate re-check then raises
+    // one conflicted intent and cancels the auto-merge (not just leave it on).
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &auto_merge_href(&f.org_slug, &f.repo_name, f.number),
+        Some(&f.token),
+        None,
+        json!({"method": "merge"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        auto_merge_count(&f).await,
+        0,
+        "auto-merge is cancelled on conflict"
+    );
+    assert_eq!(intent_count(&f).await, 1, "exactly one conflicted intent");
+
+    let conflicted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM merge_intents WHERE repository_id = $1 AND state = 'conflicted'",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(conflicted, 1);
+
+    // Later triggers (a status, a review) must not raise fresh conflicted
+    // intents: the auto-merge is already gone.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/commits/{}/statuses",
+            f.org_slug, f.repo_name, f.feature_head
+        ),
+        Some(&f.token),
+        None,
+        json!({"context": "ci", "state": "success"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let reviewer = add_member(&f.pool, f.org_id, "write").await;
+    let reviewer_token = fixture_session(&f.pool, reviewer).await;
+    let (status, _) = approve(&f, "approved", &f.feature_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    assert_eq!(
+        intent_count(&f).await,
+        1,
+        "no additional intents accumulate"
+    );
 
     finish(f).await;
 }

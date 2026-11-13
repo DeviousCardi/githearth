@@ -400,7 +400,7 @@ fn validate_patch(input: &PatchIssue) -> Result<(), ApiError> {
         return Err(invalid());
     }
     if let Some(ref t) = input.title
-        && !(1..=256).contains(&t.chars().count())
+        && (t.trim().is_empty() || !(1..=256).contains(&t.chars().count()))
     {
         return Err(invalid());
     }
