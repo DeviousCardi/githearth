@@ -976,3 +976,144 @@ fn sensitive_actions_require_fresh_authentication() {
     });
     assert!(d.is_allowed(), "{d:?}");
 }
+
+/// Role templates are cumulative: every higher role permits every action a
+/// lower role permits (issue #133). Each role is granted at both organization
+/// and repository scope so org-level and repository-level actions are both
+/// covered. `read`/`triage` deliberately do not carry the base `member`
+/// privilege to create repositories, so the chain checked here starts at
+/// `read`; `member` is checked separately below `write`.
+#[test]
+fn roles_are_cumulative() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let site = site_on(&w.private, w.member.id, "refs/heads/main");
+    let chain = [
+        BuiltinRole::Read,
+        BuiltinRole::Triage,
+        BuiltinRole::Write,
+        BuiltinRole::Maintain,
+        BuiltinRole::Admin,
+        BuiltinRole::Owner,
+    ];
+    let permitted = |role: BuiltinRole| {
+        let who = account(&[w.acme.id], &[]);
+        let grants = [
+            grant(
+                role,
+                Subject::Account(who.id),
+                Scope::Organization(w.acme.id),
+            ),
+            grant(
+                role,
+                Subject::Account(who.id),
+                Scope::Repository(w.private.id),
+            ),
+        ];
+        Action::ALL
+            .iter()
+            .map(|&action| {
+                let (resource, merge) = site.resource(action);
+                engine
+                    .authorize(&Request {
+                        principal: Principal::Account(&who),
+                        teams: &[],
+                        grants: &grants,
+                        action,
+                        organization: &w.acme,
+                        resource,
+                        merge,
+                        auth_age: Some(Duration::ZERO),
+                        read_only: false,
+                    })
+                    .is_allowed()
+            })
+            .collect::<Vec<bool>>()
+    };
+    let table: Vec<Vec<bool>> = chain.iter().map(|&role| permitted(role)).collect();
+    for (lower, lower_role) in chain.iter().enumerate() {
+        for (higher, higher_role) in chain.iter().enumerate() {
+            if higher <= lower {
+                continue;
+            }
+            for (index, &action) in Action::ALL.iter().enumerate() {
+                assert!(
+                    !table[lower][index] || table[higher][index],
+                    "{lower_role:?} permits {action:?} but {higher_role:?} does not"
+                );
+            }
+        }
+    }
+    // The base `member` role sits beside the chain, not below `read`: it
+    // carries `repository.create`, which `read`/`triage` do not, but every
+    // role from `write` upward carries everything it permits.
+    let member_table = permitted(BuiltinRole::Member);
+    let create_index = Action::ALL
+        .iter()
+        .position(|&action| action == Action::RepositoryCreate)
+        .unwrap();
+    for (offset, &higher) in chain.iter().enumerate().skip(2) {
+        for (index, &action) in Action::ALL.iter().enumerate() {
+            assert!(
+                !member_table[index] || table[offset][index],
+                "member permits {action:?} but {higher:?} does not"
+            );
+        }
+    }
+    assert!(member_table[create_index], "member cannot create");
+    assert!(!table[0][create_index], "read can create");
+    assert!(!table[1][create_index], "triage can create");
+}
+
+/// `repository.create` lives in the `member` action group, which the base
+/// `member` role and every grant from `write` upward must grant (issue #133):
+/// an organization member with a `member`, `write`, `maintain` or `admin`
+/// grant can create a repository, while a `read`/`triage` grant cannot (the
+/// fork tests pin that) and an outsider cannot either.
+#[test]
+fn repository_create_availability_matches_the_role_ladder() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    for (role, allowed) in [
+        (BuiltinRole::Member, true),
+        (BuiltinRole::Read, false),
+        (BuiltinRole::Triage, false),
+        (BuiltinRole::Write, true),
+        (BuiltinRole::Maintain, true),
+        (BuiltinRole::Admin, true),
+        (BuiltinRole::Owner, true),
+    ] {
+        let who = account(&[w.acme.id], &[]);
+        let grants = [grant(
+            role,
+            Subject::Account(who.id),
+            Scope::Organization(w.acme.id),
+        )];
+        let d = engine.authorize(&Request {
+            principal: Principal::Account(&who),
+            teams: &[],
+            grants: &grants,
+            action: Action::RepositoryCreate,
+            organization: &w.acme,
+            resource: Resource::Organization,
+            merge: None,
+            auth_age: Some(Duration::ZERO),
+            read_only: false,
+        });
+        assert_eq!(d.is_allowed(), allowed, "{role:?}: {d:?}");
+    }
+    // A visitor who is not a member of the organization cannot create there.
+    let outsider = account(&[], &[]);
+    let d = engine.authorize(&Request {
+        principal: Principal::Account(&outsider),
+        teams: &[],
+        grants: &[],
+        action: Action::RepositoryCreate,
+        organization: &w.acme,
+        resource: Resource::Organization,
+        merge: None,
+        auth_age: Some(Duration::ZERO),
+        read_only: false,
+    });
+    assert!(!d.is_allowed(), "{d:?}");
+}

@@ -466,6 +466,105 @@ async fn read_only_member_403_on_mutation() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn org_write_member_can_create_repository() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // A member with a write organization grant must be able to create a
+    // repository (issue #133: roles are cumulative).
+    let writer = fixture_account(&pool, &tag("writer")).await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(writer)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'write','account',$2,'organization',$3,$2)")
+        .bind(Uuid::new_v4())
+        .bind(writer)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let writer_token = fixture_session(&pool, writer).await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&writer_token),
+        None,
+        json!({"name": "writer-repo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn member_without_grant_gets_403_not_404() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // An organization member without a create-capable grant is refused with a
+    // clear 403, not a misleading 404 "organization not found" (issue #133).
+    let member = fixture_account(&pool, &tag("member")).await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let member_token = fixture_session(&pool, member).await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&member_token),
+        None,
+        json!({"name": "blocked-repo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, json!({"error": "not permitted"}));
+
+    // A stranger (not a member) still sees a 404, so the organization is not
+    // revealed.
+    let stranger = fixture_account(&pool, &tag("stranger")).await;
+    let stranger_token = fixture_session(&pool, stranger).await;
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&stranger_token),
+        None,
+        json!({"name": "also-blocked"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn list_paging() {
     let (app, pool, storage_root, _, org_slug) = setup().await;
     let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")

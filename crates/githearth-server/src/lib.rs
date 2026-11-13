@@ -633,10 +633,6 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiRe
         expires_in: state.config.token_ttl_seconds,
     }))
 }
-pub(crate) fn bearer(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
-    Ok(bearer_credential(headers)?.hash())
-}
-
 /// A Bearer credential is either a 64-hex session token or a personal access
 /// token (`gth_` followed by 64 hex). Both resolve to their SHA-256 for a
 /// database lookup; the kind only changes which table the hash is matched in.
@@ -804,10 +800,20 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json
     Ok(Json(authenticate(&state.pool, &headers).await?.0))
 }
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<StatusCode> {
-    let (account, _) = authenticate(&state.pool, &headers).await?;
+    let credential = bearer_credential(&headers)?;
+    // A personal access token has no session to revoke; reporting 204 while
+    // writing a `session.revoked` event would be misleading (issue #139).
+    if matches!(&credential, Credential::AccessToken { .. }) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "access tokens cannot log out",
+        ));
+    }
+    let token_hash = credential.hash();
+    let (account, _) = authenticate_credential(&state.pool, credential).await?;
     let mut tx = state.pool.begin().await?;
     sqlx::query("DELETE FROM sessions WHERE token_hash=$1")
-        .bind(bearer(&headers)?)
+        .bind(token_hash)
         .execute(&mut *tx)
         .await?;
     event(&mut tx, None, account.id, "session.revoked").await?;
