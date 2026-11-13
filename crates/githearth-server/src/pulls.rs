@@ -532,21 +532,11 @@ async fn detail(
     } else {
         crate::merge_intents::approvals_latest(conn, pull.id).await?
     };
-    // Change requests are always counted at the current head: they describe the
-    // head's own review state, not the merge gate's stale-approval policy.
+    // Change requests use the gate's own scope, so the detail never reports 0
+    // while an outstanding request blocks the merge.
     let changes_requested = match &head_id {
         Some(head) => {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM ( \
-                 SELECT DISTINCT ON (reviewer_id) verdict FROM pull_request_reviews \
-                 WHERE pull_request_id = $1 AND commit_id = $2 AND verdict <> 'commented' \
-                 ORDER BY reviewer_id, seq DESC) latest \
-                 WHERE verdict = 'changes_requested'",
-            )
-            .bind(pull.id)
-            .bind(head)
-            .fetch_one(&mut *conn)
-            .await?
+            crate::merge_intents::outstanding_change_requests(conn, pull.id, head, dismiss).await?
         }
         None => 0,
     };

@@ -1024,6 +1024,67 @@ async fn stale_approval_does_not_count_by_default() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_stale_change_request_is_reported_and_blocks_when_dismissal_is_off() {
+    let f = build_fixture().await;
+    add_rule(
+        &f,
+        json!({
+            "pattern": "main",
+            "required_approvals": 1,
+            "dismiss_stale_approvals": false
+        }),
+    )
+    .await;
+    let reviewer = add_member(&f.pool, f.org_id, "write").await;
+    let reviewer_token = fixture_session(&f.pool, reviewer).await;
+
+    // A change request on the old head survives the head move when stale
+    // reviews are not dismissed, so the detail and the merge gate must agree.
+    let (status, _) = approve(
+        &f,
+        f.number,
+        "changes_requested",
+        &f.feature_head,
+        &reviewer_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let new_head = advance_feature(&f).await;
+
+    let (status, detail) = request(
+        &f.app,
+        "GET",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.token),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["changes_requested"], 1, "{detail}");
+
+    // An approval from a second reviewer satisfies the approval count, so the
+    // refusal that follows is the outstanding change request (409), not the
+    // approval gate (403).
+    let approver = add_member(&f.pool, f.org_id, "write").await;
+    let approver_token = fixture_session(&f.pool, approver).await;
+    let (status, _) = approve(&f, f.number, "approved", &new_head, &approver_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A fresh approval from the same reviewer clears the request.
+    let (status, _) = approve(&f, f.number, "approved", &new_head, &reviewer_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = create_merge_intent(&f, "merge", &new_head).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn pull_detail_reports_the_latest_status_per_context() {
     let f = build_fixture().await;
     let statuses = format!(

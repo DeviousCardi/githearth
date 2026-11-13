@@ -185,6 +185,16 @@ async fn apply_outcome(
 /// Runs one claimed intent through the ADR 0004 worker steps. Returns Ok on
 /// any business outcome (including a lost fence); only infrastructure failures
 /// return Err.
+/// A database failure (including one nested in a journal replay) keeps the
+/// full lease: an outage must not consume the bounded retry budget.
+fn keeps_lease(error: &MergeError) -> bool {
+    matches!(error, MergeError::Database(_))
+        || matches!(
+            error,
+            MergeError::Replay(crate::pushes::ReplayError::Database(_))
+        )
+}
+
 async fn run_intent(state: &AppState, claim: &Claim) -> Result<(), MergeError> {
     // 1. Move `validating` -> `executing`, fenced. A reclaimed `executing`
     // intent goes straight to step 2. If the fence lost (e.g. a cancel won),
@@ -210,15 +220,16 @@ async fn run_intent(state: &AppState, claim: &Claim) -> Result<(), MergeError> {
     // 2. Execute. `execute_intent` revalidates everything.
     let outcome = match execute_intent(state, claim.operation_id).await {
         Ok(outcome) => outcome,
-        // 3. Err(MergeError): log and leave the row; the lease expires and it
-        // is retried later. A deterministic storage/join failure does not
-        // benefit from waiting out the lease, so release it to retry on the
-        // next pass; attempts stay bounded by MAX_ATTEMPTS. A database error
-        // keeps the lease so an outage does not burn attempts.
+        // 3. Err(MergeError): log and leave the row. A database outage keeps
+        // the full lease so attempts are not burned. Other failures retry
+        // after a short delay (10 s) instead of the full lease, so a
+        // deterministic storage failure fails within MAX_ATTEMPTS instead of
+        // stranding the intent for hours. The next pass picks it up; the
+        // caller breaks out of the pass so it is not reclaimed immediately.
         Err(error) => {
-            if !matches!(error, MergeError::Database(_)) {
+            if !keeps_lease(&error) {
                 let _ = sqlx::query(
-                    "UPDATE merge_intents SET lease_expires_at = now() - interval '1 second', \
+                    "UPDATE merge_intents SET lease_expires_at = now() + interval '10 seconds', \
                      updated_at = now() \
                      WHERE operation_id = $1 AND lease_holder = $2 AND lease_attempt = $3",
                 )
@@ -231,7 +242,7 @@ async fn run_intent(state: &AppState, claim: &Claim) -> Result<(), MergeError> {
             tracing::warn!(
                 operation_id = %claim.operation_id,
                 error = %error,
-                "merge intent execution failed; lease will expire and retry"
+                "merge intent execution failed; will retry"
             );
             return Ok(());
         }
@@ -265,8 +276,9 @@ pub async fn run_once(state: &AppState, repository: Option<Uuid>) -> Result<usiz
                 tracing::warn!(
                     operation_id = %claim.operation_id,
                     error = %error,
-                    "merge worker error; will retry after lease expiry"
+                    "merge worker error; will retry on a later pass"
                 );
+                break;
             }
         }
     }

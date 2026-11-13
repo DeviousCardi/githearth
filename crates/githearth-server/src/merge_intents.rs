@@ -574,10 +574,6 @@ pub(crate) async fn create_intent(
             .await?;
             drop(conn);
 
-            if outstanding > 0 {
-                return Err(changes_requested());
-            }
-
             let checks_passed = statuses::all_success(&required_checks, &check_states);
             let code_owner_review_ok = crate::codeowners::review(
                 state,
@@ -599,6 +595,11 @@ pub(crate) async fn create_intent(
                 checks_passed,
                 code_owner_review_ok,
             )?;
+            // Authorize before reporting the policy state: a caller who could
+            // not merge anyway still gets the normal 403/404, not this 409.
+            if outstanding > 0 {
+                return Err(changes_requested());
+            }
 
             // A branch behind a merge queue enqueues its intent instead of
             // merging directly; the worker re-targets it as earlier entries merge.

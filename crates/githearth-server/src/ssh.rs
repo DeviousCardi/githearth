@@ -423,7 +423,16 @@ impl russh::server::Handler for SshHandler {
 
         // OpenSSH sends exec with want-reply and waits for it before sending stdin;
         // upload-pack speaks first, so stream git's output from now on, not after EOF.
-        session.channel_success(channel)?;
+        if let Err(e) = session.channel_success(channel) {
+            // The credential was recorded before spawning; no push can start.
+            if let Some(op_id) = operation {
+                let _ = sqlx::query("DELETE FROM push_credentials WHERE operation_id = $1")
+                    .bind(op_id)
+                    .execute(&state.pool)
+                    .await;
+            }
+            return Err(e.into());
+        }
 
         {
             tokio::spawn(async move {
@@ -441,27 +450,38 @@ impl russh::server::Handler for SshHandler {
 
                 if want == Want::Push {
                     drop(repo_guard);
-                    if let Err(e) = pushes::replay(&state, repo_id).await {
-                        tracing::warn!(repository_id = %repo_id, error = %e, "post-push journal replay failed; reconciler will retry");
-                    }
-                    // A refused push leaves no `repository_pushes` row; remove
-                    // the credential recorded before spawning so it does not
-                    // overstate push activity (issue #143, SSH path).
-                    if let Some(op_id) = operation
-                        && let Err(e) = sqlx::query(
-                            "DELETE FROM push_credentials \
-                             WHERE operation_id = $1 AND NOT EXISTS (\
-                               SELECT 1 FROM repository_pushes p WHERE p.operation_id = $1)",
-                        )
-                        .bind(op_id)
-                        .execute(&state.pool)
-                        .await
-                    {
-                        tracing::warn!(
+                    // Only a replayed journal proves the push was accepted (and
+                    // then a `repository_pushes` row exists). On a replay error
+                    // the reconciler will apply it later, so keeping the
+                    // credential preserves provenance; removing it here would
+                    // strip the credential from a push that did land.
+                    match pushes::replay(&state, repo_id).await {
+                        Ok(_) => {
+                            // A refused push leaves no `repository_pushes` row;
+                            // remove the credential recorded before spawning so
+                            // it does not overstate push activity (issue #143).
+                            if let Some(op_id) = operation
+                                && let Err(e) = sqlx::query(
+                                    "DELETE FROM push_credentials \
+                                     WHERE operation_id = $1 AND NOT EXISTS (\
+                                       SELECT 1 FROM repository_pushes p WHERE p.operation_id = $1)",
+                                )
+                                .bind(op_id)
+                                .execute(&state.pool)
+                                .await
+                            {
+                                tracing::warn!(
+                                    repository_id = %repo_id,
+                                    error = %e,
+                                    "cannot remove the credential of a refused push"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
                             repository_id = %repo_id,
                             error = %e,
-                            "cannot remove the credential of a refused push"
-                        );
+                            "post-push journal replay failed; reconciler will retry"
+                        ),
                     }
                 }
 
