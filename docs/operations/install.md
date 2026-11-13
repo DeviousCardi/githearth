@@ -12,9 +12,9 @@ lives in Compose volumes; `docker compose down` keeps it and
 
 ### Direct binary on Linux
 
-Prerequisites: a Linux host, **Git ≥ 2.40**, `curl`, `openssl`, Python 3, and a
-local PostgreSQL 17 (or a reachable server). The Docker image ships Git 2.47
-and `openssh-client` (for SSH-signed commit verification).
+Prerequisites: a Linux host, **Git ≥ 2.40**, `curl`, `openssl`, Python 3,
+`openssh-client` (for SSH-signed commit verification), and a local PostgreSQL 17
+(or a reachable server). The Docker image ships Git 2.47 and `openssh-client`.
 
 1. Install `githearth-server` somewhere on `PATH` and make it executable.
 2. Create a dedicated database and role, and note the connection URL.
@@ -22,8 +22,9 @@ and `openssh-client` (for SSH-signed commit verification).
    `database_url`, `storage_root`, `ssh_enabled = true` and
    `ssh_host_key_path`, and keep the file mode `0600`.
 4. Preflight: `githearth-server doctor --config /etc/githearth/config.toml`.
-   Before the first migrate, `schema` fails as documented below; every other
-   check should be `ok` or `warn`.
+   Before the first migrate, `schema` fails (and the dependent `lifecycle` and
+   `jobs` checks fail or skip) as documented below; the remaining checks should
+   be `ok` or `warn`.
 5. `githearth-server migrate --config /etc/githearth/config.toml`, then re-run
    `doctor` — it must exit 0.
 6. Bootstrap the first administrator (password on stdin only, 12+ bytes):

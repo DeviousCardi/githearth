@@ -116,12 +116,10 @@ GitHearth does not need to be restarted — it never sees the certificate.
 | Personal access token expiry | chosen at creation: 1–3650 days, or none | `tokens.rs` `create_token` |
 | CSRF token size | 128 bits (16 bytes hex → 32 chars) | `ui.rs:317` |
 | Auth concurrency (login throttling) | 2 concurrent argon2 verifications; queue 2 s timeout | `config.rs:64`, `lib.rs:506` |
-| `Cache-Control: no-store` (API) | all JSON + git responses | `lib.rs:347` |
-| `Cache-Control: no-store` (UI) | all browser pages | `ui.rs` `page_headers` |
-| `Cache-Control: no-cache` (Git) | info_refs, upload-pack, receive-pack | `git_http.rs` |
+| `Cache-Control: no-store` | all responses (JSON, UI and Git), set by the `observe` middleware | `lib.rs` `observe` |
 | `X-Frame-Options: DENY` | all browser pages | `ui.rs` `page_headers` |
-| `X-Content-Type-Options: nosniff` | all responses | `lib.rs` `security_headers` |
-| `Referrer-Policy: same-origin` | all responses | `lib.rs` `security_headers` |
+| `X-Content-Type-Options: nosniff` | all responses | `lib.rs` `observe` |
+| `Referrer-Policy: same-origin` | all responses | `lib.rs` `observe` |
 | `Content-Security-Policy` | all browser pages (`default-src 'none'`, inline styles only, `frame-ancestors 'none'`) | `ui.rs` `PAGE_CSP` |
 | `X-Forwarded-For` consumption | trusted proxies only (`trusted_proxies`), used for the audit client IP | `client_ip.rs`, `lib.rs` |
 | `X-Forwarded-Proto` / `X-Forwarded-Host` | not consumed; no IP-based rate limiting, cookie-domain filtering or Host validation | `client_ip.rs` |
