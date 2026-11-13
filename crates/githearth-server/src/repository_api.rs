@@ -231,15 +231,18 @@ pub(crate) async fn create(
     let Some(facts) = facts::load(&mut conn, actor.id, org_id).await? else {
         return Err(org_not_found());
     };
-    if !state
-        .authz
-        .authorize(&facts.request(
-            Action::RepositoryCreate,
-            Resource::Organization,
-            Some(Duration::from_secs(auth_age)),
-        ))
-        .is_allowed()
-    {
+    let decision = state.authz.authorize(&facts.request(
+        Action::RepositoryCreate,
+        Resource::Organization,
+        Some(Duration::from_secs(auth_age)),
+    ));
+    if !decision.is_allowed() {
+        // Do not mask an authorization failure as a missing organization: an
+        // organization member who lacks the grant gets 403, only a stranger
+        // gets 404 (issue #133).
+        if facts.account.organizations.contains(&org_id) {
+            return Err(ApiError(StatusCode::FORBIDDEN, "not permitted"));
+        }
         return Err(org_not_found());
     }
 

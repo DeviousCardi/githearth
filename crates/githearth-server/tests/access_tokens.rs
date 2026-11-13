@@ -622,6 +622,42 @@ async fn session_write_is_unchanged() {
     pool.close().await;
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn logout_with_access_token_is_rejected_without_side_effects() {
+    let (pool, app) = api_pool().await;
+    let username = tag("user");
+    let owner = fixture_account(&pool, &username, "correct horse battery staple").await;
+    let session = login(&app, &username, "correct horse battery staple").await;
+    let (_id, token) = create_token(&app, &session, &["repo:write"], None).await;
+
+    // Logging out with an access token must fail cleanly instead of reporting
+    // success while revoking nothing (issue #139).
+    let (status, body) = request(&app, "POST", "/api/v1/logout", Some(&token), Value::Null).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, json!({"error": "access tokens cannot log out"}));
+
+    // The token still authenticates.
+    assert_eq!(
+        request(&app, "GET", "/api/v1/me", Some(&token), Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // No misleading `session.revoked` audit row was written.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE actor_id = $1 AND kind = 'session.revoked'",
+    )
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+
+    pool.close().await;
+}
+
 // ---------------------------------------------------------------------------
 // Git Smart HTTP tests
 // ---------------------------------------------------------------------------
@@ -684,6 +720,7 @@ struct GitFx {
     repo_name: String,
     port: u16,
     read_token: String,
+    read_token_id: Uuid,
     write_token: String,
 }
 
@@ -754,7 +791,7 @@ async fn git_setup() -> GitFx {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let session = login(&app, &username, "testpass").await;
-    let (_rid, read_token) = create_token(&app, &session, &["repo:read"], None).await;
+    let (read_token_id, read_token) = create_token(&app, &session, &["repo:read"], None).await;
     let (_wid, write_token) = create_token(&app, &session, &["repo:write"], None).await;
 
     GitFx {
@@ -764,6 +801,7 @@ async fn git_setup() -> GitFx {
         repo_name,
         port,
         read_token,
+        read_token_id,
         write_token,
     }
 }
@@ -810,6 +848,25 @@ async fn git_clone_with_token_and_push_fails_for_read_token() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // A refused push must not leave a dangling push_credentials row (issue #143).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let dangling: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM push_credentials WHERE credential_id = $1")
+                .bind(fx.read_token_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        if dangling == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "push_credentials row for the refused push was not cleaned up"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // The same push succeeds with a write token.
     let write_remote = token_url(fx.port, &fx.org_slug, &fx.repo_name, &fx.write_token);

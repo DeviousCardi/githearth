@@ -976,3 +976,115 @@ fn sensitive_actions_require_fresh_authentication() {
     });
     assert!(d.is_allowed(), "{d:?}");
 }
+
+/// Role templates are cumulative: every higher role permits every action a
+/// lower role permits (issue #133). Each role is granted at both organization
+/// and repository scope so org-level and repository-level actions are both
+/// covered, and the permitted set of a lower role must be a subset of a
+/// higher role's.
+#[test]
+fn roles_are_cumulative() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let site = site_on(&w.private, w.member.id, "refs/heads/main");
+    let roles = [
+        BuiltinRole::Member,
+        BuiltinRole::Read,
+        BuiltinRole::Triage,
+        BuiltinRole::Write,
+        BuiltinRole::Maintain,
+        BuiltinRole::Admin,
+        BuiltinRole::Owner,
+    ];
+    let permitted = |role: BuiltinRole| {
+        let who = account(&[w.acme.id], &[]);
+        let grants = [
+            grant(
+                role,
+                Subject::Account(who.id),
+                Scope::Organization(w.acme.id),
+            ),
+            grant(
+                role,
+                Subject::Account(who.id),
+                Scope::Repository(w.private.id),
+            ),
+        ];
+        Action::ALL
+            .iter()
+            .map(|&action| {
+                let (resource, merge) = site.resource(action);
+                engine
+                    .authorize(&Request {
+                        principal: Principal::Account(&who),
+                        teams: &[],
+                        grants: &grants,
+                        action,
+                        organization: &w.acme,
+                        resource,
+                        merge,
+                        auth_age: Some(Duration::ZERO),
+                        read_only: false,
+                    })
+                    .is_allowed()
+            })
+            .collect::<Vec<bool>>()
+    };
+    let table: Vec<Vec<bool>> = roles.iter().map(|&role| permitted(role)).collect();
+    for (lower, lower_role) in roles.iter().enumerate() {
+        for (higher, higher_role) in roles.iter().enumerate() {
+            if higher <= lower {
+                continue;
+            }
+            for (index, &action) in Action::ALL.iter().enumerate() {
+                assert!(
+                    !table[lower][index] || table[higher][index],
+                    "{lower_role:?} permits {action:?} but {higher_role:?} does not"
+                );
+            }
+        }
+    }
+}
+
+/// `repository.create` lives in the `member` action group, which every role
+/// template must grant (issue #133): an organization member with a `read`,
+/// `triage`, `write`, `maintain` or `admin` grant can create a repository.
+#[test]
+fn repository_create_is_available_to_every_role() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    for role in BuiltinRole::ALL {
+        let who = account(&[w.acme.id], &[]);
+        let grants = [grant(
+            role,
+            Subject::Account(who.id),
+            Scope::Organization(w.acme.id),
+        )];
+        let d = engine.authorize(&Request {
+            principal: Principal::Account(&who),
+            teams: &[],
+            grants: &grants,
+            action: Action::RepositoryCreate,
+            organization: &w.acme,
+            resource: Resource::Organization,
+            merge: None,
+            auth_age: Some(Duration::ZERO),
+            read_only: false,
+        });
+        assert!(d.is_allowed(), "{role:?}: {d:?}");
+    }
+    // A visitor who is not a member of the organization cannot create there.
+    let outsider = account(&[], &[]);
+    let d = engine.authorize(&Request {
+        principal: Principal::Account(&outsider),
+        teams: &[],
+        grants: &[],
+        action: Action::RepositoryCreate,
+        organization: &w.acme,
+        resource: Resource::Organization,
+        merge: None,
+        auth_age: Some(Duration::ZERO),
+        read_only: false,
+    });
+    assert!(!d.is_allowed(), "{d:?}");
+}

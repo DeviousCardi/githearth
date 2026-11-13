@@ -833,6 +833,66 @@ async fn receive_pack_concurrency_exhausted_503() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn chunked_and_gzip_push_over_limit_413() {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    let fx = setup(1024).await;
+    let path = format!("/{}/{}.git/git-receive-pack", fx.org_slug, fx.repo_name);
+
+    // No Content-Length (chunked): the size is only known while streaming, but
+    // the push must still be refused with a clean 413 (issue #142).
+    let response = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::post(&path)
+                .header("authorization", basic_auth(&fx.username, "testpass"))
+                .header("content-type", "application/x-git-receive-pack-request")
+                .body(Body::from(vec![b'x'; 2048]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    let _ = response.into_body().collect().await;
+
+    // Gzip: the decompressed body exceeds the limit even though the compressed
+    // body is small, so the Content-Length pre-check cannot catch it.
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&vec![b'x'; 2048]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let response = fx
+        .app
+        .clone()
+        .oneshot(
+            Request::post(&path)
+                .header("authorization", basic_auth(&fx.username, "testpass"))
+                .header("content-type", "application/x-git-receive-pack-request")
+                .header("content-encoding", "gzip")
+                .body(Body::from(compressed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    let _ = response.into_body().collect().await;
+
+    // Neither over-limit request applied a push.
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 0);
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn no_credentials_401_and_unrelated_user_404() {
     let fx = setup(1 << 30).await;
 

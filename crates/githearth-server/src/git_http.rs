@@ -9,6 +9,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
@@ -253,6 +255,7 @@ async fn upload_pack(
 
     // Kill channel: stdin feeder sends when the decoded body exceeds the limit.
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let limit_exceeded = Arc::new(AtomicBool::new(false));
 
     // CancellationToken: one per request.  The supervisor cancels it after git
     // exits so the feeder stops promptly.  The response body holds a drop-guard
@@ -269,6 +272,7 @@ async fn upload_pack(
             limit,
             kill_tx,
             feeder_token,
+            limit_exceeded.clone(),
         ))
     } else {
         tokio::spawn(stream_body_to_stdin(
@@ -278,6 +282,7 @@ async fn upload_pack(
             limit,
             kill_tx,
             feeder_token,
+            limit_exceeded.clone(),
         ))
     };
 
@@ -458,6 +463,12 @@ async fn receive_pack(
         Ok(child) => child,
         Err(e) => {
             drop(token_guard);
+            // The credential was recorded before spawning; a push that never
+            // starts must not leave it dangling (issue #143).
+            let _ = sqlx::query("DELETE FROM push_credentials WHERE operation_id = $1")
+                .bind(operation)
+                .execute(&state.pool)
+                .await;
             tracing::error!(
                 category = "git",
                 repository_id = %repo_id,
@@ -472,7 +483,10 @@ async fn receive_pack(
     let stderr = child.stderr.take().expect("stderr piped");
 
     // Kill channel: stdin feeder sends when the decoded body exceeds the limit.
+    // A separate flag lets the handler return a clean 413 for chunked/gzip
+    // bodies whose size is only known while streaming (issue #142).
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let limit_exceeded = Arc::new(AtomicBool::new(false));
     let token = CancellationToken::new();
     let feeder_token = token.clone();
 
@@ -484,6 +498,7 @@ async fn receive_pack(
             limit,
             kill_tx,
             feeder_token,
+            limit_exceeded.clone(),
         ))
     } else {
         tokio::spawn(stream_body_to_stdin(
@@ -493,6 +508,7 @@ async fn receive_pack(
             limit,
             kill_tx,
             feeder_token,
+            limit_exceeded.clone(),
         ))
     };
 
@@ -507,14 +523,36 @@ async fn receive_pack(
             // itself dropped, never before the hook has had a chance to run.
             let _guard = repo_guard;
             let _token_guard = token_guard;
-            if let Err(e) = pushes::replay(&state, repo_id).await {
-                // A metadata failure after git succeeded never changes the
-                // client's result; the reconciler applies it later.
-                tracing::warn!(
-                    repository_id = %repo_id,
-                    error = %e,
-                    "post-push journal replay failed; reconciler will retry"
-                );
+            match pushes::replay(&state, repo_id).await {
+                Ok(_) => {
+                    // A refused push leaves no `repository_pushes` row; remove
+                    // the credential recorded before spawning so it does not
+                    // overstate push activity (issue #143).
+                    if let Err(e) = sqlx::query(
+                        "DELETE FROM push_credentials \
+                         WHERE operation_id = $1 AND NOT EXISTS (\
+                           SELECT 1 FROM repository_pushes p WHERE p.operation_id = $1)",
+                    )
+                    .bind(operation)
+                    .execute(&state.pool)
+                    .await
+                    {
+                        tracing::warn!(
+                            repository_id = %repo_id,
+                            error = %e,
+                            "cannot remove the credential of a refused push"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // A metadata failure after git succeeded never changes the
+                    // client's result; the reconciler applies it later.
+                    tracing::warn!(
+                        repository_id = %repo_id,
+                        error = %e,
+                        "post-push journal replay failed; reconciler will retry"
+                    );
+                }
             }
         })
     };
@@ -539,6 +577,12 @@ async fn receive_pack(
     // The supervisor already owns git and the post-push replay, so a client that
     // disconnects here still gets its push applied.
     output.as_mut().peek().await;
+    // Once the body has been fully fed (git produces nothing until then), a
+    // chunked or gzip body that exceeded the limit can be refused with a clean
+    // 413 instead of a dropped connection (issue #142).
+    if limit_exceeded.load(Ordering::SeqCst) {
+        return Err(GitHttpError::PayloadTooLarge);
+    }
     let body = Body::from_stream(output);
 
     let mut response = Response::new(body);
@@ -958,6 +1002,7 @@ async fn stream_body_to_stdin(
     limit: usize,
     kill_tx: oneshot::Sender<()>,
     token: CancellationToken,
+    limit_exceeded: Arc<AtomicBool>,
 ) {
     let mut stream = body.into_data_stream();
     let mut total: usize = 0;
@@ -971,6 +1016,7 @@ async fn stream_body_to_stdin(
                 };
                 total += chunk.len();
                 if total > limit {
+                    limit_exceeded.store(true, Ordering::SeqCst);
                     tracing::warn!(
                         repository_id = %repo_id, total, limit,
                         "git request body exceeds limit; signalling kill"
@@ -997,6 +1043,7 @@ async fn stream_gzip_body_to_stdin(
     limit: usize,
     kill_tx: oneshot::Sender<()>,
     token: CancellationToken,
+    limit_exceeded: Arc<AtomicBool>,
 ) {
     use async_compression::tokio::bufread::GzipDecoder;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -1017,6 +1064,7 @@ async fn stream_gzip_body_to_stdin(
                     Ok(n) => {
                         total += n;
                         if total > limit {
+                            limit_exceeded.store(true, Ordering::SeqCst);
                             tracing::warn!(
                                 repository_id = %repo_id, total, limit,
                                 "git decoded request body exceeds limit; signalling kill"
