@@ -41,4 +41,4 @@ The harness subclasses the M2 harness in [`scripts/verify-m2.py`](../../scripts/
 - A publicly trusted certificate, ACME renewal, and OCSP stapling.
 - Proxies other than nginx; only the nginx configuration is documented and tested.
 - SSH; it is served directly by GitHearth, not proxied, and is covered by the M4 drills.
-- The security-header gaps listed in [tls.md](../operations/tls.md#gaps-filed-as-issues): `X-Content-Type-Options`, `Referrer-Policy` and `Content-Security-Policy` are not set. They are filed as #87 and #88 rather than changed here.
+- The remaining edge cases listed in [tls.md](../operations/tls.md#remaining-gaps): `X-Forwarded-Proto`/`X-Forwarded-Host` are not consumed and the app does not validate the Host header; the proxy is expected to enforce the public hostname and TLS. `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and a page CSP are now set (see the header table in [tls.md](../operations/tls.md#session-and-tls-defaults)).
