@@ -196,10 +196,21 @@ Scope and exit criteria are in the [roadmap](04-forge-roadmap.md#m5--single-regi
 | Increment | Person A leads | Person B leads |
 | --- | --- | --- |
 | 10A Commit point and lifecycle | Metadata apply, operation-ID retry, audit for replicated refs | Raft log, object manifests, hook behaviour, create/adopt/delete entries |
-| 10B Placement, reads and moves | Placement schema, routing generation, move record and switch decision | Seal, adoption, release, stale-route refusal, follower read-index |
+| 10B Placement, reads and moves | Placement schema, routing generation, move record and switch decision | Seal, import, release, stale-route refusal, follower read-index |
 | 10C Metadata HA | Patroni and etcd configuration, primary discovery, connection recovery | Authorization reads at a known position; refusal when the primary is not authoritative |
 | 10D Shared object store | CI data on the object-store interface, tenant prefixes | S3-compatible store integration and the reference backend chosen by failure tests |
 | 10E Conversion, upgrade, backup, capacity | Conversion procedure and rolling upgrade; online backup cut protocol; capacity model and machine counts | Journal format migration, mixed-version test, backup across groups, M6 cluster cases |
+
+### M5 acceptance cases
+
+| ID | Owner | Requirement |
+| --- | --- | --- |
+| U45 | B | A push reports `ok` only for a committed entry. A leader killed between proposal and commit gives the client no verdict, and a retry with the operation ID returns the committed result; no local ref is ever ahead of the log |
+| U46 | B | Repository create, fork adoption and delete survive the loss of the node that served them; a member that missed a delete cannot serve the repository |
+| U47 | A | A move aborted before the switch leaves the source serving; a target that dies after import leaves exactly one readable copy; a gateway holding a stale route cannot read the released source |
+| U48 | A | A write racing the online backup is in the restore or was refused; a restore whose metadata, Git groups and object store disagree is refused, as is a repository recorded mid-move |
+| U49 | B | A member that lacks a committed manifest cannot lead, vote or be counted in that entry's quorum; a membership change that would leave fewer than two holders of a committed manifest is refused |
+| U50 | A | A single node converts with both learners caught up before either is promoted; an N/N+1 cluster upgrades followers before the leader and old voters apply and ignore unknown entries without stalling quorum |
 
 M5 implementation needs the open items in ADRs 0010–0012 closed first; Docker Compose serves M5 development, and qualification runs on the available independent machines.
 

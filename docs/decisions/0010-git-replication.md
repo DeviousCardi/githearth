@@ -101,6 +101,17 @@ The hook's contract is therefore:
   the committed result instead of re-executing. An entry is unique on
   `(repository_id, op_id)`.
 
+Two implementation constraints follow, and neither is optional:
+
+- The reference-transaction channel must not reuse the pre-receive socket's
+  30-second read timeout, and a transport error on it must abort the request,
+  not become a rejection. The existing channel turns every error into `DENIED`;
+  that behaviour is correct for `pre-receive` and wrong here.
+- The single-node classifier that treats "prepared record, refs still at the
+  old value" as aborted is removed. Without a decision from the log, that state
+  is **Unknown**: the reconciler waits for or retries the proposal, and never
+  rolls the ref back on the strength of a missing marker.
+
 This is what makes "no acknowledged loss" and "no false rejection" compatible:
 `ok` implies committed, and the only alternative to `ok` is silence.
 
@@ -112,8 +123,13 @@ This is what makes "no acknowledged loss" and "no false rejection" compatible:
   a majority with a manifest before the entry that moves the ref.
 - A fork (`adopt`, below) carries the copy's refs and manifest; the objects
   reach the target group's majority before the entry is proposed.
-- A fork-pull fetch, an applied suggestion and any server-created object get a
-  manifest before their entry.
+- A fork-pull fetch and an applied suggestion get a manifest before their
+  entry. The fetch itself writes no journal entry, and it does not need one:
+  the pull request's pin (M4.1's `pinned_commits`, carried into the replicated
+  keep-set) makes the fetched object graph live from the moment the pull
+  request commits, and the fetch runs under the repository's maintenance lock.
+  The requirement is that the pin is committed before any prune can run, not
+  that the fetch is journaled.
 - A prune entry, which deletes rather than creates, carries the keep-set it
   was computed from (see Housekeeping).
 
@@ -145,6 +161,13 @@ Objects-before-log guarantees a majority at commit time. Keeping that true
 afterwards requires the property to be visible to Raft:
 
 - Each member reports its object watermark and the manifests it holds.
+- **A member appends or acknowledges a ref entry only when it already holds
+  that entry's manifest.** Before then it takes no part in that entry's
+  quorum, and the leader does not count it. This is what ties the object
+  majority to the commit majority: the set that can commit is a subset of the
+  set that holds the objects, so any majority that commits an entry also holds
+  it. Without this rule the two majorities can differ, and a leader election
+  can hand the repository to a member that never received the pack.
 - A member may serve as leader for writes, or serve reads, only if it holds
   every manifest up to the commit index for the repositories it serves. A
   member that does not steps down from write service and requests catch-up;
@@ -254,6 +277,11 @@ repository:
   a change from today's hook that only returns a status.
 - The lifecycle commands make create, fork and delete slower than a local
   `git init`/copy and make them survivable.
+- The single-node path is not a compatibility layer: M5 changes the hook, the
+  journal classification and the lifecycle commands in the one code path both
+  modes share. The M2–M4.1 crash and recovery drills are its regression suite,
+  and the rewrite is budgeted as part of the commit-point work, not as an
+  addition on top of it.
 - M5 is the largest milestone in the roadmap. The design here is smaller than
   the open implementation work, not larger.
 

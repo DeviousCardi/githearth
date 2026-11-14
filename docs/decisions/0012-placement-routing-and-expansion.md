@@ -75,12 +75,12 @@ The record is `repository_moves`; every transition is a compare-and-swap on
 3. **`sealed`** — a `seal` entry commits in the **source** log at position
    `F`. From `F` the source refuses new writes for the repository; it still
    serves reads at `F`.
-4. **`adopted`** — entries `P+1..F` are replayed to the target and an `adopt`
+4. **`imported`** — entries `P+1..F` are replayed to the target and an `import`
    entry carrying the repository ID, per-repository sequence `F` and the object
    manifest commits on a **target majority**. The target holds the repository
    in a non-serving `importing` state. Until this commits, the move can still
    be aborted.
-5. **`switching`** — the move row is compare-and-swapped from `adopted` to
+5. **`switching`** — the move row is compare-and-swapped from `imported` to
    `switching`, which also increments the placement generation. Exactly one
    coordinator wins this CAS. The target begins refusing requests with "not
    serving yet".
@@ -96,12 +96,12 @@ holding a cached route to the source cannot read the old copy after the
 switch. The window in which neither serves is bounded and returns
 `503`/`stale route`, never a stale read.
 
-**Abort paths.** Before `adopted`, the move can be aborted: a `unseal` entry
-commits on the source and the target's copy is discarded. Between `adopted` and
+**Abort paths.** Before `imported`, the move can be aborted: a `unseal` entry
+commits on the source and the target's copy is discarded. Between `imported` and
 `switching`, abort requires a `discard` on the target and an `unseal` on the
 source, in that order. After `switching`, there is no abort: the only route
 back is a new reverse move, because the placement decision is already durable.
-A target that dies after `adopted` therefore leaves the repository readable (at
+A target that dies after `imported` therefore leaves the repository readable (at
 the source, sealed) and unwritable until the target recovers or a reverse move
 runs; that is stated, and it is why abort is a documented operator action
 rather than an automatic rollback.
@@ -159,7 +159,7 @@ Conversion is a maintenance-window procedure, not an online migration:
 ### Backup interaction
 
 - A backup records the move state for every repository. A repository in
-  `copying`, `sealed` or `adopted` is recorded as mid-move; a restore of such a
+  `copying`, `sealed` or `imported` is recorded as mid-move; a restore of such a
   backup **refuses** to serve that repository until an operator resolves the
   move, rather than guessing which copy is authoritative.
 - A backup cannot be taken while a move is in `switching`; the backup retries
@@ -185,8 +185,8 @@ Conversion is a maintenance-window procedure, not an online migration:
 
 ### Fork placement
 
-A fork is placed in its parent's group by default, so the copy is local and
-`adopt` does not cross a group boundary. A cross-group fork is allowed, at the
+A fork is placed in its parent's group by default, so the copy is local and its
+`adopt` entry does not cross a group boundary. A cross-group fork is allowed, at the
 cost of a full object transfer, and is recorded as such.
 
 ## Consequences
@@ -217,7 +217,7 @@ cost of a full object transfer, and is recorded as such.
    [the fault matrix](../plan/07-qualification-and-decisions.md#correctness-and-fault-matrix)
    as executable tests: interrupted move, stale route, membership change.
 6. Tests for a push racing each step of a move, a partitioned source group, a
-   target death after adoption, an abort after sealing, a stale gateway read
+   target death after import, an abort after sealing, a stale gateway read
    after release, and an interrupted move at each boundary.
 7. Restore with a placement generation older than the storage nodes', and a
    repository that was mid-move when the backup was taken.
