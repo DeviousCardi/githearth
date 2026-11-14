@@ -859,6 +859,69 @@ async fn branch_settings_page_lists_creates_and_deletes_rules() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn branch_settings_writes_require_manage_and_csrf() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    fixture_repository(&pool, org_id, "r", owner).await;
+    let path = branch_settings_path(&slug, "r");
+
+    // A write member may read the page but not create or delete a rule.
+    let writer = add_member(&pool, org_id, "write").await;
+    let writer_token = fixture_session(&pool, writer).await;
+    let writer_cookie = format!("githearth_session={writer_token}");
+    let (status, html) = get_html(&app, &path, Some(&writer_cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let csrf = hidden(&html, "csrf_token");
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &writer_cookie,
+        &[
+            ("csrf_token", &csrf),
+            ("idempotency_key", "00112233445566778899aabbccddeeff"),
+            ("pattern", "main"),
+            ("required_approvals", "0"),
+            ("required_status_checks", ""),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM branch_protection_rules WHERE repository_id = (SELECT id FROM repositories WHERE organization_id = $1 AND name = 'r')")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "a write member must not create a rule");
+
+    // Missing CSRF is rejected before any state change, even for the owner.
+    let owner_token = fixture_session(&pool, owner).await;
+    let owner_cookie = format!("githearth_session={owner_token}");
+    let (status, _, _) = post_form(
+        &app,
+        &path,
+        &owner_cookie,
+        &[("csrf_token", "wrong"), ("pattern", "main")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A non-member gets the not-found page, not the rule list.
+    let stranger = fixture_account(&pool, &tag("stranger")).await;
+    let stranger_token = fixture_session(&pool, stranger).await;
+    let (status, _) = get_html(
+        &app,
+        &path,
+        Some(&format!("githearth_session={stranger_token}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn branch_settings_page_hides_forms_from_viewers_who_cannot_manage() {
     let (app, pool, storage, owner, org_id, slug) = setup().await;
     let repo_id = fixture_repository(&pool, org_id, "r", owner).await;

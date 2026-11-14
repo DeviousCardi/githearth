@@ -422,6 +422,12 @@ async fn source_repository_options(
     let loaded = repository_api::load_repo(state, s.account.id, s.auth_age, slug, name)
         .await
         .map_err(|e| api_error(s, e))?;
+    // The invalid-title and idempotency-replay paths render this form before
+    // the API call would authorize; require read here so they cannot be used
+    // to probe whether a private repository exists.
+    if repository_api::require(state, &loaded, Action::RepositoryRead).is_err() {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    }
     let forks: Vec<(String, String, Uuid)> = sqlx::query_as(
         "SELECT o.slug, r.name, r.id FROM repositories r \
          JOIN organizations o ON o.id = r.organization_id \

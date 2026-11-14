@@ -99,6 +99,15 @@ fn api_error(s: &Session, slug: &str, name: &str, error: crate::ApiError) -> ui:
             );
             ui::UiError::from(page(s, StatusCode::FORBIDDEN, "Not permitted", &body))
         }
+        StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY => {
+            let title = "Cannot apply that change";
+            let body = format!(
+                "<h1>{title}</h1><p>{}</p><p><a href=\"{}\">Back to branch protection</a></p>",
+                ui::esc(error.message()),
+                ui::esc(&format!("{}/settings/branches", repo_href(slug, name)))
+            );
+            ui::UiError::from(page(s, error.status_code(), title, &body))
+        }
         _ => ui::unavailable_page(Some(&s.account.username)),
     }
 }
@@ -196,10 +205,11 @@ async fn render_settings(
             format!(
                 "<td><form method=\"post\" action=\"{}/settings/branches/{}/delete\" style=\"display:inline\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
-<button type=\"submit\">Delete</button></form></td>",
+<button type=\"submit\" aria-label=\"Delete rule {}\">Delete</button></form></td>",
                 ui::esc(&repo_href(slug, name)),
                 rule.id,
                 ui::esc(&s.csrf),
+                ui::esc(&rule.pattern),
             )
         } else {
             String::new()
