@@ -12,13 +12,15 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
+use githearth_authz::{Action, Resource};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    AppState, auto_merge, browse_ui, idempotency, merge_intents, pulls, repository_api, ui,
+    AppState, auto_merge, browse_ui, facts, idempotency, merge_intents, pulls, repositories,
+    repository_api, ui,
 };
 
 pub(crate) fn router() -> Router<AppState> {
@@ -375,6 +377,7 @@ fn new_pull_body(
     s: &Session,
     base: &str,
     name: &str,
+    source_options: &str,
     source: &str,
     target: &str,
     title: &str,
@@ -390,6 +393,7 @@ fn new_pull_body(
     format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / New</nav>\
 <h1>New pull request</h1>{error}<form class=\"card\" method=\"post\" action=\"{base}/pulls\">{}\
+<label for=\"source_repository\">Source repository</label><select id=\"source_repository\" name=\"source_repository\">{source_options}</select>\
 <label for=\"source_branch\">Source branch</label><input id=\"source_branch\" name=\"source_branch\" required value=\"{}\">\
 <label for=\"target_branch\">Target branch</label><input id=\"target_branch\" name=\"target_branch\" required value=\"{}\">\
 <label for=\"title\">Title</label><input id=\"title\" name=\"title\" required maxlength=\"256\" value=\"{}\">\
@@ -403,6 +407,71 @@ fn new_pull_body(
         ui::esc(title),
         ui::esc(text)
     )
+}
+
+/// Options for the source-repository selector: this repository plus every
+/// active fork the viewer can read, so a fork contributor can open the pull
+/// request from the same form.
+async fn source_repository_options(
+    state: &AppState,
+    s: &Session,
+    slug: &str,
+    name: &str,
+    selected: &str,
+) -> Result<String, ui::UiError> {
+    let loaded = repository_api::load_repo(state, s.account.id, s.auth_age, slug, name)
+        .await
+        .map_err(|e| api_error(s, e))?;
+    let forks: Vec<(String, String, Uuid)> = sqlx::query_as(
+        "SELECT o.slug, r.name, r.id FROM repositories r \
+         JOIN organizations o ON o.id = r.organization_id \
+         WHERE r.parent_repository_id = $1 AND r.status = 'active' \
+         ORDER BY o.slug, r.name",
+    )
+    .bind(loaded.repo.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
+    let mut options = format!(
+        "<option value=\"\"{}>This repository ({})</option>",
+        if selected.is_empty() { " selected" } else { "" },
+        ui::esc(name)
+    );
+    for (org_slug, fork_name, fork_id) in forks {
+        let mut conn = state
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
+        let fork = repositories::get(&mut conn, fork_id)
+            .await
+            .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
+        let Some(fork) = fork else { continue };
+        let Some(org_facts) = facts::load(&mut conn, s.account.id, fork.organization_id)
+            .await
+            .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?
+        else {
+            continue;
+        };
+        drop(conn);
+        let read = state.authz.authorize(&org_facts.request(
+            Action::RepositoryRead,
+            Resource::Repository(&repositories::authz_repository(&fork)),
+            Some(Duration::from_secs(s.auth_age)),
+        ));
+        if !read.is_allowed() {
+            continue;
+        }
+        let spec = format!("{org_slug}/{fork_name}");
+        let selected = if spec == selected { " selected" } else { "" };
+        options.push_str(&format!(
+            "<option value=\"{}\"{}>{}</option>",
+            ui::esc(&spec),
+            selected,
+            ui::esc(&spec)
+        ));
+    }
+    Ok(options)
 }
 
 async fn new_page(
@@ -426,6 +495,7 @@ async fn new_page(
     .await
     .map_err(|e| api_error(&s, e))?;
     let base = repo_href(&slug, &name);
+    let options = source_repository_options(&state, &s, &slug, &name, "").await?;
     Ok(page(
         &s,
         StatusCode::OK,
@@ -434,6 +504,7 @@ async fn new_page(
             &s,
             &base,
             &name,
+            &options,
             "",
             "main",
             "",
@@ -451,6 +522,8 @@ struct PullForm {
     csrf_token: String,
     #[serde(default)]
     idempotency_key: String,
+    #[serde(default)]
+    source_repository: String,
     #[serde(default)]
     source_branch: String,
     #[serde(default)]
@@ -474,6 +547,8 @@ async fn create_submit(
     let base = repo_href(&slug, &name);
     let draft = form.draft.is_some();
     if !title_ok(&form.title) || !body_ok(&form.body) {
+        let options =
+            source_repository_options(&state, &s, &slug, &name, &form.source_repository).await?;
         return Ok(page(
             &s,
             StatusCode::BAD_REQUEST,
@@ -482,6 +557,7 @@ async fn create_submit(
                 &s,
                 &base,
                 &name,
+                &options,
                 &form.source_branch,
                 &form.target_branch,
                 &form.title,
@@ -494,14 +570,18 @@ async fn create_submit(
             ),
         ));
     }
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "source_branch": &form.source_branch,
         "target_branch": &form.target_branch,
         "title": &form.title,
         "body": &form.body,
         "draft": draft,
-    })
-    .to_string();
+    });
+    let source_repository = form.source_repository.trim();
+    if !source_repository.is_empty() {
+        payload["source_repository"] = serde_json::Value::String(source_repository.to_owned());
+    }
+    let payload = payload.to_string();
     let (_, value) = match pulls::create_pull(
         &state,
         s.account.id,
@@ -516,6 +596,9 @@ async fn create_submit(
         Ok(v) => v,
         Err(e) => {
             if let Some(message) = ui::idempotency_notice(&e) {
+                let options =
+                    source_repository_options(&state, &s, &slug, &name, &form.source_repository)
+                        .await?;
                 return Ok(page(
                     &s,
                     e.status_code(),
@@ -524,6 +607,7 @@ async fn create_submit(
                         &s,
                         &base,
                         &name,
+                        &options,
                         &form.source_branch,
                         &form.target_branch,
                         &form.title,
