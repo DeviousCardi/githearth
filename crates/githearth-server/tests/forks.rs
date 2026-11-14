@@ -983,6 +983,128 @@ async fn fork_form_lists_only_namespaces_the_viewer_can_create_repositories_in()
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_listing_returns_parent_and_children() {
+    let f = build_fixture().await;
+
+    // The upstream lists its readable fork.
+    let (status, listing) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/forks",
+            f.parent_org_slug, f.parent_repo_name
+        ),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["parent"], Value::Null);
+    assert_eq!(listing["count"], 1);
+    let children = listing["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["id"].as_str().unwrap(), f.fork_id.to_string());
+    assert_eq!(
+        children[0]["parent_repository_id"].as_str().unwrap(),
+        f.parent_repo_id.to_string()
+    );
+
+    // The fork itself links back to its parent and has no children.
+    let (status, listing) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/forks",
+            f.contrib_org_slug, f.fork_name
+        ),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(
+        listing["parent"]["id"].as_str().unwrap(),
+        f.parent_repo_id.to_string()
+    );
+    assert_eq!(listing["count"], 0);
+    assert!(listing["children"].as_array().unwrap().is_empty());
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_pull_list_includes_outgoing_cross_repository_pulls() {
+    let f = build_fixture().await;
+
+    let (status, page) = request(
+        &f.app,
+        "GET",
+        &repo_href(&f.contrib_org_slug, &f.fork_name),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{page}");
+    assert_eq!(items[0]["number"], f.number);
+    assert_eq!(
+        items[0]["source_repository_id"].as_str().unwrap(),
+        f.fork_id.to_string()
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reopening_a_pull_after_its_source_fork_is_deleted_is_refused() {
+    let f = build_fixture().await;
+
+    let (status, _) = request(
+        &f.app,
+        "DELETE",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}",
+            f.contrib_org_slug, f.fork_name
+        ),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{}",
+            repo_href(&f.parent_org_slug, &f.parent_repo_name),
+            f.number
+        ),
+        Some(&f.owner_token),
+        json!({"state": "open"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let (state, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, closed_reason FROM pull_requests WHERE repository_id = $1 AND number = $2",
+    )
+    .bind(f.parent_repo_id)
+    .bind(f.number as i32)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "closed");
+    assert_eq!(reason.as_deref(), Some("source repository deleted"));
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn reopening_a_pull_request_clears_its_closed_reason() {
     let f = build_fixture().await;
 

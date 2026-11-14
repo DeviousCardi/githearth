@@ -19,7 +19,7 @@ use githearth_git::journal::{Origin, Record};
 use githearth_git::merge::Identity;
 use githearth_git::suggestion;
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, PgConnection};
+use sqlx::{Connection, FromRow, PgConnection, Row};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -98,6 +98,12 @@ pub(crate) fn not_ready() -> ApiError {
 }
 fn already_merged() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is merged")
+}
+fn cannot_reopen() -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        "source repository or branch no longer exists",
+    )
 }
 
 /// Re-checks inside the transaction, on the same row lock the PATCH
@@ -867,11 +873,14 @@ pub(crate) async fn list_pulls(
     require_readable_repo(&loaded)?;
 
     let mut conn = state.pool.acquire().await?;
-    let rows = sqlx::query_as::<_, PullJson>(&format!(
-        "SELECT {PULL_COLUMNS} FROM pull_requests WHERE repository_id = $1 \
+    // A fork's own list includes the pull requests it opened against other
+    // repositories, not just those targeting the fork itself (issue #156).
+    let rows = sqlx::query(&format!(
+        "SELECT {PULL_COLUMNS}, repository_id AS target_repository_id FROM pull_requests \
+         WHERE (repository_id = $1 OR source_repository_id = $1) \
          AND ($2::integer IS NULL OR number < $2) \
          AND ($3::text IS NULL OR state = $3) \
-         ORDER BY number DESC LIMIT $4"
+         ORDER BY number DESC, id DESC LIMIT $4"
     ))
     .bind(loaded.repo.id)
     .bind(query.after)
@@ -881,7 +890,49 @@ pub(crate) async fn list_pulls(
     .await?;
 
     let has_more = rows.len() as i64 > limit;
-    let mut items = rows;
+    let mut items = Vec::new();
+    let mut org_facts: HashMap<Uuid, Option<facts::Facts>> = HashMap::new();
+    org_facts.insert(loaded.org_id, Some(loaded.facts.clone()));
+    for row in rows {
+        let pull = PullJson::from_row(&row)?;
+        let target_id: Uuid = row.get("target_repository_id");
+        if target_id == loaded.repo.id {
+            items.push(pull);
+            continue;
+        }
+        // An outgoing pull is only visible when the caller may read its target
+        // repository, so a fork cannot reveal a private upstream's pull list.
+        let Some(target) = repositories::get(&mut conn, target_id).await? else {
+            continue;
+        };
+        if target.status == RepositoryStatus::Deleted {
+            continue;
+        }
+        let target_org = target.organization_id;
+        let target_facts = match org_facts.get(&target_org) {
+            Some(facts) => facts.clone(),
+            None => {
+                let facts = facts::load(&mut conn, actor_id, target_org).await?;
+                org_facts.insert(target_org, facts.clone());
+                facts
+            }
+        };
+        let Some(target_facts) = target_facts else {
+            continue;
+        };
+        let authz_repo = repositories::authz_repository(&target);
+        let readable = state
+            .authz
+            .authorize(&target_facts.request(
+                Action::RepositoryRead,
+                Resource::Repository(&authz_repo),
+                Some(Duration::from_secs(auth_age)),
+            ))
+            .is_allowed();
+        if readable {
+            items.push(pull);
+        }
+    }
     items.truncate(limit as usize);
     let next = if has_more {
         items.last().map(|p| p.number)
@@ -1040,6 +1091,21 @@ async fn update(
                 return Err(already_merged());
             }
             let new_state = input.state.as_deref().unwrap_or(locked.state.as_str());
+            // A system-closed pull whose source repository or branch was
+            // deleted must not be resurrected as an open pull with a null head
+            // (issue #156).
+            if locked.state == "closed" && new_state == "open" {
+                let source = repositories::get(&mut tx, locked.source_repository_id).await?;
+                let source_active =
+                    source.is_some_and(|row| row.status == RepositoryStatus::Active);
+                if !source_active
+                    || branch_tip(state, locked.source_repository_id, &locked.source_branch)
+                        .await?
+                        .is_none()
+                {
+                    return Err(cannot_reopen());
+                }
+            }
             // Reopening clears any system-close reason (e.g. "source repository
             // deleted") so a reopened pull no longer reports why it was closed.
             let updated = sqlx::query(
