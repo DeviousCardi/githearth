@@ -390,6 +390,28 @@ pub async fn admit_account(
         .await
         .map_err(unavailable)?;
 
+    // Refuse a push at admission, before the client uploads a pack. The
+    // synthetic unprotected ref asks the same policy engine whether this
+    // principal may push at all; per-branch protection is still decided by the
+    // pre-receive hook once the actual updates are known.
+    if want == Want::Push {
+        let authz_repo = repositories::authz_repository(&repo);
+        let reference = Ref {
+            repository: repo.id,
+            name: "refs/heads/githearth-admission".to_owned(),
+            protection: None,
+            exists: true,
+        };
+        let decision = state.authz.authorize(&facts.request(
+            Action::RefPush,
+            Resource::Ref(&authz_repo, &reference),
+            Some(Duration::from_secs(0)),
+        ));
+        if !decision.is_allowed() {
+            return Err(AuthError(StatusCode::FORBIDDEN, "not permitted"));
+        }
+    }
+
     Ok(Admitted {
         account: account_id,
         organization: org_id,

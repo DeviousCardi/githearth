@@ -721,6 +721,165 @@ async fn gzip_encoded_post_body_accepted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn malformed_receive_pack_bodies_are_400() {
+    let (app, pool, storage_root, _owner, username, org_slug, repo_name, _repo_id, _head) =
+        setup_with_repo_on_disk().await;
+    let path = format!("/{org_slug}/{repo_name}.git/git-receive-pack");
+    let auth = basic_auth(&username, "testpass");
+
+    // Invalid gzip.
+    let (status, _headers, _body) = raw_request(
+        &app,
+        "POST",
+        &path,
+        &[
+            ("authorization", &auth),
+            ("content-encoding", "gzip"),
+            ("content-type", "application/x-git-receive-pack-request"),
+        ],
+        b"this is not gzip".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Truncated gzip: a valid stream with the tail cut off.
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(b"0011abc").unwrap();
+    let mut truncated = encoder.finish().unwrap();
+    truncated.truncate(truncated.len() / 2);
+    let (status, _headers, _body) = raw_request(
+        &app,
+        "POST",
+        &path,
+        &[
+            ("authorization", &auth),
+            ("content-encoding", "gzip"),
+            ("content-type", "application/x-git-receive-pack-request"),
+        ],
+        truncated,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A pkt-line that promises more bytes than the HTTP body carries.
+    let (status, _headers, _body) = raw_request(
+        &app,
+        "POST",
+        &path,
+        &[
+            ("authorization", &auth),
+            ("content-type", "application/x-git-receive-pack-request"),
+        ],
+        b"0011abc".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn receive_pack_v2_header_still_gets_v0_advertisement() {
+    let (app, pool, storage_root, _owner, username, org_slug, repo_name, _repo_id, _head) =
+        setup_with_repo_on_disk().await;
+
+    let (status, headers, body) = raw_request(
+        &app,
+        "GET",
+        &format!("/{org_slug}/{repo_name}.git/info/refs?service=git-receive-pack"),
+        &[
+            ("authorization", &basic_auth(&username, "testpass")),
+            ("git-protocol", "version=2"),
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/x-git-receive-pack-advertisement")
+    );
+    let svc = "# service=git-receive-pack\n";
+    let expected = format!("{:04x}{svc}0000", svc.len() + 4);
+    assert!(
+        body.starts_with(expected.as_bytes()),
+        "body did not start with the v0 service header: {:?}",
+        String::from_utf8_lossy(&body[..body.len().min(80)])
+    );
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn upload_pack_answers_expect_100_continue_before_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (app, pool, storage_root, _owner, username, org_slug, repo_name, _repo_id, head_commit) =
+        setup_with_repo_on_disk().await;
+    let port = find_port_and_serve(&app).await;
+    let body = format!("0032want {head_commit}\n00000009done\n");
+    let auth = basic_auth(&username, "testpass");
+    let request = format!(
+        "POST /{org_slug}/{repo_name}.git/git-upload-pack HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Authorization: {auth}\r\n\
+         Content-Type: application/x-git-upload-pack-request\r\n\
+         Expect: 100-continue\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    // The server must send the interim response without waiting for the body.
+    let mut interim = Vec::new();
+    let mut buf = [0u8; 1024];
+    let read = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            interim.extend_from_slice(&buf[..n]);
+            if interim.windows(4).any(|w| w == b"\r\n\r\n") {
+                break interim.len();
+            }
+        }
+    })
+    .await
+    .expect("server stalled waiting for the request body");
+    let interim = String::from_utf8_lossy(&interim[..read]).to_string();
+    assert!(interim.starts_with("HTTP/1.1 100 Continue"), "{interim}");
+
+    // Send the body and read the final response headers. The connection is
+    // kept alive, so stop at the header terminator rather than EOF.
+    stream.write_all(body.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            response.extend_from_slice(&buf[..n]);
+            if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("final response timed out");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn unsupported_content_encoding_415() {
     let (app, pool, storage_root, _owner, username, org_slug, repo_name, _repo_id, _head) =
         setup_with_repo_on_disk().await;

@@ -100,9 +100,13 @@ async fn info_refs(
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(state.config.git_timeout_seconds);
 
-    let git_protocol = extract_git_protocol(&headers);
+    // Git protocol v2 is a fetch-only capability. A receive-pack client that
+    // sends `Git-Protocol: version=2` (real Git does not) must still receive
+    // the v0 advertisement, including the `# service=` header.
+    let is_fetch = want == git_admission::Want::Fetch;
+    let git_protocol = is_fetch.then(|| extract_git_protocol(&headers)).flatten();
 
-    let cmd = if want == git_admission::Want::Fetch {
+    let cmd = if is_fetch {
         state.storage.upload_pack(
             repo_id,
             githearth_git::layout::PackMode::Advertise,
@@ -113,7 +117,7 @@ async fn info_refs(
         state.storage.receive_pack(
             repo_id,
             githearth_git::layout::PackMode::Advertise,
-            git_protocol.as_deref(),
+            None,
             &hooks_dir,
         )
     }
@@ -144,7 +148,7 @@ async fn info_refs(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    let use_v2 = is_protocol_v2(git_protocol.as_deref());
+    let use_v2 = is_fetch && is_protocol_v2(git_protocol.as_deref());
     let prefix: Vec<u8> = if use_v2 {
         Vec::new()
     } else {
@@ -160,6 +164,7 @@ async fn info_refs(
     let token = CancellationToken::new();
     let body = Body::from_stream(stream_git_output(
         child, stdout, stderr, prefix, repo_id, deadline, permit, None, None, token, None, true,
+        None,
     ));
 
     let mut response = Response::new(body);
@@ -256,6 +261,7 @@ async fn upload_pack(
     // Kill channel: stdin feeder sends when the decoded body exceeds the limit.
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
     let limit_exceeded = Arc::new(AtomicBool::new(false));
+    let decode_failed = Arc::new(AtomicBool::new(false));
 
     // CancellationToken: one per request.  The supervisor cancels it after git
     // exits so the feeder stops promptly.  The response body holds a drop-guard
@@ -273,6 +279,7 @@ async fn upload_pack(
             kill_tx,
             feeder_token,
             limit_exceeded.clone(),
+            decode_failed.clone(),
         ))
     } else {
         tokio::spawn(stream_body_to_stdin(
@@ -283,10 +290,12 @@ async fn upload_pack(
             kill_tx,
             feeder_token,
             limit_exceeded.clone(),
+            decode_failed.clone(),
         ))
     };
 
-    let body = Body::from_stream(stream_git_output(
+    let (done_tx, done_rx) = oneshot::channel();
+    let mut output = Box::pin(futures_util::StreamExt::peekable(stream_git_output(
         child,
         stdout,
         stderr,
@@ -299,7 +308,22 @@ async fn upload_pack(
         token,
         None,
         true,
-    ));
+        Some(done_tx),
+    )));
+    // Wait for git's first output so the request body has been polled before
+    // the response headers go out. That makes hyper answer `Expect:
+    // 100-continue` immediately instead of after a client-side stall.
+    let first_output = output.as_mut().peek().await;
+    if limit_exceeded.load(Ordering::SeqCst) {
+        return Err(GitHttpError::PayloadTooLarge);
+    }
+    if decode_failed.load(Ordering::SeqCst) {
+        return Err(GitHttpError::BadRequest("invalid git request body"));
+    }
+    if first_output.is_none() && matches!(done_rx.await, Ok(false)) {
+        return Err(GitHttpError::BadRequest("invalid git request body"));
+    }
+    let body = Body::from_stream(output);
 
     let mut response = Response::new(body);
     response.headers_mut().insert(
@@ -487,6 +511,7 @@ async fn receive_pack(
     // bodies whose size is only known while streaming (issue #142).
     let (kill_tx, kill_rx) = oneshot::channel::<()>();
     let limit_exceeded = Arc::new(AtomicBool::new(false));
+    let decode_failed = Arc::new(AtomicBool::new(false));
     let token = CancellationToken::new();
     let feeder_token = token.clone();
 
@@ -499,6 +524,7 @@ async fn receive_pack(
             kill_tx,
             feeder_token,
             limit_exceeded.clone(),
+            decode_failed.clone(),
         ))
     } else {
         tokio::spawn(stream_body_to_stdin(
@@ -509,6 +535,7 @@ async fn receive_pack(
             kill_tx,
             feeder_token,
             limit_exceeded.clone(),
+            decode_failed.clone(),
         ))
     };
 
@@ -557,6 +584,7 @@ async fn receive_pack(
         })
     };
 
+    let (done_tx, done_rx) = oneshot::channel();
     let mut output = Box::pin(futures_util::StreamExt::peekable(stream_git_output(
         child,
         stdout,
@@ -570,18 +598,28 @@ async fn receive_pack(
         token,
         Some(after_exit),
         false,
+        Some(done_tx),
     )));
     // Half-duplex proxies (nginx) stop forwarding the request body once response
     // headers arrive. receive-pack writes nothing until it has read the whole pack,
     // so wait for its first output (or end, or the deadline) before responding.
     // The supervisor already owns git and the post-push replay, so a client that
     // disconnects here still gets its push applied.
-    output.as_mut().peek().await;
+    let first_output = output.as_mut().peek().await;
     // Once the body has been fully fed (git produces nothing until then), a
     // chunked or gzip body that exceeded the limit can be refused with a clean
     // 413 instead of a dropped connection (issue #142).
     if limit_exceeded.load(Ordering::SeqCst) {
         return Err(GitHttpError::PayloadTooLarge);
+    }
+    // A decode failure or a body shorter than its framing is invalid input, not
+    // an empty successful push. When git produced no stdout at all, wait for it
+    // to exit and turn that failure into a 400 (#154).
+    if decode_failed.load(Ordering::SeqCst) {
+        return Err(GitHttpError::BadRequest("invalid git request body"));
+    }
+    if first_output.is_none() && matches!(done_rx.await, Ok(false)) {
+        return Err(GitHttpError::BadRequest("invalid git request body"));
     }
     let body = Body::from_stream(output);
 
@@ -995,6 +1033,7 @@ fn is_protocol_v2(protocol: Option<&str>) -> bool {
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_body_to_stdin(
     repo_id: Uuid,
     body: axum::body::Body,
@@ -1003,6 +1042,7 @@ async fn stream_body_to_stdin(
     kill_tx: oneshot::Sender<()>,
     token: CancellationToken,
     limit_exceeded: Arc<AtomicBool>,
+    decode_failed: Arc<AtomicBool>,
 ) {
     let mut stream = body.into_data_stream();
     let mut total: usize = 0;
@@ -1012,7 +1052,12 @@ async fn stream_body_to_stdin(
                 let Some(chunk) = chunk else { break };
                 let chunk = match chunk {
                     Ok(c) => c,
-                    Err(_) => break,
+                    Err(_) => {
+                        // A short or broken HTTP body is malformed input, not a
+                        // clean end of the push (#154).
+                        decode_failed.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 };
                 total += chunk.len();
                 if total > limit {
@@ -1036,6 +1081,7 @@ async fn stream_body_to_stdin(
     drop(stdin);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_gzip_body_to_stdin(
     repo_id: Uuid,
     body: axum::body::Body,
@@ -1044,6 +1090,7 @@ async fn stream_gzip_body_to_stdin(
     kill_tx: oneshot::Sender<()>,
     token: CancellationToken,
     limit_exceeded: Arc<AtomicBool>,
+    decode_failed: Arc<AtomicBool>,
 ) {
     use async_compression::tokio::bufread::GzipDecoder;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -1077,6 +1124,7 @@ async fn stream_gzip_body_to_stdin(
                         }
                     }
                     Err(e) => {
+                        decode_failed.store(true, Ordering::SeqCst);
                         tracing::warn!(repository_id = %repo_id, "gzip decode failed: {e}; signalling kill");
                         let _ = kill_tx.send(());
                         return;
@@ -1109,6 +1157,7 @@ fn stream_git_output(
     token: CancellationToken,
     after_exit: Option<futures_util::future::BoxFuture<'static, ()>>,
     kill_on_disconnect: bool,
+    completion: Option<oneshot::Sender<bool>>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::stream;
     use tokio_util::io::ReaderStream;
@@ -1169,6 +1218,10 @@ fn stream_git_output(
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or_default();
+
+        if let Some(tx) = completion {
+            let _ = tx.send(status.as_ref().is_ok_and(std::process::ExitStatus::success));
+        }
 
         if let Ok(s) = status
             && !s.success()
