@@ -17,6 +17,9 @@ use uuid::Uuid;
 
 use crate::{AppState, idempotency, issues, ui};
 
+/// Comments per page; matches the API default so the anchor and page agree.
+const ISSUE_COMMENT_PAGE: i64 = 30;
+
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -481,7 +484,7 @@ async fn render_issue(
     let mut list = String::new();
     for c in &comments.items {
         list.push_str(&format!(
-            "<li><article aria-label=\"Comment {seq}\"><p class=\"muted\">{} commented at {}</p><div style=\"white-space:pre-wrap\">{}</div></article></li>",
+            "<li id=\"comment-{seq}\"><article aria-label=\"Comment {seq}\"><p class=\"muted\">{} commented at {}</p><div style=\"white-space:pre-wrap\">{}</div></article></li>",
             who(&names, &c.author_id),
             ui::esc(&c.created_at),
             ui::esc(&c.body),
@@ -597,7 +600,7 @@ async fn comment_submit(
         .await;
     }
     let payload = serde_json::json!({ "body": &form.body }).to_string();
-    if let Err(e) = issues::create_issue_comment(
+    let created = match issues::create_issue_comment(
         &state,
         s.account.id,
         s.auth_age,
@@ -609,27 +612,44 @@ async fn comment_submit(
     )
     .await
     {
-        if let Some(message) = ui::idempotency_notice(&e) {
-            let draft = Draft {
-                text: &form.body,
-                key,
-                error: Some(message),
-            };
-            return render_issue(
-                &state,
-                &s,
-                &slug,
-                &name,
-                number,
-                None,
-                draft,
-                e.status_code(),
-            )
-            .await;
+        Ok((_, value)) => value,
+        Err(e) => {
+            if let Some(message) = ui::idempotency_notice(&e) {
+                let draft = Draft {
+                    text: &form.body,
+                    key,
+                    error: Some(message),
+                };
+                return render_issue(
+                    &state,
+                    &s,
+                    &slug,
+                    &name,
+                    number,
+                    None,
+                    draft,
+                    e.status_code(),
+                )
+                .await;
+            }
+            return Err(api_error(&s, e));
         }
-        return Err(api_error(&s, e));
+    };
+    let seq = created["seq"].as_i64().unwrap_or(1).max(1);
+    Ok(Redirect::to(&comment_href(&slug, &name, number, seq)).into_response())
+}
+
+/// The page (and anchor) that shows the comment with sequence number `seq`.
+/// Comments page by fixed-size windows of `ISSUE_COMMENT_PAGE` comment seqs.
+fn comment_href(slug: &str, name: &str, number: i32, seq: i64) -> String {
+    let page = (seq - 1) / ISSUE_COMMENT_PAGE + 1;
+    let base = repo_href(slug, name);
+    if page <= 1 {
+        format!("{base}/issues/{number}#comment-{seq}")
+    } else {
+        let after = (page - 1) * ISSUE_COMMENT_PAGE;
+        format!("{base}/issues/{number}?after={after}#comment-{seq}")
     }
-    Ok(Redirect::to(&format!("{}/issues/{number}", repo_href(&slug, &name))).into_response())
 }
 
 #[derive(Deserialize)]
