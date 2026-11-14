@@ -16,6 +16,85 @@ Prerequisites: a Linux host, **Git ≥ 2.40**, `curl`, `openssl`, Python 3,
 `openssh-client` (for SSH-signed commit verification), and a local PostgreSQL 17
 (or a reachable server). The Docker image ships Git 2.47 and `openssh-client`.
 
+#### One command: `setup`
+
+`githearth-server setup` takes a clean host with a reachable PostgreSQL to a
+`doctor`-clean installation. It performs the manual steps below in one run:
+
+1. writes the configuration file (mode `0600`) from its flags and safe defaults;
+   an existing file must be a regular file owned by the current user that group
+   or others cannot read, otherwise the run stops and prints the mode it
+   actually read;
+2. creates the storage root and the host key's directory (mode `0700`), refusing
+   a path that is group- or world-writable or owned by another user;
+3. generates the SSH host key (Ed25519, mode `0600`) when it is absent;
+4. runs migrations;
+5. creates the first administrator, `admin`;
+6. runs the `doctor` checks and exits non-zero if any fails.
+
+```bash
+# The database URL is never a command argument. Put it in the environment
+# (preferred), or pipe it on stdin for a first install. The administrator
+# password is piped on stdin as well: setup never prompts, because a terminal
+# would echo what is typed. Piped input is not printed.
+export GITHEARTH_DATABASE_URL='postgres://githearth:PASSWORD@127.0.0.1:5432/githearth'
+read -r -s -p 'New administrator password (12+ bytes): ' ADMIN_PASSWORD; echo
+printf '%s' "$ADMIN_PASSWORD" | githearth-server setup --config-path /etc/githearth/config.toml
+unset ADMIN_PASSWORD
+
+githearth-server serve --config /etc/githearth/config.toml
+curl --fail http://127.0.0.1:8080/health/ready
+```
+
+Flags:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--config-path PATH` | `/etc/githearth/config.toml` | configuration file to write; the global `--config PATH` is accepted too, but not together with this flag |
+| `--storage-root PATH` | `/var/lib/githearth/repositories` | Git storage root, created mode `0700` |
+| `--http-port PORT` | `8080` | HTTP listener port on `127.0.0.1` |
+| `--ssh-port PORT` | `2222` | SSH listener port on `127.0.0.1`, recorded as `ssh_bind` |
+| `--ssh-host-key-path PATH` | `<config dir>/ssh_host_key` | host key file and its directory |
+| `--no-ssh` | off | install without the embedded SSH server |
+
+`--http-port` and `--ssh-port` must differ; `setup` refuses a configuration
+whose `bind` and `ssh_bind` share a port, both on a first install and when it
+resumes from an existing file. The rule compares ports only, so two different
+interfaces on the same port are refused as well.
+
+Re-running `setup` is safe and is the documented way to finish an interrupted
+run: every step detects completed work, prints `created`, `unchanged` or
+`skipped`, and leaves an existing configuration file, host key or administrator
+untouched. When `GITHEARTH_DATABASE_URL` is not set, a run with an existing
+configuration uses the URL recorded in it and reads nothing from stdin, so a
+resumed install needs only the password (and none once the administrator
+exists). A run that fails names the step that stopped it and lists the steps
+already completed; fix the reported problem and run the same command again.
+
+Once the configuration file exists it is the source of truth: its settings are
+used for the remaining steps, so an operator's later edits (`bind`,
+`secure_cookies`, `storage_root`, proxies) are kept and a repeated run does not
+overwrite them. The file is inspected before it is used: a symlink, a file
+owned by another user, or a file that group or others can read is refused with
+the mode that was actually read, rather than silently fixed or reported as
+`0600`. A run whose database URL differs from the one recorded in the file is
+refused, so a database is never migrated while the file records another; use
+the recorded URL, or edit the file, to change databases.
+
+`setup` keeps most defaults from `githearth.example.toml` and writes
+`secure_cookies = true`. A browser on plain HTTP does not send those cookies
+back, so a loopback-only development install that browses the UI over
+`http://127.0.0.1:8080` must set `secure_cookies = false` in the file after
+`setup` (as Compose does) or terminate TLS at a proxy ([tls.md](tls.md)).
+
+The secrets the server needs are the SSH host key, which `setup` generates, and
+the per-deployment rows it creates on first use in PostgreSQL (session tokens,
+personal access tokens, and the audit IP-retention keys), which never appear in
+configuration. The database password belongs to PostgreSQL: create the role and
+its database first, as in the manual path below.
+
+#### Manual steps (what `setup` automates)
+
 1. Install `githearth-server` somewhere on `PATH` and make it executable.
 2. Create a dedicated database and role, and note the connection URL.
 3. Write `/etc/githearth/config.toml` from `githearth.example.toml`; set
@@ -34,6 +113,10 @@ Prerequisites: a Linux host, **Git ≥ 2.40**, `curl`, `openssl`, Python 3,
    idempotent: an existing host key is kept and the command succeeds.
 8. `githearth-server serve --config /etc/githearth/config.toml`, then confirm
    `curl --fail http://127.0.0.1:8080/health/ready` returns 200.
+
+Each command prints only paths, statuses and reasons: a configuration error, a
+refused directory or an unreachable database never echoes the database URL or
+its password.
 
 See [upgrade.md](upgrade.md) for the upgrade runbook,
 [uninstall.md](uninstall.md) for removal, [tls.md](tls.md) for TLS setup,
