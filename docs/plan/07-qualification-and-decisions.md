@@ -62,14 +62,15 @@ Expansion gate: version/storage preflight, current backup, establish replicas, v
 | Metadata | PostgreSQL provisional | Rust workload, restore, HA and sustained load before production |
 | Application | Rust, axum/Tokio, SQLx for M1 | Pinned compatible versions and tests; alternatives need evidence |
 | Authorization | Cedar PBAC engine ([ADR 0002](../decisions/0002-authorization.md)) | Grant/team/protection tables, anonymous principal and list-filter tests before M2 public access; revocation/cache contract before any decision cache or M5 local checks |
-| Git write protocol | Native Git + owned journal/intents proposed | ADR before M2 public push; crash tests before release |
-| Git consensus | Library/protocol not selected | Object/log durability, membership/snapshot/GC proof sketch and faults before M5 |
-| Metadata HA | Synchronous replication + qualified failover/fencing | Select manager/topology in M5 ADR; failover tests required |
+| Git write protocol | Decided: native Git with owned journal and intents ([ADR 0003](../decisions/0003-git-push-and-repository-lifecycle.md), [ADR 0004](../decisions/0004-merge-execution.md), [ADR 0005](../decisions/0005-ssh-transport.md)) | Single-node crash tests recorded in M2–M4 verification; replicated form is the Git consensus row |
+| Git consensus | Library/protocol not selected | ADR with object/log durability, membership/snapshot/GC proof sketch and faults before M5 implementation |
+| Metadata HA | Synchronous replication + qualified failover/fencing | Select manager/topology in an ADR before M5 implementation; failover tests required |
+| M5 test environment | Docker Compose on one host for development and functional tests; independent machines (available) for qualification | Compose results never support an availability or durability claim; exit evidence names the machines and network faults |
 | Sharding | Tenant ownership now; defer physical shards until measured | Global catalog/oversized tenant/migration design before claiming write scale |
 | Object store | Local first; S3-compatible distributed backend | License, checksums, GC, restore and failure evidence before M5/M7 |
 | Search | Evaluate Tantivy/trigrams | Corpus/permissions/update-churn benchmark before M9 selection |
-| Queue/events | PostgreSQL outbox/jobs first; optional JetStream | Backlog/recovery evidence before separate transport |
-| UI | Server rendering plus focused TypeScript | Framework choice, escaping/accessibility/CSP before M2 UI |
+| Queue/events | PostgreSQL jobs decided ([ADR 0006](../decisions/0006-durable-jobs.md)); the outbox is written but not yet delivered; optional JetStream | Outbox relay and ADR 0006 revision in M4.1; backlog/recovery evidence before separate transport |
+| UI | Server-rendered pages, no client framework so far | Decide the TypeScript/interaction approach before the first feature that needs it (boards, editors) |
 | Runner/scheduler | MicroVM boundary proposed; remote option | Hardware/kernel support, untrusted-run contract and churn benchmark before M6 |
 | Actions compatibility | Explicit subset proposed | Pinned fixtures and differences before compatibility claim |
 | Scanners/feeds | Open/self-hostable integrations | License/freshness/privacy evidence before M10 |

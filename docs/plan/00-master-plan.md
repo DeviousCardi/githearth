@@ -1,6 +1,6 @@
 # GitHearth master plan
 
-Status: proposed design, revision 4; local screening complete and application foundation verified. Planning date: 2026-10-27.
+Status: design revision 4. Planning date: 2026-10-27; status updated 2026-11-14. M1–M4 are verified experimental on a single node; M4.1 (usable team alpha) is next. Current milestone states are in [the roadmap](04-forge-roadmap.md#sequence-and-dependencies); sections below describe the design as planned and are not rewritten per milestone.
 
 ## 1. Objective
 

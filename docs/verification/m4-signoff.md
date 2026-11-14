@@ -38,6 +38,14 @@ Note on item 1: the installation drill was performed by an AI agent that did
 not author the product, following only the runbooks in `docs/operations/`.
 That exercises the documented path end to end, but it is not a human user; a
 human independent install is still recommended before public distribution.
+Update 2026-11-14: the project owner accepts the Docker installation drill as
+closing item 1 for M4; no further install drill is scheduled for this milestone.
+
+Scope note: this sign-off covers the M4 **exit** list. Build-list and inventory
+items allocated to M4 that were not delivered (account and membership
+administration, housekeeping, outbox delivery, email, metrics, setup and backup
+commands) are scheduled as
+[M4.1](../plan/04-forge-roadmap.md#m41--usable-team-alpha).
 
 ## V4 acceptance campaign
 
