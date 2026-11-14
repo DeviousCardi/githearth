@@ -68,6 +68,7 @@ fn page(s: &Session, status: StatusCode, title: &str, body: &str) -> Response {
             title,
             Some(&s.account.username),
             Some(&s.csrf),
+            s.account.is_admin,
             body,
         )),
     )

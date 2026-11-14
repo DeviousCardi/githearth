@@ -6,12 +6,13 @@
 
 use axum::{
     Form, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use serde::Deserialize;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{AppState, idempotency, ssh_keys, tokens, ui};
@@ -32,11 +33,20 @@ pub(crate) fn router() -> Router<AppState> {
             "/settings/ssh-keys/{id}/revoke",
             axum::routing::post(revoke_ssh_key_submit),
         )
+        .route(
+            "/settings/password",
+            axum::routing::post(change_password_submit),
+        )
+        .route(
+            "/settings/reauthenticate",
+            axum::routing::post(reauthenticate_submit),
+        )
 }
 
 struct Session {
     account: crate::Account,
     csrf: String,
+    fresh_auth: Duration,
 }
 
 async fn session(state: &AppState, headers: &HeaderMap) -> Result<Session, ui::UiError> {
@@ -49,6 +59,7 @@ async fn session(state: &AppState, headers: &HeaderMap) -> Result<Session, ui::U
     Ok(Session {
         account,
         csrf: ui::csrf_expected(&hash),
+        fresh_auth: state.fresh_auth(),
     })
 }
 
@@ -72,6 +83,7 @@ fn page(s: &Session, status: StatusCode, title: &str, body: &str) -> Response {
             title,
             Some(&s.account.username),
             Some(&s.csrf),
+            s.account.is_admin,
             body,
         )),
     )
@@ -277,8 +289,38 @@ style=\"width:100%;box-sizing:border-box\">{}</textarea>\
         ui::esc(key_form.expiry),
     );
 
+    // Password form: never pre-filled, and it carries no idempotency key since
+    // a password change has no side effect a replay could duplicate.
+    let password_body = format!(
+        "<form class=\"card\" method=\"post\" action=\"/settings/password\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<label for=\"current_password\">Current password</label>\
+<input id=\"current_password\" name=\"current_password\" type=\"password\" autocomplete=\"current-password\" required>\
+<label for=\"new_password\">New password</label>\
+<input id=\"new_password\" name=\"new_password\" type=\"password\" autocomplete=\"new-password\" required minlength=\"12\" maxlength=\"1024\" aria-describedby=\"new-password-help\">\
+<p class=\"muted\" id=\"new-password-help\">At least 12 characters. Every other session, access token and SSH key of this account will be revoked.</p>\
+<p><button type=\"submit\">Change password</button></p></form>",
+        ui::esc(&s.csrf)
+    );
+
+    // The settings-page prompt for sensitive actions whose session is stale.
+    let minutes = ui::fresh_auth_minutes(s.fresh_auth);
+    let reauth_body = format!(
+        "<form class=\"card\" method=\"post\" action=\"/settings/reauthenticate\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<input type=\"hidden\" name=\"return_to\" value=\"/settings\">\
+<label for=\"reauth_password\">Password</label>\
+<input id=\"reauth_password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required>\
+<p class=\"muted\" id=\"reauth-help\">Account administration requires a password entry in the last {minutes} minutes.</p>\
+<p><button type=\"submit\">Confirm password</button></p></form>",
+        ui::esc(&s.csrf),
+        minutes = minutes
+    );
+
     let body = format!(
         "<h1>Settings</h1>{plaintext_box}{notice}\
+<h2>Password</h2>{password_body}\
+<h2>Confirm password</h2>{reauth_body}\
 <h2>Access tokens</h2><div class=\"card\">{token_table}</div>{token_body}\
 <h2>SSH keys</h2><div class=\"card\">{key_table}</div>{key_body}"
     );
@@ -324,16 +366,27 @@ async fn render_page(
     ))
 }
 
+#[derive(Deserialize, Default)]
+struct SettingsQuery {
+    #[serde(default)]
+    password: Option<String>,
+}
+
 async fn settings_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<SettingsQuery>,
 ) -> Result<Response, ui::UiError> {
     let s = session(&state, &headers).await?;
+    let notice = match query.password.as_deref() {
+        Some("changed") => Some("Password changed."),
+        _ => None,
+    };
     render_page(
         &state,
         &s,
         StatusCode::OK,
-        None,
+        notice,
         None,
         TokenDraft {
             name: "",
@@ -592,6 +645,116 @@ async fn revoke_ssh_key_submit(
 struct CsrfForm {
     #[serde(default)]
     csrf_token: String,
+}
+
+/// The account's own password change. The current password is required, and
+/// the session that submits the form stays signed in while every other session
+/// of the account is revoked (M4.1 U02).
+#[derive(Deserialize)]
+struct PasswordForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    current_password: String,
+    #[serde(default)]
+    new_password: String,
+}
+
+/// The password form's notices, kept short and free of any password value.
+fn password_notice(error: &crate::ApiError) -> &'static str {
+    match error.status_code() {
+        StatusCode::BAD_REQUEST => "Use a new password of 12 to 1024 characters.",
+        StatusCode::FORBIDDEN if error.message() == "current password is incorrect" => {
+            "Your current password is incorrect."
+        }
+        StatusCode::TOO_MANY_REQUESTS => "Too many attempts. Try again later.",
+        StatusCode::UNAUTHORIZED => "Your session has ended. Sign in again.",
+        _ => "The password could not be changed. Try again.",
+    }
+}
+
+async fn change_password_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    match crate::account_admin::change_password(
+        &state,
+        s.account.id,
+        ui::browser_token_hash(&headers),
+        &form.current_password,
+        crate::account_admin::Secret::new(form.new_password),
+    )
+    .await
+    {
+        Ok(()) => Ok(Redirect::to("/settings?password=changed").into_response()),
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => Err(ui::auth_required()),
+        Err(e) => {
+            let notice = password_notice(&e);
+            render_page(
+                &state,
+                &s,
+                e.status_code(),
+                Some(notice),
+                None,
+                empty_token_draft(),
+                empty_key_draft(),
+            )
+            .await
+        }
+    }
+}
+
+/// The settings-page re-authentication prompt. It refreshes the session's
+/// `authenticated_at`; `return_to` is restricted to the administration page so
+/// the prompt cannot become an open redirect.
+#[derive(Deserialize)]
+struct ReauthenticateForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    return_to: String,
+}
+
+async fn reauthenticate_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ReauthenticateForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let token_hash = ui::browser_token_hash(&headers).ok_or_else(ui::auth_required)?;
+    let destination = if form.return_to == "/admin/accounts" {
+        "/admin/accounts"
+    } else {
+        "/settings"
+    };
+    match crate::account_admin::reauthenticate_session(
+        &state,
+        &s.account,
+        &token_hash,
+        &form.password,
+    )
+    .await
+    {
+        Ok(()) => Ok(Redirect::to(destination).into_response()),
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => Err(ui::auth_required()),
+        Err(e) => {
+            let notice = password_notice(&e);
+            render_page(
+                &state,
+                &s,
+                e.status_code(),
+                Some(notice),
+                None,
+                empty_token_draft(),
+                empty_key_draft(),
+            )
+            .await
+        }
+    }
 }
 
 fn form_draft<'a>(form: &'a TokenForm, key: &'a str) -> TokenDraft<'a> {

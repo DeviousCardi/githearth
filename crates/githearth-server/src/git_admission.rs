@@ -148,16 +148,24 @@ pub async fn admit(
                 }
             }
         } else {
-            let Some(account_id) = crate::verify_password(state, &username, &password)
-                .await
-                // Busy or unavailable is not a bad password: the client must not re-prompt.
-                .map_err(|e| match e.0 {
-                    StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, "authentication busy"),
-                    _ => AuthError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "authentication unavailable",
-                    ),
-                })?
+            // The same throttled sign-in as the API and the browser form (M4.1
+            // U03); the resolved client address comes from the client-IP
+            // middleware, which wraps this route too.
+            let Some(account_id) = crate::sign_in(
+                state,
+                &username,
+                &password,
+                crate::login_throttle::Request::from_current(),
+            )
+            .await
+            // Busy or unavailable is not a bad password: the client must not re-prompt.
+            .map_err(|e| match e.0 {
+                StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, e.message()),
+                _ => AuthError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication unavailable",
+                ),
+            })?
             else {
                 return Err(AuthError(
                     StatusCode::UNAUTHORIZED,
@@ -352,6 +360,22 @@ pub async fn admit_account(
     reject_nul_path(org_slug, repo_name)?;
     let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
     let mut conn = state.pool.acquire().await.map_err(unavailable)?;
+    // An account that must change its password after an administrator reset may
+    // take no Git action, whatever credential admitted it. Sign-in, sessions,
+    // access tokens and SSH keys already refuse it; this keeps the transport
+    // itself fail-closed.
+    let may_use_git: Option<bool> =
+        sqlx::query_scalar("SELECT NOT must_change_password FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(unavailable)?;
+    if may_use_git != Some(true) {
+        return Err(AuthError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired credentials",
+        ));
+    }
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
         .bind(org_slug)
         .fetch_optional(&mut *conn)

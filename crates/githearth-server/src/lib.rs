@@ -1,3 +1,5 @@
+pub mod account_admin;
+mod account_admin_ui;
 pub mod audit;
 pub mod audit_retention;
 pub mod auto_merge;
@@ -17,6 +19,7 @@ pub mod idempotency;
 pub mod issues;
 mod issues_ui;
 pub mod jobs;
+mod login_throttle;
 pub mod membership;
 mod membership_ui;
 pub mod merge;
@@ -83,7 +86,8 @@ tokio::task_local! {
 pub struct AppState {
     pub pool: PgPool,
     pub(crate) config: Config,
-    pub(crate) auth_slots: Arc<Semaphore>,
+    // pub so the password-reset saturation test can hold the only permit.
+    pub auth_slots: Arc<Semaphore>,
     // pub so the concurrency-exhaustion integration test can hold a permit.
     pub git_slots: Arc<Semaphore>,
     dummy_hash: Arc<String>,
@@ -164,6 +168,13 @@ impl AppState {
         };
         tokio::spawn(crate::git_http::hook_accept_loop(listener, state.clone()));
         Ok(state)
+    }
+
+    /// The sudo-mode window the authorization engine applies to sensitive
+    /// actions. Callers compare against this rather than a copied constant, so
+    /// a configured engine and the account API/page cannot disagree.
+    pub(crate) fn fresh_auth(&self) -> std::time::Duration {
+        self.authz.fresh_auth()
     }
 }
 
@@ -274,6 +285,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ui::router())
         .merge(browse::router())
         .merge(tokens::router())
+        .merge(account_admin::router())
         .merge(ssh_keys::router())
         .merge(notifications::router())
         .route(
@@ -463,7 +475,14 @@ async fn observe(request: axum::extract::Request, next: axum::middleware::Next) 
 pub struct ApiError(StatusCode, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+        // Sensitive actions carry a machine-readable reason so a client can
+        // prompt for re-authentication instead of parsing the sentence.
+        let body = if self.1 == "reauthentication required" {
+            serde_json::json!({"error": self.1, "reason": "sensitive"})
+        } else {
+            serde_json::json!({"error": self.1})
+        };
+        (self.0, Json(body)).into_response()
     }
 }
 impl ApiError {
@@ -491,6 +510,20 @@ impl From<sqlx::Error> for ApiError {
 type ApiResult<T> = Result<T, ApiError>;
 fn unauthorized() -> ApiError {
     ApiError(StatusCode::UNAUTHORIZED, "invalid or expired credentials")
+}
+/// Too many failed sign-ins from this username or client address. The message
+/// is the same for a known and an unknown username, so throttling reveals
+/// nothing about which accounts exist.
+pub(crate) fn too_many_attempts() -> ApiError {
+    ApiError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many sign-in attempts; try again later",
+    )
+}
+/// A sensitive action needs a fresh password entry (`POST
+/// /api/v1/me/reauthenticate`). The response body adds `"reason":"sensitive"`.
+pub(crate) fn reauthentication_required() -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, "reauthentication required")
 }
 pub(crate) fn invalid() -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "invalid input")
@@ -614,6 +647,78 @@ pub async fn bootstrap_admin(
     Ok(id)
 }
 
+/// Break-glass recovery from the host: restores an existing account as an
+/// enabled site administrator with a password read from stdin. Every existing
+/// credential (sessions, access tokens, SSH keys, reset codes) is revoked in
+/// the same transaction, and the action is audited without the password.
+/// It never creates an account: the operator bootstrap does that.
+pub async fn reset_admin(pool: &PgPool, username: &str, password: String) -> anyhow::Result<Uuid> {
+    anyhow::ensure!(
+        valid_username(username),
+        "username must contain 3..64 lowercase ASCII letters, digits, underscores or hyphens"
+    );
+    anyhow::ensure!(
+        (12..=1024).contains(&password.len()) && !has_nul(&password),
+        "password must contain 12..1024 bytes without NUL"
+    );
+    let hash = tokio::task::spawn_blocking(move || hash_password(&password)).await??;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(706918231)")
+        .execute(&mut *tx)
+        .await?;
+    let id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1 FOR UPDATE")
+            .bind(username)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(id) = id else {
+        anyhow::bail!("no account named `{username}`; create one with bootstrap-admin first");
+    };
+    sqlx::query(
+        "UPDATE accounts SET password_hash = $2, is_admin = true, suspended = false, \
+         must_change_password = false WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&hash)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM sessions WHERE account_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE access_tokens SET revoked_at = clock_timestamp() \
+         WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ssh_keys SET revoked_at = clock_timestamp() \
+         WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = clock_timestamp() \
+         WHERE account_id = $1 AND used_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    // A forgotten password is often accompanied by failed guesses; clear the
+    // counter so the restored password is usable without waiting out the
+    // window.
+    sqlx::query("DELETE FROM login_attempts WHERE scope = 'username' AND subject = $1")
+        .bind(login_throttle::subject_username(username))
+        .execute(&mut *tx)
+        .await?;
+    event(&mut tx, None, id, "administrator.reset").await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Login {
@@ -628,32 +733,54 @@ struct Token {
 }
 const AUTH_QUEUE_WAIT: Duration = Duration::from_secs(2);
 
-pub(crate) async fn verify_password(
-    state: &AppState,
-    username: &str,
-    password: &str,
-) -> ApiResult<Option<Uuid>> {
-    if !valid_username(username) || password.len() > 1024 {
-        return Ok(None);
-    }
-    // A short queue absorbs bursts such as a clone's back-to-back Git requests; only a
-    // sustained overload is refused. Waiting holds no connection.
-    let permit = tokio::time::timeout(AUTH_QUEUE_WAIT, state.auth_slots.clone().acquire_owned())
+/// Waits briefly for an authentication slot. A short queue absorbs bursts such
+/// as a clone's back-to-back Git requests; only a sustained overload is
+/// refused. Callers hold the permit across the database lookup and the hash so
+/// the concurrency bound covers both, and waiting itself holds no connection.
+pub(crate) async fn acquire_auth_slot(state: &AppState) -> ApiResult<OwnedSemaphorePermit> {
+    tokio::time::timeout(AUTH_QUEUE_WAIT, state.auth_slots.clone().acquire_owned())
         .await
         .ok()
         .and_then(Result::ok)
         .ok_or(ApiError(
             StatusCode::TOO_MANY_REQUESTS,
             "authentication busy",
-        ))?;
-    let row = sqlx::query("SELECT id, password_hash, suspended FROM accounts WHERE username = $1")
-        .bind(username)
-        .fetch_optional(&state.pool)
-        .await?;
-    // A suspended account still pays for the hash, so timing does not reveal the suspension.
+        ))
+}
+
+pub(crate) async fn verify_password(
+    state: &AppState,
+    username: &str,
+    password: &str,
+) -> ApiResult<Option<Uuid>> {
+    let permit = acquire_auth_slot(state).await?;
+    verify_password_with(state, username, password, permit).await
+}
+
+/// Verifies a password while holding a caller-supplied authentication slot.
+/// `sign_in` acquires the permit before its throttle query so a saturated queue
+/// answers `429` without touching PostgreSQL.
+async fn verify_password_with(
+    state: &AppState,
+    username: &str,
+    password: &str,
+    permit: OwnedSemaphorePermit,
+) -> ApiResult<Option<Uuid>> {
+    if !valid_username(username) || password.len() > 1024 {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT id, password_hash, suspended, must_change_password FROM accounts WHERE username = $1",
+    )
+    .bind(username)
+    .fetch_optional(&state.pool)
+    .await?;
+    // A suspended account, or one that must change its password after an
+    // administrator reset, still pays for the hash so timing does not reveal
+    // the account state.
     let id = row
         .as_ref()
-        .filter(|r| !r.get::<bool, _>("suspended"))
+        .filter(|r| !r.get::<bool, _>("suspended") && !r.get::<bool, _>("must_change_password"))
         .map(|r| r.get::<Uuid, _>("id"));
     let hash = row
         .as_ref()
@@ -672,8 +799,41 @@ pub(crate) async fn verify_password(
     Ok(id.filter(|_| valid))
 }
 
+/// The throttled sign-in decision (M4.1 U03): shared by the JSON login, the
+/// browser sign-in form and Git password authentication so all three count
+/// towards the same bounds. `Ok(None)` is a wrong password or a disabled
+/// account, which are deliberately indistinguishable to the caller.
+pub(crate) async fn sign_in(
+    state: &AppState,
+    username: &str,
+    password: &str,
+    request: login_throttle::Request,
+) -> ApiResult<Option<Uuid>> {
+    // Take an authentication slot before the throttle query: a saturated queue
+    // refuses the request with 429 without reading PostgreSQL, and a throttled
+    // guess is then refused before any Argon2 work.
+    let permit = acquire_auth_slot(state).await?;
+    // Refused before the hash so a throttled guess costs nothing; a missing or
+    // disabled account is still charged like a failed password.
+    if login_throttle::throttled(&state.pool, &state.config, request, username).await? {
+        return Err(too_many_attempts());
+    }
+    match verify_password_with(state, username, password, permit).await {
+        Ok(Some(id)) => {
+            login_throttle::succeeded(&state.pool, username).await?;
+            Ok(Some(id))
+        }
+        Ok(None) => {
+            login_throttle::failed(&state.pool, request, username).await?;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiResult<Json<Token>> {
-    let id = verify_password(&state, &input.username, &input.password)
+    let request = login_throttle::Request::from_current();
+    let id = sign_in(&state, &input.username, &input.password, request)
         .await?
         .ok_or_else(unauthorized)?;
     let mut bytes = [0u8; 32];
@@ -736,7 +896,7 @@ pub(crate) async fn authenticate_token_hash(
     token_hash: Vec<u8>,
 ) -> ApiResult<(Account, u64)> {
     let row = sqlx::query_as::<_, (Uuid, String, bool, i64)>(
-        "SELECT a.id, a.username, a.is_admin, EXTRACT(EPOCH FROM clock_timestamp() - s.authenticated_at)::bigint AS auth_age FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp() AND NOT a.suspended",
+        "SELECT a.id, a.username, a.is_admin, EXTRACT(EPOCH FROM clock_timestamp() - s.authenticated_at)::bigint AS auth_age FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=$1 AND s.expires_at > clock_timestamp() AND NOT a.suspended AND NOT a.must_change_password",
     )
     .bind(token_hash)
     .fetch_optional(pool)
@@ -807,7 +967,8 @@ pub async fn authenticate_access_token(
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, bool, Vec<String>, Option<bool>)>(
         "SELECT a.id, t.id, a.username, a.is_admin, t.scopes, (t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp()) AS expired \
          FROM accounts a JOIN access_tokens t ON t.account_id = a.id \
-         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND NOT a.suspended",
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND NOT a.suspended \
+         AND NOT a.must_change_password",
     )
     .bind(&token_hash)
     .fetch_optional(pool)

@@ -457,6 +457,11 @@ impl Engine {
         Ok(engine)
     }
 
+    /// The sudo-mode window this engine applies to sensitive actions.
+    pub fn fresh_auth(&self) -> Duration {
+        self.fresh_auth
+    }
+
     /// Move the sudo-mode window for sensitive actions.
     pub fn with_fresh_auth(mut self, window: Duration) -> Self {
         self.fresh_auth = window;

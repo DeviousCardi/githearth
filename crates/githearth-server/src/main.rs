@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use githearth_server::audit_retention::{self, DEFAULT_BATCH_SIZE};
 use githearth_server::{
-    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, jobs, reconcile, router,
-    setup, ssh,
+    AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, jobs, reconcile,
+    reset_admin, router, setup, ssh,
 };
 use std::{
     io::{self, BufRead, IsTerminal, Read},
@@ -27,6 +27,12 @@ enum Command {
     Doctor,
     /// Create the first admin; password is read from stdin (never command arguments).
     BootstrapAdmin {
+        #[arg(long)]
+        username: String,
+    },
+    /// Break-glass: restore an existing account as an enabled site administrator.
+    /// The password is read from stdin (never command arguments).
+    ResetAdmin {
         #[arg(long)]
         username: String,
     },
@@ -151,15 +157,7 @@ async fn run(args: Args) -> Result<()> {
             tracing::info!("schema migrated");
         }
         Command::BootstrapAdmin { username } => {
-            let mut password = String::new();
-            io::stdin()
-                .take(1026)
-                .read_to_string(&mut password)
-                .context("cannot read password from stdin")?;
-            if password.len() > 1025 {
-                bail!("password input exceeds limit");
-            }
-            let password = password.trim_end_matches(['\r', '\n']).to_owned();
+            let password = read_password_from_stdin()?;
             // Preserve actionable duplicate errors without displaying SQL driver data.
             match bootstrap_admin(&pool, &username, password).await {
                 Ok(id) => tracing::info!(%id, "administrator created"),
@@ -172,6 +170,22 @@ async fn run(args: Args) -> Result<()> {
                         bail!("{message}");
                     }
                     bail!("bootstrap failed; check schema, database, and username availability");
+                }
+            }
+        }
+        Command::ResetAdmin { username } => {
+            let password = read_password_from_stdin()?;
+            match reset_admin(&pool, &username, password).await {
+                Ok(id) => tracing::info!(%id, "administrator reset"),
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.starts_with("no account named")
+                        || message.starts_with("username must")
+                        || message.starts_with("password must")
+                    {
+                        bail!("{message}");
+                    }
+                    bail!("administrator reset failed; check schema and database");
                 }
             }
         }
@@ -367,6 +381,20 @@ fn database_url_from_environment_or_stdin(recorded: Option<String>) -> Result<St
         bail!("database URL input exceeds limit");
     }
     Ok(line.trim().to_owned())
+}
+
+/// Reads the operator-supplied password from stdin, never from argv, and
+/// strips only the trailing newline.
+fn read_password_from_stdin() -> Result<String> {
+    let mut password = String::new();
+    io::stdin()
+        .take(1026)
+        .read_to_string(&mut password)
+        .context("cannot read password from stdin")?;
+    if password.len() > 1025 {
+        bail!("password input exceeds limit");
+    }
+    Ok(password.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 async fn shutdown() {

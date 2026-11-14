@@ -302,7 +302,8 @@ pub async fn authenticate(
     let row = sqlx::query_as::<_, (Uuid, Uuid, bool)>(
         "SELECT k.id, k.account_id, (k.expires_at IS NOT NULL AND k.expires_at <= clock_timestamp()) AS expired \
          FROM ssh_keys k JOIN accounts a ON a.id = k.account_id \
-         WHERE k.fingerprint = $1 AND k.revoked_at IS NULL AND NOT a.suspended",
+         WHERE k.fingerprint = $1 AND k.revoked_at IS NULL AND NOT a.suspended \
+         AND NOT a.must_change_password",
     )
     .bind(fingerprint)
     .fetch_optional(&mut *conn)
