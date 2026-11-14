@@ -1,6 +1,6 @@
 # Deployment and failure contract
 
-Status: architecture requirements for the foundation experiments. An experimental M1 server/development Compose setup exists; no production installer or distributed service is implemented.
+Status: architecture requirements for the foundation experiments. An experimental M1 server/development Compose setup exists, and M4 adds runbook-driven installation and recovery drills; the one `setup` command and any distributed service are not implemented.
 
 ## One product, different placement
 
@@ -70,13 +70,13 @@ The future installer/admin tool should support this controlled sequence:
 4. Add application roles, initially routing limited work to them.
 5. Migrate large objects to the selected distributed backend with checksums and an explicit read/write cutover.
 6. Change repository placement through versioned routing, write fencing, and a resumable migration record.
-7. Run failure tests before advertising the distributed availability profile.
+7. Run failure tests before advertising the distributed availability profile. Both new Git members are added as learners and promoted only after both hold every committed object.
 
 Preserve tenant/repository identities, client URLs, API contracts, and export semantics. Same product does not mean that copying a data directory while writers are active is a supported migration.
 
 ## Recovery and upgrade requirements
 
-Backups cover metadata, Git refs and reachable objects, large objects, configuration, and the keys needed to decrypt or verify them. Search indexes may be rebuilt. A successful backup job is not enough: restore into a fresh installation and verify relationships, permissions, representative clones, and object integrity.
+Backups cover metadata, Git refs and reachable objects, large objects and configuration, and they record the key id needed to decrypt the archive. The encryption key itself is kept separately, never inside the backup, so one stolen archive does not yield the secrets it protects. Search indexes may be rebuilt. A successful backup job is not enough: restore into a fresh installation and verify relationships, permissions, representative clones, and object integrity.
 
 Upgrades need a supported version window, expand/contract metadata migrations, durable-format compatibility checks, and a tested roll-forward or restore route. Downgrading a binary is not automatically a valid rollback after a data migration.
 

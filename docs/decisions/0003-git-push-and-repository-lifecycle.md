@@ -46,6 +46,8 @@ Smart HTTP `git-receive-pack` runs native `git receive-pack --stateless-rpc` wit
 2. **Quarantine.** Git writes the received pack to its quarantine directory and runs `fsck` on it. Nothing is visible in the repository yet.
 3. **Policy (`pre-receive`).** The hook sends every `<old> <new> <ref>` line to the server, which decides each one through the [ADR 0002](0002-authorization.md) engine: `ref.push`, `ref.force_push` when `old` is not an ancestor of `new` (checked against the quarantined objects), `ref.delete` when `new` is zero, plus branch protection. One denied ref rejects the whole push. Only `refs/heads/*` and `refs/tags/*` are writable; any other namespace is refused. On acceptance Git migrates the quarantined objects into the repository and fsyncs them.
 4. **Journal (`reference-transaction`, state `prepared`).** Before Git commits any ref, the hook appends a *prepared* record to `<repo>/githearth/journal`: operation ID, actor, and every `<old> <new> <ref>` in the transaction. The append is fsynced. If the append fails, the hook exits non-zero and Git aborts the transaction.
+
+   Server-owned object pinning (M4.1) does not use this path and adds no namespace: a pull-request head is pinned by a `pinned_commits` row, and the housekeeping keep-set walks objects from it. Nothing is journaled, advertised or writable, so `refs/heads/*` and `refs/tags/*` remain the only writable namespaces.
 5. **Ref commit.** Git writes the refs (fsynced by `core.fsync=reference`) and runs the hook in state `committed` or `aborted`, which appends the matching marker. Marker appends are best-effort: the reconciler can recover a missing marker from the refs themselves.
 6. **Acknowledgement.** `receive-pack` reports `ok`/`ng` per ref to the client. An `ok` therefore means objects, journal record and ref are all on disk.
 7. **Metadata (`post-receive` and after).** The server records the push in PostgreSQL in one transaction: the push operation row, ref update rows, and the outbox event, keyed by `(repository_id, journal_sequence)` so applying the same journal record twice changes nothing. A failure here never turns an acknowledged push into a failed one; the reconciler applies it later.
@@ -101,7 +103,7 @@ A consistent backup is a PostgreSQL backup plus a storage snapshot taken *after*
 
 ## Consequences
 
-- Push durability relies on Git's own fsync and quarantine behavior plus one fsynced journal append per ref transaction. The journal is the unit that M5 replicates: a replicated group commits the prepared record before the hook allows the ref commit.
+- Push durability relies on Git's own fsync and quarantine behavior plus one fsynced journal append per ref transaction. The journal is the unit that M5 replicates, with one change to the order: the replicated entry commits before the hook allows the ref commit, and the hook returns no verdict at all when the log has not decided (see [ADR 0010](0010-git-replication.md)). The single-node "prepared, then local commit, then marker" order is M2's, not M5's.
 - Every ref change made outside `receive-pack` (merges in M3, web edits, API ref updates) must go through the same `reference-transaction` path with an operation ID, so it is journaled and authorized identically.
 
 ## Open items

@@ -2,7 +2,7 @@
 
 Date: 2026-10-27.
 
-Status: **accepted for implementation**. The engine, schema, built-in policies and role templates exist in `crates/githearth-authz`; the organization read path uses it. Persisted teams, grants and branch protection arrive with their M2/M3 tables.
+Status: **accepted for implementation**. The engine, schema, built-in policies and role templates exist in `crates/githearth-authz`; the organization read path uses it. The M2/M3 teams, grants and protection tables are in place; M3 is signed off. The M4.2 platform slice adds non-account principal kinds (service accounts and CI run tokens) and the account administration actions M4.1 needs.
 
 ## Decision
 

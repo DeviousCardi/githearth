@@ -2,7 +2,9 @@
 
 Date: 2026-11-07.
 
-Status: **accepted** for phase 5, after Person A's review on 2026-11-07 (PR #63). The [two-person roadmap](../plan/08-two-person-roadmap.md) phase 5 splits the work:
+Status: **accepted** for phase 5, after Person A's review on 2026-11-07 (PR #63). Two statements in the Constraints below are superseded by M4.1's outbox relay and are corrected at the end of this document; the jobs design itself is unchanged.
+
+The [two-person roadmap](../plan/08-two-person-roadmap.md) phase 5 splits the work:
 
 - **Person A:** transactional job records and domain handlers.
 - **Person B:** claiming, retry and recovery execution.
@@ -165,6 +167,43 @@ RETURNING *
 - Delivery never blocks a domain transaction beyond one `INSERT`.
 - Handlers carry the idempotence burden; this ADR states it as their contract.
 - Polling costs one indexed query per interval while idle.
+
+## Revision for M4.1: the outbox is delivered
+
+The constraints above say "the outbox is never delivered" and "`outbox_events`
+is unchanged. Whether a future external relay sets `delivered_at` is out of
+scope." M4.1 supersedes both. The job runner is still not the outbox consumer,
+which is the part of this ADR that stands: a relay reads committed outbox rows
+and **enqueues one job per registered consumer**, deduplicated on
+`(event_id, consumer_id)`.
+
+What changes:
+
+- `outbox_events` gains `(chain, seq)` from the audit chain, unique and indexed
+  for the undelivered scan. The `audit_events` sequence is per chain (one per
+  organization plus the site chain), so a cutover watermark is one value per
+  chain, not one value.
+- A `consumers` table holds each consumer's name, start position and event
+  filter. A consumer registered after the cutover starts at its registration
+  position and receives nothing older; an upgrade writes one watermark per
+  chain, so nothing from before the upgrade is delivered.
+- A per-consumer delivery row records attempts, next attempt and completion, so
+  `delivered_at` on the event means "the fan-out committed", not "every
+  consumer succeeded".
+- The retry budget is measured in hours, not in the default five attempts with
+  a one-second base. An ordinary SMTP outage must not lose notifications. A
+  consumer that exhausts its budget goes `dead`, the `doctor` command reports
+  it, and an operator can requeue it. One consumer's dead jobs never prevent
+  another consumer from receiving the same event.
+- The relay filters by event kind; session events are not fanned out to every
+  consumer at scale.
+
+A defect found while building M4.1 is recorded here as a requirement: the
+`Retry` outcome's reschedule used a PostgreSQL `make_interval(millis => …)`
+parameter that does not exist, so the fenced update failed and a retry stayed
+`running` until its lease expired. Backoff was therefore never exercised. Any
+retry path must have a test that observes the next attempt time, not only the
+job's final state.
 
 ## Settled with Person A
 

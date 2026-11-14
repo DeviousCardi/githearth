@@ -78,6 +78,8 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [First milestone](docs/plan/05-first-milestone.md) | M1 scope, acceptance criteria and M2 task breakdown |
 | [Capability inventory](docs/plan/06-capability-inventory.md) | Required feature families and their acceptance obligations |
 | [Qualification and decisions](docs/plan/07-qualification-and-decisions.md) | Capacity, faults, deployment profiles, pending choices and release evidence |
+| [Two-person delivery roadmap](docs/plan/08-two-person-roadmap.md) | Phase ownership, increments and acceptance cases, including M4.1–M11a |
+| [Milestone direction decisions](docs/plan/09-milestone-decisions.md) | Build order and the direction chosen for each milestone's main decisions |
 | [M1 verification](docs/verification/m1-foundation.md) | Reviewer evidence, criterion outcomes and limits |
 | [Foundation runbook](docs/foundation.md) | Start the server, migrate, bootstrap, exercise API and run real PostgreSQL tests |
 | [Metadata contract](docs/plan/01-metadata-contract.md) | Data ownership, transactions, workload definitions, and account-scale profiles |
@@ -87,7 +89,12 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [Database experiment](experiments/metadata/README.md) | Reproducible lab setup, workload runner, and result interpretation |
 | [Database decision](docs/decisions/0001-metadata-database.md) | Provisional PostgreSQL selection, measured evidence, and remaining qualification gates |
 | [Authorization decision](docs/decisions/0002-authorization.md) | Cedar policy-based authorization: roles, built-in forbids, failing closed |
-| [Merge execution decision](docs/decisions/0004-merge-execution.md) | A/B merge contract: intents, methods, expected-ref execution, recovery (proposed for M3) |
+| [Merge execution decision](docs/decisions/0004-merge-execution.md) | A/B merge contract: intents, methods, expected-ref execution, recovery |
+| [Git replication decision](docs/decisions/0010-git-replication.md) | M5 commit point, object manifests, replicated lifecycle and member rules |
+| [PostgreSQL HA decision](docs/decisions/0011-postgresql-ha.md) | Patroni topology, exact synchronous settings, fencing and the application contract |
+| [Placement and reads decision](docs/decisions/0012-placement-routing-and-expansion.md) | Placement, per-endpoint reads, the move protocol and expansion |
+| [Platform slice decision](docs/decisions/0014-platform-slice.md) | M4.2 object storage, tokens, secrets, encrypted backups and fairness |
+| [Identity slice decision](docs/decisions/0015-identity-slice.md) | M11a OIDC, second factors, sign-up, recovery and deletion |
 | [Local results](experiments/metadata/results/local-screening-2026-10-27/REPORT.md) | 84 measured runs, errors, resource observations, and process recovery |
 | [Git prototype](docs/git-prototype.md) | Working local commands, tests, and current limitations |
 

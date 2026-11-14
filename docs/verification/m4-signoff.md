@@ -20,7 +20,7 @@ run dates recorded in each evidence document.
 
 | # | M4 exit item | Evidence (doc) | Script / method | Date | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Independent user installs from the runbook on clean Linux | [m4-signoff.md](m4-signoff.md) checklist below; [lab-m4/15](../verification/lab-m4/15-operations-drills.md) | A clean `ubuntu:24.04` host with PostgreSQL 17.12, then a fresh Docker Compose deployment; operator used only `docs/operations/` | 2026-11-13, 2026-11-14 | verified (agent drill; see note) |
+| 1 | Independent user installs from the runbook on clean Linux | [lab-m4/15](../verification/lab-m4/15-operations-drills.md) and the checklist below | A clean `ubuntu:24.04` host with PostgreSQL 17.12, then a fresh Docker Compose deployment; operator used only `docs/operations/` | 2026-11-13, 2026-11-14 | verified (agent drill; see note) |
 | 2 | Restart | [m4-qualification.md](m4-qualification.md) s6 (restart and jobs), s7 (container restart, data persists); lab-m4/15 round 2 | `scripts/verify-m4.py`; `docker compose stop/start app`, `down` → `up` | 2026-11-08, 2026-11-14 | verified |
 | 3 | Disk-full behavior | [m4-qualification.md](m4-qualification.md) s8 and [db-disk-full.md](db-disk-full.md) | `scripts/verify-m4.py`, `scripts/verify-db-disk-full.py` | 2026-11-08, 2026-11-09 | verified |
 | 4 | Bounded resources | [m4-qualification.md](m4-qualification.md) s10 and "Measured resource use" | `scripts/verify-m4.py` | 2026-11-08 | verified |
@@ -40,6 +40,18 @@ That exercises the documented path end to end, but it is not a human user; a
 human independent install is still recommended before public distribution.
 Update 2026-11-14: the project owner accepts the Docker installation drill as
 closing item 1 for M4; no further install drill is scheduled for this milestone.
+
+Correction 2026-11-15, exit items 5 and 6: the backup/restore drills took the
+database dump and storage tarball while the server was running and idle, not
+stopped as [m4-qualification.md](m4-qualification.md) stated. Both
+`scripts/verify-m4.py` and `scripts/verify-offhost-backup.py` take the dump and
+the tarball before stopping the server. The evidence therefore covers a
+quiescent installation only; a backup taken during a push can lose an
+acknowledged write. M4 stays signed off with this recorded as a known
+limitation: the runbook now requires the server to be stopped for the whole
+procedure, M4.1 replaces the procedure with a `backup` command that enforces a
+write fence and re-points both harnesses at it (case U13), and M4.2 adds the
+single-node online path.
 
 Scope note: this sign-off covers the M4 **exit** list. Build-list and inventory
 items allocated to M4 that were not delivered (account and membership

@@ -41,13 +41,13 @@ concrete exit criteria. Each is accounted for separately.
 
 | # | Exit item | Code | Tests | Status |
 | --- | --- | --- | --- | --- |
-| E1 | Merge intents bind source/target OIDs, candidate result, checks/approvals, policy generation and operation ID | `merge_intents.rs` (`create_intent` records `source_oid`, `expected_target_oid`, `policy_generation`, `checks_approvals_digest`, `operation_id`; `record_merge_result` records `result_oid`) | `tests/merge_intents.rs`, `tests/m3_exit.rs` | verified |
+| E1 | Merge intents bind source/target OIDs, candidate result, checks/approvals, policy generation and operation ID | `merge_intents.rs` (`create_intent` records `source_oid`, `expected_target_oid`, `policy_generation`, `checks_approvals_digest`, `operation_id`; `record_merge_result` records `result_oid`) | `tests/merge_intents.rs`, `tests/m3_exit.rs` | verified for binding; corrected 2026-11-15 — checks bind to the source head, not the candidate (see below) |
 | E2 | Expected-target mutation; duplicate workers reuse the outcome | `merge.rs` (`execute_intent` compare-and-swap via `githearth_git::merge::update_ref_expected`, journal lookup), `merge_worker.rs` (lease) | `tests/merge_execute.rs` (`second_call_returns_already_merged_without_a_second_ref_update`, `two_concurrent_calls_for_one_intent_merge_exactly_once`), `tests/merge_worker.rs` | verified |
 | E3 | Changed tips, permissions and policies require revalidation | `merge.rs` (`execute_intent` re-checks pull state, `source_oid`, `expected_target_oid`, `policy_generation`, actor grant, approvals/checks digest) | `tests/merge_execute.rs` (`stale_cases_return_stale_and_leave_the_ref`, `a_required_check_flipping_after_the_intent_is_stale`), `tests/m3_exit.rs` (`revoking_the_merger_between_intent_and_execution_goes_stale`) | verified |
 | E4 | Fork contributions | `forks.rs`, `pulls.rs` (`source_repository_id`), `merge.rs` (cross-repo fetch), migration `0038` | `tests/forks.rs` (`cross_repo_pull_requests_merge_by_each_method`, `merge_intent_revalidates_recorded_refs`) | verified |
 | E5 | Stale approvals/checks | `merge_intents.rs` (`dismiss_stale_approvals`), `statuses.rs` (status bound to a commit), migration `0037` | `tests/merge_intents.rs` (`stale_approval_does_not_count_by_default`, `stale_approval_counts_when_dismissal_is_off`, `a_status_for_a_different_sha_never_authorizes_the_merge`), `tests/merge_queue.rs` (`a_stale_approval_cannot_authorize_a_different_head_in_the_queue`) | verified |
 | X1 | Concurrent merges cannot overwrite accepted history | `merge.rs` + `merge_worker.rs` (per-repository lock + compare-and-swap) | `tests/m3_exit.rs` (`two_concurrent_merges_into_one_target_one_wins_and_history_is_never_rewound`) | verified |
-| X2 | Stale checks cannot authorize different code | `merge_intents.rs` + `statuses.rs` (digest binds checks to the source oid) | `tests/m3_exit.rs` (`a_passing_check_on_head_a_cannot_authorize_merging_head_b`) | verified |
+| X2 | Stale checks cannot authorize different code | `merge_intents.rs` + `statuses.rs` (digest binds checks to the source oid) | `tests/m3_exit.rs` (`a_passing_check_on_head_a_cannot_authorize_merging_head_b`) | verified for the source head; corrected 2026-11-15 — a check that passes on the head but fails on the merged tree is not caught (see below) |
 | X3 | Lost metadata after a Git commit reconciles | `merge.rs` (`apply_merge_record`), `reconcile.rs`, `pushes.rs` (replay) | `tests/m3_exit.rs` (`lost_metadata_after_git_commit_is_reconciled_exactly_once`), `tests/reconcile.rs` | verified |
 | X4 | Duplicate delivery cannot merge twice | `merge_intents.rs` (`record_merge_result` idempotent by `(repository_id, journal_sequence)`) | `tests/m3_exit.rs` (`duplicate_delivery_merges_once_with_one_journal_entry_and_one_event`) | verified |
 | X5 | Revocation races obey documented admission semantics | `merge.rs` (authorization re-evaluated under the per-repository lock); ADR 0004 | `tests/m3_exit.rs` (`revoking_the_merger_between_intent_and_execution_goes_stale`) | verified |
@@ -67,10 +67,25 @@ concrete exit criteria. Each is accounted for separately.
   [ADR 0007](../decisions/0007-signed-commits-and-stale-approvals.md); fork
   contributions in [ADR 0008](../decisions/0008-forks.md); merge execution in
   [ADR 0004](../decisions/0004-merge-execution.md).
-- No production gap remains: drafts (#129) and tag protection (#130) merged, so
-  every M3 build and exit item is implemented and tested.
+- Two gaps are corrected below: the merge queue tests the source head rather than the merged candidate, and drafts/tag protection were the last build items to merge. Neither changes the M3 sign-off, which is over the contracted behavior; both are recorded so the claim is not repeated as delivered.
+
+## Correction (2026-11-15): the queue does not test the merged candidate
+
+The master plan promises that a successful merge identifies the tested
+candidate, and M3's exit says stale checks cannot authorize different code. What
+shipped binds the check digest to the **source head** and the queue re-targets
+the merge; it does not build the candidate and run required checks on it. A
+check that passes on the source and fails only after the merge with the target
+can therefore authorize the merge.
+
+This is a real gap against the promise, not a documentation ambiguity. The
+delivered behavior is retained and M3 remains signed off over it; the missing
+candidate test is scheduled as M6's "tested merge candidates" build item, with
+the exit case in the [two-person roadmap](../plan/08-two-person-roadmap.md#m6--isolated-ci).
+Until it ships, no document may repeat "the queue tests the candidate it merges".
 
 ## Sign-off
+
 
 Two reviewers each confirm the tables above.
 

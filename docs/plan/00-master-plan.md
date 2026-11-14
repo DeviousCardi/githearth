@@ -1,19 +1,19 @@
 # GitHearth master plan
 
-Status: design revision 4. Planning date: 2026-10-27; status updated 2026-11-14. M1–M4 are verified experimental on a single node; M4.1 (usable team alpha) is next. Current milestone states are in [the roadmap](04-forge-roadmap.md#sequence-and-dependencies); sections below describe the design as planned and are not rewritten per milestone.
+Status: design revision 4. Planning date: 2026-10-27; status updated 2026-11-15. M1–M4 are verified experimental on a single node; M4.1 (usable team alpha) is in progress, followed by M4.2, the identity slice, M6 and M5. Current milestone states are in [the roadmap](04-forge-roadmap.md#sequence-and-dependencies); sections below describe the design as planned and are not rewritten per milestone.
 
 ## 1. Objective
 
-Build a freely usable, self-hostable development platform with a path from a personal installation to a large organization. The intended scope covers source hosting, review, planning, automation, releases, packages, security, administration, and an integration ecosystem.
+Build a self-hostable development platform with a path from a personal installation to a large organization, licensed under the Business Source License 1.1 with commercial production use. The intended scope covers source hosting, review, planning, automation, releases, packages, security, administration, and an integration ecosystem.
 
-The founder has explicitly confirmed that **one product must support single-node and distributed deployment modes**. The distributed requirement refers to one logical GitHearth installation spread across machines. Federation between independent installations is a separate, later capability.
+The founder has explicitly confirmed that **one product must support single-node and distributed deployment modes**, and (2026-11-15) that it serves both an organization hosting for itself and an operator hosting many independent organizations on one installation. The distributed requirement refers to one logical GitHearth installation spread across machines. Federation between independent installations is a separate, later capability.
 
 The initial experiments established a Git reader and metadata baseline. The next deliverable is an executable application foundation, followed by the complete Git-and-issues workflow. The full scope and gated sequence are in [the implementation roadmap](04-forge-roadmap.md).
 
 ## 2. Priority order
 
 1. Preserve customer data and enforce access boundaries.
-2. Preserve customer freedom: self-hosting, standard protocols, complete export, permissive product licensing, and no required vendor service.
+2. Preserve customer freedom: self-hosting, standard protocols, complete export, source availability under the Business Source License 1.1 (converting to Apache-2.0 after four years; production use needs a commercial license), and no required vendor service.
 3. Deliver high useful throughput under a stated durability model and bounded resource consumption.
 4. Keep installation, upgrades, recovery, and expansion understandable.
 5. Make everyday browsing, reviewing, and collaboration responsive and accessible.
@@ -32,7 +32,7 @@ It does not mean every dependency must live inside one executable. PostgreSQL re
 | Application | Co-located gateway, domain, and worker roles | Independently replicated roles |
 | Metadata | Chosen engine's local deployment | Same engine's qualified distributed deployment |
 | Git | Local Git data; one-member journal group | Sharded repository groups with replicated journals and object durability |
-| Large objects | Filesystem backend | Supported S3-compatible backend |
+| Large objects | Filesystem backend behind one S3-shaped interface (M4.2) | Shared S3-compatible backend behind the same interface (M5) |
 | Search | Local index workers | Partitioned indexes and query fan-out |
 | Events | Transactional outbox and durable jobs in the chosen engine | Same outbox; optional JetStream transport |
 | CI | Separate local microVM executor when supported, or remote runners | Dedicated runner pools |
@@ -56,7 +56,7 @@ Managed hosting, payments, marketplace commerce, and an organization-operated pu
 - Use the provisional PostgreSQL decision from the completed PostgreSQL/FoundationDB screening for the first application milestone. Tenant ownership is explicit from the first schema. PostgreSQL read replicas alone do not provide horizontal write scaling; a FoundationDB design needs its own query and index layer. Add another candidate only for a concrete advantage not covered by these two.
 - A Git service that owns every repository mutation. Native Git is the initial wire-protocol baseline; gitoxide is used for supported read operations after conformance testing.
 - A durable repository journal in single-node mode that can become a replicated group without changing repository identity or client URLs.
-- Local immutable object files for Git; filesystem or S3-compatible storage for LFS, uploads, packages, logs, and artifacts.
+- Local immutable object files for Git; one S3-shaped object interface for LFS, uploads, packages, logs, artifacts and CI data, with a filesystem backend on one node and an operator-provided S3-compatible store in a cluster.
 - Server-rendered pages with focused TypeScript interaction for review, boards, and editors. WASM is optional where measurements justify it.
 - Permissions and policy evaluation in Rust backed by the selected metadata store, with a versioned authorization contract. Introducing another policy engine requires a benchmark and migration decision.
 - Transactional outbox/jobs in the selected engine; optional JetStream for event transport at scale. Consumers remain idempotent regardless of transport.
@@ -69,7 +69,7 @@ The first local comparison is now complete. [ADR 0001](../decisions/0001-metadat
 
 An acknowledged write has a documented durability boundary. Replication has a documented failure model. An interrupted request can return an unknown outcome; retries must discover or reuse the existing operation instead of blindly duplicating it.
 
-A successful merge identifies the exact target revision, source revision, policy generation, and tested candidate. Background worker duplication must never produce a second branch update for the same merge intent.
+A successful merge identifies the exact target revision, source revision, policy generation, and tested candidate. The merge queue runs required checks on the candidate it will merge, not on the source head. Background worker duplication must never produce a second branch update for the same merge intent.
 
 Authorization is checked by the service that owns the resource. Search indexes, cache contents, package digests, and replica placement do not confer access. Critical revocation behavior is explicit, including in-flight work.
 
@@ -77,7 +77,7 @@ Export includes product metadata and large objects as well as Git history. Resto
 
 ## 7. Release strategy
 
-The roadmap progresses through engineering foundations; single-node storage; collaborative forge; distributed foundation; CI; packages and delivery; planning and discovery; application security; enterprise operations; ecosystem and portability; and full baseline qualification. AI and remote development are optional later modules whose hosting and implementation have not been selected.
+The roadmap progresses through engineering foundations; single-node storage; collaborative forge; a platform slice for objects, tokens, secrets and fairness; the identity slice; isolated CI; the distributed foundation; packages and delivery; planning and discovery; application security; enterprise operations; ecosystem and portability; and full baseline qualification. AI and remote development are optional later modules whose hosting and implementation have not been selected.
 
 Every production feature ships with UI/API behavior, permissions, export/restore behavior, telemetry, operational documentation, and tests appropriate to its risk. A checkbox in the UI does not make a feature complete.
 
@@ -85,12 +85,12 @@ An early single-node release may be useful before distributed mode is production
 
 ## 8. Planning honesty
 
-The plan deliberately provides milestone gates instead of promising full parity within a few months. A complete forge is a multi-year undertaking at solo scale and requires ongoing maintenance after initial delivery. The unknowns with the greatest schedule impact are native Git integration, replicated write correctness, CI compatibility, and disaster recovery.
+The plan deliberately provides milestone gates instead of promising full parity within a few months. A complete forge is a multi-year undertaking at two-person scale and requires ongoing maintenance after initial delivery. The unknowns with the greatest schedule impact are native Git integration, replicated write correctness, CI compatibility, and disaster recovery.
 
 Before assigning calendar dates, finish the foundation experiments, measure available weekly engineering time, and estimate the next two milestones. Reforecast after each completed milestone. Preserve the full product scope while allowing evidence to change implementation choices and sequencing.
 
 ## 9. How to use this plan
 
-Read this document and the metadata contract, then the [full roadmap](04-forge-roadmap.md), [M1 acceptance specification](05-first-milestone.md), [capability inventory](06-capability-inventory.md), and [qualification/decision register](07-qualification-and-decisions.md). The database is provisionally selected. Complete each milestone against its recorded evidence rather than repeating the completed screening.
+Read this document and the metadata contract, then the [full roadmap](04-forge-roadmap.md), [M1 acceptance specification](05-first-milestone.md), [capability inventory](06-capability-inventory.md), [qualification/decision register](07-qualification-and-decisions.md), [two-person delivery roadmap](08-two-person-roadmap.md) and [milestone direction decisions](09-milestone-decisions.md). The distributed directions are in [ADR 0010](../decisions/0010-git-replication.md), [ADR 0011](../decisions/0011-postgresql-ha.md) and [ADR 0012](../decisions/0012-placement-routing-and-expansion.md); the platform slice is [ADR 0014](../decisions/0014-platform-slice.md) and the identity slice is [ADR 0015](../decisions/0015-identity-slice.md). The database is provisionally selected. Complete each milestone against its recorded evidence rather than repeating the completed screening.
 
 Record design changes as new revisions of the relevant decision. Keep future capability inventories and compatibility matrices synchronized with actual tests. Use statuses `planned`, `experimental`, `beta`, and `stable`; the current executable components are experimental.
