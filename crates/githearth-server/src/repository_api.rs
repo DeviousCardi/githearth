@@ -12,7 +12,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, Page, authenticate, event, facts, idempotency, invalid, repositories,
+    ApiError, AppState, Page, authenticate, event, facts, has_nul, idempotency, invalid,
+    repositories, valid_path_param,
 };
 
 fn not_found() -> ApiError {
@@ -92,6 +93,9 @@ pub(crate) async fn load_repo(
     org_slug: &str,
     name: &str,
 ) -> Result<Loaded, ApiError> {
+    if !valid_path_param(org_slug) || !valid_path_param(name) {
+        return Err(invalid());
+    }
     let mut conn = state.pool.acquire().await?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
         .bind(org_slug)
@@ -205,9 +209,13 @@ pub(crate) async fn create(
 ) -> Result<(StatusCode, Json<RepositoryJson>), ApiError> {
     let input: NewRepository = serde_json::from_slice(&body).map_err(|_| invalid())?;
 
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-
-    if !valid_repo_name(&input.name) || input.description.chars().count() > 1000 {
+    if !valid_path_param(&org_slug) {
+        return Err(invalid());
+    }
+    if !valid_repo_name(&input.name)
+        || input.description.chars().count() > 1000
+        || has_nul(&input.description)
+    {
         return Err(invalid());
     }
     if let Some(ref v) = input.visibility
@@ -220,6 +228,7 @@ pub(crate) async fn create(
     {
         return Err(invalid());
     }
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let mut conn = state.pool.acquire().await?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
@@ -404,6 +413,9 @@ pub(crate) async fn list(
     Path(org_slug): Path<String>,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<RepositoryJson>>, ApiError> {
+    if !valid_path_param(&org_slug) {
+        return Err(invalid());
+    }
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let limit = page.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
@@ -496,7 +508,7 @@ pub(crate) async fn update(
                 return Err(invalid());
             }
             if let Some(ref desc) = input.description
-                && desc.chars().count() > 1000
+                && (desc.chars().count() > 1000 || has_nul(desc))
             {
                 return Err(invalid());
             }

@@ -99,6 +99,16 @@ fn parse_basic(headers: &HeaderMap) -> Result<(String, String), AuthError> {
     Ok((user.to_owned(), pass.to_owned()))
 }
 
+/// Git URLs are decoded before this point, so a `%00` in a path segment arrives
+/// as NUL. PostgreSQL cannot store it, and querying with it must never happen.
+fn reject_nul_path(org_slug: &str, repo_name: &str) -> Result<(), AuthError> {
+    if crate::valid_path_param(org_slug) && crate::valid_path_param(repo_name) {
+        Ok(())
+    } else {
+        Err(AuthError(StatusCode::BAD_REQUEST, "invalid input"))
+    }
+}
+
 pub async fn admit(
     state: &AppState,
     headers: &HeaderMap,
@@ -106,6 +116,7 @@ pub async fn admit(
     repo_name: &str,
     want: Want,
 ) -> Result<Admitted, AuthError> {
+    reject_nul_path(org_slug, repo_name)?;
     let (username, password) = parse_basic(headers)?;
     // A personal access token may be supplied as the Basic password (or the
     // username when only the token is embedded in the URL). Detect `gth_` and
@@ -210,6 +221,7 @@ async fn authorize_fetch(
     repo_name: &str,
     clone: bool,
 ) -> Result<FetchAuth, AuthError> {
+    reject_nul_path(org_slug, repo_name)?;
     let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
     let mut conn = state.pool.acquire().await.map_err(unavailable)?;
 
@@ -302,6 +314,7 @@ async fn admit_anonymous(
     org_slug: &str,
     repo_name: &str,
 ) -> Result<RepositoryRow, AuthError> {
+    reject_nul_path(org_slug, repo_name)?;
     let unauthorized = || AuthError(StatusCode::UNAUTHORIZED, "invalid or expired credentials");
     match authorize_fetch(state, Requester::Anonymous, org_slug, repo_name, true).await? {
         FetchAuth::Admitted(repo) => Ok(repo),
@@ -336,6 +349,7 @@ pub async fn admit_account(
     repo_name: &str,
     want: Want,
 ) -> Result<Admitted, AuthError> {
+    reject_nul_path(org_slug, repo_name)?;
     let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
     let mut conn = state.pool.acquire().await.map_err(unavailable)?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")

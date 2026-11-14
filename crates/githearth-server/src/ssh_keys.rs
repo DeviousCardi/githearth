@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::{
     Account, ApiError, AppState, Credential, authenticate_token_hash, bearer_credential,
-    event_with, invalid, ssh,
+    event_with, has_nul, invalid, ssh,
 };
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -38,7 +38,7 @@ pub(crate) fn router() -> Router<AppState> {
 const MAX_PUBLIC_KEY_LEN: usize = 16 * 1024;
 
 fn name_ok(name: &str) -> bool {
-    (1..=100).contains(&name.chars().count()) && !name.trim().is_empty()
+    (1..=100).contains(&name.chars().count()) && !name.trim().is_empty() && !has_nul(name)
 }
 
 /// Accept only Ed25519 and ECDSA (nistp256/384/521). RSA and DSA are refused

@@ -1102,6 +1102,32 @@ async fn postgres_read_organization_fact_contract() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn organization_name_rejects_nul_bytes() {
+    let (pool, config) = postgres_facts_pool().await;
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let app = router(state);
+    let owner = fixture_account(&pool, &tag("owner")).await;
+    let token = fixture_session(&pool, owner).await;
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v1/organizations",
+        Some(&token),
+        json!({"slug": tag("nul"), "name": "bad\u{0}name"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM organizations WHERE name LIKE 'bad%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "invalid input must not reach the database");
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn postgres_create_organization_backfills_grants() {
     let (pool, config) = postgres_facts_pool().await;
     let state = AppState::new(pool.clone(), config).await.unwrap();

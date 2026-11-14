@@ -18,7 +18,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, event, facts, idempotency, invalid, repositories,
+    ApiError, AppState, authenticate, event, facts, has_nul, idempotency, invalid, repositories,
     repository_api::{self, RepositoryJson},
 };
 
@@ -90,8 +90,9 @@ pub(crate) async fn create_fork(
         || input
             .description
             .as_deref()
-            .is_some_and(|d| d.chars().count() > 1000)
+            .is_some_and(|d| d.chars().count() > 1000 || has_nul(d))
         || input.organization.trim().is_empty()
+        || has_nul(&input.organization)
     {
         return Err(invalid());
     }

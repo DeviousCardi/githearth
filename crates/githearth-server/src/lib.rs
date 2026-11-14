@@ -452,6 +452,19 @@ pub(crate) fn invalid() -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "invalid input")
 }
 
+/// PostgreSQL text columns cannot store U+0000. Reject it as invalid input
+/// before a value reaches a query so it never surfaces as a 503 database
+/// error (issue #152).
+pub(crate) fn has_nul(value: &str) -> bool {
+    value.contains('\0')
+}
+
+/// Validate a raw string path parameter before it is compared against a text
+/// column. Path extractors decode percent escapes, so `%00` arrives as NUL.
+pub(crate) fn valid_path_param(value: &str) -> bool {
+    !has_nul(value)
+}
+
 /// A read-only scoped access token is refused any write with 403.
 pub(crate) fn read_only_denied() -> ApiError {
     ApiError(StatusCode::FORBIDDEN, "read-only token")
@@ -840,7 +853,6 @@ async fn create_organization(
     headers: HeaderMap,
     Json(input): Json<NewOrganization>,
 ) -> ApiResult<(StatusCode, Json<Organization>)> {
-    let (account, _) = authenticate(&state.pool, &headers).await?;
     if input.slug.is_empty()
         || input.slug.len() > 64
         || input.slug.starts_with('-')
@@ -852,9 +864,11 @@ async fn create_organization(
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         || input.name.trim().is_empty()
         || input.name.chars().count() > 200
+        || has_nul(&input.name)
     {
         return Err(invalid());
     }
+    let (account, _) = authenticate(&state.pool, &headers).await?;
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
     sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,$3)")

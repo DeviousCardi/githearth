@@ -821,6 +821,31 @@ async fn invalid_input_400() {
             format!("{}/1/comments", issues_path(&slug, "v")),
             json!({"body": "\u{200b}"}),
         ),
+        // NUL bytes cannot be stored in PostgreSQL; they must be a 400 before
+        // any database round-trip, never a 503 "database unavailable" (#152).
+        (
+            "POST",
+            issues_path(&slug, "v"),
+            json!({"title": "bad\u{0}title"}),
+        ),
+        (
+            "POST",
+            issues_path(&slug, "v"),
+            json!({"title": "ok", "body": "bad\u{0}body"}),
+        ),
+        (
+            "PATCH",
+            format!("{}/1", issues_path(&slug, "v")),
+            json!({"body": "bad\u{0}body"}),
+        ),
+        (
+            "POST",
+            format!("{}/1/comments", issues_path(&slug, "v")),
+            json!({"body": "bad\u{0}comment"}),
+        ),
+        // A NUL in a decoded path parameter is invalid input too.
+        ("GET", issues_path(&format!("{slug}%00"), "v"), Value::Null),
+        ("GET", issues_path(&slug, "v%00"), Value::Null),
     ];
 
     for (method, path, body) in cases {

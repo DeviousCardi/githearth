@@ -25,7 +25,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, browse, event, event_with, facts, idempotency, invalid,
+    ApiError, AppState, authenticate, browse, event, event_with, facts, has_nul, idempotency,
+    invalid,
     issues::{allocate_number, not_active, require_readable_repo},
     protection, repositories,
     repository_api::{self, Loaded},
@@ -582,6 +583,8 @@ fn new_pull(body: &[u8]) -> Result<NewPull, ApiError> {
     if input.title.trim().is_empty()
         || input.title.chars().count() > 256
         || input.body.chars().count() > 65536
+        || has_nul(&input.title)
+        || has_nul(&input.body)
         || !valid_branch(&input.source_branch)
         || !valid_branch(&input.target_branch)
         // A same-repository pull must name two distinct branches; a
@@ -590,7 +593,7 @@ fn new_pull(body: &[u8]) -> Result<NewPull, ApiError> {
         || input
             .source_repository
             .as_deref()
-            .is_some_and(|s| s.is_empty() || s.matches('/').count() != 1)
+            .is_some_and(|s| s.is_empty() || s.matches('/').count() != 1 || has_nul(s))
     {
         return Err(invalid());
     }
@@ -933,11 +936,11 @@ async fn update(
         || input
             .title
             .as_ref()
-            .is_some_and(|t| t.trim().is_empty() || t.chars().count() > 256)
+            .is_some_and(|t| t.trim().is_empty() || t.chars().count() > 256 || has_nul(t))
         || input
             .body
             .as_ref()
-            .is_some_and(|b| b.chars().count() > 65536)
+            .is_some_and(|b| b.chars().count() > 65536 || has_nul(b))
         || input
             .state
             .as_ref()
@@ -1247,6 +1250,7 @@ fn new_comment(body: &[u8]) -> Result<NewComment, ApiError> {
     let anchored = input.commit_id.is_some();
     if input.body.trim().is_empty()
         || input.body.chars().count() > 65536
+        || has_nul(&input.body)
         // An anchor names all three of commit, path and line, or none of them.
         || anchored != input.path.is_some()
         || anchored != input.line.is_some()
@@ -1584,7 +1588,11 @@ fn new_review(body: &[u8]) -> Result<NewReview, ApiError> {
         "commented" => !input.body.trim().is_empty(),
         _ => false,
     };
-    if !valid_verdict || !valid_commit_id(&input.commit_id) || input.body.chars().count() > 65536 {
+    if !valid_verdict
+        || !valid_commit_id(&input.commit_id)
+        || input.body.chars().count() > 65536
+        || has_nul(&input.body)
+    {
         return Err(invalid());
     }
     Ok(input)

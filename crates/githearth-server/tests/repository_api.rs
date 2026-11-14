@@ -292,6 +292,61 @@ async fn invalid_names_400() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn nul_bytes_are_invalid_input_400() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
+        .bind(&org_slug)
+        .fetch_one(&pool).await.unwrap();
+    let token = fixture_session(&pool, owner_id).await;
+
+    // A repository description with NUL must be refused before INSERT.
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "nul-desc", "description": "bad\u{0}description"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "nul-patch"}),
+    )
+    .await;
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v1/organizations/{org_slug}/repositories/nul-patch"),
+        Some(&token),
+        None,
+        json!({"description": "bad\u{0}description"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // NUL in a decoded organization or repository path parameter is a 400,
+    // not a database error.
+    for path in [
+        format!("/api/v1/organizations/{org_slug}%00/repositories"),
+        format!("/api/v1/organizations/{org_slug}/repositories/nul-patch%00"),
+    ] {
+        let (status, _) = request(&app, "GET", &path, Some(&token), None, Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn unrelated_user_404_on_read_list_patch_delete() {
     let (app, pool, storage_root, _, org_slug) = setup().await;
     let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
