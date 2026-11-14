@@ -622,6 +622,12 @@ pub(crate) async fn review(
     base: &str,
 ) -> Result<CodeOwnerReview, ApiError> {
     let loaded = load(state, repo_id, base, head).await?;
+    // Resolve the fail-closed cases before touching the pool: when base or head
+    // does not resolve there is nothing to compute, and a flaky database must
+    // not turn an unknown changed-file set into a 503.
+    if let Some(review) = fail_closed_review(&loaded) {
+        return Ok(review);
+    }
     let mut conn = state.pool.acquire().await?;
     Ok(review_loaded(&mut conn, org_id, org_slug, pull_id, head, loaded).await?)
 }
