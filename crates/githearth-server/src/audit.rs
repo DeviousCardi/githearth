@@ -48,6 +48,9 @@ async fn authorize(
     auth_age: u64,
     org_slug: &str,
 ) -> Result<(Uuid, facts::Facts), ApiError> {
+    if !crate::valid_path_param(org_slug) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid input"));
+    }
     let mut conn = state.pool.acquire().await?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
         .bind(org_slug)

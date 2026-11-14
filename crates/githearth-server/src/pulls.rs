@@ -873,11 +873,12 @@ pub(crate) async fn list_pulls(
     require_readable_repo(&loaded)?;
 
     let mut conn = state.pool.acquire().await?;
-    // A fork's own list includes the pull requests it opened against other
-    // repositories, not just those targeting the fork itself (issue #156).
+    // The list is the pull requests that target this repository; a fork's
+    // outgoing pull requests are shown separately by the UI (see
+    // `outgoing_pulls`) so pagination stays on one number sequence.
     let rows = sqlx::query(&format!(
-        "SELECT {PULL_COLUMNS}, repository_id AS target_repository_id FROM pull_requests \
-         WHERE (repository_id = $1 OR source_repository_id = $1) \
+        "SELECT {PULL_COLUMNS} FROM pull_requests \
+         WHERE repository_id = $1 \
          AND ($2::integer IS NULL OR number < $2) \
          AND ($3::text IS NULL OR state = $3) \
          ORDER BY number DESC, id DESC LIMIT $4"
@@ -891,47 +892,8 @@ pub(crate) async fn list_pulls(
 
     let has_more = rows.len() as i64 > limit;
     let mut items = Vec::new();
-    let mut org_facts: HashMap<Uuid, Option<facts::Facts>> = HashMap::new();
-    org_facts.insert(loaded.org_id, Some(loaded.facts.clone()));
     for row in rows {
-        let pull = PullJson::from_row(&row)?;
-        let target_id: Uuid = row.get("target_repository_id");
-        if target_id == loaded.repo.id {
-            items.push(pull);
-            continue;
-        }
-        // An outgoing pull is only visible when the caller may read its target
-        // repository, so a fork cannot reveal a private upstream's pull list.
-        let Some(target) = repositories::get(&mut conn, target_id).await? else {
-            continue;
-        };
-        if target.status == RepositoryStatus::Deleted {
-            continue;
-        }
-        let target_org = target.organization_id;
-        let target_facts = match org_facts.get(&target_org) {
-            Some(facts) => facts.clone(),
-            None => {
-                let facts = facts::load(&mut conn, actor_id, target_org).await?;
-                org_facts.insert(target_org, facts.clone());
-                facts
-            }
-        };
-        let Some(target_facts) = target_facts else {
-            continue;
-        };
-        let authz_repo = repositories::authz_repository(&target);
-        let readable = state
-            .authz
-            .authorize(&target_facts.request(
-                Action::RepositoryRead,
-                Resource::Repository(&authz_repo),
-                Some(Duration::from_secs(auth_age)),
-            ))
-            .is_allowed();
-        if readable {
-            items.push(pull);
-        }
+        items.push(PullJson::from_row(&row)?);
     }
     items.truncate(limit as usize);
     let next = if has_more {
@@ -940,6 +902,97 @@ pub(crate) async fn list_pulls(
         None
     };
     Ok(PullPage { items, next })
+}
+
+/// A pull request opened *from* this repository against another one. The
+/// number belongs to the target repository's sequence, so these rows are not
+/// mixed into [`list_pulls`] (their links and pagination would be wrong); the
+/// UI shows them as a separate section.
+pub(crate) struct OutgoingPull {
+    pub number: i32,
+    pub title: String,
+    pub state: String,
+    /// `"{org}/{repo}"` of the target repository.
+    pub target: String,
+}
+
+pub(crate) async fn outgoing_pulls(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    limit: i64,
+) -> Result<Vec<OutgoingPull>, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    repository_api::require(state, &loaded, Action::RepositoryRead)?;
+    require_readable_repo(&loaded)?;
+
+    let mut conn = state.pool.acquire().await?;
+    let rows = sqlx::query(
+        "SELECT pr.number, pr.title, pr.state, o.slug AS org_slug, r.name AS repo_name, \
+                r.id AS target_id, r.organization_id AS target_org_id, r.status AS target_status \
+         FROM pull_requests pr \
+         JOIN repositories r ON r.id = pr.repository_id \
+         JOIN organizations o ON o.id = r.organization_id \
+         WHERE pr.source_repository_id = $1 \
+         ORDER BY pr.created_at DESC, pr.id DESC LIMIT 200",
+    )
+    .bind(loaded.repo.id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut items = Vec::new();
+    let mut org_facts: HashMap<Uuid, Option<facts::Facts>> = HashMap::new();
+    for row in rows {
+        let target_id: Uuid = row.get("target_id");
+        if target_id == loaded.repo.id {
+            continue;
+        }
+        if row.get::<String, _>("target_status") == "deleted" {
+            continue;
+        }
+        let target_org_id: Uuid = row.get("target_org_id");
+        let target_facts = match org_facts.get(&target_org_id) {
+            Some(facts) => facts.clone(),
+            None => {
+                let facts = facts::load(&mut conn, actor_id, target_org_id).await?;
+                org_facts.insert(target_org_id, facts.clone());
+                facts
+            }
+        };
+        let Some(target_facts) = target_facts else {
+            continue;
+        };
+        let Some(target) = repositories::get(&mut conn, target_id).await? else {
+            continue;
+        };
+        let readable = state
+            .authz
+            .authorize(&target_facts.request(
+                Action::RepositoryRead,
+                Resource::Repository(&repositories::authz_repository(&target)),
+                Some(Duration::from_secs(auth_age)),
+            ))
+            .is_allowed();
+        if !readable {
+            continue;
+        }
+        items.push(OutgoingPull {
+            number: row.get("number"),
+            title: row.get("title"),
+            state: row.get("state"),
+            target: format!(
+                "{}/{}",
+                row.get::<String, _>("org_slug"),
+                row.get::<String, _>("repo_name")
+            ),
+        });
+        if items.len() as i64 >= limit {
+            break;
+        }
+    }
+    Ok(items)
 }
 
 async fn read(
@@ -2074,6 +2127,9 @@ async fn add_review_request(
     body: Bytes,
 ) -> Result<Json<Vec<ReviewRequestJson>>, ApiError> {
     let input: NewReviewRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    if has_nul(&input.reviewer) {
+        return Err(invalid());
+    }
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let loaded =
@@ -2145,6 +2201,9 @@ async fn remove_review_request(
     headers: HeaderMap,
     Path((org_slug, repo_name, number, username)): Path<(String, String, i32, String)>,
 ) -> Result<StatusCode, ApiError> {
+    if !crate::valid_path_param(&username) {
+        return Err(invalid());
+    }
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let loaded =

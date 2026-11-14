@@ -401,6 +401,15 @@ async fn api_paging_and_permission_errors() {
     }
     let owner_token = fixture_session(&pool, owner).await;
 
+    // A NUL in the organization path is invalid input, not a database error.
+    for path in [
+        "/api/v1/organizations/%00/audit",
+        "/api/v1/organizations/%00/audit/verify",
+    ] {
+        let (status, _) = request(&app, "GET", path, Some(&owner_token), Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+
     // Paging: newest last, default limit, next cursor.
     let (status, body) = request(
         &app,

@@ -1034,9 +1034,11 @@ async fn fork_listing_returns_parent_and_children() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn fork_pull_list_includes_outgoing_cross_repository_pulls() {
+async fn fork_pull_list_shows_outgoing_cross_repository_pulls_separately() {
     let f = build_fixture().await;
 
+    // The JSON list stays on this repository's own number sequence: outgoing
+    // pull requests are not mixed in (their numbers belong to the target).
     let (status, page) = request(
         &f.app,
         "GET",
@@ -1046,12 +1048,26 @@ async fn fork_pull_list_includes_outgoing_cross_repository_pulls() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{page}");
-    let items = page["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1, "{page}");
-    assert_eq!(items[0]["number"], f.number);
-    assert_eq!(
-        items[0]["source_repository_id"].as_str().unwrap(),
-        f.fork_id.to_string()
+    assert_eq!(page["items"].as_array().unwrap().len(), 0, "{page}");
+
+    // The browser page shows them in their own section, linked to the target.
+    let cookie = format!("githearth_session={}", f.contributor_token);
+    let path = format!(
+        "/organizations/{}/repositories/{}/pulls",
+        f.contrib_org_slug, f.fork_name
+    );
+    let (status, body) = get_body(&f.app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("Pull requests opened from this fork"),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "/organizations/{}/repositories/{}/pulls/{}",
+            f.parent_org_slug, f.parent_repo_name, f.number
+        )),
+        "{body}"
     );
 
     finish(f).await;

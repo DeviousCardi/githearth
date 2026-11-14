@@ -350,6 +350,34 @@ async fn list_page(
             "<table><caption class=\"muted\">Pull requests, newest first</caption><thead><tr><th scope=\"col\">Number</th><th scope=\"col\">Title</th><th scope=\"col\">State</th><th scope=\"col\">Branches</th><th scope=\"col\">Author</th><th scope=\"col\">Opened</th></tr></thead><tbody>{rows}</tbody></table>"
         )
     };
+    // Pull requests this repository opened against other repositories (a
+    // fork's contributions) are shown separately: their numbers belong to the
+    // target's sequence, so they must not be mixed into the incoming table.
+    let outgoing = pulls::outgoing_pulls(&state, s.account.id, s.auth_age, &slug, &name, 20)
+        .await
+        .map_err(|e| api_error(&s, e))?;
+    let outgoing_section = if outgoing.is_empty() {
+        String::new()
+    } else {
+        let items = outgoing
+            .iter()
+            .map(|pull| {
+                let (org, repo) = pull.target.split_once('/').unwrap_or((&pull.target, ""));
+                format!(
+                    "<li><a href=\"/organizations/{}/repositories/{}/pulls/{}\">{}</a>                      <span class=\"muted\">{} · {}</span></li>",
+                    ui::url_encode(org),
+                    ui::url_encode(repo),
+                    pull.number,
+                    ui::esc(&pull.title),
+                    ui::esc(&pull.state),
+                    ui::esc(&pull.target)
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<div class=\"card\"><h2>Pull requests opened from this fork</h2><ul>{items}</ul></div>"
+        )
+    };
     let mut pager = String::new();
     if params.after.is_some() {
         pager.push_str(&format!(
@@ -366,7 +394,7 @@ async fn list_page(
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / Pull requests</nav>\
 <h1>Pull requests</h1><p><a href=\"{base}/pulls/new\">New pull request</a></p>\
-<p aria-label=\"Filter by state\">{tabs}</p><div class=\"card\">{table}</div><p>{pager}</p>",
+<p aria-label=\"Filter by state\">{tabs}</p><div class=\"card\">{table}</div>{outgoing_section}<p>{pager}</p>",
         ui::esc(&name)
     );
     Ok(page(&s, StatusCode::OK, "Pull requests", &body))

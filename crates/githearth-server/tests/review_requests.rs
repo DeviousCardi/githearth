@@ -666,3 +666,32 @@ async fn closed_pull_request_refuses_a_request() {
 
     finish(f).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn nul_bytes_in_reviewer_fields_are_invalid_400() {
+    let f = build_fixture().await;
+    let href = review_requests_href(&f.org_slug, &f.repo_name, f.number);
+
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &href,
+        Some(&f.author_token),
+        json!({"reviewer": "bad\u{0}name"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = request(
+        &f.app,
+        "DELETE",
+        &format!("{}/%00", href),
+        Some(&f.author_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    finish(f).await;
+}
