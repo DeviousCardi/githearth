@@ -295,7 +295,7 @@ fn busy_page() -> UiError {
                 "Busy",
                 None,
                 None,
-                "<h1>Busy</h1><p>Too many sign-ins in progress. Try again in a moment.</p>",
+                "<h1>Busy</h1><p>Too many sign-in attempts right now. Try again in a few minutes.</p>",
             )),
         )
             .into_response(),

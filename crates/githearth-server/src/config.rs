@@ -54,6 +54,17 @@ pub struct Config {
     /// Empty by default; every entry is validated at load.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Failed logins allowed for one account inside the throttle window before
+    /// further attempts are refused (M4.1 U03).
+    #[serde(default = "default_login_throttle_account_limit")]
+    pub login_throttle_account_limit: u32,
+    /// Failed logins allowed from one client address inside the window.
+    #[serde(default = "default_login_throttle_client_limit")]
+    pub login_throttle_client_limit: u32,
+    /// Window in seconds; a lockout expires when its failures fall out of it,
+    /// so no account is ever permanently locked out.
+    #[serde(default = "default_login_throttle_window_seconds")]
+    pub login_throttle_window_seconds: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -86,6 +97,9 @@ impl Default for Config {
             job_poll_interval_ms: default_job_poll_interval_ms(),
             job_retention_days: default_job_retention_days(),
             trusted_proxies: Vec::new(),
+            login_throttle_account_limit: default_login_throttle_account_limit(),
+            login_throttle_client_limit: default_login_throttle_client_limit(),
+            login_throttle_window_seconds: default_login_throttle_window_seconds(),
         }
     }
 }
@@ -106,6 +120,15 @@ fn default_job_poll_interval_ms() -> u64 {
 }
 fn default_job_retention_days() -> u64 {
     7
+}
+fn default_login_throttle_account_limit() -> u32 {
+    5
+}
+fn default_login_throttle_client_limit() -> u32 {
+    20
+}
+fn default_login_throttle_window_seconds() -> u64 {
+    900
 }
 
 impl Config {
@@ -191,6 +214,18 @@ impl Config {
         env!(job_timeout_seconds, "GITHEARTH_JOB_TIMEOUT_SECONDS");
         env!(job_poll_interval_ms, "GITHEARTH_JOB_POLL_INTERVAL_MS");
         env!(job_retention_days, "GITHEARTH_JOB_RETENTION_DAYS");
+        env!(
+            login_throttle_account_limit,
+            "GITHEARTH_LOGIN_THROTTLE_ACCOUNT_LIMIT"
+        );
+        env!(
+            login_throttle_client_limit,
+            "GITHEARTH_LOGIN_THROTTLE_CLIENT_LIMIT"
+        );
+        env!(
+            login_throttle_window_seconds,
+            "GITHEARTH_LOGIN_THROTTLE_WINDOW_SECONDS"
+        );
         if let Ok(value) = std::env::var("GITHEARTH_TRUSTED_PROXIES") {
             c.trusted_proxies = value
                 .split(',')
@@ -227,9 +262,13 @@ impl Config {
             || !(1..=3600).contains(&self.job_timeout_seconds)
             || !(50..=60000).contains(&self.job_poll_interval_ms)
             || !(1..=365).contains(&self.job_retention_days)
+            || !(1..=100).contains(&self.login_throttle_account_limit)
+            || !(1..=1000).contains(&self.login_throttle_client_limit)
+            || self.login_throttle_client_limit < self.login_throttle_account_limit
+            || !(1..=86400).contains(&self.login_throttle_window_seconds)
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, login throttle account 1..100, client 1..1000 (>= account), window 1..86400s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
