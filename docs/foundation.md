@@ -108,7 +108,7 @@ Usernames are lowercase ASCII letters/digits/underscore/hyphen, 3–64 bytes; or
 
 Passwords use salted Argon2id version 19 with explicitly pinned memory 19,456 KiB (19 MiB), 2 iterations, 1 lane, and a 32-byte output. Session tokens contain 256 random bits and only their SHA-256 digests are stored. Tokens expire according to the PostgreSQL clock. New authorization checks after a committed logout reject that token; a request already admitted may finish within configured deadlines. Organization reads load the organization and then authorize `organization.read` through the Cedar engine ([ADR 0002](decisions/0002-authorization.md)); a denial returns the same 404 as a missing organization. Organization lists filter by membership in SQL. M1 has no tenant-admin bypass. Responses use `Cache-Control: no-store`. JSON logs include matched route, method, status, duration, and `client_ip` (the TCP peer, or the resolved client IP when behind a trusted proxy), never credentials, request bodies, raw URIs/queries, SQL bind values, or driver error text. Access logs on a future proxy must follow the same policy.
 
-M1 does not implement operation-ID replay for organization creation. A deadline or connection loss can leave a commit outcome unknown; inspect the member-visible organization list and slug before retrying. Reusing a committed slug returns 409. Durable command replay, membership administration, session cleanup/quotas, password reset, outbox delivery, backups/restore automation, and production abuse controls remain later work. No HA or capacity claim is made.
+M1 does not implement operation-ID replay for organization creation. A deadline or connection loss can leave a commit outcome unknown; inspect the member-visible organization list and slug before retrying. Reusing a committed slug returns 409. Durable command replay, session cleanup/quotas, password reset, outbox delivery, backups/restore automation, and production abuse controls remain later work. No HA or capacity claim is made.
 
 ## Verification
 
@@ -219,3 +219,66 @@ The two kinds are `pull_request.merged` and `pull_request.reviewed`. The recipie
 ## Settings
 
 Signed-in sessions manage personal access tokens and SSH keys from the browser at `/settings` (create with a one-time plaintext-token display, list, and revoke), using the same CSRF-protected forms and shared API functions as the JSON endpoints.
+
+## Organization members
+
+An organization's owners administer its membership from the JSON API or the
+browser at `/organizations/{slug}/members`. The page lists members with the
+role and join time, and adds, changes and removes members through CSRF-protected
+forms that call the same functions as the API.
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /api/v1/organizations/{slug}/members` | Requires `organization.manage_members`; account-id ordered pages, `limit` 1–100 (default 50), pass the last `account_id` as `after`; each item has `account_id`, `username`, `role`, `created_at` |
+| `POST /api/v1/organizations/{slug}/members` | JSON `username`, `role` (`owner` or `member`); 201 with the member; 404 for an unknown username; 409 if already a member |
+| `PATCH /api/v1/organizations/{slug}/members/{username}` | JSON `role`; returns the member; 404 for an unknown username or non-member; 409 when the change would leave the organization without an owner |
+| `DELETE /api/v1/organizations/{slug}/members/{username}` | 204; removing yourself is leaving, which any member may do; 404 for an unknown username or non-member; 409 for the last owner |
+
+Leaving is permitted in a suspended organization because it only reduces the
+caller's own access, and it is exempt from the `suspended-organization` forbid
+for that reason.
+
+Authorization uses the policy engine's existing `organization.manage_members`
+action, which only the built-in `owner` role grants ([ADR 0002](decisions/0002-authorization.md));
+it is a sensitive action, so it also needs a session authenticated within the
+sudo-mode window. A member who may read the organization but cannot administer
+it gets 403; anyone else gets the same 404 a missing or private organization
+gives, as on the other organization endpoints. Authorization is decided before
+request validation, including on page form submissions, so a malformed role or
+username cannot be used to render the member list. A plain member is refused
+before any account lookup, so those responses do not reveal whether an account
+exists; an owner, who can already list members, may distinguish an unknown
+username by the status of an add.
+
+A membership holds exactly one organization role, mirrored by one
+account-scoped organization grant, which is what authorization reads. Adding,
+changing a role and removing all write the membership, the grant, the audit
+record and the outbox record in one transaction, honor `Idempotency-Key` the
+way other mutating endpoints do, and record `organization.member_added`,
+`organization.member_promoted`, `organization.member_demoted`,
+`organization.member_removed` or `organization.member_left`. A role change
+replaces only the membership's own `owner`/`member` grant; an independently
+created organization-scope grant such as `write` is left active.
+
+The last owner cannot be removed, demoted or leave. The rule counts active
+organization-scope `owner` grants, not the `memberships.role` cache, and a team
+owner grant counts too, so a team grant can make another owner non-last. Every
+membership mutation — add, role change, removal and leave — takes the
+organization row lock first, then reloads the caller's authorization inside
+that same transaction and re-checks it before any write; a role change or
+removal also authorizes the target against that locked snapshot. This closes
+the race where an owner starts an add, a removal or a role change, is demoted
+or removed by a request that commits while the first request waits for the
+lock, and would otherwise finish with the authority it held before the wait.
+Such a caller is now refused (403 when still a member, 404 when removed) and no
+membership row is added, removed or changed.
+The lock also serializes the last-owner count, so two requests that would each
+remove one of the last two owners cannot both commit: exactly one change wins
+and the other is refused, normally 409 (the last-owner rule).
+
+Removing a member deletes the membership, revokes every grant the account holds
+in that organization (including direct repository grants) and drops its team
+memberships, so new admission is denied immediately on the JSON API, the
+browser UI, Git over HTTP and Git over SSH. A role change takes effect the same
+way: promoting a member to owner grants the owner actions organization-wide,
+and demoting them removes that access on the next decision.

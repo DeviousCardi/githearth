@@ -77,9 +77,35 @@ pub async fn load_scoped(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await?;
+    let facts = snapshot(&mut tx, account_id, organization_id, read_only).await?;
+    tx.commit().await?;
+    Ok(facts)
+}
+
+/// Load the same snapshot on a connection that is already inside a transaction.
+///
+/// Membership mutations take the organization row lock and then re-read the
+/// caller's authorization in that transaction: the locked read must see a
+/// concurrent demotion that committed while this request waited, so this uses
+/// the transaction's own (READ COMMITTED) snapshot instead of opening the
+/// read-only `REPEATABLE READ` transaction [`load`] uses.
+pub async fn load_in_transaction(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+) -> Result<Option<Facts>, sqlx::Error> {
+    snapshot(conn, account_id, organization_id, false).await
+}
+
+async fn snapshot(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+    read_only: bool,
+) -> Result<Option<Facts>, sqlx::Error> {
     let organization = match sqlx::query("SELECT suspended FROM organizations WHERE id = $1")
         .bind(organization_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?
     {
         Some(row) => Organization {
@@ -90,7 +116,7 @@ pub async fn load_scoped(
     };
     let Some(account) = sqlx::query("SELECT suspended, is_admin FROM accounts WHERE id = $1")
         .bind(account_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?
     else {
         return Ok(None);
@@ -100,7 +126,7 @@ pub async fn load_scoped(
     )
     .bind(account_id)
     .bind(organization_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
     // The engine links Team grants through the Account's direct teams even
     // when the grant sits on an ancestor.
@@ -110,7 +136,7 @@ pub async fn load_scoped(
     )
     .bind(account_id)
     .bind(organization_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?
     .into_iter()
     .map(|row| row.get("id"))
@@ -131,7 +157,7 @@ pub async fn load_scoped(
     ))
     .bind(account_id)
     .bind(organization_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?
     .into_iter()
     .map(|row| Team {
@@ -151,7 +177,7 @@ pub async fn load_scoped(
     ))
     .bind(account_id)
     .bind(organization_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?
     {
         let role = match row.get::<String, _>("role").as_str() {
@@ -187,7 +213,6 @@ pub async fn load_scoped(
             scope,
         });
     }
-    tx.commit().await?;
     Ok(Some(Facts {
         account,
         teams,
