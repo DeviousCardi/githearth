@@ -638,12 +638,31 @@ async fn organization(
     } else {
         String::new()
     };
+    // Owners (and only them) can administer membership, so only they get the
+    // link; the page checks the same action again before rendering.
+    let can_manage_members = state
+        .authz
+        .authorize(&facts.request(
+            Action::OrganizationManageMembers,
+            Resource::Organization,
+            Some(Duration::from_secs(auth_age)),
+        ))
+        .is_allowed();
+    let members_link = if can_manage_members {
+        format!(
+            "<p><a href=\"/organizations/{}/members\">Members</a></p>",
+            url_encode(&slug)
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        "<h1>{}</h1><p class=\"muted\">{}</p>{}<div class=\"card\"><ul>{}</ul></div>",
+        "<h1>{}</h1><p class=\"muted\">{}</p>{}<div class=\"card\"><ul>{}</ul></div>{}",
         esc(&org_name),
         esc(&slug),
         new_repo_link,
-        items
+        items,
+        members_link
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
     let csrf = Some(csrf_expected(&hash));
@@ -1417,6 +1436,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::tag_protection_ui::router())
         .merge(crate::branch_protection_ui::router())
         .merge(crate::notifications_ui::router())
+        .merge(crate::membership_ui::router())
         .fallback(fallback_page)
         .layer(axum::middleware::map_response(page_headers))
 }

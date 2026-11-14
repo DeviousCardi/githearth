@@ -17,6 +17,8 @@ pub mod idempotency;
 pub mod issues;
 mod issues_ui;
 pub mod jobs;
+pub mod membership;
+mod membership_ui;
 pub mod merge;
 pub mod merge_intents;
 pub mod merge_worker;
@@ -263,6 +265,7 @@ pub fn router(state: AppState) -> Router {
         .merge(pulls::router())
         .merge(merge_intents::router())
         .merge(auto_merge::router())
+        .merge(membership::router())
         .merge(protection::router())
         .merge(tag_protection::router())
         .merge(statuses::router())
