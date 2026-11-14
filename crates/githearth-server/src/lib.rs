@@ -407,9 +407,14 @@ async fn json_rejections(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/plain"));
-    if is_api && response.status() == StatusCode::BAD_REQUEST && plain {
+    let status = response.status();
+    if is_api && (status == StatusCode::METHOD_NOT_ALLOWED || (status.is_client_error() && plain)) {
         let (mut parts, _body) = response.into_parts();
-        let body = r#"{"error":"invalid input"}"#;
+        let body = if status == StatusCode::METHOD_NOT_ALLOWED {
+            r#"{"error":"method not allowed"}"#
+        } else {
+            r#"{"error":"invalid input"}"#
+        };
         parts.headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),

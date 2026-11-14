@@ -25,6 +25,8 @@ async fn fixture() -> (Router, PgPool, PathBuf, String) {
         database_max_connections: 4,
         database_timeout_seconds: 3,
         storage_root: storage_root.clone(),
+        ssh_enabled: true,
+        ssh_host_key_path: storage_root.join("ssh_host_key"),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
@@ -145,6 +147,25 @@ async fn read_member(pool: &PgPool, org_id: Uuid) -> String {
     format!("githearth_session={token}")
 }
 
+async fn post_raw(app: &Router, path: &str, cookie: &str, body: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn urlencode(value: &str) -> String {
     value
         .bytes()
@@ -238,6 +259,8 @@ async fn create_organization_and_repository_through_the_browser() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains(&repo_name));
+    assert!(page.contains("Clone:"), "{page}");
+    assert!(page.contains("ssh://"), "{page}");
 
     // Missing CSRF is refused.
     let (status, _, _) = post_form(
@@ -253,6 +276,15 @@ async fn create_organization_and_repository_through_the_browser() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
+    // The repository form is refused for a missing org and for a reader.
+    let (status, _) = get(
+        &app,
+        "/organizations/no-such-org/repositories/new",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
     // A read-only member sees the organization but not the creation link.
     let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
         .bind(&org_slug)
@@ -263,6 +295,13 @@ async fn create_organization_and_repository_through_the_browser() {
     let (status, page) = get(&app, &format!("/organizations/{org_slug}"), Some(&reader)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!page.contains("New repository"), "{page}");
+    let (status, _) = get(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        Some(&reader),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Duplicate names surface the API's 409 as a form page.
     let (_, form) = get(&app, "/organizations/new", Some(&cookie)).await;
@@ -411,6 +450,9 @@ async fn create_organization_and_repository_through_the_browser() {
     assert!(body.contains("\"error\""), "{body}");
     let (status, body) = get(&app, "/api/v1/organizations?after=abc", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("\"error\""), "{body}");
+    let (status, body) = post_raw(&app, "/api/v1/organizations", &cookie, "{}").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body.contains("\"error\""), "{body}");
 
     let _ = std::fs::remove_dir_all(storage);

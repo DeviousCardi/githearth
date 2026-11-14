@@ -2195,6 +2195,31 @@ pub(crate) fn require_review_permission(
     Ok(())
 }
 
+/// Whether the viewer may request or remove reviewers (the author or someone
+/// who may approve), used by the page to decide whether to offer the controls.
+pub(crate) async fn may_request_review(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> bool {
+    let Ok(loaded) =
+        repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await
+    else {
+        return false;
+    };
+    let Ok(mut conn) = state.pool.acquire().await else {
+        return false;
+    };
+    let Ok(Some(pull)) = find_pull(&mut conn, loaded.repo.id, number).await else {
+        return false;
+    };
+    drop(conn);
+    require_review_permission(state, &loaded, &pull).is_ok()
+}
+
 pub(crate) async fn add_review_request(
     State(state): State<AppState>,
     headers: HeaderMap,
