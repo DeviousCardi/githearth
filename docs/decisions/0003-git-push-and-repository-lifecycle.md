@@ -22,7 +22,7 @@ From the [metadata contract](../plan/01-metadata-contract.md) and [deployment co
   orphans/<id>.<unix-seconds>.git     directories found with no metadata row; never deleted automatically
 ```
 
-Paths derive only from the repository UUID, never from names, so rename and transfer are metadata changes. The storage layer's containment checks (no symlinks, canonical path inside the root) apply to every path above. The storage root is owned by the service user, mode `0700`.
+Paths derive only from the repository UUID, never from names, so rename and transfer move no Git data and change no storage path. The storage layer's containment checks (no symlinks, canonical path inside the root) apply to every path above. The storage root is owned by the service user, mode `0700`.
 
 Every repository is created with:
 
@@ -46,6 +46,8 @@ Smart HTTP `git-receive-pack` runs native `git receive-pack --stateless-rpc` wit
 2. **Quarantine.** Git writes the received pack to its quarantine directory and runs `fsck` on it. Nothing is visible in the repository yet.
 3. **Policy (`pre-receive`).** The hook sends every `<old> <new> <ref>` line to the server, which decides each one through the [ADR 0002](0002-authorization.md) engine: `ref.push`, `ref.force_push` when `old` is not an ancestor of `new` (checked against the quarantined objects), `ref.delete` when `new` is zero, plus branch protection. One denied ref rejects the whole push. Only `refs/heads/*` and `refs/tags/*` are writable; any other namespace is refused. On acceptance Git migrates the quarantined objects into the repository and fsyncs them.
 4. **Journal (`reference-transaction`, state `prepared`).** Before Git commits any ref, the hook appends a *prepared* record to `<repo>/githearth/journal`: operation ID, actor, and every `<old> <new> <ref>` in the transaction. The append is fsynced. If the append fails, the hook exits non-zero and Git aborts the transaction.
+
+   Server-owned object pinning (M4.1) does not use this path and adds no namespace: a pull-request head is pinned by a `pinned_commits` row, and the housekeeping keep-set walks objects from it. Nothing is journaled, advertised or writable, so `refs/heads/*` and `refs/tags/*` remain the only writable namespaces.
 5. **Ref commit.** Git writes the refs (fsynced by `core.fsync=reference`) and runs the hook in state `committed` or `aborted`, which appends the matching marker. Marker appends are best-effort: the reconciler can recover a missing marker from the refs themselves.
 6. **Acknowledgement.** `receive-pack` reports `ok`/`ng` per ref to the client. An `ok` therefore means objects, journal record and ref are all on disk.
 7. **Metadata (`post-receive` and after).** The server records the push in PostgreSQL in one transaction: the push operation row, ref update rows, and the outbox event, keyed by `(repository_id, journal_sequence)` so applying the same journal record twice changes nothing. A failure here never turns an acknowledged push into a failed one; the reconciler applies it later.
@@ -75,9 +77,12 @@ A ref changed on disk with no journal record (manual edit, restored older snapsh
 Repository rows in PostgreSQL hold identity, owner, name, visibility, archive state and a `status`: `creating`, `active`, `deleting`, `deleted`, `failed`. Names are unique per organization among rows that are not `deleted` (partial unique index), so a deleted name is reusable.
 
 - **Create.** (1) Insert the row as `creating` with its operation ID and commit. (2) `git init --bare` into `tmp/<operation>`, write the config above, fsync the tree, `rename` into `repositories/`, fsync the parent directory. (3) Mark the row `active`. The API answers `201` only after step 3; a lost response is answered by replaying the operation ID.
-- **Rename / transfer.** Metadata only. The previous `owner/name` is stored as a redirect for Git and web URLs until the name is reused.
+- **Rename.** Metadata only: the name changes and no grant changes, because a grant is scoped to the repository, not to its name.
+- **Transfer.** **Not metadata-only.** The repository moves to an organization the actor administers at the source and may create in at the target. The UUID, storage path and its non-fork open pull requests survive; fork pull requests are closed under the audited policy or the transfer is refused. Because a grant's subject must belong to the owning organization, every grant on the repository, and every organization-scoped grant that reached it, is revoked in the transfer transaction with one audit record; a rename inside one organization revokes nothing. Forks of the repository stay in the source organization with their existing visibility, and their pull requests into the moved repository are closed with a stated reason, or the transfer is refused — the operator chooses the policy per move and the choice is audited. Queued merge intents are cancelled; an `executing` intent blocks the transfer until it finishes. A name collision at the target is refused. The metadata change is one transaction, and a failure moves nothing.
 - **Archive / unarchive.** Metadata only; ADR 0002's archive forbids stop writes, including pushes, at the next decision.
 - **Delete.** Mark `deleting`, then rename the directory into `trash/`, then mark `deleted`. Trash is purged after the retention window (default 7 days). There is no automatic restore: a `deleted` row never transitions, so within the window an operator moves the directory back by hand and creates a new repository row.
+
+After a rename, transfer or delete, the previous `owner/name` returns `410 Gone` on API, web and Git URLs and never redirects; reusing the name does not make the old path resolve to the new repository.
 
 The lifecycle reconciler handles each intermediate state:
 
@@ -101,7 +106,7 @@ A consistent backup is a PostgreSQL backup plus a storage snapshot taken *after*
 
 ## Consequences
 
-- Push durability relies on Git's own fsync and quarantine behavior plus one fsynced journal append per ref transaction. The journal is the unit that M5 replicates: a replicated group commits the prepared record before the hook allows the ref commit.
+- Push durability relies on Git's own fsync and quarantine behavior plus one fsynced journal append per ref transaction. The journal is the unit that M5 replicates, with one change to the order: the replicated entry commits before the hook allows the ref commit, and the hook returns no verdict at all when the log has not decided (see [ADR 0010](0010-git-replication.md)). The single-node "prepared, then local commit, then marker" order is M2's, not M5's.
 - Every ref change made outside `receive-pack` (merges in M3, web edits, API ref updates) must go through the same `reference-transaction` path with an operation ID, so it is journaled and authorized identically.
 
 ## Open items

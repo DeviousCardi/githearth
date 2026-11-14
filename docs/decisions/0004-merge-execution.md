@@ -2,7 +2,7 @@
 
 Date: 2026-10-29.
 
-Status: **proposed for M3**, pending Person A review. Defines the boundary between Person A (pull requests, reviews, checks, protection, persisted merge intents/scheduling, UI) and Person B (comparison, merge methods, expected-ref updates, journaled execution, duplicate-worker handling). A reviews this before either side builds on it.
+Status: **accepted and implemented for M3.** Defines the boundary between Person A (pull requests, reviews, checks, protection, persisted merge intents/scheduling, UI) and Person B (comparison, merge methods, expected-ref updates, journaled execution, duplicate-worker handling). One part is corrected below: checks bind to the source head, and candidate binding is M6 work.
 
 ## Constraints
 
@@ -67,7 +67,7 @@ The server checks Git ≥ 2.40 at startup for these (2.47 ships in the image). `
 | Rebase (cherry-pick sequence) | For each commit `C` in `git rev-list --reverse target..source`, `git merge-tree --write-tree --merge-base=C^ <previous> C` (with `<previous>` starting at the target tip), then `git commit-tree <tree> -p <previous>`. A range containing a merge commit is refused (`Failed`, "cannot rebase merge commits"); a commit whose result tree equals its parent's is dropped, which also drops intentionally empty commits |
 | Fast-forward only | No new object; `source_oid` is the new target value, accepted only when `target_oid` is an ancestor of `source_oid` |
 
-Committer identity is the configured server identity. The merging actor authors merge commits; the squash author is set by A (see open items); each rebased commit keeps its original author, author date and message. `build_candidate` receives every identity and timestamp from the caller, so it never reads configuration or the clock. A conflict makes `build_candidate` return the conflicting paths; the intent goes `conflicted`, no ref changes, and the paths are reported. Candidate objects are unreferenced until the ref moves and are left to scheduled maintenance: the scheduled GC never prunes objects unreferenced for less than 48 hours (configurable, and longer than any intent's queue lifetime), so a candidate survives the execute window and a crash recovery.
+Committer identity is the configured server identity. The merging actor authors merge commits; the squash author is set by A (see open items); each rebased commit keeps its original author, author date and message. `build_candidate` receives every identity and timestamp from the caller, so it never reads configuration or the clock. A conflict makes `build_candidate` return the conflicting paths; the intent goes `conflicted`, no ref changes, and the paths are reported. Candidate objects are unreferenced until the ref moves. They are protected by the M4.1 housekeeping keep-set, which pins every object referenced by a merge intent in `validating` or `executing` (candidate and result OIDs), so a candidate survives the execute window and a crash recovery without relying on a fixed time-based grace period.
 
 ## Execution
 
@@ -88,7 +88,7 @@ No `pre-receive` runs for merges: policy was decided at revalidation. This is eq
 
 ## Stale authorization and checks
 
-In M3, checks and approvals bind to code by the source head OID only. A rule with a non-empty `required_status_checks` list requires every listed context to be `success` on the head; a context with no recorded status is not success, so the merge is refused rather than passing silently. A rule that carried the pre-M3 `require_checks` toggle is migrated to the reserved, un-satisfiable `githearth/legacy-require-checks` context, which the status API refuses to post, so such rules keep refusing every merge until an owner reconfigures. Binding checks to a tested candidate (merge queue) needs deterministic or persisted candidates and is decided with the queue increment.
+In M3, checks and approvals bind to code by the source head OID only. A rule with a non-empty `required_status_checks` list requires every listed context to be `success` on the head; a context with no recorded status is not success, so the merge is refused rather than passing silently. A rule that carried the pre-M3 `require_checks` toggle is migrated to the reserved, un-satisfiable `githearth/legacy-require-checks` context, which the status API refuses to post, so such rules keep refusing every merge until an owner reconfigures. **Correction 2026-11-15:** this does not meet the master plan's tested-candidate promise. The merge queue must build the candidate it will merge and run required checks on it, with the intent binding the checks to that candidate OID. That is M6's "tested merge candidates" build item; see the [roadmap](../plan/04-forge-roadmap.md#m6--isolated-ci). Until it ships, a check that passes on the source head and fails only on the merged tree can authorize the merge.
 
 - Target moved (`expected_target_oid` mismatch), source unchanged: approvals/checks still bind to the same source code, so no new approval is required; only a recomputed candidate against the new target tip is needed. The intent goes `stale` and the queue re-drives it with the new `expected_target_oid`, unless branch protection requires the source to be up to date with the target (a future `require_up_to_date` rule flag, which A adds with merge intents; #30 has no such flag yet), in which case the author must update the branch.
 - Source moved (`source_oid` mismatch): existing approvals/checks do not bind to the new head; new approvals/checks are required, and the intent goes `stale`.
@@ -115,7 +115,7 @@ The merge's prepared record gains an optional `origin` field, `"merge"`, copied 
 | Crash point | Journal | Refs | Recovery |
 | --- | --- | --- | --- |
 | Before candidate | none | unchanged | A re-drives from `queued`/`executing` after lease expiry; intent eventually `merged`, `stale` or `failed` |
-| After candidate, before lock | none | unchanged | Candidate unreferenced (GC grace); re-drive rebuilds it |
+| After candidate, before lock | none | unchanged | Candidate unreferenced and no longer pinned once the intent leaves `executing`; re-drive rebuilds it |
 | Prepared only, ref at expected old | prepared, no marker | target at `expected_target_oid` | aborted (marker lost): reconciler appends the aborted marker; no metadata; worker may re-drive |
 | Committed, marker lost | prepared, no marker | target at candidate | committed-marker-lost: reconciler appends the committed marker and replays the merge record |
 | Committed before metadata | prepared + committed | target at candidate | reconciler replays the merge record into the intent + ref-update/outbox rows |
@@ -125,7 +125,7 @@ The merge's prepared record gains an optional `origin` field, `"merge"`, copied 
 
 - A merge is a compare-and-swap ref update journaled through the same `reference-transaction` path as pushes, satisfying ADR 0003's requirement that every non-receive-pack ref change be journaled and authorized identically.
 - The intent row is metadata; the journal record is the durable merge result. One idempotent function turns a merge record into a merged intent, on the normal path and on replay, so lost metadata self-heals.
-- Candidate objects are unreferenced until the ref moves; scheduled maintenance must honour the 48-hour grace period above.
+- Candidate objects are unreferenced until the ref moves; scheduled maintenance keeps every object a `validating` or `executing` intent references and applies no separate grace period.
 
 ## Open items
 

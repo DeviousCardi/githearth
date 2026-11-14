@@ -103,10 +103,16 @@ Items previously listed here that are now verified elsewhere:
 
 Still genuinely open:
 
-- **Independent installation.** The harness automates the runbook. An install by a person who has not seen the code, on a clean Linux host, is still to be done; the sign-off checklist is in [m4-signoff.md](m4-signoff.md).
+- **Independent installation.** The harness automates the runbook. A clean-host install was performed by an AI agent following only `docs/operations/` and accepted by the project owner as closing this item; a human independent install is still recommended before public distribution. See [m4-signoff.md](m4-signoff.md) and [lab-m4/15](lab-m4/15-operations-drills.md).
 - **Hardware minimums beyond one host.** s10 bounds concurrency, memory and request sizes and measures one machine. Larger repositories, other concurrency settings and long-running load are now measured by the separate [hardware drill](hardware.md) and published in [hardware.md](../operations/hardware.md).
-- **Online (non-maintenance-window) backup.** Not implemented; backup/restore is maintenance-window-only (s4). This is documented precisely below.
+- **Online (non-maintenance-window) backup.** Not implemented in M4; backup/restore is maintenance-window-only (s4). This is documented precisely below, and M4.2 builds the single-node online path.
+
+## Correction (2026-11-15): the backup drill did not stop the server first
+
+This report says below that the backup/restore drill (s4) runs "while the server is stopped". That is not what either harness does: `s4_backup_restore` in `scripts/verify-m4.py` and the restore scenario in `scripts/verify-offhost-backup.py` take the `pg_dump` and the storage tarball while the server is running and stop it afterwards. No writes were in flight during either drill, so their results stand for a quiescent installation only. The runbook has since been corrected to require the server to be stopped for the whole procedure; it previously said "ideally with the server stopped". A push that lands between the dump and the tarball, or while the tarball is being written, can be acknowledged to the client and absent after restore. The M4.1 `backup` command must refuse to run unless writes are stopped or fenced, and case U13 adds a drill with a push racing the backup and re-points both harnesses at the command. Until then, operators must stop the server before taking a backup.
 
 ## Online backup: maintenance-window-only
 
-Online (zero-downtime, non-maintenance-window) backup is **not implemented**. The backup/restore drill (s4) runs `pg_dump -Fc` plus a storage tarball while the server is stopped, and restores into a fresh database and storage root; this is the only supported backup path today. The [roadmap](../plan/04-forge-roadmap.md#m4--recoverable-single-node-alpha) allows a maintenance window initially and defers online backup to verified snapshot/watermark semantics, so there is no half-working online-backup mode to report: it is either the offline s4 procedure, or nothing.
+Online (zero-downtime, non-maintenance-window) backup is **not implemented** in M4. The backup/restore drill (s4) runs `pg_dump -Fc` plus a storage tarball while the server is **running**, and restores into a fresh database and storage root. No writes were in flight, so it is evidence for a quiescent installation only: it is not evidence for the stopped-server procedure the runbook now requires, and it is not evidence for an online backup taken under load.
+
+The supported path today is the runbook procedure with the server stopped. The [roadmap](../plan/04-forge-roadmap.md#m41--usable-team-alpha) gives M4.1 a `backup` command that refuses unless writes are stopped or fenced, and M4.2 a single-node online mode with recorded positions and a filesystem snapshot; until then there is no half-working online mode to report: it is either the offline procedure, or nothing.

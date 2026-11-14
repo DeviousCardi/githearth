@@ -2,7 +2,9 @@
 
 Date: 2026-11-07.
 
-Status: **accepted** for phase 5, after Person A's review on 2026-11-07 (PR #63). The [two-person roadmap](../plan/08-two-person-roadmap.md) phase 5 splits the work:
+Status: **accepted** for phase 5, after Person A's review on 2026-11-07 (PR #63). The M4.1 outbox relay supersedes two statements in the Constraints below and changes the attempt budget, both recorded at the end of this document; the rest of the jobs design is unchanged.
+
+The [two-person roadmap](../plan/08-two-person-roadmap.md) phase 5 splits the work:
 
 - **Person A:** transactional job records and domain handlers.
 - **Person B:** claiming, retry and recovery execution.
@@ -40,7 +42,7 @@ The claim loop polls a new `jobs` table, not `outbox_events`.
 | `dedupe_key` | Unique per `kind` while `pending` or `running` |
 | `state` | `pending`, `running`, `done` or `dead` |
 | `not_before` | Earliest time the job may run |
-| `attempt`, `max_attempts` | Attempts so far; the limit (default 5) |
+| `attempt`, `max_attempts` | Attempts so far; the limit (default 5, overridden per `enqueue` by a kind that needs a longer budget) |
 | `lease_holder`, `lease_expires_at` | The current claim |
 | `last_error` | Last failure reason, kept on `dead` |
 | `created_at`, `updated_at` | Timestamps |
@@ -154,7 +156,7 @@ RETURNING *
 - **Crash mid-job:** a process dies with a job running; after the lease expires, another loop runs it.
 - **Poison pill:** a job that crashes its runner every time ends `dead` with `last_error = 'lease expired'` after `max_attempts` claims.
 - **Stale completion:** a completion with the old attempt or holder after a reclaim changes nothing.
-- **Backoff:** `Retry` and timeouts advance `not_before` within the jitter bounds.
+- **Backoff:** `Retry` and timeouts advance `not_before` within the jitter bounds, and the test observes the next attempt time rather than only the final state.
 - **Attempt cap and `Failed`:** the job ends `dead` with `last_error`, and isn't claimed again.
 - **Dedupe:** an active duplicate key is a no-op; after `done`, the same key enqueues.
 - **Shutdown:** no new claims; a job still running goes back to `pending`.
@@ -166,8 +168,55 @@ RETURNING *
 - Handlers carry the idempotence burden; this ADR states it as their contract.
 - Polling costs one indexed query per interval while idle.
 
+## Revision for M4.1: the outbox is delivered
+
+The constraints above say "the outbox is never delivered" and "`outbox_events`
+is unchanged. Whether a future external relay sets `delivered_at` is out of
+scope." M4.1 supersedes both. The job runner is still not the outbox consumer,
+which is the part of this ADR that stands: a relay reads committed outbox rows
+and **enqueues one job per registered consumer**, deduplicated on
+`(event_id, consumer_id)`.
+
+What changes:
+
+- `outbox_events` gains `(chain, seq)` from the audit chain, unique and indexed
+  for the undelivered scan. The `audit_events` sequence is per chain (one per
+  organization plus the site chain), so a cutover watermark is one value per
+  chain, not one value.
+- A `consumers` table holds each consumer's name, start position and event
+  filter. A consumer registered after the cutover starts at its registration
+  position and receives nothing older; an upgrade writes one watermark per
+  chain, so nothing from before the upgrade is delivered.
+- A per-consumer delivery row records attempts, next attempt and completion, so
+  `delivered_at` on the event means "the fan-out committed", not "every
+  consumer succeeded".
+- The retry budget is a per-enqueue parameter, and the outbox delivery job
+  uses a budget that spans hours. The relay enqueues one job per
+  `(event, consumer)` with the delivery row's `max_attempts` (default 30) and
+  the consumer's backoff cap (default 10 minutes), so the default span is more
+  than three hours with a base of 1 s doubling. An ordinary SMTP outage must
+  not lose notifications: a 30-minute outage is absorbed inside the budget. A
+  consumer that exhausts its budget goes `dead` on its delivery row rather than
+  only on the job, the `doctor` command reports it, and an operator can
+  `jobs requeue` it; the requeue enqueues a new job from the delivery row under
+  a new job key, so the five-attempt default of the generic runner can never be
+  the reason an outbox event is lost. One consumer's dead deliveries never
+  prevent another consumer from receiving the same event.
+- The relay filters by event kind; session events are not fanned out to every
+  consumer at scale.
+
+A defect found while building M4.1 is recorded here as a requirement: the
+`Retry` outcome's reschedule used a PostgreSQL `make_interval(millis => …)`
+parameter that does not exist, so the fenced update failed and a retry stayed
+`running` until its lease expired. Backoff was therefore never exercised. Any
+retry path must have a test that observes the next attempt time, not only the
+job's final state.
+
 ## Settled with Person A
 
 1. **First jobs:** `pull_request.merged` and review-requested notifications. A adds an in-app `notifications` table as the handler's idempotent target, keyed on (event ID, recipient).
-2. **`max_attempts`:** 5 for every kind for now. A per-`enqueue` parameter is added when a kind needs one.
+2. **`max_attempts`:** 5 for every kind was the phase-5 position and is no
+   longer true. It is a per-`enqueue` parameter; the outbox delivery kinds use
+   30 attempts with a 10-minute backoff cap, which is the hours-long budget the
+   roadmap requires. Other kinds keep 5 until one needs more.
 3. **Merge worker:** stays on its own loop for phase 5.

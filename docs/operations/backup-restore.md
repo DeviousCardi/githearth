@@ -5,6 +5,22 @@ A backup is only proven by restoring it and verifying object integrity
 
 ## Procedure
 
+**No write may be acknowledged at any point between the start of the database
+dump and the end of the storage snapshot.** Stop the server before step 1 and
+start it again only after the storage snapshot is complete. A push that lands
+between the dump and the snapshot, or while the snapshot is being taken, can be
+acknowledged to the client and missing after a restore. The M4 drill ran these
+steps on an **idle** installation, not a stopped one, so its evidence covers
+only a quiescent installation; see the correction in
+[m4-qualification.md](../verification/m4-qualification.md).
+
+M4.1 replaces this procedure with `githearth backup`, which refuses to run
+unless it has proved that no writer can acknowledge a commit — either the
+server is not running, or it is in maintenance mode and has drained. M4.2 adds
+an encrypted online mode for single-node deployments with a filesystem
+snapshot. Until the command ships, an operator who cannot stop the server has
+no supported backup path.
+
 1. **Dump the database** snapshot first, so the storage snapshot that follows
    includes any journal records that reference rows in the dump.
 
@@ -25,8 +41,11 @@ A backup is only proven by restoring it and verifying object integrity
    ```
 
    Atomic filesystem snapshots (btrfs, ZFS, LVM) are preferred when available.
-   In a single-host deployment with no concurrent writes a tar is acceptable;
-   the journal reconciler will still replay any discrepancy on restore.
+   A snapshot taken while the server is stopped is equivalent to a stopped tar.
+   A tar taken while the server is running is not a backup: the reconciler
+   replays journal records after the metadata high-water mark, which covers a
+   push committed *after* the dump, not a push that commits *during* the tar
+   after its journal record was already copied.
 
 ## Restore
 
@@ -147,6 +166,19 @@ Secrets that are not inside the dump or storage tarball:
   key after a restore, and `StrictHostKeyChecking` blocks their connections.
   It is a private key: store it encrypted.
 
+- **Encryption key material**: an installation key or backup passphrase does
+  **not** belong with the backup. Keep it on a separate medium and a separate
+  access path, so that one stolen archive does not also yield its key. The
+  manifest records only a key id, algorithm and wrap method. Losing the key
+  means the archive cannot be decrypted; there is no recovery path by design.
+  From M4.1 the archive itself is encrypted with this key or passphrase,
+  because the configuration file it contains holds the database and SMTP
+  credentials.
+
+The M4.1 `backup` command includes the configuration file and the host key in
+its checksummed manifest; until then this manual procedure leaves both outside
+`SHA256SUMS`, so their integrity is not checked.
+
 ### Retention
 
 Keep N most-recent generations (e.g. `N=7` for a daily backup — one
@@ -182,8 +214,13 @@ database and old keys deleted still exist in backups — see
 
 - Database relationships, permissions, or metadata consistency (that is a
   separate database-level restore test).
-- Whether the storage snapshot is consistent with the database dump — the
-  journal reconciler handles that.
+- Whether the storage snapshot is consistent with the database dump. The
+  journal reconciler replays records committed after the dump, but it cannot
+  recover a write that committed during the tar; that is why the server must
+  be stopped (or, from M4.1, why `backup` requires the fence).
+- Encryption and key custody. The manual procedure produces plaintext
+  artefacts; from M4.1 the archive is encrypted and the manifest names a key
+  id.
 - Rotated/archived journals (`journal.<first>`); `verify` reads only the live
   `journal` file.
 - Search indexes (rebuilt after restore).  Back up configuration and keys separately.
