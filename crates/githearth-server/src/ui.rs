@@ -214,7 +214,7 @@ fn clear_csrf_cookie(state: &AppState) -> String {
 }
 
 /// Redirect to sign-in and drop the browser's session cookie, which the server no longer honours.
-fn signed_out(state: &AppState) -> UiError {
+pub(crate) fn signed_out(state: &AppState) -> UiError {
     let mut response = Redirect::to("/login").into_response();
     if let Ok(value) = clear_session_cookie(state).parse() {
         response.headers_mut().insert(SET_COOKIE, value);
@@ -1417,6 +1417,7 @@ pub fn router() -> Router<AppState> {
             axum::routing::post(fork_submit),
         )
         .merge(crate::accounts_ui::router())
+        .merge(crate::passwords_ui::router())
         .merge(crate::issues_ui::router())
         .merge(crate::pulls_ui::router())
         .merge(crate::browse_ui::router())

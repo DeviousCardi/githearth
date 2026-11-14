@@ -315,6 +315,157 @@ async fn account_creation_validates_input_and_uses_no_default_password() {
             expected
         );
     }
+    // A password change cannot be done with a personal access token.
+    let (status, token) = request(
+        &app,
+        "POST",
+        "/api/v1/user/tokens",
+        Some(&admin_session),
+        json!({"name": tag("token"), "scopes": ["repo:write"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = token["token"].as_str().unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/v1/user/password",
+            Some(token),
+            json!({"current_password": "administrator-secret", "new_password": "replacement-secret"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn own_password_change_requires_current_password_and_revokes_sessions() {
+    let (pool, app) = api_pool().await;
+    let name = tag("user");
+    fixture_account(&pool, &name, "original-secret-pass", false).await;
+    let session = login(&app, &name, "original-secret-pass").await;
+
+    // A wrong current password is refused.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/v1/user/password",
+            Some(&session),
+            json!({"current_password": "wrong-secret-pass", "new_password": "brand-new-secret-pass"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+
+    // A valid change succeeds and revokes every session.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/v1/user/password",
+            Some(&session),
+            json!({"current_password": "original-secret-pass", "new_password": "brand-new-secret-pass"})
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(&app, "GET", "/api/v1/me", Some(&session), Value::Null)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login_status(&app, &name, "original-secret-pass").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    login(&app, &name, "brand-new-secret-pass").await;
+    let changed: Option<String> =
+        sqlx::query_scalar("SELECT password_changed_at::text FROM accounts WHERE username = $1")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(changed.is_some());
+
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn administrator_reset_revokes_sessions() {
+    let (pool, app) = api_pool().await;
+    let admin_name = tag("admin");
+    fixture_account(&pool, &admin_name, "administrator-secret", true).await;
+    let admin_session = login(&app, &admin_name, "administrator-secret").await;
+
+    let member_name = tag("member");
+    let (_, created) = request(
+        &app,
+        "POST",
+        "/api/v1/admin/accounts",
+        Some(&admin_session),
+        json!({"username": member_name, "password": "member-secret-pass"}),
+    )
+    .await;
+    let member_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let member_session = login(&app, &member_name, "member-secret-pass").await;
+
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("/api/v1/admin/accounts/{member_id}/password"),
+            Some(&admin_session),
+            json!({"new_password": "reset-secret-password"})
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    // The old session is gone, the old password no longer works, the new one does.
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/v1/me",
+            Some(&member_session),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login_status(&app, &member_name, "member-secret-pass")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    login(&app, &member_name, "reset-secret-password").await;
+
+    // A non-administrator cannot reset another account.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("/api/v1/admin/accounts/{member_id}/password"),
+            Some(&member_session),
+            json!({"new_password": "should-not-apply"})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+
     pool.close().await;
 }
 

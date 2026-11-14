@@ -278,7 +278,8 @@ style=\"width:100%;box-sizing:border-box\">{}</textarea>\
     );
 
     let body = format!(
-        "<h1>Settings</h1>{plaintext_box}{notice}\
+        "<h1>Settings</h1><p><a href=\"/settings/password\">Change password</a></p>\
+{plaintext_box}{notice}\
 <h2>Access tokens</h2><div class=\"card\">{token_table}</div>{token_body}\
 <h2>SSH keys</h2><div class=\"card\">{key_table}</div>{key_body}"
     );

@@ -26,6 +26,8 @@ mod mergeability;
 pub mod notifications;
 mod notifications_ui;
 pub mod outbox;
+pub mod passwords;
+mod passwords_ui;
 pub mod protection;
 pub mod pulls;
 mod pulls_ui;
@@ -262,6 +264,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
         .merge(accounts::router())
+        .merge(passwords::router())
         .merge(issues::router())
         .merge(forks::router())
         .merge(pulls::router())
