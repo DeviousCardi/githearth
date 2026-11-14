@@ -191,7 +191,8 @@ const PULL_COLUMNS: &str = "id, number, title, body, state, draft, author_id, so
  source_repository_id, closed_reason, \
  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at, \
- to_char(closed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS closed_at";
+ to_char(closed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS closed_at, \
+ to_char(merged_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS merged_at, merged_by";
 
 /// Comment columns with the `c.` alias the thread-resolution join needs.
 const COMMENT_ROW_COLUMNS: &str = "c.id, c.author_id, c.body, c.seq, c.commit_id, c.path, c.line, \
@@ -221,6 +222,10 @@ pub(crate) struct PullJson {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) closed_at: Option<String>,
+    #[serde(default)]
+    pub(crate) merged_at: Option<String>,
+    #[serde(default)]
+    pub(crate) merged_by: Option<Uuid>,
 }
 
 /// A pull request with its live head and base, the reviews that count at that
@@ -390,6 +395,61 @@ async fn load_pull(
     drop(conn);
     require_pull(state, loaded, &pull, action)?;
     Ok(pull)
+}
+
+/// Whether the viewer may merge at all (independent of the current policy
+/// facts), used by the page to decide whether a blocked merge should explain
+/// itself or simply be absent.
+pub(crate) async fn may_merge_permission(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> bool {
+    let Ok(loaded) =
+        repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await
+    else {
+        return false;
+    };
+    let Ok(mut conn) = state.pool.acquire().await else {
+        return false;
+    };
+    let Ok(Some(pull)) = find_pull(&mut conn, loaded.repo.id, number).await else {
+        return false;
+    };
+    drop(conn);
+    let authz_repo = repositories::authz_repository(&loaded.repo);
+    let entity = PullRequest {
+        id: pull.id,
+        repository: loaded.repo.id,
+        author: pull.author_id,
+        target: Ref {
+            repository: loaded.repo.id,
+            name: format!("refs/heads/{}", pull.target_branch),
+            protection: None,
+            exists: true,
+        },
+    };
+    state
+        .authz
+        .authorize(&githearth_authz::Request {
+            principal: githearth_authz::Principal::Account(&loaded.facts.account),
+            teams: &loaded.facts.teams,
+            grants: &loaded.facts.grants,
+            action: Action::PullRequestMerge,
+            organization: &loaded.facts.organization,
+            resource: Resource::PullRequest(&authz_repo, &entity),
+            merge: Some(githearth_authz::Merge {
+                approvals: u32::MAX,
+                checks_passed: true,
+                code_owner_review_ok: true,
+            }),
+            auth_age: Some(Duration::from_secs(auth_age)),
+            read_only: loaded.facts.read_only,
+        })
+        .is_allowed()
 }
 
 pub(crate) fn require_pull(
@@ -569,7 +629,7 @@ async fn detail(
         statuses,
         mergeability: Vec::new(),
         required_code_owners: Vec::new(),
-        code_owner_review_satisfied: true,
+        code_owner_review_satisfied: false,
         code_owner_errors: Vec::new(),
     })
 }
@@ -1398,8 +1458,23 @@ pub(crate) async fn set_draft(
 
             let pull = fetch_pull(&mut tx, pull.id).await?.unwrap();
             let status = StatusCode::OK;
-            let body =
-                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, tips).await?).unwrap();
+            let mut detail = detail(&mut tx, loaded.repo.id, pull, tips).await?;
+            if let (Some(head), Some(base)) = (detail.head_id.clone(), detail.base_id.clone()) {
+                let review = crate::codeowners::review(
+                    state,
+                    loaded.repo.id,
+                    loaded.org_id,
+                    org_slug,
+                    detail.pull.id,
+                    &head,
+                    &base,
+                )
+                .await?;
+                detail.required_code_owners = review.required;
+                detail.code_owner_review_satisfied = review.satisfied;
+                detail.code_owner_errors = review.errors;
+            }
+            let body = serde_json::to_value(detail).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
                 return Err(idempotency::claim_lost());
             }
@@ -1962,7 +2037,7 @@ struct NewReviewRequest {
 }
 
 #[derive(Serialize, sqlx::FromRow)]
-struct ReviewRequestJson {
+pub(crate) struct ReviewRequestJson {
     reviewer_id: Uuid,
     username: String,
     requested_by: Option<Uuid>,
@@ -2120,7 +2195,7 @@ pub(crate) fn require_review_permission(
     Ok(())
 }
 
-async fn add_review_request(
+pub(crate) async fn add_review_request(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
@@ -2196,7 +2271,7 @@ async fn add_review_request(
     Ok(Json(list))
 }
 
-async fn remove_review_request(
+pub(crate) async fn remove_review_request(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((org_slug, repo_name, number, username)): Path<(String, String, i32, String)>,

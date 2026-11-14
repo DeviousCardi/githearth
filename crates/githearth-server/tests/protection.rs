@@ -766,6 +766,8 @@ async fn branch_settings_page_lists_creates_and_deletes_rules() {
     assert!(html.contains("main"), "{html}");
     assert!(html.contains("ci, lint"), "{html}");
     assert!(html.contains(">2</td>"), "{html}");
+    assert!(html.contains("Dismiss stale"), "{html}");
+    assert!(html.contains("id=\"required_status_checks\""), "{html}");
 
     let (pattern, approvals, checks, require_pr, require_signed, require_queue, require_owners): (
         String,
@@ -852,6 +854,63 @@ async fn branch_settings_page_lists_creates_and_deletes_rules() {
     .await
     .unwrap();
     assert_eq!(events, 2);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn branch_settings_reports_an_inactive_repository_and_bad_form_keys() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let repo_id = fixture_repository(&pool, org_id, "r", owner).await;
+    let token = fixture_session(&pool, owner).await;
+    let cookie = format!("githearth_session={token}");
+    let path = branch_settings_path(&slug, "r");
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
+    let csrf = hidden(&html, "csrf_token");
+
+    // A malformed idempotency key re-renders the page with a 400.
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &csrf),
+            ("idempotency_key", "bad key"),
+            ("pattern", "main"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Reload the page"), "{body}");
+
+    // A repository that is no longer active reports its 409 on the page.
+    let rule_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO branch_protection_rules (id, repository_id, pattern, created_by) \
+         VALUES ($1, $2, 'main', $3)",
+    )
+    .bind(rule_id)
+    .bind(repo_id)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, body) = post_form(
+        &app,
+        &format!("{path}/{rule_id}/delete"),
+        &cookie,
+        &[("csrf_token", &csrf)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("Cannot apply that change"), "{body}");
 
     cleanup(&storage);
     pool.close().await;
