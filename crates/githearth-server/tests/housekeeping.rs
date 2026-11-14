@@ -1403,6 +1403,447 @@ async fn a_closed_pull_requests_pinned_head_renders_after_its_branch_is_pruned()
 }
 
 // ---------------------------------------------------------------------------
+// Tests: the keep-set kinds U11 names (0046)
+// ---------------------------------------------------------------------------
+
+/// Push an anchored review comment through the API, which writes the pin in
+/// the same transaction as the comment. Returns the comment's id.
+async fn comment_on_head(fx: &Fixture, number: i64, head: &str) -> Uuid {
+    let (status, body) = call(
+        fx,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/pulls/{number}/comments",
+            fx.org_slug, fx.repo_name
+        ),
+        Some(serde_json::json!({
+            "body": "anchored",
+            "commit_id": head,
+            "path": "side.txt",
+            "line": 1,
+            "side": "new",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().parse().unwrap()
+}
+
+/// Post a commit status through the API, which writes its pin.
+async fn post_status(fx: &Fixture, commit: &str, context: &str, state: &str) {
+    let (status, body) = call(
+        fx,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/commits/{commit}/statuses",
+            fx.org_slug, fx.repo_name
+        ),
+        Some(serde_json::json!({"context": context, "state": state})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// B1: a pull request's **base** is pinned in the target when it is created.
+/// Delete the target branch, close the request and prune with zero grace: the
+/// base commit and its tree survive, so `compare/base...head` still resolves
+/// both sides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
+async fn a_closed_pull_requests_base_survives_a_prune_after_its_target_branch_is_deleted() {
+    let fx = setup("keep-base", |config| {
+        config.housekeeping_grace_seconds = 0;
+    })
+    .await;
+    let (dir, head) = side_branch(&fx).await;
+    let href = format!(
+        "/api/v1/organizations/{}/repositories/{}/pulls",
+        fx.org_slug, fx.repo_name
+    );
+    // An unrelated base commit: history the head does not descend from and
+    // that no other branch reaches, so neither the head pin nor a ref can keep
+    // it. `refs/heads/trunk` is then its only ref, and deleting it leaves the
+    // commit reachable only through the base pin.
+    let trunk = chain_without_ref(&fx, "trunk-only.txt", "trunk\n");
+    git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "update-ref",
+            "refs/heads/trunk",
+            &trunk,
+        ],
+    );
+    let (status, created) = call(
+        &fx,
+        "POST",
+        &href,
+        Some(serde_json::json!({
+            "title": "keep the base",
+            "source_branch": "side",
+            "target_branch": "trunk",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let number = created["number"].as_i64().unwrap();
+    let pull_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let base_pin: (String, Option<String>) = sqlx::query_as(
+        "SELECT commit_oid, retain_until::text FROM pinned_commits \
+         WHERE base_of_pull_request_id = $1 AND reason = 'pull_request_base'",
+    )
+    .bind(pull_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        base_pin.0, trunk,
+        "the base is pinned when the request opens"
+    );
+    assert!(
+        base_pin.1.is_none(),
+        "an open request's base lives with the request"
+    );
+
+    // Target branch gone, request closed, head branch gone too.
+    for reference in ["refs/heads/trunk", "refs/heads/side"] {
+        git_ok(
+            &["--git-dir", fx.repo_path.to_str().unwrap()],
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "-d",
+                reference,
+            ],
+        );
+    }
+    let (status, closed) = call(
+        &fx,
+        "PATCH",
+        &format!("{href}/{number}"),
+        Some(serde_json::json!({"state": "closed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{closed}");
+    let extended: bool = sqlx::query_scalar(
+        "SELECT retain_until > now() + interval '29 days' FROM pinned_commits \
+         WHERE base_of_pull_request_id = $1",
+    )
+    .bind(pull_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(extended, "closing starts the retention window for the base");
+
+    let doomed = commit_without_ref(&fx, "doomed.txt", "gone\n");
+    fx.age_objects();
+    let outcome = fx.run().await;
+    assert!(matches!(outcome, Outcome::Completed(_)), "{outcome:?}");
+    assert!(!fx.has_object(&doomed), "the prune really ran");
+    assert!(
+        fx.has_object(&trunk),
+        "the base commit survives with no branch pointing at it"
+    );
+    let base_tree = git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &["rev-parse", &format!("{trunk}^{{tree}}")],
+    );
+    assert!(
+        fx.has_object(&base_tree),
+        "the pinned base's tree survives: the diff needs it"
+    );
+    assert!(fx.has_object(&head), "the head pin still works as before");
+
+    // The diff renders from the base pin once the target branch is gone.
+    let (status, body) = call(&fx, "GET", &format!("{href}/{number}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["base_id"].as_str(), Some(trunk.as_str()));
+    let diff = git(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &["diff", "--stat", &trunk, &head],
+    );
+    assert!(
+        diff.status.success(),
+        "the pinned base still diffs against the pinned head: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    fx.fsck();
+
+    // Retention is the bound, on the base pin alone: the head does not reach
+    // the base, so the base's survival above was the base pin's doing.
+    sqlx::query(
+        "UPDATE pinned_commits SET retain_until = now() - interval '1 day' \
+                 WHERE base_of_pull_request_id = $1",
+    )
+    .bind(pull_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    fx.age_objects();
+    assert!(matches!(fx.run().await, Outcome::Completed(_)));
+    // Retention is the bound: once the base pin has elapsed, housekeeping no
+    // longer counts the base as live. The assertion is on the pin (the
+    // keep-set's input), not on Git's collector: a loose object a pack also
+    // contains survives a repack at grace zero, so asserting the commit file
+    // disappears would test `git repack`, not the pin.
+    sqlx::query(
+        "UPDATE pinned_commits SET retain_until = now() - interval '1 day' \
+                 WHERE base_of_pull_request_id = $1",
+    )
+    .bind(pull_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    fx.age_objects();
+    assert!(matches!(fx.run().await, Outcome::Completed(_)));
+    let still_pinned: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pinned_commits WHERE base_of_pull_request_id = $1 \
+                        AND (retain_until IS NULL OR retain_until > now()))",
+    )
+    .bind(pull_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(!still_pinned, "the retention bound released the base pin");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    teardown(fx).await;
+}
+
+/// B2: a review comment's commit is pinned while the comment exists. The
+/// comment names a commit that a force push makes unreachable; with zero grace
+/// and no ref to it, the commit and its tree survive a prune, and deleting the
+/// comment releases the pin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
+async fn a_review_comments_commit_survives_a_force_push_and_a_prune() {
+    let fx = setup("keep-comment", |config| {
+        config.housekeeping_grace_seconds = 0;
+    })
+    .await;
+    let (dir, reviewed) = side_branch(&fx).await;
+    let href = format!(
+        "/api/v1/organizations/{}/repositories/{}/pulls",
+        fx.org_slug, fx.repo_name
+    );
+    let (status, created) = call(
+        &fx,
+        "POST",
+        &href,
+        Some(serde_json::json!({
+            "title": "reviewed commit",
+            "source_branch": "side",
+            "target_branch": "main",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let number = created["number"].as_i64().unwrap();
+    let comment_id = comment_on_head(&fx, number, &reviewed).await;
+    let pinned: (String, String) = sqlx::query_as(
+        "SELECT commit_oid, reason FROM pinned_commits WHERE review_comment_id = $1",
+    )
+    .bind(comment_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(pinned.0, reviewed, "the comment's commit is pinned");
+    assert_eq!(pinned.1, "review_comment");
+
+    // A force push moves the branch; the reviewed commit is now unreachable.
+    // The clone checks out the default branch, so check `side` out first.
+    let clone = fx.clone().await;
+    git_ok(
+        &[],
+        &["-C", clone.to_str().unwrap(), "checkout", "--quiet", "side"],
+    );
+    git_ok(
+        &[],
+        &["-C", clone.to_str().unwrap(), "reset", "--hard", "HEAD~1"],
+    );
+    std::fs::write(clone.join("other.txt"), "other\n").unwrap();
+    git_ok(&[], &["-C", clone.to_str().unwrap(), "add", "other.txt"]);
+    git_ok(
+        &[],
+        &[
+            "-C",
+            clone.to_str().unwrap(),
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "rewritten",
+        ],
+    );
+    let forced = tokio::task::spawn_blocking({
+        let clone = clone.clone();
+        move || {
+            git(
+                &[],
+                &[
+                    "-C",
+                    clone.to_str().unwrap(),
+                    "push",
+                    "--force",
+                    "origin",
+                    "HEAD:side",
+                ],
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        forced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let tip = branch_tip_of(&fx, "side");
+    assert_ne!(tip, reviewed, "the branch no longer reaches the review");
+
+    let doomed = commit_without_ref(&fx, "doomed.txt", "gone\n");
+    fx.age_objects();
+    assert!(matches!(fx.run().await, Outcome::Completed(_)));
+    assert!(!fx.has_object(&doomed), "the prune really ran");
+    assert!(
+        fx.has_object(&reviewed),
+        "the commented commit survives an unreachable force push"
+    );
+    let tree = git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &["rev-parse", &format!("{reviewed}^{{tree}}")],
+    );
+    assert!(fx.has_object(&tree), "its tree survives too");
+
+    // The pin lives with the comment: removing the comment releases it.
+    sqlx::query("DELETE FROM pull_request_comments WHERE id = $1")
+        .bind(comment_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pinned_commits WHERE review_comment_id = $1")
+            .bind(comment_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "the pin cascades with its comment");
+    fx.age_objects();
+    assert!(matches!(fx.run().await, Outcome::Completed(_)));
+    assert!(
+        !fx.has_object(&reviewed),
+        "without the comment nothing pins the commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&clone);
+    let _ = std::fs::remove_dir_all(&dir);
+    teardown(fx).await;
+}
+
+/// B3: a status pins its commit while it is the latest result for its context.
+/// A status on a commit no ref reaches survives a zero-grace prune; when a
+/// later status of the same context supersedes it, its pin gains the retention
+/// timestamp and stops keeping the ancestry of an unreachable commit forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
+async fn a_statuses_commit_survives_a_prune_until_it_is_superseded_and_retention_elapses() {
+    let fx = setup("keep-status", |config| {
+        config.housekeeping_grace_seconds = 0;
+    })
+    .await;
+    let orphan = commit_without_ref(&fx, "ci.txt", "ci\n");
+    post_status(&fx, &orphan, "ci/build", "success").await;
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT p.retain_until::text FROM pinned_commits p \
+         JOIN commit_statuses s ON s.id = p.commit_status_id \
+         WHERE s.commit_id = $1 AND s.context = 'ci/build' \
+         ORDER BY s.seq DESC LIMIT 1",
+    )
+    .bind(&orphan)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(
+        latest.is_none(),
+        "the latest status of a context lives with its row"
+    );
+
+    let doomed = commit_without_ref(&fx, "doomed.txt", "gone\n");
+    fx.age_objects();
+    assert!(matches!(fx.run().await, Outcome::Completed(_)));
+    assert!(!fx.has_object(&doomed), "the prune really ran");
+    assert!(
+        fx.has_object(&orphan),
+        "the reported commit survives with no ref reaching it"
+    );
+    let tree = git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &["rev-parse", &format!("{orphan}^{{tree}}")],
+    );
+    assert!(fx.has_object(&tree));
+
+    // A newer result for the same context supersedes it: the old pin gets the
+    // retention window instead of living forever.
+    post_status(&fx, &orphan, "ci/build", "failure").await;
+    let superseded: Option<String> = sqlx::query_scalar(
+        "SELECT p.retain_until::text FROM pinned_commits p \
+         JOIN commit_statuses s ON s.id = p.commit_status_id \
+         WHERE s.commit_id = $1 AND s.context = 'ci/build' \
+         ORDER BY s.seq ASC LIMIT 1",
+    )
+    .bind(&orphan)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(
+        superseded.is_some(),
+        "a superseded status's pin expires: {superseded:?}"
+    );
+    let newest_live: bool = sqlx::query_scalar(
+        "SELECT p.retain_until IS NULL FROM pinned_commits p \
+         JOIN commit_statuses s ON s.id = p.commit_status_id \
+         WHERE s.commit_id = $1 AND s.context = 'ci/build' \
+         ORDER BY s.seq DESC LIMIT 1",
+    )
+    .bind(&orphan)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(newest_live, "the new latest status is live");
+
+    // Elapse the superseded window and release both (the new latest lives with
+    // its row; elapsing it here proves the bound is a timestamp, not a ref).
+    sqlx::query(
+        "UPDATE pinned_commits p SET retain_until = now() - interval '1 day' \
+                 FROM commit_statuses s \
+                 WHERE s.id = p.commit_status_id AND s.commit_id = $1",
+    )
+    .bind(&orphan)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    fx.age_objects();
+    assert!(matches!(fx.run().await, Outcome::Completed(_)));
+    assert!(
+        !fx.has_object(&orphan),
+        "past retention a status no longer pins its commit"
+    );
+
+    teardown(fx).await;
+}
+
+fn branch_tip_of(fx: &Fixture, branch: &str) -> String {
+    git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &["rev-parse", &format!("refs/heads/{branch}")],
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests: crash safety
 // ---------------------------------------------------------------------------
 
@@ -1521,6 +1962,76 @@ fn commit_without_ref(fx: &Fixture, name: &str, content: &str) -> String {
             "update-ref",
             "-d",
             "refs/heads/dangling",
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    oid
+}
+
+/// One commit in the bare repository, a child of `parent`, reachable from no
+/// ref. Used as a base commit that the head does not descend from.
+fn chain_without_ref(fx: &Fixture, name: &str, content: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("githearth-hk-chain-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let work = dir.to_str().unwrap();
+    git_ok(
+        &[],
+        &[
+            "clone",
+            "--quiet",
+            "--",
+            fx.repo_path.to_str().unwrap(),
+            work,
+        ],
+    );
+    // An orphan branch: the commit shares no history with `main` or `side`.
+    git_ok(
+        &[],
+        &["-C", work, "checkout", "--quiet", "--orphan", "trunk-only"],
+    );
+    // Start from nothing: an orphan branch keeps the index of the branch it
+    // left, so clear it before the first commit or this commit is `main`'s
+    // with another name.
+    git_ok(&[], &["-C", work, "rm", "-r", "--quiet", "--cached", "."]);
+    std::fs::write(dir.join(name), content).unwrap();
+    git_ok(&[], &["-C", work, "add", name]);
+    git_ok(
+        &[],
+        &[
+            "-C",
+            work,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "orphan",
+        ],
+    );
+    let oid = git_ok(&[], &["-C", work, "rev-parse", "HEAD"]);
+    // Copy the object without a ref in the bare repository: `fetch` would
+    // otherwise name it after `HEAD`'s branch.
+    git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "fetch",
+            "--quiet",
+            "--",
+            work,
+            "trunk-only",
+        ],
+    );
+    git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "update-ref",
+            "-d",
+            "refs/heads/trunk-only",
         ],
     );
     let _ = std::fs::remove_dir_all(&dir);

@@ -66,10 +66,18 @@ pub struct Config {
     /// walk refuses to prune rather than using a partial live set.
     #[serde(default = "default_housekeeping_max_live_set_bytes")]
     pub housekeeping_max_live_set_bytes: usize,
-    /// How long a closed or merged pull request's head pin stays live, in
-    /// days. The pin is what keeps the diff readable after the branch goes.
+    /// How long a closed or merged pull request's head, base and superseded
+    /// status pins stay live, in days. A pin is what keeps the diff readable
+    /// after the branch goes.
     #[serde(default = "default_housekeeping_pin_retention_days")]
     pub housekeeping_pin_retention_days: u64,
+    /// The most bytes one fork pull request's head may add to the target
+    /// repository. The objects are copied into the target (which is what
+    /// makes `compare` and mergeability resolve them there) and charged to
+    /// the target organization; a fetch that would exceed this is refused
+    /// before it runs, and the pull request still works from the fork.
+    #[serde(default = "default_housekeeping_fork_fetch_limit_bytes")]
+    pub housekeeping_fork_fetch_limit_bytes: u64,
     /// Completed jobs retention in days (ADR 0006).
     #[serde(default = "default_job_retention_days")]
     pub job_retention_days: u64,
@@ -124,6 +132,7 @@ impl Default for Config {
             housekeeping_timeout_seconds: default_housekeeping_timeout_seconds(),
             housekeeping_max_live_set_bytes: default_housekeeping_max_live_set_bytes(),
             housekeeping_pin_retention_days: default_housekeeping_pin_retention_days(),
+            housekeeping_fork_fetch_limit_bytes: default_housekeeping_fork_fetch_limit_bytes(),
             trusted_proxies: Vec::new(),
             login_throttle_max_per_username: default_login_throttle_max_per_username(),
             login_throttle_max_per_client: default_login_throttle_max_per_client(),
@@ -179,6 +188,9 @@ fn default_housekeeping_max_live_set_bytes() -> usize {
 fn default_housekeeping_pin_retention_days() -> u64 {
     30
 }
+fn default_housekeeping_fork_fetch_limit_bytes() -> u64 {
+    1 << 26
+}
 
 /// The bounded phases of one housekeeping run, each covered by one
 /// `housekeeping_timeout_seconds`:
@@ -196,9 +208,19 @@ fn default_housekeeping_pin_retention_days() -> u64 {
 pub const HOUSEKEEPING_STEPS: u64 = 7;
 /// Extra time for the parts of a run that are not a single Git command.
 pub const HOUSEKEEPING_JOB_SLACK_SECONDS: u64 = 60;
-/// No job budget (and therefore no lease) may exceed seven days, so a stuck
-/// lease is always recoverable long before job retention.
-pub const MAX_JOB_BUDGET_SECONDS: u64 = 604_800;
+/// The largest step timeout `validate` accepts. The budget maximum is derived
+/// from it rather than stated separately: three numbers that must agree (the
+/// step count, the slack and the budget maximum) are two numbers, so the
+/// arithmetic cannot drift again.
+pub const MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS: u64 = 86_400;
+/// No job budget (and therefore no lease) may exceed
+/// [`MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS`] worth of steps plus slack, so a
+/// stuck lease is always recoverable long before job retention:
+/// `7 * 86400 + 60 = 604_860` seconds (about 7 days and 1 minute), and the
+/// claim lease (twice the budget) is at most `1_209_720` seconds, about 14
+/// days, inside the 365-day job retention.
+pub const MAX_JOB_BUDGET_SECONDS: u64 =
+    MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS * HOUSEKEEPING_STEPS + HOUSEKEEPING_JOB_SLACK_SECONDS;
 
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -320,6 +342,10 @@ impl Config {
             housekeeping_pin_retention_days,
             "GITHEARTH_HOUSEKEEPING_PIN_RETENTION_DAYS"
         );
+        env!(
+            housekeeping_fork_fetch_limit_bytes,
+            "GITHEARTH_HOUSEKEEPING_FORK_FETCH_LIMIT_BYTES"
+        );
         if let Ok(value) = std::env::var("GITHEARTH_TRUSTED_PROXIES") {
             c.trusted_proxies = value
                 .split(',')
@@ -384,9 +410,10 @@ impl Config {
             || !(60..=2_592_000).contains(&self.housekeeping_interval_seconds)
             || self.housekeeping_grace_seconds > 31_536_000
             || !(1..=16).contains(&self.housekeeping_concurrency)
-            || !(10..=86_400).contains(&self.housekeeping_timeout_seconds)
+            || !(10..=MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS).contains(&self.housekeeping_timeout_seconds)
             || !(1_048_576..=1_073_741_824).contains(&self.housekeeping_max_live_set_bytes)
             || !(1..=3650).contains(&self.housekeeping_pin_retention_days)
+            || !(1_048_576..=1_073_741_824).contains(&self.housekeeping_fork_fetch_limit_bytes)
             // The per-kind job budget covers every bounded phase plus slack,
             // and its lease is twice that; keep both within a recoverable
             // maximum.
@@ -394,7 +421,7 @@ impl Config {
             || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping job budget (7*timeout+60s) <= 604800s"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -495,10 +522,22 @@ mod tests {
         );
         assert!(c.validate().is_ok());
 
-        // The largest permitted step timeout still fits the budget maximum.
-        c.housekeeping_timeout_seconds = 86_400;
+        // The largest permitted step timeout still fits the budget maximum,
+        // and the maximum is exactly the arithmetic of the largest one rather
+        // than a separately stated number that can drift from it.
+        assert_eq!(
+            MAX_JOB_BUDGET_SECONDS,
+            HOUSEKEEPING_STEPS * MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS
+                + HOUSEKEEPING_JOB_SLACK_SECONDS
+        );
+        c.housekeeping_timeout_seconds = MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS;
         assert!(c.validate().is_ok());
         assert!(c.housekeeping_job_timeout_seconds() <= MAX_JOB_BUDGET_SECONDS);
+        // One second above the largest permitted step timeout is refused,
+        // as is a budget the maximum cannot cover.
+        c.housekeeping_timeout_seconds = MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS + 1;
+        assert!(c.validate().is_err());
+        c.housekeeping_timeout_seconds = MAX_HOUSEKEEPING_STEP_TIMEOUT_SECONDS;
 
         c.housekeeping_timeout_seconds = 0; // below the 10 s bound
         assert!(c.validate().is_err());
