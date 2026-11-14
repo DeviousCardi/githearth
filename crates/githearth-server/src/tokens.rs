@@ -14,7 +14,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, Credential, authenticate_token_hash, bearer_credential, event_with, invalid,
+    ApiError, AppState, Credential, authenticate_token_hash, bearer_credential, event_with,
+    has_nul, invalid,
 };
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -48,7 +49,7 @@ fn scope_ok(scopes: &[String]) -> bool {
 }
 
 fn name_ok(name: &str) -> bool {
-    (1..=100).contains(&name.chars().count()) && !name.trim().is_empty()
+    (1..=100).contains(&name.chars().count()) && !name.trim().is_empty() && !has_nul(name)
 }
 
 #[derive(Deserialize)]

@@ -42,6 +42,26 @@ async fn request(
     )
 }
 
+async fn raw_request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
 fn tag(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
@@ -292,6 +312,61 @@ async fn invalid_names_400() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn nul_bytes_are_invalid_input_400() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
+        .bind(&org_slug)
+        .fetch_one(&pool).await.unwrap();
+    let token = fixture_session(&pool, owner_id).await;
+
+    // A repository description with NUL must be refused before INSERT.
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "nul-desc", "description": "bad\u{0}description"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "nul-patch"}),
+    )
+    .await;
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v1/organizations/{org_slug}/repositories/nul-patch"),
+        Some(&token),
+        None,
+        json!({"description": "bad\u{0}description"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // NUL in a decoded organization or repository path parameter is a 400,
+    // not a database error.
+    for path in [
+        format!("/api/v1/organizations/{org_slug}%00/repositories"),
+        format!("/api/v1/organizations/{org_slug}/repositories/nul-patch%00"),
+    ] {
+        let (status, _) = request(&app, "GET", &path, Some(&token), None, Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn unrelated_user_404_on_read_list_patch_delete() {
     let (app, pool, storage_root, _, org_slug) = setup().await;
     let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
@@ -365,6 +440,49 @@ async fn unrelated_user_404_on_read_list_patch_delete() {
         .0,
         StatusCode::NOT_FOUND
     );
+
+    cleanup(&storage_root);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn not_found_bodies_do_not_reveal_existence() {
+    let (app, pool, storage_root, _, org_slug) = setup().await;
+    let owner_id = sqlx::query_scalar("SELECT account_id FROM memberships WHERE organization_id=(SELECT id FROM organizations WHERE slug=$1) LIMIT 1")
+        .bind(&org_slug)
+        .fetch_one(&pool).await.unwrap();
+    let token = fixture_session(&pool, owner_id).await;
+    request(
+        &app,
+        "POST",
+        &format!("/api/v1/organizations/{org_slug}/repositories"),
+        Some(&token),
+        None,
+        json!({"name": "private-repo"}),
+    )
+    .await;
+
+    let stranger = fixture_account(&pool, &tag("stranger")).await;
+    let stranger_token = fixture_session(&pool, stranger).await;
+    let missing_org = tag("missing-org");
+    let cases = [
+        // Existing but unreadable private repository.
+        format!("/api/v1/organizations/{org_slug}/repositories/private-repo"),
+        // Missing repository in an existing organization.
+        format!("/api/v1/organizations/{org_slug}/repositories/missing"),
+        // Missing organization.
+        format!("/api/v1/organizations/{missing_org}/repositories/private-repo"),
+    ];
+    let mut bodies = Vec::new();
+    for path in &cases {
+        let (status, body) = raw_request(&app, "GET", path, Some(&stranger_token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        bodies.push(body);
+    }
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(bodies[1], bodies[2]);
+    assert_eq!(bodies[0], br#"{"error":"not found"}"#);
 
     cleanup(&storage_root);
     pool.close().await;
@@ -1516,7 +1634,7 @@ async fn mutations_through_a_renamed_away_name_are_404() {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {suffix}");
-        assert_eq!(body["error"], "repository not found");
+        assert_eq!(body["error"], "not found");
     }
     let (status, _) = request(
         &app,

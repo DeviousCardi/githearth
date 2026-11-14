@@ -436,6 +436,21 @@ pub async fn list(
     .map(|rows| rows.iter().map(row_to_repository).collect())
 }
 
+/// Repositories forked directly from `parent_id`, newest id order. Deleted
+/// forks are omitted; callers still filter by read authorization.
+pub async fn list_children(
+    conn: &mut PgConnection,
+    parent_id: Uuid,
+) -> Result<Vec<RepositoryRow>, sqlx::Error> {
+    sqlx::query(&format!(
+        "SELECT {REPO_COLS} FROM repositories WHERE parent_repository_id=$1 AND status <> 'deleted' ORDER BY id"
+    ))
+    .bind(parent_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map(|rows| rows.iter().map(row_to_repository).collect())
+}
+
 pub async fn set_description(
     conn: &mut PgConnection,
     id: Uuid,

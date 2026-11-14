@@ -1732,7 +1732,7 @@ async fn resolve_through_a_renamed_away_name_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"], "repository not found");
+    assert_eq!(body["error"], "not found");
 
     finish(f).await;
 }

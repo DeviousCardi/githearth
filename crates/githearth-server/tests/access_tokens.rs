@@ -843,10 +843,12 @@ async fn git_clone_with_token_and_push_fails_for_read_token() {
     .await;
     let out = git_run(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
     assert!(!out.status.success(), "read-only push must fail");
+    // Admission refuses the receive-pack request before any pack is uploaded,
+    // so the transport reports 403 rather than a hook rejection.
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("permission denied: ref.push"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("403"),
+        "read-only push should be refused at admission: {stderr}"
     );
 
     // A refused push must not leave a dangling push_credentials row (issue #143).

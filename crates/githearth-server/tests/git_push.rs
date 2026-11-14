@@ -685,6 +685,58 @@ async fn force_push_and_delete_allowed_for_owner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn read_only_push_refused_at_admission_before_pack() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+
+    let fx = setup(1 << 30).await;
+    let org_id: Uuid = sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id=$1")
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    let (_reader, username) = member_with_repo_grant(&fx.pool, org_id, fx.repo_id, "read").await;
+    let auth = basic_auth(&username, "testpass");
+
+    // Both the advertisement and the pack upload are refused before git runs.
+    let advertise = Request::get(format!(
+        "/{}/{}.git/info/refs?service=git-receive-pack",
+        fx.org_slug, fx.repo_name
+    ))
+    .header("authorization", &auth)
+    .body(Body::empty())
+    .unwrap();
+    let response = fx.app.clone().oneshot(advertise).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let _ = response.into_body().collect().await;
+
+    let upload = Request::post(format!(
+        "/{}/{}.git/git-receive-pack",
+        fx.org_slug, fx.repo_name
+    ))
+    .header("authorization", &auth)
+    .header("content-type", "application/x-git-receive-pack-request")
+    .body(Body::from(vec![b'x'; 2048]))
+    .unwrap();
+    let response = fx.app.clone().oneshot(upload).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let _ = response.into_body().collect().await;
+
+    let pc: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pc, 0);
+
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn read_only_user_push_denied_and_ref_unchanged() {
     let fx = setup(1 << 30).await;
     let org_id: Uuid = sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id=$1")
@@ -720,9 +772,11 @@ async fn read_only_user_push_denied_and_ref_unchanged() {
     let out = git_run(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
     assert!(!out.status.success(), "read-only push must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Admission refuses the receive-pack advertisement before any pack is
+    // uploaded, so the transport reports 403 rather than a hook rejection.
     assert!(
-        stderr.contains("permission denied: ref.push"),
-        "reason relayed as remote: {stderr}"
+        stderr.contains("403"),
+        "read-only push should be refused at admission: {stderr}"
     );
 
     // Nothing journaled as committed.
@@ -978,7 +1032,12 @@ async fn archived_repository_push_denied() {
     .await;
     let out = git_run(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("permission denied: ref.push"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Admission refuses the receive-pack request before any pack is uploaded.
+    assert!(
+        stderr.contains("403"),
+        "archived push should be refused at admission: {stderr}"
+    );
     assert!(journal_records(&fx.repo_path).is_empty());
 
     let _ = std::fs::remove_dir_all(&clone);

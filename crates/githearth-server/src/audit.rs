@@ -35,7 +35,7 @@ const SITE_CHAIN: Uuid = Uuid::nil();
 const ZERO_HASH: [u8; 32] = [0u8; 32];
 
 fn does_not_exist() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "organization not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 
 /// Authorize reading the audit log. There is no `audit` action in
@@ -48,6 +48,9 @@ async fn authorize(
     auth_age: u64,
     org_slug: &str,
 ) -> Result<(Uuid, facts::Facts), ApiError> {
+    if !crate::valid_path_param(org_slug) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid input"));
+    }
     let mut conn = state.pool.acquire().await?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
         .bind(org_slug)

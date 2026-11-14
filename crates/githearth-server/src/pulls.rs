@@ -19,13 +19,14 @@ use githearth_git::journal::{Origin, Record};
 use githearth_git::merge::Identity;
 use githearth_git::suggestion;
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, PgConnection};
+use sqlx::{Connection, FromRow, PgConnection, Row};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, browse, event, event_with, facts, idempotency, invalid,
+    ApiError, AppState, authenticate, browse, event, event_with, facts, has_nul, idempotency,
+    invalid,
     issues::{allocate_number, not_active, require_readable_repo},
     protection, repositories,
     repository_api::{self, Loaded},
@@ -72,7 +73,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "pull request not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn branch_missing() -> ApiError {
     ApiError(StatusCode::UNPROCESSABLE_ENTITY, "branch not found")
@@ -97,6 +98,12 @@ pub(crate) fn not_ready() -> ApiError {
 }
 fn already_merged() -> ApiError {
     ApiError(StatusCode::CONFLICT, "pull request is merged")
+}
+fn cannot_reopen() -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        "source repository or branch no longer exists",
+    )
 }
 
 /// Re-checks inside the transaction, on the same row lock the PATCH
@@ -507,6 +514,14 @@ async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, 
 }
 type Tips = (Option<String>, Option<String>);
 
+/// Attaches the live code-owner facts to a detail response so create/PATCH
+/// report the same fields as GET .../pulls/{n} (#157).
+fn apply_codeowner_review(detail: &mut PullDetail, review: crate::codeowners::CodeOwnerReview) {
+    detail.required_code_owners = review.required;
+    detail.code_owner_review_satisfied = review.satisfied;
+    detail.code_owner_errors = review.errors;
+}
+
 /// Builds the detail on `conn`, so a caller inside a transaction needs no
 /// second connection; `tips` are resolved beforehand, outside it.
 async fn detail(
@@ -582,6 +597,8 @@ fn new_pull(body: &[u8]) -> Result<NewPull, ApiError> {
     if input.title.trim().is_empty()
         || input.title.chars().count() > 256
         || input.body.chars().count() > 65536
+        || has_nul(&input.title)
+        || has_nul(&input.body)
         || !valid_branch(&input.source_branch)
         || !valid_branch(&input.target_branch)
         // A same-repository pull must name two distinct branches; a
@@ -590,7 +607,7 @@ fn new_pull(body: &[u8]) -> Result<NewPull, ApiError> {
         || input
             .source_repository
             .as_deref()
-            .is_some_and(|s| s.is_empty() || s.matches('/').count() != 1)
+            .is_some_and(|s| s.is_empty() || s.matches('/').count() != 1 || has_nul(s))
     {
         return Err(invalid());
     }
@@ -615,7 +632,7 @@ async fn resolve_source_repository(
         .bind(source_org)
         .fetch_optional(&mut *conn)
         .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "organization not found"))?;
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
     let source_repo = repositories::find_by_name(&mut conn, source_org_id, source_name)
         .await?
         .ok_or_else(not_found)?;
@@ -624,7 +641,7 @@ async fn resolve_source_repository(
     // non-existent repository, so private existence and fork status cannot be
     // enumerated through this route.
     let Some(facts) = facts::load(&mut conn, actor_id, source_org_id).await? else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "organization not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
     let authz_repo = repositories::authz_repository(&source_repo);
     let read = state.authz.authorize(&facts.request(
@@ -706,9 +723,21 @@ pub(crate) async fn create_pull(
             };
             let head = branch_tip(state, source_repository_id, &input.source_branch).await?;
             let base = branch_tip(state, loaded.repo.id, &input.target_branch).await?;
-            if head.is_none() || base.is_none() {
+            let (Some(head), Some(base)) = (head, base) else {
                 return Err(branch_missing());
-            }
+            };
+            // Read the code-owner facts from the same head and base the detail
+            // endpoint uses, before opening the transaction that stores the
+            // response.
+            fetch_cross_repo_head(
+                state,
+                loaded.repo.id,
+                source_repository_id,
+                &input.source_branch,
+            )
+            .await?;
+            let codeowners =
+                crate::codeowners::load(state, loaded.repo.id, &base, &head).await?;
 
             let mut tx = state.pool.begin().await?;
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
@@ -764,9 +793,24 @@ pub(crate) async fn create_pull(
 
             let pull = fetch_pull(&mut tx, id).await?.unwrap();
             let status = StatusCode::CREATED;
-            let body =
-                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, (head, base)).await?)
-                    .unwrap();
+            let mut detail = detail(
+                &mut tx,
+                loaded.repo.id,
+                pull,
+                (Some(head.clone()), Some(base.clone())),
+            )
+            .await?;
+            let review = crate::codeowners::review_loaded(
+                &mut tx,
+                loaded.org_id,
+                org_slug,
+                detail.pull.id,
+                &head,
+                codeowners,
+            )
+            .await?;
+            apply_codeowner_review(&mut detail, review);
+            let body = serde_json::to_value(detail).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
                 return Err(idempotency::claim_lost());
             }
@@ -829,11 +873,15 @@ pub(crate) async fn list_pulls(
     require_readable_repo(&loaded)?;
 
     let mut conn = state.pool.acquire().await?;
-    let rows = sqlx::query_as::<_, PullJson>(&format!(
-        "SELECT {PULL_COLUMNS} FROM pull_requests WHERE repository_id = $1 \
+    // The list is the pull requests that target this repository; a fork's
+    // outgoing pull requests are shown separately by the UI (see
+    // `outgoing_pulls`) so pagination stays on one number sequence.
+    let rows = sqlx::query(&format!(
+        "SELECT {PULL_COLUMNS} FROM pull_requests \
+         WHERE repository_id = $1 \
          AND ($2::integer IS NULL OR number < $2) \
          AND ($3::text IS NULL OR state = $3) \
-         ORDER BY number DESC LIMIT $4"
+         ORDER BY number DESC, id DESC LIMIT $4"
     ))
     .bind(loaded.repo.id)
     .bind(query.after)
@@ -843,7 +891,10 @@ pub(crate) async fn list_pulls(
     .await?;
 
     let has_more = rows.len() as i64 > limit;
-    let mut items = rows;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(PullJson::from_row(&row)?);
+    }
     items.truncate(limit as usize);
     let next = if has_more {
         items.last().map(|p| p.number)
@@ -851,6 +902,97 @@ pub(crate) async fn list_pulls(
         None
     };
     Ok(PullPage { items, next })
+}
+
+/// A pull request opened *from* this repository against another one. The
+/// number belongs to the target repository's sequence, so these rows are not
+/// mixed into [`list_pulls`] (their links and pagination would be wrong); the
+/// UI shows them as a separate section.
+pub(crate) struct OutgoingPull {
+    pub number: i32,
+    pub title: String,
+    pub state: String,
+    /// `"{org}/{repo}"` of the target repository.
+    pub target: String,
+}
+
+pub(crate) async fn outgoing_pulls(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    limit: i64,
+) -> Result<Vec<OutgoingPull>, ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    repository_api::require(state, &loaded, Action::RepositoryRead)?;
+    require_readable_repo(&loaded)?;
+
+    let mut conn = state.pool.acquire().await?;
+    let rows = sqlx::query(
+        "SELECT pr.number, pr.title, pr.state, o.slug AS org_slug, r.name AS repo_name, \
+                r.id AS target_id, r.organization_id AS target_org_id, r.status AS target_status \
+         FROM pull_requests pr \
+         JOIN repositories r ON r.id = pr.repository_id \
+         JOIN organizations o ON o.id = r.organization_id \
+         WHERE pr.source_repository_id = $1 \
+         ORDER BY pr.created_at DESC, pr.id DESC LIMIT 200",
+    )
+    .bind(loaded.repo.id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut items = Vec::new();
+    let mut org_facts: HashMap<Uuid, Option<facts::Facts>> = HashMap::new();
+    for row in rows {
+        let target_id: Uuid = row.get("target_id");
+        if target_id == loaded.repo.id {
+            continue;
+        }
+        if row.get::<String, _>("target_status") == "deleted" {
+            continue;
+        }
+        let target_org_id: Uuid = row.get("target_org_id");
+        let target_facts = match org_facts.get(&target_org_id) {
+            Some(facts) => facts.clone(),
+            None => {
+                let facts = facts::load(&mut conn, actor_id, target_org_id).await?;
+                org_facts.insert(target_org_id, facts.clone());
+                facts
+            }
+        };
+        let Some(target_facts) = target_facts else {
+            continue;
+        };
+        let Some(target) = repositories::get(&mut conn, target_id).await? else {
+            continue;
+        };
+        let readable = state
+            .authz
+            .authorize(&target_facts.request(
+                Action::RepositoryRead,
+                Resource::Repository(&repositories::authz_repository(&target)),
+                Some(Duration::from_secs(auth_age)),
+            ))
+            .is_allowed();
+        if !readable {
+            continue;
+        }
+        items.push(OutgoingPull {
+            number: row.get("number"),
+            title: row.get("title"),
+            state: row.get("state"),
+            target: format!(
+                "{}/{}",
+                row.get::<String, _>("org_slug"),
+                row.get::<String, _>("repo_name")
+            ),
+        });
+        if items.len() as i64 >= limit {
+            break;
+        }
+    }
+    Ok(items)
 }
 
 async fn read(
@@ -933,11 +1075,11 @@ async fn update(
         || input
             .title
             .as_ref()
-            .is_some_and(|t| t.trim().is_empty() || t.chars().count() > 256)
+            .is_some_and(|t| t.trim().is_empty() || t.chars().count() > 256 || has_nul(t))
         || input
             .body
             .as_ref()
-            .is_some_and(|b| b.chars().count() > 65536)
+            .is_some_and(|b| b.chars().count() > 65536 || has_nul(b))
         || input
             .state
             .as_ref()
@@ -969,6 +1111,22 @@ async fn update(
                 return Err(not_active());
             }
             let tips = tips(state, loaded.repo.id, &pull).await?;
+            let codeowners = match (&tips.0, &tips.1) {
+                (Some(head), Some(base)) => {
+                    fetch_cross_repo_head(
+                        state,
+                        loaded.repo.id,
+                        pull.source_repository_id,
+                        &pull.source_branch,
+                    )
+                    .await?;
+                    Some((
+                        head.clone(),
+                        crate::codeowners::load(state, loaded.repo.id, base, head).await?,
+                    ))
+                }
+                _ => None,
+            };
 
             let mut tx = state.pool.begin().await?;
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
@@ -986,6 +1144,21 @@ async fn update(
                 return Err(already_merged());
             }
             let new_state = input.state.as_deref().unwrap_or(locked.state.as_str());
+            // A system-closed pull whose source repository or branch was
+            // deleted must not be resurrected as an open pull with a null head
+            // (issue #156).
+            if locked.state == "closed" && new_state == "open" {
+                let source = repositories::get(&mut tx, locked.source_repository_id).await?;
+                let source_active =
+                    source.is_some_and(|row| row.status == RepositoryStatus::Active);
+                if !source_active
+                    || branch_tip(state, locked.source_repository_id, &locked.source_branch)
+                        .await?
+                        .is_none()
+                {
+                    return Err(cannot_reopen());
+                }
+            }
             // Reopening clears any system-close reason (e.g. "source repository
             // deleted") so a reopened pull no longer reports why it was closed.
             let updated = sqlx::query(
@@ -1036,8 +1209,20 @@ async fn update(
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
             let status = StatusCode::OK;
-            let body =
-                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, tips).await?).unwrap();
+            let mut detail = detail(&mut tx, loaded.repo.id, pull, tips).await?;
+            if let Some((head, codeowners)) = codeowners {
+                let review = crate::codeowners::review_loaded(
+                    &mut tx,
+                    loaded.org_id,
+                    &org_slug,
+                    detail.pull.id,
+                    &head,
+                    codeowners,
+                )
+                .await?;
+                apply_codeowner_review(&mut detail, review);
+            }
+            let body = serde_json::to_value(detail).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
                 return Err(idempotency::claim_lost());
             }
@@ -1247,6 +1432,7 @@ fn new_comment(body: &[u8]) -> Result<NewComment, ApiError> {
     let anchored = input.commit_id.is_some();
     if input.body.trim().is_empty()
         || input.body.chars().count() > 65536
+        || has_nul(&input.body)
         // An anchor names all three of commit, path and line, or none of them.
         || anchored != input.path.is_some()
         || anchored != input.line.is_some()
@@ -1584,7 +1770,11 @@ fn new_review(body: &[u8]) -> Result<NewReview, ApiError> {
         "commented" => !input.body.trim().is_empty(),
         _ => false,
     };
-    if !valid_verdict || !valid_commit_id(&input.commit_id) || input.body.chars().count() > 65536 {
+    if !valid_verdict
+        || !valid_commit_id(&input.commit_id)
+        || input.body.chars().count() > 65536
+        || has_nul(&input.body)
+    {
         return Err(invalid());
     }
     Ok(input)
@@ -1937,6 +2127,9 @@ async fn add_review_request(
     body: Bytes,
 ) -> Result<Json<Vec<ReviewRequestJson>>, ApiError> {
     let input: NewReviewRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    if has_nul(&input.reviewer) {
+        return Err(invalid());
+    }
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let loaded =
@@ -2008,6 +2201,9 @@ async fn remove_review_request(
     headers: HeaderMap,
     Path((org_slug, repo_name, number, username)): Path<(String, String, i32, String)>,
 ) -> Result<StatusCode, ApiError> {
+    if !crate::valid_path_param(&username) {
+        return Err(invalid());
+    }
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let loaded =
@@ -2022,7 +2218,7 @@ async fn remove_review_request(
             .fetch_optional(&mut *tx)
             .await?;
     let Some(reviewer_id) = reviewer_id else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "review request not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
 
     let deleted = sqlx::query(
@@ -2033,7 +2229,7 @@ async fn remove_review_request(
     .execute(&mut *tx)
     .await?;
     if deleted.rows_affected() == 0 {
-        return Err(ApiError(StatusCode::NOT_FOUND, "review request not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     }
 
     event_with(
@@ -2131,7 +2327,7 @@ pub(crate) async fn set_thread_resolved(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(root_id) = root_id else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "comment not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
     if resolved {
         // The first resolution wins; resolving again keeps the original actor.
@@ -2386,7 +2582,7 @@ pub(crate) async fn apply_pull_suggestion(
     let mut conn = state.pool.acquire().await?;
     let comment = fetch_comment_row(&mut conn, pull.id, comment_id)
         .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "comment not found"))?;
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
     drop(conn);
     let (Some(commit_id), Some(path), Some(line)) =
         (&comment.commit_id, &comment.path, comment.line)

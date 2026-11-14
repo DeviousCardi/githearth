@@ -540,6 +540,9 @@ async fn organization(
         }
         Err(_) => return Err(unavailable_page(None)),
     };
+    if !crate::valid_path_param(&slug) {
+        return Err(not_found_page(Some(&account.username)));
+    }
     let mut conn = state
         .pool
         .acquire()

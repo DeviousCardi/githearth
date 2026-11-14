@@ -12,7 +12,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, event, idempotency, invalid, repositories,
+    ApiError, AppState, authenticate, event, has_nul, idempotency, invalid, repositories,
     repository_api::{self, Loaded},
 };
 
@@ -33,7 +33,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "issue not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 pub(crate) fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
@@ -205,6 +205,8 @@ fn new_issue(body: &[u8]) -> Result<NewIssue, ApiError> {
     if blank_text(&input.title)
         || input.title.chars().count() > 256
         || input.body.chars().count() > 65536
+        || has_nul(&input.title)
+        || has_nul(&input.body)
     {
         return Err(invalid());
     }
@@ -415,12 +417,12 @@ fn validate_patch(input: &PatchIssue) -> Result<(), ApiError> {
         return Err(invalid());
     }
     if let Some(ref t) = input.title
-        && (blank_text(t) || !(1..=256).contains(&t.chars().count()))
+        && (blank_text(t) || !(1..=256).contains(&t.chars().count()) || has_nul(t))
     {
         return Err(invalid());
     }
     if let Some(ref b) = input.body
-        && b.chars().count() > 65536
+        && (b.chars().count() > 65536 || has_nul(b))
     {
         return Err(invalid());
     }
@@ -568,7 +570,7 @@ async fn create_comment(
 
 fn new_comment(body: &[u8]) -> Result<NewComment, ApiError> {
     let input: NewComment = serde_json::from_slice(body).map_err(|_| invalid())?;
-    if blank_text(&input.body) || input.body.chars().count() > 65536 {
+    if blank_text(&input.body) || input.body.chars().count() > 65536 || has_nul(&input.body) {
         return Err(invalid());
     }
     Ok(input)

@@ -983,6 +983,144 @@ async fn fork_form_lists_only_namespaces_the_viewer_can_create_repositories_in()
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_listing_returns_parent_and_children() {
+    let f = build_fixture().await;
+
+    // The upstream lists its readable fork.
+    let (status, listing) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/forks",
+            f.parent_org_slug, f.parent_repo_name
+        ),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["parent"], Value::Null);
+    assert_eq!(listing["count"], 1);
+    let children = listing["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["id"].as_str().unwrap(), f.fork_id.to_string());
+    assert_eq!(
+        children[0]["parent_repository_id"].as_str().unwrap(),
+        f.parent_repo_id.to_string()
+    );
+
+    // The fork itself links back to its parent and has no children.
+    let (status, listing) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/forks",
+            f.contrib_org_slug, f.fork_name
+        ),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(
+        listing["parent"]["id"].as_str().unwrap(),
+        f.parent_repo_id.to_string()
+    );
+    assert_eq!(listing["count"], 0);
+    assert!(listing["children"].as_array().unwrap().is_empty());
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn fork_pull_list_shows_outgoing_cross_repository_pulls_separately() {
+    let f = build_fixture().await;
+
+    // The JSON list stays on this repository's own number sequence: outgoing
+    // pull requests are not mixed in (their numbers belong to the target).
+    let (status, page) = request(
+        &f.app,
+        "GET",
+        &repo_href(&f.contrib_org_slug, &f.fork_name),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["items"].as_array().unwrap().len(), 0, "{page}");
+
+    // The browser page shows them in their own section, linked to the target.
+    let cookie = format!("githearth_session={}", f.contributor_token);
+    let path = format!(
+        "/organizations/{}/repositories/{}/pulls",
+        f.contrib_org_slug, f.fork_name
+    );
+    let (status, body) = get_body(&f.app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("Pull requests opened from this fork"),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "/organizations/{}/repositories/{}/pulls/{}",
+            f.parent_org_slug, f.parent_repo_name, f.number
+        )),
+        "{body}"
+    );
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn reopening_a_pull_after_its_source_fork_is_deleted_is_refused() {
+    let f = build_fixture().await;
+
+    let (status, _) = request(
+        &f.app,
+        "DELETE",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}",
+            f.contrib_org_slug, f.fork_name
+        ),
+        Some(&f.contributor_token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = request(
+        &f.app,
+        "PATCH",
+        &format!(
+            "{}/{}",
+            repo_href(&f.parent_org_slug, &f.parent_repo_name),
+            f.number
+        ),
+        Some(&f.owner_token),
+        json!({"state": "open"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let (state, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, closed_reason FROM pull_requests WHERE repository_id = $1 AND number = $2",
+    )
+    .bind(f.parent_repo_id)
+    .bind(f.number as i32)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "closed");
+    assert_eq!(reason.as_deref(), Some("source repository deleted"));
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn reopening_a_pull_request_clears_its_closed_reason() {
     let f = build_fixture().await;
 

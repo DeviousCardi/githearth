@@ -13,27 +13,107 @@ use axum::{
 };
 use githearth_authz::{Action, Resource};
 use githearth_core::RepositoryStatus;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, event, facts, idempotency, invalid, repositories,
+    ApiError, AppState, authenticate, event, facts, has_nul, idempotency, invalid, repositories,
     repository_api::{self, RepositoryJson},
 };
 
 pub fn router() -> Router<AppState> {
     Router::new().route(
         "/api/v1/organizations/{org}/repositories/{repo}/forks",
-        axum::routing::post(create),
+        axum::routing::post(create).get(list),
     )
 }
 
+#[derive(Serialize)]
+pub(crate) struct ForkListing {
+    /// The repository this fork came from, when it is a fork and the caller may
+    /// read the parent.
+    pub(crate) parent: Option<RepositoryJson>,
+    /// Forks of this repository the caller may read.
+    pub(crate) children: Vec<RepositoryJson>,
+    pub(crate) count: usize,
+}
+
+/// `GET .../forks`: the parent link and the readable child forks (issue #156).
+async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, repo_name)): Path<(String, String)>,
+) -> Result<Json<ForkListing>, ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let loaded =
+        repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    repository_api::require(&state, &loaded, Action::RepositoryRead)?;
+    crate::issues::require_readable_repo(&loaded)?;
+
+    let can_read = |facts: &facts::Facts, row: &repositories::RepositoryRow| {
+        let authz_repo = repositories::authz_repository(row);
+        state
+            .authz
+            .authorize(&facts.request(
+                Action::RepositoryRead,
+                Resource::Repository(&authz_repo),
+                Some(Duration::from_secs(auth_age)),
+            ))
+            .is_allowed()
+    };
+
+    let mut conn = state.pool.acquire().await?;
+    let parent = match loaded.repo.parent_repository_id {
+        Some(parent_id) => {
+            let row = repositories::get(&mut conn, parent_id)
+                .await?
+                .filter(|row| row.status != RepositoryStatus::Deleted);
+            match row {
+                Some(row) => {
+                    let parent_facts = if row.organization_id == loaded.org_id {
+                        Some(loaded.facts.clone())
+                    } else {
+                        facts::load(&mut conn, actor.id, row.organization_id).await?
+                    };
+                    parent_facts
+                        .filter(|f| can_read(f, &row))
+                        .map(|_| RepositoryJson::from(&row))
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+
+    let mut children = Vec::new();
+    for row in repositories::list_children(&mut conn, loaded.repo.id).await? {
+        if row.organization_id == loaded.org_id {
+            if can_read(&loaded.facts, &row) {
+                children.push(RepositoryJson::from(&row));
+            }
+            continue;
+        }
+        let Some(facts) = facts::load(&mut conn, actor.id, row.organization_id).await? else {
+            continue;
+        };
+        if can_read(&facts, &row) {
+            children.push(RepositoryJson::from(&row));
+        }
+    }
+    let count = children.len();
+    Ok(Json(ForkListing {
+        parent,
+        children,
+        count,
+    }))
+}
+
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "repository not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn org_not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "organization not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn name_taken() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository name already taken")
@@ -90,8 +170,9 @@ pub(crate) async fn create_fork(
         || input
             .description
             .as_deref()
-            .is_some_and(|d| d.chars().count() > 1000)
+            .is_some_and(|d| d.chars().count() > 1000 || has_nul(d))
         || input.organization.trim().is_empty()
+        || has_nul(&input.organization)
     {
         return Err(invalid());
     }

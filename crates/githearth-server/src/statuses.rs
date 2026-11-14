@@ -20,8 +20,8 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, authenticate, event_with, idempotency, invalid, issues, repositories,
-    repository_api,
+    ApiError, AppState, authenticate, event_with, has_nul, idempotency, invalid, issues,
+    repositories, repository_api,
 };
 
 pub fn router() -> Router<AppState> {
@@ -40,7 +40,7 @@ fn valid_state(state: &str) -> bool {
 /// leading or trailing whitespace. Such whitespace would make a posted status
 /// or a required check context impossible to match against a well-formed rule.
 pub(crate) fn valid_context(context: &str) -> bool {
-    (1..=255).contains(&context.chars().count()) && context == context.trim()
+    (1..=255).contains(&context.chars().count()) && context == context.trim() && !has_nul(context)
 }
 
 /// Whether a context has leading or trailing whitespace around a non-empty
@@ -125,11 +125,11 @@ fn new_status(body: &[u8]) -> Result<NewStatus, ApiError> {
         || input
             .description
             .as_ref()
-            .is_some_and(|d| d.chars().count() > 65536)
+            .is_some_and(|d| d.chars().count() > 65536 || has_nul(d))
         || input
             .target_url
             .as_ref()
-            .is_some_and(|u| u.chars().count() > 4096)
+            .is_some_and(|u| u.chars().count() > 4096 || has_nul(u))
     {
         return Err(invalid());
     }

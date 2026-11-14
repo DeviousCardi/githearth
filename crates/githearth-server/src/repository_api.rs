@@ -12,14 +12,15 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, Page, authenticate, event, facts, idempotency, invalid, repositories,
+    ApiError, AppState, Page, authenticate, event, facts, has_nul, idempotency, invalid,
+    repositories, valid_path_param,
 };
 
 fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn org_not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "organization not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
@@ -92,6 +93,9 @@ pub(crate) async fn load_repo(
     org_slug: &str,
     name: &str,
 ) -> Result<Loaded, ApiError> {
+    if !valid_path_param(org_slug) || !valid_path_param(name) {
+        return Err(invalid());
+    }
     let mut conn = state.pool.acquire().await?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
         .bind(org_slug)
@@ -104,7 +108,7 @@ pub(crate) async fn load_repo(
     };
 
     let Some(repo) = repositories::find_by_name(&mut conn, org_id, name).await? else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
 
     Ok(Loaded {
@@ -126,7 +130,7 @@ pub(crate) async fn load_current(
 ) -> Result<Loaded, ApiError> {
     let loaded = load_repo(state, actor_id, auth_age, org_slug, name).await?;
     if !loaded.repo.name.eq_ignore_ascii_case(name) {
-        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     }
     Ok(loaded)
 }
@@ -142,7 +146,7 @@ async fn load_by_operation(
 ) -> Result<Loaded, ApiError> {
     let mut conn = state.pool.acquire().await?;
     let Some(repo) = repositories::find_by_operation(&mut conn, operation_id).await? else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
     let org_id = repo.organization_id;
     let Some(facts) = facts::load(&mut conn, actor_id, org_id).await? else {
@@ -205,9 +209,13 @@ pub(crate) async fn create(
 ) -> Result<(StatusCode, Json<RepositoryJson>), ApiError> {
     let input: NewRepository = serde_json::from_slice(&body).map_err(|_| invalid())?;
 
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-
-    if !valid_repo_name(&input.name) || input.description.chars().count() > 1000 {
+    if !valid_path_param(&org_slug) {
+        return Err(invalid());
+    }
+    if !valid_repo_name(&input.name)
+        || input.description.chars().count() > 1000
+        || has_nul(&input.description)
+    {
         return Err(invalid());
     }
     if let Some(ref v) = input.visibility
@@ -220,6 +228,7 @@ pub(crate) async fn create(
     {
         return Err(invalid());
     }
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
 
     let mut conn = state.pool.acquire().await?;
     let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
@@ -334,7 +343,7 @@ pub(crate) async fn create(
                 let mut conn = state.pool.acquire().await?;
                 let row = repositories::get(&mut conn, repo_id)
                     .await?
-                    .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
+                    .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
                 drop(conn);
                 row.status
             };
@@ -378,7 +387,7 @@ pub(crate) async fn create(
             .await?;
             let row = repositories::get(&mut tx, repo.id)
                 .await?
-                .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
+                .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
             let result = RepositoryJson::from(&row);
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&result).unwrap();
@@ -404,6 +413,9 @@ pub(crate) async fn list(
     Path(org_slug): Path<String>,
     Query(page): Query<Page>,
 ) -> Result<Json<Vec<RepositoryJson>>, ApiError> {
+    if !valid_path_param(&org_slug) {
+        return Err(invalid());
+    }
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let limit = page.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
@@ -496,7 +508,7 @@ pub(crate) async fn update(
                 return Err(invalid());
             }
             if let Some(ref desc) = input.description
-                && desc.chars().count() > 1000
+                && (desc.chars().count() > 1000 || has_nul(desc))
             {
                 return Err(invalid());
             }
@@ -983,7 +995,7 @@ pub(crate) async fn revoke_access(
             .await?;
 
             if result.rows_affected() == 0 {
-                return Err(ApiError(StatusCode::NOT_FOUND, "grant not found"));
+                return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
             }
 
             event(

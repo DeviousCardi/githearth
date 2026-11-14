@@ -526,15 +526,11 @@ async fn archived_repository_is_cloneable_but_refuses_ref_updates() {
     let admit = |want| admit_basic(&state, &org_slug, "old", &username, "correctpass", want);
 
     admit(git_admission::Want::Fetch).await.unwrap();
-    let admitted = admit(git_admission::Want::Push).await.unwrap();
-    let update = githearth_git::journal::Update {
-        old: "0".repeat(40),
-        new: "a".repeat(40),
-        reference: "refs/heads/main".into(),
-    };
+    // Admission refuses a push to an archived repository before any pack is
+    // uploaded, rather than waiting for the pre-receive hook.
     assert_eq!(
-        git_admission::decide_ref(&state, &admitted, &update, true),
-        Err("permission denied: ref.push")
+        admit(git_admission::Want::Push).await.unwrap_err().0,
+        StatusCode::FORBIDDEN
     );
 
     // Only a 401 challenges for credentials.
@@ -869,7 +865,7 @@ async fn admit_account_non_member_of_private_repo_not_found() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn admit_account_read_grant_with_want_push_ok() {
+async fn admit_account_read_grant_with_want_push_is_refused() {
     let (pool, _owner, org_slug, _tmp) = setup().await;
     let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug=$1")
         .bind(&org_slug)
@@ -909,7 +905,8 @@ async fn admit_account_read_grant_with_want_push_ok() {
 
     let state = app_state_for_test(pool.clone(), &_tmp).await;
 
-    let result = git_admission::admit_account(
+    // A read grant cannot push: admission refuses before a pack is uploaded.
+    let err = git_admission::admit_account(
         &state,
         reader,
         false,
@@ -917,6 +914,20 @@ async fn admit_account_read_grant_with_want_push_ok() {
         &org_slug,
         "read-only-repo",
         git_admission::Want::Push,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+    // Reading the same repository is still admitted.
+    let result = git_admission::admit_account(
+        &state,
+        reader,
+        false,
+        git_admission::CredentialRef::Password,
+        &org_slug,
+        "read-only-repo",
+        git_admission::Want::Fetch,
     )
     .await
     .unwrap();

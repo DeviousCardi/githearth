@@ -577,6 +577,40 @@ pub(crate) async fn compute_review(
     })
 }
 
+/// The fail-closed result when the changed-file set is unknown: `changed_files`
+/// reports `None` when base or head does not resolve, and a truncated diff or
+/// an unreadable CODEOWNERS file leaves the requirements unknown.
+fn fail_closed_review(loaded: &CodeOwnersLoad) -> Option<CodeOwnerReview> {
+    (loaded.paths.is_none() || loaded.diff_truncated || loaded.unreadable).then(|| {
+        CodeOwnerReview {
+            required: Vec::new(),
+            satisfied: false,
+            errors: loaded.errors.clone(),
+        }
+    })
+}
+
+/// Computes the review on an existing connection. Pull create/PATCH use this so
+/// the response carries the same code-owner facts as the detail endpoint while
+/// still writing the response in the mutation transaction.
+pub(crate) async fn review_loaded(
+    conn: &mut PgConnection,
+    org_id: Uuid,
+    org_slug: &str,
+    pull_id: Uuid,
+    head: &str,
+    loaded: CodeOwnersLoad,
+) -> Result<CodeOwnerReview, sqlx::Error> {
+    if let Some(review) = fail_closed_review(&loaded) {
+        return Ok(review);
+    }
+    let paths = loaded.paths.as_ref().expect("checked above");
+    let mut review =
+        compute_review(conn, org_id, org_slug, pull_id, head, &loaded.rules, paths).await?;
+    review.errors = loaded.errors;
+    Ok(review)
+}
+
 /// The full review status used by the pull request page and the merge gate.
 pub(crate) async fn review(
     state: &AppState,
@@ -588,36 +622,14 @@ pub(crate) async fn review(
     base: &str,
 ) -> Result<CodeOwnerReview, ApiError> {
     let loaded = load(state, repo_id, base, head).await?;
-    // `changed_files` reports `None` when base or head does not resolve, and a
-    // truncated diff or an unreadable CODEOWNERS file leaves the changed-file
-    // set unknown, so the gate must fail closed.
-    let Some(paths) = loaded.paths else {
-        return Ok(CodeOwnerReview {
-            required: Vec::new(),
-            satisfied: false,
-            errors: loaded.errors,
-        });
-    };
-    if loaded.diff_truncated || loaded.unreadable {
-        return Ok(CodeOwnerReview {
-            required: Vec::new(),
-            satisfied: false,
-            errors: loaded.errors,
-        });
+    // Resolve the fail-closed cases before touching the pool: when base or head
+    // does not resolve there is nothing to compute, and a flaky database must
+    // not turn an unknown changed-file set into a 503.
+    if let Some(review) = fail_closed_review(&loaded) {
+        return Ok(review);
     }
     let mut conn = state.pool.acquire().await?;
-    let mut review = compute_review(
-        &mut conn,
-        org_id,
-        org_slug,
-        pull_id,
-        head,
-        &loaded.rules,
-        &paths,
-    )
-    .await?;
-    review.errors = loaded.errors;
-    Ok(review)
+    Ok(review_loaded(&mut conn, org_id, org_slug, pull_id, head, loaded).await?)
 }
 
 // ---------------------------------------------------------------------------
