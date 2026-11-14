@@ -33,7 +33,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "issue not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 pub(crate) fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")

@@ -73,7 +73,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "pull request not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn branch_missing() -> ApiError {
     ApiError(StatusCode::UNPROCESSABLE_ENTITY, "branch not found")
@@ -618,7 +618,7 @@ async fn resolve_source_repository(
         .bind(source_org)
         .fetch_optional(&mut *conn)
         .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "organization not found"))?;
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
     let source_repo = repositories::find_by_name(&mut conn, source_org_id, source_name)
         .await?
         .ok_or_else(not_found)?;
@@ -627,7 +627,7 @@ async fn resolve_source_repository(
     // non-existent repository, so private existence and fork status cannot be
     // enumerated through this route.
     let Some(facts) = facts::load(&mut conn, actor_id, source_org_id).await? else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "organization not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
     let authz_repo = repositories::authz_repository(&source_repo);
     let read = state.authz.authorize(&facts.request(
@@ -2030,7 +2030,7 @@ async fn remove_review_request(
             .fetch_optional(&mut *tx)
             .await?;
     let Some(reviewer_id) = reviewer_id else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "review request not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
 
     let deleted = sqlx::query(
@@ -2041,7 +2041,7 @@ async fn remove_review_request(
     .execute(&mut *tx)
     .await?;
     if deleted.rows_affected() == 0 {
-        return Err(ApiError(StatusCode::NOT_FOUND, "review request not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     }
 
     event_with(
@@ -2139,7 +2139,7 @@ pub(crate) async fn set_thread_resolved(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(root_id) = root_id else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "comment not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
     if resolved {
         // The first resolution wins; resolving again keeps the original actor.
@@ -2394,7 +2394,7 @@ pub(crate) async fn apply_pull_suggestion(
     let mut conn = state.pool.acquire().await?;
     let comment = fetch_comment_row(&mut conn, pull.id, comment_id)
         .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "comment not found"))?;
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
     drop(conn);
     let (Some(commit_id), Some(path), Some(line)) =
         (&comment.commit_id, &comment.path, comment.line)

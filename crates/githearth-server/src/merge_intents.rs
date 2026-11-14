@@ -38,7 +38,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "merge intent not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn head_moved() -> ApiError {
     ApiError(StatusCode::CONFLICT, "commit is not the pull request head")

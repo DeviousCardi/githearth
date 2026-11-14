@@ -924,7 +924,7 @@ async fn read_organization(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Organization>> {
     let (account, auth_age) = authenticate(&state.pool, &headers).await?;
-    let not_found = || ApiError(StatusCode::NOT_FOUND, "organization not found");
+    let not_found = || ApiError(StatusCode::NOT_FOUND, "not found");
     // Load, then authorize: a denial and a missing organization look the same.
     let mut conn = state.pool.acquire().await?;
     let Some(facts) = facts::load(&mut conn, account.id, id).await? else {

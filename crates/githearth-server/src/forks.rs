@@ -30,10 +30,10 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "repository not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn org_not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "organization not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn name_taken() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository name already taken")

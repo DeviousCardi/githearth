@@ -39,7 +39,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "auto-merge not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn branch_missing() -> ApiError {
     ApiError(StatusCode::UNPROCESSABLE_ENTITY, "branch not found")

@@ -35,7 +35,7 @@ const SITE_CHAIN: Uuid = Uuid::nil();
 const ZERO_HASH: [u8; 32] = [0u8; 32];
 
 fn does_not_exist() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "organization not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 
 /// Authorize reading the audit log. There is no `audit` action in

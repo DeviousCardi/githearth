@@ -20,7 +20,7 @@ fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn org_not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "organization not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
@@ -108,7 +108,7 @@ pub(crate) async fn load_repo(
     };
 
     let Some(repo) = repositories::find_by_name(&mut conn, org_id, name).await? else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
 
     Ok(Loaded {
@@ -130,7 +130,7 @@ pub(crate) async fn load_current(
 ) -> Result<Loaded, ApiError> {
     let loaded = load_repo(state, actor_id, auth_age, org_slug, name).await?;
     if !loaded.repo.name.eq_ignore_ascii_case(name) {
-        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     }
     Ok(loaded)
 }
@@ -146,7 +146,7 @@ async fn load_by_operation(
 ) -> Result<Loaded, ApiError> {
     let mut conn = state.pool.acquire().await?;
     let Some(repo) = repositories::find_by_operation(&mut conn, operation_id).await? else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "repository not found"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
     };
     let org_id = repo.organization_id;
     let Some(facts) = facts::load(&mut conn, actor_id, org_id).await? else {
@@ -343,7 +343,7 @@ pub(crate) async fn create(
                 let mut conn = state.pool.acquire().await?;
                 let row = repositories::get(&mut conn, repo_id)
                     .await?
-                    .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
+                    .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
                 drop(conn);
                 row.status
             };
@@ -387,7 +387,7 @@ pub(crate) async fn create(
             .await?;
             let row = repositories::get(&mut tx, repo.id)
                 .await?
-                .ok_or(ApiError(StatusCode::NOT_FOUND, "repository not found"))?;
+                .ok_or(ApiError(StatusCode::NOT_FOUND, "not found"))?;
             let result = RepositoryJson::from(&row);
             let status = StatusCode::CREATED;
             let body = serde_json::to_value(&result).unwrap();
@@ -995,7 +995,7 @@ pub(crate) async fn revoke_access(
             .await?;
 
             if result.rows_affected() == 0 {
-                return Err(ApiError(StatusCode::NOT_FOUND, "grant not found"));
+                return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
             }
 
             event(

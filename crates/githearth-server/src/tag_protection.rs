@@ -42,7 +42,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn not_found() -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "tag protection rule not found")
+    ApiError(StatusCode::NOT_FOUND, "not found")
 }
 fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
