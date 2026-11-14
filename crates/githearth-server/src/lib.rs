@@ -23,6 +23,7 @@ pub mod merge_worker;
 mod mergeability;
 pub mod notifications;
 mod notifications_ui;
+pub mod outbox;
 pub mod protection;
 pub mod pulls;
 mod pulls_ui;

@@ -65,6 +65,43 @@ pub async fn load(
     load_scoped(conn, account_id, organization_id, false).await
 }
 
+/// Facts for instance (site-level) administration, used with
+/// [`Resource::Instance`](githearth_authz::Resource::Instance): the acting
+/// account and nothing else. The synthetic organization is never read by an
+/// instance action; it exists only because a request always names one. Returns
+/// `None` for an unknown account.
+pub async fn load_site(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+) -> Result<Option<Facts>, sqlx::Error> {
+    let Some(account) = sqlx::query(
+        "SELECT (suspended OR disabled_at IS NOT NULL) AS suspended, is_admin \
+         FROM accounts WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Facts {
+        account: Account {
+            id: account_id,
+            suspended: account.get("suspended"),
+            site_admin: account.get("is_admin"),
+            organizations: vec![],
+            teams: vec![],
+        },
+        teams: vec![],
+        grants: vec![],
+        organization: Organization {
+            id: Uuid::nil(),
+            suspended: false,
+        },
+        read_only: false,
+    }))
+}
+
 /// The same snapshot as [`load`], but marking the principal as read-only when
 /// the request authenticated with a scoped access token lacking `repo:write`.
 pub async fn load_scoped(
@@ -88,10 +125,15 @@ pub async fn load_scoped(
         },
         None => return Ok(None),
     };
-    let Some(account) = sqlx::query("SELECT suspended, is_admin FROM accounts WHERE id = $1")
-        .bind(account_id)
-        .fetch_optional(&mut *tx)
-        .await?
+    // A disabled account has no active principal: `disabled_at` and `suspended`
+    // are folded into the one fact the engine's `suspended-account` forbid reads.
+    let Some(account) = sqlx::query(
+        "SELECT (suspended OR disabled_at IS NOT NULL) AS suspended, is_admin \
+         FROM accounts WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?
     else {
         return Ok(None);
     };
