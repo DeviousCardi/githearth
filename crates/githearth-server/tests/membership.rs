@@ -438,6 +438,89 @@ async fn serve(app: &Router) -> u16 {
     port
 }
 
+/// A test SSH client authenticated as `account`, with `git ls-remote` pointed
+/// at the fixture repository. `None` when the ssh binary is unavailable.
+struct SshClient {
+    key_dir: PathBuf,
+    command: String,
+    url: String,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl SshClient {
+    fn ls_remote(&self) -> Command {
+        let mut cmd = git_cmd(&["ls-remote", &self.url]);
+        cmd.env("GIT_SSH_COMMAND", &self.command);
+        cmd
+    }
+}
+
+impl Drop for SshClient {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.key_dir);
+    }
+}
+
+async fn ssh_client(f: &Fixture, account: Uuid) -> Option<SshClient> {
+    if Command::new("ssh").arg("-V").output().is_err() {
+        eprintln!("SKIP: ssh binary not found");
+        return None;
+    }
+    let key_dir = temp_dir("membership-ssh-key");
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let client_key = key_dir.join("id_ed25519");
+    let _ = std::fs::remove_file(&client_key);
+    let generated = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-f",
+            &client_key.to_string_lossy(),
+            "-N",
+            "",
+            "-C",
+            "membership-test",
+            "-q",
+        ])
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let fingerprint = String::from_utf8_lossy(
+        &Command::new("ssh-keygen")
+            .args(["-lf", &client_key.to_string_lossy(), "-E", "sha256"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .split_whitespace()
+    .nth(1)
+    .unwrap()
+    .to_owned();
+
+    let authenticate: ssh::Authenticate = Arc::new(move |fp: String| {
+        let identity = (fp == fingerprint).then_some(ssh::SshIdentity {
+            account,
+            key_id: Uuid::new_v4(),
+            read_only: false,
+        });
+        Box::pin(async move { Ok(identity) })
+    });
+    let (server, port_rx) = ssh::spawn(f.state.clone(), authenticate);
+    let ssh_port = port_rx.await.unwrap().port();
+    Some(SshClient {
+        key_dir,
+        command: format!(
+            "ssh -i {} -p {ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes",
+            client_key.display()
+        ),
+        url: format!(
+            "ssh://git@127.0.0.1:{ssh_port}/{}/{}.git",
+            f.org_slug, f.repo_name
+        ),
+        _server: server,
+    })
+}
+
 fn members_path(f: &Fixture) -> String {
     format!("/api/v1/organizations/{}/members", f.org_slug)
 }
@@ -463,6 +546,47 @@ async fn grant_repo(f: &Fixture, account: Uuid, role: &str) {
         .execute(&f.pool)
         .await
         .unwrap();
+}
+
+/// An independent organization-scope grant, not the membership role grant.
+async fn grant_org(f: &Fixture, account: Uuid, role: &str) {
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,$2,'account',$3,'organization',$4,$3)")
+        .bind(Uuid::new_v4())
+        .bind(role)
+        .bind(account)
+        .bind(f.org_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+}
+
+/// A team in the fixture organization with an organization-scope owner grant.
+async fn grant_team_owner(f: &Fixture, org_id: Uuid, members: &[Uuid]) -> Uuid {
+    let team_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO teams (id,organization_id,slug,name) VALUES ($1,$2,$3,'Owners')")
+        .bind(team_id)
+        .bind(org_id)
+        .bind(tag("team-owner"))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    for member in members {
+        sqlx::query("INSERT INTO team_members (team_id,account_id) VALUES ($1,$2)")
+            .bind(team_id)
+            .bind(member)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'owner','team',$2,'organization',$3,$4)")
+        .bind(Uuid::new_v4())
+        .bind(team_id)
+        .bind(org_id)
+        .bind(f.owner.id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    team_id
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1163,12 @@ async fn member_can_leave_and_is_denied_on_api_ui_http_and_ssh_afterwards() {
     );
     git_ok(git_cmd(&["clone", "--", &url, clone.to_str().unwrap()])).await;
 
+    // The same member is admitted over SSH before leaving.
+    let ssh = ssh_client(&f, f.member.id).await;
+    if let Some(ssh) = &ssh {
+        git_ok(ssh.ls_remote()).await;
+    }
+
     // A plain member may remove their own membership.
     let (status, body) = api(
         &f.app,
@@ -1098,6 +1228,17 @@ async fn member_can_leave_and_is_denied_on_api_ui_http_and_ssh_afterwards() {
         stderr.contains("not found") || stderr.contains("not permitted") || stderr.contains("403"),
         "unexpected HTTP refusal: {stderr}"
     );
+
+    // ... and so does SSH, so the test name's four transports are all proved.
+    if let Some(ssh) = &ssh {
+        let stderr = git_fails(ssh.ls_remote()).await;
+        assert!(
+            stderr.contains("repository not found"),
+            "unexpected SSH refusal: {stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&clone);
 }
 
 #[tokio::test]
@@ -2270,5 +2411,478 @@ async fn concurrent_adds_of_the_same_member_create_one_row() {
         audit_kinds(&f.pool, f.org_id, "organization.member_added").await,
         1
     );
+    finish(f).await;
+}
+
+// ---------------------------------------------------------------------------
+// The cross-review regressions (PR #171, round 3)
+// ---------------------------------------------------------------------------
+
+/// Wait until at least one mutation has entered the test pause for `org_id`.
+async fn await_mutation_pause(org_id: Uuid) {
+    for _ in 0..500 {
+        if githearth_server::membership::test_mutation_entries(org_id) >= 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no membership mutation ever reached the pause");
+}
+
+async fn seed_reused_key(pool: &PgPool, actor: Uuid, key: &str, method: &str, path: &str) {
+    let hash = githearth_server::idempotency::request_hash(method, path, b"another request");
+    sqlx::query(
+        "INSERT INTO operations (actor_id,key,request_hash,status,response_status,response_body,expires_at) \
+         VALUES ($1,$2,$3,'done',200,'{}'::jsonb, clock_timestamp() + interval '24 hours')",
+    )
+    .bind(actor)
+    .bind(key)
+    .bind(hash)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn demoted_owner_cannot_finish_an_in_flight_removal() {
+    let f = fixture().await;
+    // A second owner can demote the caller while its removal is paused after
+    // the outer authorization and before the organization lock.
+    let second = user(&f.pool, "coowner").await;
+    add_membership(&f.pool, f.org_id, second.id, "owner").await;
+
+    githearth_server::membership::test_pause_mutations(f.org_id, 2_000);
+    let app = f.app.clone();
+    let token = f.owner.token.clone();
+    let path = member_path(&f, &f.member.username);
+    let pending =
+        tokio::spawn(async move { api(&app, "DELETE", &path, Some(&token), None, None).await });
+    await_mutation_pause(f.org_id).await;
+    // The demotion itself must not pause.
+    githearth_server::membership::test_pause_mutations(f.org_id, 0);
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &member_path(&f, &f.owner.username),
+        Some(&second.token),
+        None,
+        Some(&json!({"role": "member"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "real demotion: {body}");
+
+    let (status, body) = pending.await.unwrap();
+    assert!(
+        matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::CONFLICT
+        ),
+        "a demoted caller must not finish the removal, got {status}: {body}"
+    );
+    assert_eq!(
+        membership_role(&f.pool, f.org_id, f.member.id)
+            .await
+            .as_deref(),
+        Some("member"),
+        "the target membership must still be present"
+    );
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn demoted_owner_cannot_finish_an_in_flight_role_change() {
+    let f = fixture().await;
+    let second = user(&f.pool, "coowner").await;
+    add_membership(&f.pool, f.org_id, second.id, "owner").await;
+
+    githearth_server::membership::test_pause_mutations(f.org_id, 2_000);
+    let app = f.app.clone();
+    let token = f.owner.token.clone();
+    let path = member_path(&f, &f.member.username);
+    let pending = tokio::spawn(async move {
+        api(
+            &app,
+            "PATCH",
+            &path,
+            Some(&token),
+            None,
+            Some(&json!({"role": "owner"})),
+        )
+        .await
+    });
+    await_mutation_pause(f.org_id).await;
+    githearth_server::membership::test_pause_mutations(f.org_id, 0);
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &member_path(&f, &f.owner.username),
+        Some(&second.token),
+        None,
+        Some(&json!({"role": "member"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "real demotion: {body}");
+
+    let (status, body) = pending.await.unwrap();
+    assert!(
+        matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::CONFLICT
+        ),
+        "a demoted caller must not finish the role change, got {status}: {body}"
+    );
+    assert_eq!(
+        membership_role(&f.pool, f.org_id, f.member.id)
+            .await
+            .as_deref(),
+        Some("member"),
+        "the target role must not change"
+    );
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn role_change_keeps_independent_organization_grants() {
+    let f = fixture().await;
+    let target = user(&f.pool, "grant-keep").await;
+    add_membership(&f.pool, f.org_id, target.id, "member").await;
+    grant_org(&f, target.id, "write").await;
+    assert_eq!(
+        active_grant_roles(&f.pool, f.org_id, target.id).await,
+        vec!["member".to_owned(), "write".to_owned()]
+    );
+
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &member_path(&f, &target.username),
+        Some(&f.owner.token),
+        None,
+        Some(&json!({"role": "owner"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        active_grant_roles(&f.pool, f.org_id, target.id).await,
+        vec!["owner".to_owned(), "write".to_owned()],
+        "the independent write grant survives and the old member grant is gone"
+    );
+
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &member_path(&f, &target.username),
+        Some(&f.owner.token),
+        None,
+        Some(&json!({"role": "member"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        active_grant_roles(&f.pool, f.org_id, target.id).await,
+        vec!["member".to_owned(), "write".to_owned()],
+        "demotion replaces only the membership grant"
+    );
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn team_owner_grant_counts_towards_the_last_owner() {
+    let f = fixture().await;
+    // A team owner grant makes the sole membership owner non-last, so leaving
+    // is allowed even though one `memberships.role = 'owner'` row remains at
+    // the start.
+    let team_id = grant_team_owner(&f, f.org_id, &[f.member.id]).await;
+    let (status, body) = api(
+        &f.app,
+        "DELETE",
+        &member_path(&f, &f.owner.username),
+        Some(&f.owner.token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "owner may leave: {body}");
+    assert!(
+        membership_role(&f.pool, f.org_id, f.owner.id)
+            .await
+            .is_none()
+    );
+    let team_owner: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM grants WHERE scope_kind = 'organization' AND scope_id = $1 \
+         AND subject_kind = 'team' AND subject_id = $2 AND role = 'owner' AND revoked_at IS NULL",
+    )
+    .bind(f.org_id)
+    .bind(team_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(team_owner, 1, "the team owner grant remains active");
+
+    // The same count allows a demotion of a sole membership owner.
+    let (org_id, org_slug) = organization(&f.pool, f.owner.id).await;
+    add_membership(&f.pool, org_id, f.member.id, "member").await;
+    grant_team_owner(&f, org_id, &[f.member.id]).await;
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &format!(
+            "/api/v1/organizations/{org_slug}/members/{}",
+            f.owner.username
+        ),
+        Some(&f.owner.token),
+        None,
+        Some(&json!({"role": "member"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a team owner grant makes the demotion legal: {body}"
+    );
+    assert_eq!(
+        membership_role(&f.pool, org_id, f.owner.id)
+            .await
+            .as_deref(),
+        Some("member")
+    );
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn masked_refusal_precedes_idempotency_checks() {
+    let f = fixture().await;
+    let victim = user(&f.pool, "mask-victim").await;
+    add_membership(&f.pool, f.org_id, victim.id, "member").await;
+    let absent = tag("absent-org");
+    let existing = member_path(&f, &victim.username);
+    let missing = format!("/api/v1/organizations/{absent}/members/{}", victim.username);
+
+    // (a) A malformed key on an existing private organization and on a missing
+    // one must both be the masked 404, not a key-validation error.
+    let (existing_status, existing_body) = api(
+        &f.app,
+        "DELETE",
+        &existing,
+        Some(&f.outsider.token),
+        Some("bad key with spaces"),
+        None,
+    )
+    .await;
+    let (missing_status, missing_body) = api(
+        &f.app,
+        "DELETE",
+        &missing,
+        Some(&f.outsider.token),
+        Some("bad key with spaces"),
+        None,
+    )
+    .await;
+    assert_eq!(existing_status, StatusCode::NOT_FOUND, "{existing_body}");
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing_body}");
+    assert_eq!(existing_body, missing_body, "the refusal must be masked");
+
+    // (b) A valid key already used for a different request must not win over
+    // the masked refusal either.
+    let key = "mask-reused-key";
+    seed_reused_key(&f.pool, f.outsider.id, key, "DELETE", &existing).await;
+    let (existing_status, existing_body) = api(
+        &f.app,
+        "DELETE",
+        &existing,
+        Some(&f.outsider.token),
+        Some(key),
+        None,
+    )
+    .await;
+    let (missing_status, missing_body) = api(
+        &f.app,
+        "DELETE",
+        &missing,
+        Some(&f.outsider.token),
+        Some(key),
+        None,
+    )
+    .await;
+    assert_eq!(existing_status, StatusCode::NOT_FOUND, "{existing_body}");
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing_body}");
+    assert_eq!(existing_body, missing_body, "the refusal must be masked");
+
+    // The page paths make the same decisions before inspecting the form key.
+    let (_, home) = get_page(&f.app, "/", Some(&f.outsider.cookie())).await;
+    let token = csrf(&home);
+    let existing_remove = format!(
+        "/organizations/{}/members/{}/remove",
+        f.org_slug, victim.username
+    );
+    let missing_remove = format!("/organizations/{absent}/members/{}/remove", victim.username);
+    for key in ["bad key with spaces", "mask-page-reused"] {
+        if key == "mask-page-reused" {
+            seed_reused_key(&f.pool, f.outsider.id, key, "DELETE", &existing).await;
+        }
+        let (existing_status, _, existing_body) = post_form(
+            &f.app,
+            &existing_remove,
+            &f.outsider.cookie(),
+            &[("csrf_token", &token), ("idempotency_key", key)],
+        )
+        .await;
+        let (missing_status, _, missing_body) = post_form(
+            &f.app,
+            &missing_remove,
+            &f.outsider.cookie(),
+            &[("csrf_token", &token), ("idempotency_key", key)],
+        )
+        .await;
+        assert_eq!(
+            existing_status,
+            StatusCode::NOT_FOUND,
+            "page remove: {existing_body}"
+        );
+        assert_eq!(
+            missing_status,
+            StatusCode::NOT_FOUND,
+            "page remove: {missing_body}"
+        );
+        assert_eq!(
+            existing_body, missing_body,
+            "the page refusal must be masked"
+        );
+    }
+
+    let existing_role = format!(
+        "/organizations/{}/members/{}/role",
+        f.org_slug, victim.username
+    );
+    let missing_role = format!("/organizations/{absent}/members/{}/role", victim.username);
+    let (existing_status, _, existing_body) = post_form(
+        &f.app,
+        &existing_role,
+        &f.outsider.cookie(),
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", "bad key with spaces"),
+            ("role", "owner"),
+        ],
+    )
+    .await;
+    let (missing_status, _, missing_body) = post_form(
+        &f.app,
+        &missing_role,
+        &f.outsider.cookie(),
+        &[
+            ("csrf_token", &token),
+            ("idempotency_key", "bad key with spaces"),
+            ("role", "owner"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        existing_status,
+        StatusCode::NOT_FOUND,
+        "page role: {existing_body}"
+    );
+    assert_eq!(
+        missing_status,
+        StatusCode::NOT_FOUND,
+        "page role: {missing_body}"
+    );
+    assert_eq!(
+        existing_body, missing_body,
+        "the page refusal must be masked"
+    );
+
+    assert_eq!(
+        membership_role(&f.pool, f.org_id, victim.id)
+            .await
+            .as_deref(),
+        Some("member")
+    );
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn demoted_member_is_denied_on_api_ui_http_and_ssh() {
+    let f = fixture().await;
+    let repo_api = format!(
+        "/api/v1/organizations/{}/repositories/{}",
+        f.org_slug, f.repo_name
+    );
+    let repo_page = format!("/organizations/{}/repositories/{}", f.org_slug, f.repo_name);
+
+    // Promote with no direct repository grant, so only the organization role
+    // decides admission.
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &member_path(&f, &f.member.username),
+        Some(&f.owner.token),
+        None,
+        Some(&json!({"role": "owner"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = api(&f.app, "GET", &repo_api, Some(&f.member.token), None, None).await;
+    assert_eq!(status, StatusCode::OK, "promoted owner API: {body}");
+    let (status, body) = get_page(&f.app, &repo_page, Some(&f.member.cookie())).await;
+    assert_eq!(status, StatusCode::OK, "promoted owner page: {body}");
+
+    let port = serve(&f.app).await;
+    let url = format!(
+        "http://{}:testpass@127.0.0.1:{port}/{}/{}.git",
+        f.member.username, f.org_slug, f.repo_name
+    );
+    git_ok(git_cmd(&["ls-remote", "--", &url])).await;
+    let ssh = ssh_client(&f, f.member.id).await;
+    if let Some(ssh) = &ssh {
+        git_ok(ssh.ls_remote()).await;
+    }
+
+    // Demote; the next admission on all four transports is refused.
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &member_path(&f, &f.member.username),
+        Some(&f.owner.token),
+        None,
+        Some(&json!({"role": "member"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = api(&f.app, "GET", &repo_api, Some(&f.member.token), None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "demoted API: {body}");
+    let (status, body) = get_page(&f.app, &repo_page, Some(&f.member.cookie())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "demoted page: {body}");
+    let stderr = git_fails(git_cmd(&["ls-remote", "--", &url])).await;
+    assert!(
+        stderr.contains("not found") || stderr.contains("not permitted") || stderr.contains("403"),
+        "unexpected HTTP refusal: {stderr}"
+    );
+    if let Some(ssh) = &ssh {
+        let stderr = git_fails(ssh.ls_remote()).await;
+        assert!(
+            stderr.contains("repository not found"),
+            "unexpected SSH refusal: {stderr}"
+        );
+    }
+
+    let direct: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM grants WHERE scope_id = $1 AND subject_id = $2 \
+         AND repository_id IS NOT NULL AND revoked_at IS NULL",
+    )
+    .bind(f.org_id)
+    .bind(f.member.id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(direct, 0, "no direct grant can mask the demotion");
     finish(f).await;
 }

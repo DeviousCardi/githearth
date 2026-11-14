@@ -127,6 +127,13 @@ impl Loaded {
             .is_allowed()
     }
 
+    /// Whether the caller may act on `username`: a membership administrator,
+    /// or themself where leaving is allowed. This is the authorization decision
+    /// `require_target` makes, without the account lookup.
+    pub(crate) fn may_change(&self, state: &AppState, username: &str, allow_self: bool) -> bool {
+        self.may_manage(state) || (allow_self && username == self.account.username)
+    }
+
     /// The masked refusal: a reader of the organization learns it is forbidden;
     /// anyone else sees the same 404 a missing organization gives.
     pub(crate) fn refuse(&self, state: &AppState) -> ApiError {
@@ -191,6 +198,24 @@ async fn lock_organization(conn: &mut PgConnection, org_id: Uuid) -> Result<(), 
     Ok(())
 }
 
+/// Re-read the caller's authorization facts inside the mutation transaction,
+/// after the organization lock. The facts `load` captured before the lock may
+/// be stale: an owner demoted or removed while this request waited must lose
+/// the ability to finish the mutation it already passed the outer check for.
+async fn reauthorize(conn: &mut PgConnection, loaded: &Loaded) -> Result<Loaded, ApiError> {
+    let Some(facts) = facts::load_in_transaction(conn, loaded.account.id, loaded.org_id).await?
+    else {
+        return Err(not_found());
+    };
+    Ok(Loaded {
+        org_id: loaded.org_id,
+        slug: loaded.slug.clone(),
+        account: loaded.account.clone(),
+        auth_age: loaded.auth_age,
+        facts,
+    })
+}
+
 // Test-only mutation barrier. The concurrency tests must know that both racing
 // requests are inside the mutation before either commits, which a barrier on
 // request start cannot show. `pause_mutation` runs in the transaction after the
@@ -211,11 +236,13 @@ static TEST_ENTRIES: LazyLock<Mutex<HashMap<Uuid, u64>>> =
 
 /// Test hook: pause every membership mutation in `org_id` for `millis`, so two
 /// racing requests overlap inside the mutation. Not called in production.
+#[doc(hidden)]
 pub fn test_pause_mutations(org_id: Uuid, millis: u64) {
     TEST_PAUSES.lock().unwrap().insert(org_id, millis);
 }
 
 /// Test hook: how many mutations have entered the pause for `org_id`.
+#[doc(hidden)]
 pub fn test_mutation_entries(org_id: Uuid) -> u64 {
     TEST_ENTRIES
         .lock()
@@ -236,7 +263,7 @@ async fn pause_mutation(org_id: Uuid) {
         configured
     } else {
         // Read once per request: a production process pays one lookup with the
-        // variable unset and never pauses.
+        // variable unset and never pauses. The variable is test-only.
         std::env::var("GITHEARTH_TEST_MEMBERSHIP_MUTATION_PAUSE_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -250,8 +277,14 @@ async fn pause_mutation(org_id: Uuid) {
 }
 
 async fn owner_count(conn: &mut PgConnection, org_id: Uuid) -> Result<i64, sqlx::Error> {
+    // The authoritative owner set is the grants, not the membership cache:
+    // owner grants on a team count, because members of the team hold the owner
+    // actions the rule protects.
     sqlx::query_scalar(
-        "SELECT count(*) FROM memberships WHERE organization_id = $1 AND role = 'owner'",
+        "SELECT count(*) FROM grants \
+         WHERE scope_kind = 'organization' AND scope_id = $1 AND role = 'owner' \
+         AND repository_id IS NULL AND revoked_at IS NULL \
+         AND (expires_at IS NULL OR expires_at > clock_timestamp())",
     )
     .bind(org_id)
     .fetch_one(conn)
@@ -297,12 +330,15 @@ async fn upsert_grant(
     actor: Uuid,
 ) -> Result<(), sqlx::Error> {
     // Grants are never edited: a superseded organization grant is revoked and a
-    // new one inserted, exactly as repository grants are. Repository grants are
-    // untouched by a role change; only the organization role moves.
+    // new one inserted, exactly as repository grants are. Only the membership
+    // role grant is replaced: an independent organization-scope grant (for
+    // example `write`) is not the membership row's to revoke and survives a
+    // role change.
     sqlx::query(
         "UPDATE grants SET revoked_at = clock_timestamp(), revoked_by = $1 \
          WHERE scope_kind = 'organization' AND scope_id = $2 AND subject_kind = 'account' \
-         AND subject_id = $3 AND repository_id IS NULL AND revoked_at IS NULL AND role <> $4",
+         AND subject_id = $3 AND repository_id IS NULL AND revoked_at IS NULL \
+         AND role IN ('owner', 'member') AND role <> $4",
     )
     .bind(actor)
     .bind(org_id)
@@ -315,7 +351,8 @@ async fn upsert_grant(
          SELECT $1, $2, 'account', $3, 'organization', $4, $5 \
          WHERE NOT EXISTS (SELECT 1 FROM grants WHERE scope_kind = 'organization' \
            AND scope_id = $4 AND subject_kind = 'account' AND subject_id = $3 \
-           AND repository_id IS NULL AND role = $2 AND revoked_at IS NULL)",
+           AND repository_id IS NULL AND role = $2 AND role IN ('owner', 'member') \
+           AND revoked_at IS NULL)",
     )
     .bind(Uuid::new_v4())
     .bind(role)
@@ -517,8 +554,7 @@ async fn require_target(
     username: &str,
     allow_self: bool,
 ) -> Result<Uuid, ApiError> {
-    let manager = loaded.may_manage(state);
-    if !manager && !(allow_self && username == loaded.account.username.as_str()) {
+    if !loaded.may_change(state, username, allow_self) {
         return Err(loaded.refuse(state));
     }
     // A NUL byte cannot be bound as PostgreSQL text and is not a valid path
@@ -557,14 +593,18 @@ pub(crate) async fn set_role(
         key,
         |idem| async move {
             let mut tx = state.pool.begin().await?;
-            let account_id = require_target(state, &mut tx, loaded, username, false).await?;
+            pause_mutation(loaded.org_id).await;
+            lock_organization(&mut tx, loaded.org_id).await?;
+            // Re-authorize the caller against the locked snapshot: a concurrent
+            // demotion or removal that committed while this request waited must
+            // not let it finish with the authority it had before the lock.
+            let loaded = reauthorize(&mut tx, loaded).await?;
+            let account_id = require_target(state, &mut tx, &loaded, username, false).await?;
             // Validate the role only after authorization, so an unauthorized
             // caller cannot turn a bad role into a 400 that renders the page.
             if !ROLES.contains(&role) {
                 return Err(invalid());
             }
-            pause_mutation(loaded.org_id).await;
-            lock_organization(&mut tx, loaded.org_id).await?;
             let current = locked_role(&mut tx, loaded.org_id, account_id)
                 .await?
                 .ok_or_else(no_such_member)?;
@@ -664,9 +704,13 @@ pub(crate) async fn remove(
         key,
         |idem| async move {
             let mut tx = state.pool.begin().await?;
-            let account_id = require_target(state, &mut tx, loaded, username, allow_self).await?;
             pause_mutation(loaded.org_id).await;
             lock_organization(&mut tx, loaded.org_id).await?;
+            // Re-authorize after the lock: a caller demoted or removed by a
+            // request that committed while this one waited is refused here
+            // instead of completing the removal with stale authority.
+            let loaded = reauthorize(&mut tx, loaded).await?;
+            let account_id = require_target(state, &mut tx, &loaded, username, allow_self).await?;
             let current = locked_role(&mut tx, loaded.org_id, account_id)
                 .await?
                 .ok_or_else(no_such_member)?;
@@ -726,9 +770,14 @@ async fn remove_member(
 ) -> Result<StatusCode, ApiError> {
     // Not `load_manage`: a plain member may remove their own membership (leave)
     // without holding the administrate permission. `remove` authorizes the
-    // target: an administrator, or the caller themselves.
+    // target: an administrator, or the caller themselves. Decide that before
+    // the idempotency key is extracted, so a malformed or reused key cannot
+    // distinguish an existing private organization from a missing one.
     let (account, auth_age) = authenticate(&state.pool, &headers).await?;
     let loaded = load(&state, account, auth_age, &org_slug).await?;
+    if !loaded.may_change(&state, &username, true) {
+        return Err(loaded.refuse(&state));
+    }
     let key = idempotency::extract_key(&headers).transpose()?;
     remove(&state, &loaded, &username, key, true).await?;
     Ok(StatusCode::NO_CONTENT)

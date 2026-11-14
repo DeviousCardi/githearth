@@ -256,14 +256,23 @@ changing a role and removing all write the membership, the grant, the audit
 record and the outbox record in one transaction, honor `Idempotency-Key` the
 way other mutating endpoints do, and record `organization.member_added`,
 `organization.member_promoted`, `organization.member_demoted`,
-`organization.member_removed` or `organization.member_left`.
+`organization.member_removed` or `organization.member_left`. A role change
+replaces only the membership's own `owner`/`member` grant; an independently
+created organization-scope grant such as `write` is left active.
 
-The last owner cannot be removed, demote themselves or leave. Every membership
-mutation locks the organization row for its transaction, so two concurrent
-requests that would each remove one of the last two owners serialize: exactly
-one change wins and the other is refused, so an owner always remains. The
-loser is normally 409 (the last-owner rule), but can be 403 or 404 when its
-authorization facts were loaded only after the winner committed.
+The last owner cannot be removed, demoted or leave. The rule counts active
+organization-scope `owner` grants, not the `memberships.role` cache, and a team
+owner grant counts too, so a team grant can make another owner non-last. Every
+membership mutation takes the organization row lock first, then reloads the
+caller's authorization inside that same transaction and authorizes the target
+against that locked snapshot before any write. This closes the race where an
+owner starts a removal or role change, is demoted or removed by a request that
+commits while the first request waits for the lock, and would otherwise finish
+with the authority it held before the wait. Such a caller is now refused (403
+when still a member, 404 when removed) and the target membership is unchanged.
+The lock also serializes the last-owner count, so two requests that would each
+remove one of the last two owners cannot both commit: exactly one change wins
+and the other is refused, normally 409 (the last-owner rule).
 
 Removing a member deletes the membership, revokes every grant the account holds
 in that organization (including direct repository grants) and drops its team

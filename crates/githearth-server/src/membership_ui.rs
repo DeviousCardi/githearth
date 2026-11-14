@@ -161,6 +161,29 @@ fn require_manage(
     )
 }
 
+/// The page equivalent of `require_target`: an administrator, or the caller
+/// themself where leaving is allowed. This runs before the per-form
+/// idempotency key is inspected, so a bad or reused key cannot distinguish a
+/// private organization from a missing one.
+fn require_target_page(
+    state: &AppState,
+    s: &Session,
+    loaded: &membership::Loaded,
+    username: &str,
+    allow_self: bool,
+) -> Result<(), ui::UiError> {
+    if loaded.may_change(state, username, allow_self) {
+        return Ok(());
+    }
+    Err(
+        if loaded.refuse(state).status_code() == StatusCode::FORBIDDEN {
+            not_permitted_page(s)
+        } else {
+            ui::not_found_page(Some(&s.account.username))
+        },
+    )
+}
+
 struct Draft<'a> {
     username: &'a str,
     role: &'a str,
@@ -319,6 +342,11 @@ async fn add_submit(
     Form(form): Form<AddForm>,
 ) -> Result<Response, ui::UiError> {
     let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
+        .await
+        .map_err(|e| api_error(&s, &e))?;
+    require_manage(&state, &s, &loaded)?;
+    // Authorization is decided before the per-form key is validated.
     let key = if idempotency::valid_key(&form.idempotency_key) {
         form.idempotency_key.as_str()
     } else {
@@ -329,9 +357,6 @@ async fn add_submit(
             "<h1>Members</h1><p>Reload the page and submit the form again.</p>",
         )));
     };
-    let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
-        .await
-        .map_err(|e| api_error(&s, &e))?;
     let draft = Draft {
         username: &form.username,
         role: if membership::ROLES.contains(&form.role.as_str()) {
@@ -373,6 +398,11 @@ async fn role_submit(
     Form(form): Form<RoleForm>,
 ) -> Result<Response, ui::UiError> {
     let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
+        .await
+        .map_err(|e| api_error(&s, &e))?;
+    require_manage(&state, &s, &loaded)?;
+    // Authorization is decided before the per-form key is validated.
     let key = if idempotency::valid_key(&form.idempotency_key) {
         form.idempotency_key.as_str()
     } else {
@@ -383,9 +413,6 @@ async fn role_submit(
             "<h1>Members</h1><p>Reload the page and submit the form again.</p>",
         )));
     };
-    let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
-        .await
-        .map_err(|e| api_error(&s, &e))?;
     match membership::set_role(&state, &loaded, &username, &form.role, Some(key)).await {
         Ok(_) => Ok(Redirect::to(&members_href(&slug)).into_response()),
         Err(e) => {
@@ -416,6 +443,11 @@ async fn remove_submit(
     Form(form): Form<RemoveForm>,
 ) -> Result<Response, ui::UiError> {
     let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
+        .await
+        .map_err(|e| api_error(&s, &e))?;
+    require_target_page(&state, &s, &loaded, &username, true)?;
+    // Authorization is decided before the per-form key is validated.
     let key = if idempotency::valid_key(&form.idempotency_key) {
         form.idempotency_key.as_str()
     } else {
@@ -426,9 +458,6 @@ async fn remove_submit(
             "<h1>Members</h1><p>Reload the page and submit the form again.</p>",
         )));
     };
-    let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
-        .await
-        .map_err(|e| api_error(&s, &e))?;
     match membership::remove(&state, &loaded, &username, Some(key), true).await {
         Ok(()) if username == s.account.username => Ok(Redirect::to("/").into_response()),
         Ok(()) => Ok(Redirect::to(&members_href(&slug)).into_response()),
