@@ -859,6 +859,75 @@ async fn branch_settings_page_lists_creates_and_deletes_rules() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn branch_settings_duplicate_is_409_and_delete_removes_the_rule() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let repo_id = fixture_repository(&pool, org_id, "r", owner).await;
+    let token = fixture_session(&pool, owner).await;
+    let cookie = format!("githearth_session={token}");
+    let path = branch_settings_path(&slug, "r");
+
+    let (status, html) = get_html(&app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let csrf = hidden(&html, "csrf_token");
+    let create = [
+        ("csrf_token", csrf.as_str()),
+        ("idempotency_key", "00112233445566778899aabbccddeeff"),
+        ("pattern", "main"),
+        ("required_approvals", "0"),
+        ("required_status_checks", ""),
+    ];
+    let (status, location, _) = post_form(&app, &path, &cookie, &create).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location.is_some());
+
+    // A second create with a fresh key is a duplicate: the page reports 409,
+    // not a 503.
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &csrf),
+            ("idempotency_key", "ffeeddccbbaa99887766554433221100"),
+            ("pattern", "main"),
+            ("required_approvals", "0"),
+            ("required_status_checks", ""),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("already exists"), "{body}");
+
+    let rule_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM branch_protection_rules WHERE repository_id = $1 AND pattern = 'main'",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delete_path = format!("{path}/{rule_id}/delete");
+
+    // Bad CSRF is refused; a valid deletion redirects and removes the rule.
+    let (status, _, _) = post_form(&app, &delete_path, &cookie, &[("csrf_token", "wrong")]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, location, _) =
+        post_form(&app, &delete_path, &cookie, &[("csrf_token", &csrf)]).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location.is_some());
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM branch_protection_rules WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn branch_settings_writes_require_manage_and_csrf() {
     let (app, pool, storage, owner, org_id, slug) = setup().await;
     fixture_repository(&pool, org_id, "r", owner).await;
