@@ -397,6 +397,61 @@ async fn load_pull(
     Ok(pull)
 }
 
+/// Whether the viewer may merge at all (independent of the current policy
+/// facts), used by the page to decide whether a blocked merge should explain
+/// itself or simply be absent.
+pub(crate) async fn may_merge_permission(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> bool {
+    let Ok(loaded) =
+        repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await
+    else {
+        return false;
+    };
+    let Ok(mut conn) = state.pool.acquire().await else {
+        return false;
+    };
+    let Ok(Some(pull)) = find_pull(&mut conn, loaded.repo.id, number).await else {
+        return false;
+    };
+    drop(conn);
+    let authz_repo = repositories::authz_repository(&loaded.repo);
+    let entity = PullRequest {
+        id: pull.id,
+        repository: loaded.repo.id,
+        author: pull.author_id,
+        target: Ref {
+            repository: loaded.repo.id,
+            name: format!("refs/heads/{}", pull.target_branch),
+            protection: None,
+            exists: true,
+        },
+    };
+    state
+        .authz
+        .authorize(&githearth_authz::Request {
+            principal: githearth_authz::Principal::Account(&loaded.facts.account),
+            teams: &loaded.facts.teams,
+            grants: &loaded.facts.grants,
+            action: Action::PullRequestMerge,
+            organization: &loaded.facts.organization,
+            resource: Resource::PullRequest(&authz_repo, &entity),
+            merge: Some(githearth_authz::Merge {
+                approvals: u32::MAX,
+                checks_passed: true,
+                code_owner_review_ok: true,
+            }),
+            auth_age: Some(Duration::from_secs(auth_age)),
+            read_only: loaded.facts.read_only,
+        })
+        .is_allowed()
+}
+
 pub(crate) fn require_pull(
     state: &AppState,
     loaded: &Loaded,
@@ -2138,6 +2193,31 @@ pub(crate) fn require_review_permission(
         return Err(ApiError(StatusCode::FORBIDDEN, "not permitted"));
     }
     Ok(())
+}
+
+/// Whether the viewer may request or remove reviewers (the author or someone
+/// who may approve), used by the page to decide whether to offer the controls.
+pub(crate) async fn may_request_review(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> bool {
+    let Ok(loaded) =
+        repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await
+    else {
+        return false;
+    };
+    let Ok(mut conn) = state.pool.acquire().await else {
+        return false;
+    };
+    let Ok(Some(pull)) = find_pull(&mut conn, loaded.repo.id, number).await else {
+        return false;
+    };
+    drop(conn);
+    require_review_permission(state, &loaded, &pull).is_ok()
 }
 
 pub(crate) async fn add_review_request(
