@@ -421,6 +421,11 @@ async fn log(
         Some(cursor) => cursor.parse::<u64>().map_err(|_| invalid())?,
         None => 0,
     };
+    // `git log --skip` takes an `int`; a larger cursor makes Git fail and
+    // would otherwise surface as a 500. Treat it as an invalid cursor instead.
+    if after > i32::MAX as u64 {
+        return Err(invalid());
+    }
 
     let repo_id = loaded.repo.id;
     let id = resolve(&state, repo_id, rev.clone()).await?;

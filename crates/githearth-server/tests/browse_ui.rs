@@ -465,6 +465,14 @@ async fn tree_page_renders_headings_table_scope_and_breadcrumbs() {
     assert!(body.contains("<table>"));
     assert!(body.contains("<th scope=\"col\">Name</th>"));
     assert!(body.contains("aria-label=\"Breadcrumb\""));
+    assert!(
+        body.contains("<caption class=\"muted\">Files at main</caption>"),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("{}/commits/main", ui_base(&f))),
+        "{body}"
+    );
     assert!(body.contains("docs"));
     assert!(body.contains("renamed.md"));
     finish(f).await;
@@ -499,6 +507,7 @@ async fn blob_page_escapes_content_and_binary_shows_notice() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     assert!(!body.contains("<script>alert(1)</script>"));
+    assert!(body.contains("aria-label=\"Breadcrumb\""), "{body}");
 
     let (status, body) = get_page(
         &f.app,
@@ -542,8 +551,12 @@ async fn empty_repository_page_shows_clone_instructions() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("git clone /"));
-    assert!(body.contains(&format!("/{}/{}.git", f.org_slug, empty_name)));
+    assert!(body.contains("git clone http"), "{body}");
+    assert!(
+        body.contains(&format!("/{}/{}.git", f.org_slug, empty_name)),
+        "{body}"
+    );
+    assert!(!body.contains("git clone /"), "{body}");
     finish(f).await;
 }
 
@@ -626,6 +639,7 @@ async fn commits_page_lists_commits_with_links() {
     assert!(body.contains("root"));
     assert!(body.contains("rename"));
     assert!(body.contains(&format!("{}/commit/", ui_base(&f))));
+    assert!(body.contains("aria-label=\"Breadcrumb\""), "{body}");
     finish(f).await;
 }
 
@@ -641,6 +655,7 @@ async fn commit_page_renders_rename_and_binary_notices() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("renamed.md"));
+    assert!(body.contains("aria-label=\"Breadcrumb\""), "{body}");
 
     let (status, body) = get_page(
         &f.app,
@@ -960,6 +975,11 @@ async fn compare_page_renders_mergeability_conflicts_commits_and_diff() {
     assert!(body.contains("1 ahead, 1 behind"));
     assert!(body.contains("Files changed"));
     assert!(body.contains("<table>"));
+    assert!(
+        body.contains("<caption class=\"muted\">Commits in this comparison</caption>"),
+        "{body}"
+    );
+    assert!(body.contains("aria-label=\"Breadcrumb\""), "{body}");
     assert!(body.contains("feature.txt"));
     assert!(body.contains(&format!("{}/commit/", cmp_ui_base(&f))));
     finish_cmp_ui(f).await;
@@ -1030,4 +1050,54 @@ async fn compare_page_requires_login() {
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     finish_cmp_ui(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn unmatched_paths_render_the_styled_404_with_page_headers() {
+    let f = build_fixture().await;
+    for path in [
+        "/no-such-page".to_owned(),
+        format!("{}/tree/", ui_base(&f)),
+        format!("{}/tree", ui_base(&f)),
+    ] {
+        let response = f
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&path)
+                    .header("cookie", &f.cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "{path}"
+        );
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY",
+            "{path}"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_some(),
+            "{path}"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("<h1>Not found</h1>"), "{path}: {body}");
+    }
+    finish(f).await;
 }
