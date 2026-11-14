@@ -1032,7 +1032,12 @@ async fn archived_repository_push_denied() {
     .await;
     let out = git_run(git_cmd(&["-C", cd, "push", "origin", "feature"])).await;
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("permission denied: ref.push"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Admission refuses the receive-pack request before any pack is uploaded.
+    assert!(
+        stderr.contains("403"),
+        "archived push should be refused at admission: {stderr}"
+    );
     assert!(journal_records(&fx.repo_path).is_empty());
 
     let _ = std::fs::remove_dir_all(&clone);

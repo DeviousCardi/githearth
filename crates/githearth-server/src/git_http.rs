@@ -268,6 +268,7 @@ async fn upload_pack(
     // so client disconnect also cancels.
     let token = CancellationToken::new();
     let feeder_token = token.clone();
+    let (body_polled_tx, body_polled_rx) = oneshot::channel::<()>();
 
     // Spawn stdin feeder, storing its JoinHandle.
     let feeder_handle: tokio::task::JoinHandle<()> = if is_gzip {
@@ -280,6 +281,7 @@ async fn upload_pack(
             feeder_token,
             limit_exceeded.clone(),
             decode_failed.clone(),
+            Some(body_polled_tx),
         ))
     } else {
         tokio::spawn(stream_body_to_stdin(
@@ -291,11 +293,11 @@ async fn upload_pack(
             feeder_token,
             limit_exceeded.clone(),
             decode_failed.clone(),
+            Some(body_polled_tx),
         ))
     };
 
-    let (done_tx, done_rx) = oneshot::channel();
-    let mut output = Box::pin(futures_util::StreamExt::peekable(stream_git_output(
+    let output = stream_git_output(
         child,
         stdout,
         stderr,
@@ -308,19 +310,20 @@ async fn upload_pack(
         token,
         None,
         true,
-        Some(done_tx),
-    )));
-    // Wait for git's first output so the request body has been polled before
-    // the response headers go out. That makes hyper answer `Expect:
-    // 100-continue` immediately instead of after a client-side stall.
-    let first_output = output.as_mut().peek().await;
+        None,
+    );
+    // Do not wait for git's first output: it cannot produce any until it has
+    // read the request, and a client may keep the body open indefinitely
+    // (e.g. a disconnect test, or a slow upload). Waiting only for the feeder
+    // to poll the body is enough for hyper to answer `Expect: 100-continue`
+    // before the response headers go out, without holding the response back.
+    // If the feeder is cancelled before polling (git already exited), the
+    // sender is dropped and this resolves with an error, so it never hangs.
+    let _ = body_polled_rx.await;
     if limit_exceeded.load(Ordering::SeqCst) {
         return Err(GitHttpError::PayloadTooLarge);
     }
     if decode_failed.load(Ordering::SeqCst) {
-        return Err(GitHttpError::BadRequest("invalid git request body"));
-    }
-    if first_output.is_none() && matches!(done_rx.await, Ok(false)) {
         return Err(GitHttpError::BadRequest("invalid git request body"));
     }
     let body = Body::from_stream(output);
@@ -525,6 +528,7 @@ async fn receive_pack(
             feeder_token,
             limit_exceeded.clone(),
             decode_failed.clone(),
+            None,
         ))
     } else {
         tokio::spawn(stream_body_to_stdin(
@@ -536,6 +540,7 @@ async fn receive_pack(
             feeder_token,
             limit_exceeded.clone(),
             decode_failed.clone(),
+            None,
         ))
     };
 
@@ -1043,19 +1048,26 @@ async fn stream_body_to_stdin(
     token: CancellationToken,
     limit_exceeded: Arc<AtomicBool>,
     decode_failed: Arc<AtomicBool>,
+    mut body_polled: Option<oneshot::Sender<()>>,
 ) {
     let mut stream = body.into_data_stream();
     let mut total: usize = 0;
     loop {
         tokio::select! {
             chunk = stream.next() => {
-                let Some(chunk) = chunk else { break };
                 let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(_) => {
+                    None => {
+                        // Polling the body once is what makes hyper emit
+                        // `100 Continue` for an `Expect` request.
+                        signal_body_polled(&mut body_polled);
+                        break;
+                    }
+                    Some(Ok(c)) => c,
+                    Some(Err(_)) => {
                         // A short or broken HTTP body is malformed input, not a
                         // clean end of the push (#154).
                         decode_failed.store(true, Ordering::SeqCst);
+                        signal_body_polled(&mut body_polled);
                         break;
                     }
                 };
@@ -1066,9 +1078,11 @@ async fn stream_body_to_stdin(
                         repository_id = %repo_id, total, limit,
                         "git request body exceeds limit; signalling kill"
                     );
+                    signal_body_polled(&mut body_polled);
                     let _ = kill_tx.send(());
                     return;
                 }
+                signal_body_polled(&mut body_polled);
                 if stdin.write_all(&chunk).await.is_err() {
                     break;
                 }
@@ -1081,6 +1095,12 @@ async fn stream_body_to_stdin(
     drop(stdin);
 }
 
+fn signal_body_polled(sender: &mut Option<oneshot::Sender<()>>) {
+    if let Some(tx) = sender.take() {
+        let _ = tx.send(());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn stream_gzip_body_to_stdin(
     repo_id: Uuid,
@@ -1091,6 +1111,7 @@ async fn stream_gzip_body_to_stdin(
     token: CancellationToken,
     limit_exceeded: Arc<AtomicBool>,
     decode_failed: Arc<AtomicBool>,
+    mut body_polled: Option<oneshot::Sender<()>>,
 ) {
     use async_compression::tokio::bufread::GzipDecoder;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -1107,7 +1128,10 @@ async fn stream_gzip_body_to_stdin(
         tokio::select! {
             result = decoder.read(&mut buf) => {
                 match result {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        signal_body_polled(&mut body_polled);
+                        break;
+                    }
                     Ok(n) => {
                         total += n;
                         if total > limit {
@@ -1116,9 +1140,11 @@ async fn stream_gzip_body_to_stdin(
                                 repository_id = %repo_id, total, limit,
                                 "git decoded request body exceeds limit; signalling kill"
                             );
+                            signal_body_polled(&mut body_polled);
                             let _ = kill_tx.send(());
                             return;
                         }
+                        signal_body_polled(&mut body_polled);
                         if stdin.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
@@ -1126,6 +1152,7 @@ async fn stream_gzip_body_to_stdin(
                     Err(e) => {
                         decode_failed.store(true, Ordering::SeqCst);
                         tracing::warn!(repository_id = %repo_id, "gzip decode failed: {e}; signalling kill");
+                        signal_body_polled(&mut body_polled);
                         let _ = kill_tx.send(());
                         return;
                     }
