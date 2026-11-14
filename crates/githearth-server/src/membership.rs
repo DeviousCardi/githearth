@@ -351,7 +351,7 @@ async fn upsert_grant(
          SELECT $1, $2, 'account', $3, 'organization', $4, $5 \
          WHERE NOT EXISTS (SELECT 1 FROM grants WHERE scope_kind = 'organization' \
            AND scope_id = $4 AND subject_kind = 'account' AND subject_id = $3 \
-           AND repository_id IS NULL AND role = $2 AND role IN ('owner', 'member') \
+           AND repository_id IS NULL AND role = $2 \
            AND revoked_at IS NULL)",
     )
     .bind(Uuid::new_v4())
@@ -466,7 +466,15 @@ pub(crate) async fn add(
         key,
         |idem| async move {
             let mut tx = state.pool.begin().await?;
+            pause_mutation(loaded.org_id).await;
             lock_organization(&mut tx, loaded.org_id).await?;
+            // Re-authorize after the lock exactly as `set_role` and `remove`
+            // do: an owner demoted or removed while this add waited must not
+            // finish it with the authority it held before the lock.
+            let loaded = reauthorize(&mut tx, loaded).await?;
+            if !loaded.may_manage(state) {
+                return Err(loaded.refuse(state));
+            }
             let account_id: Option<Uuid> =
                 sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
                     .bind(&input.username)

@@ -439,7 +439,8 @@ async fn serve(app: &Router) -> u16 {
 }
 
 /// A test SSH client authenticated as `account`, with `git ls-remote` pointed
-/// at the fixture repository. `None` when the ssh binary is unavailable.
+/// at the fixture repository. The `ssh` binary is required: the transport tests
+/// fail loudly rather than skipping the SSH assertions.
 struct SshClient {
     key_dir: PathBuf,
     command: String,
@@ -461,10 +462,9 @@ impl Drop for SshClient {
     }
 }
 
-async fn ssh_client(f: &Fixture, account: Uuid) -> Option<SshClient> {
+async fn ssh_client(f: &Fixture, account: Uuid) -> SshClient {
     if Command::new("ssh").arg("-V").output().is_err() {
-        eprintln!("SKIP: ssh binary not found");
-        return None;
+        panic!("the SSH transport tests require the `ssh` binary");
     }
     let key_dir = temp_dir("membership-ssh-key");
     std::fs::create_dir_all(&key_dir).unwrap();
@@ -507,7 +507,7 @@ async fn ssh_client(f: &Fixture, account: Uuid) -> Option<SshClient> {
     });
     let (server, port_rx) = ssh::spawn(f.state.clone(), authenticate);
     let ssh_port = port_rx.await.unwrap().port();
-    Some(SshClient {
+    SshClient {
         key_dir,
         command: format!(
             "ssh -i {} -p {ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes",
@@ -518,7 +518,7 @@ async fn ssh_client(f: &Fixture, account: Uuid) -> Option<SshClient> {
             f.org_slug, f.repo_name
         ),
         _server: server,
-    })
+    }
 }
 
 fn members_path(f: &Fixture) -> String {
@@ -1163,11 +1163,10 @@ async fn member_can_leave_and_is_denied_on_api_ui_http_and_ssh_afterwards() {
     );
     git_ok(git_cmd(&["clone", "--", &url, clone.to_str().unwrap()])).await;
 
-    // The same member is admitted over SSH before leaving.
+    // The same member is admitted over SSH before leaving. The fixture is
+    // required: a missing `ssh` must fail the test rather than skip silently.
     let ssh = ssh_client(&f, f.member.id).await;
-    if let Some(ssh) = &ssh {
-        git_ok(ssh.ls_remote()).await;
-    }
+    git_ok(ssh.ls_remote()).await;
 
     // A plain member may remove their own membership.
     let (status, body) = api(
@@ -1229,14 +1228,12 @@ async fn member_can_leave_and_is_denied_on_api_ui_http_and_ssh_afterwards() {
         "unexpected HTTP refusal: {stderr}"
     );
 
-    // ... and so does SSH, so the test name's four transports are all proved.
-    if let Some(ssh) = &ssh {
-        let stderr = git_fails(ssh.ls_remote()).await;
-        assert!(
-            stderr.contains("repository not found"),
-            "unexpected SSH refusal: {stderr}"
-        );
-    }
+    // ... and so does SSH (the fixture is required, not optional).
+    let stderr = git_fails(ssh.ls_remote()).await;
+    assert!(
+        stderr.contains("repository not found"),
+        "unexpected SSH refusal: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&clone);
 }
@@ -2473,12 +2470,10 @@ async fn demoted_owner_cannot_finish_an_in_flight_removal() {
     assert_eq!(status, StatusCode::OK, "real demotion: {body}");
 
     let (status, body) = pending.await.unwrap();
-    assert!(
-        matches!(
-            status,
-            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::CONFLICT
-        ),
-        "a demoted caller must not finish the removal, got {status}: {body}"
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a demoted caller must not finish the removal: {body}"
     );
     assert_eq!(
         membership_role(&f.pool, f.org_id, f.member.id)
@@ -2526,12 +2521,10 @@ async fn demoted_owner_cannot_finish_an_in_flight_role_change() {
     assert_eq!(status, StatusCode::OK, "real demotion: {body}");
 
     let (status, body) = pending.await.unwrap();
-    assert!(
-        matches!(
-            status,
-            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::CONFLICT
-        ),
-        "a demoted caller must not finish the role change, got {status}: {body}"
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a demoted caller must not finish the role change: {body}"
     );
     assert_eq!(
         membership_role(&f.pool, f.org_id, f.member.id)
@@ -2539,6 +2532,71 @@ async fn demoted_owner_cannot_finish_an_in_flight_role_change() {
             .as_deref(),
         Some("member"),
         "the target role must not change"
+    );
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn demoted_owner_cannot_finish_an_in_flight_add() {
+    let f = fixture().await;
+    // A second owner demotes the caller while its add is paused after the
+    // outer authorization and before the organization lock.
+    let second = user(&f.pool, "coowner").await;
+    add_membership(&f.pool, f.org_id, second.id, "owner").await;
+    let newcomer = user(&f.pool, "newcomer").await;
+
+    githearth_server::membership::test_pause_mutations(f.org_id, 2_000);
+    let app = f.app.clone();
+    let token = f.owner.token.clone();
+    let path = members_path(&f);
+    let body = json!({"username": newcomer.username, "role": "member"});
+    let pending = tokio::spawn(async move {
+        api(
+            &app,
+            "POST",
+            &path,
+            Some(&token),
+            Some("add-paused"),
+            Some(&body),
+        )
+        .await
+    });
+    await_mutation_pause(f.org_id).await;
+    // The demotion itself must not pause.
+    githearth_server::membership::test_pause_mutations(f.org_id, 0);
+    let (status, body) = api(
+        &f.app,
+        "PATCH",
+        &member_path(&f, &f.owner.username),
+        Some(&second.token),
+        None,
+        Some(&json!({"role": "member"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "real demotion: {body}");
+
+    let (status, body) = pending.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a demoted caller must not finish the add: {body}"
+    );
+    assert_eq!(
+        membership_role(&f.pool, f.org_id, newcomer.id).await,
+        None,
+        "no membership row may be created"
+    );
+    assert!(
+        active_grant_roles(&f.pool, f.org_id, newcomer.id)
+            .await
+            .is_empty(),
+        "no organization grant may be created"
+    );
+    assert_eq!(
+        audit_kinds(&f.pool, f.org_id, "organization.member_added").await,
+        0,
+        "no audit event may be recorded"
     );
     finish(f).await;
 }
@@ -2841,9 +2899,7 @@ async fn demoted_member_is_denied_on_api_ui_http_and_ssh() {
     );
     git_ok(git_cmd(&["ls-remote", "--", &url])).await;
     let ssh = ssh_client(&f, f.member.id).await;
-    if let Some(ssh) = &ssh {
-        git_ok(ssh.ls_remote()).await;
-    }
+    git_ok(ssh.ls_remote()).await;
 
     // Demote; the next admission on all four transports is refused.
     let (status, body) = api(
@@ -2866,13 +2922,11 @@ async fn demoted_member_is_denied_on_api_ui_http_and_ssh() {
         stderr.contains("not found") || stderr.contains("not permitted") || stderr.contains("403"),
         "unexpected HTTP refusal: {stderr}"
     );
-    if let Some(ssh) = &ssh {
-        let stderr = git_fails(ssh.ls_remote()).await;
-        assert!(
-            stderr.contains("repository not found"),
-            "unexpected SSH refusal: {stderr}"
-        );
-    }
+    let stderr = git_fails(ssh.ls_remote()).await;
+    assert!(
+        stderr.contains("repository not found"),
+        "unexpected SSH refusal: {stderr}"
+    );
 
     let direct: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM grants WHERE scope_id = $1 AND subject_id = $2 \

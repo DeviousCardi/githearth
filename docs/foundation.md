@@ -263,13 +263,15 @@ created organization-scope grant such as `write` is left active.
 The last owner cannot be removed, demoted or leave. The rule counts active
 organization-scope `owner` grants, not the `memberships.role` cache, and a team
 owner grant counts too, so a team grant can make another owner non-last. Every
-membership mutation takes the organization row lock first, then reloads the
-caller's authorization inside that same transaction and authorizes the target
-against that locked snapshot before any write. This closes the race where an
-owner starts a removal or role change, is demoted or removed by a request that
-commits while the first request waits for the lock, and would otherwise finish
-with the authority it held before the wait. Such a caller is now refused (403
-when still a member, 404 when removed) and the target membership is unchanged.
+membership mutation — add, role change, removal and leave — takes the
+organization row lock first, then reloads the caller's authorization inside
+that same transaction and re-checks it before any write; a role change or
+removal also authorizes the target against that locked snapshot. This closes
+the race where an owner starts an add, a removal or a role change, is demoted
+or removed by a request that commits while the first request waits for the
+lock, and would otherwise finish with the authority it held before the wait.
+Such a caller is now refused (403 when still a member, 404 when removed) and no
+membership row is added, removed or changed.
 The lock also serializes the last-owner count, so two requests that would each
 remove one of the last two owners cannot both commit: exactly one change wins
 and the other is refused, normally 409 (the last-owner rule).
