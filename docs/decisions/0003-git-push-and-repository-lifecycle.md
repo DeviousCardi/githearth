@@ -22,7 +22,7 @@ From the [metadata contract](../plan/01-metadata-contract.md) and [deployment co
   orphans/<id>.<unix-seconds>.git     directories found with no metadata row; never deleted automatically
 ```
 
-Paths derive only from the repository UUID, never from names, so rename and transfer are metadata changes. The storage layer's containment checks (no symlinks, canonical path inside the root) apply to every path above. The storage root is owned by the service user, mode `0700`.
+Paths derive only from the repository UUID, never from names, so rename and transfer move no Git data and change no storage path. The storage layer's containment checks (no symlinks, canonical path inside the root) apply to every path above. The storage root is owned by the service user, mode `0700`.
 
 Every repository is created with:
 
@@ -77,9 +77,12 @@ A ref changed on disk with no journal record (manual edit, restored older snapsh
 Repository rows in PostgreSQL hold identity, owner, name, visibility, archive state and a `status`: `creating`, `active`, `deleting`, `deleted`, `failed`. Names are unique per organization among rows that are not `deleted` (partial unique index), so a deleted name is reusable.
 
 - **Create.** (1) Insert the row as `creating` with its operation ID and commit. (2) `git init --bare` into `tmp/<operation>`, write the config above, fsync the tree, `rename` into `repositories/`, fsync the parent directory. (3) Mark the row `active`. The API answers `201` only after step 3; a lost response is answered by replaying the operation ID.
-- **Rename / transfer.** Metadata only. The previous `owner/name` is stored as a redirect for Git and web URLs until the name is reused.
+- **Rename.** Metadata only: the name changes and no grant changes, because a grant is scoped to the repository, not to its name.
+- **Transfer.** **Not metadata-only.** The repository moves to an organization the actor administers at the source and may create in at the target. The UUID, storage path and its non-fork open pull requests survive; fork pull requests are closed under the audited policy or the transfer is refused. Because a grant's subject must belong to the owning organization, every grant on the repository, and every organization-scoped grant that reached it, is revoked in the transfer transaction with one audit record; a rename inside one organization revokes nothing. Forks of the repository stay in the source organization with their existing visibility, and their pull requests into the moved repository are closed with a stated reason, or the transfer is refused — the operator chooses the policy per move and the choice is audited. Queued merge intents are cancelled; an `executing` intent blocks the transfer until it finishes. A name collision at the target is refused. The metadata change is one transaction, and a failure moves nothing.
 - **Archive / unarchive.** Metadata only; ADR 0002's archive forbids stop writes, including pushes, at the next decision.
 - **Delete.** Mark `deleting`, then rename the directory into `trash/`, then mark `deleted`. Trash is purged after the retention window (default 7 days). There is no automatic restore: a `deleted` row never transitions, so within the window an operator moves the directory back by hand and creates a new repository row.
+
+After a rename, transfer or delete, the previous `owner/name` returns `410 Gone` on API, web and Git URLs and never redirects; reusing the name does not make the old path resolve to the new repository.
 
 The lifecycle reconciler handles each intermediate state:
 

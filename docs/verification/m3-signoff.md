@@ -94,7 +94,7 @@ Two reviewers each confirm the tables above.
 - Name: Jadav Havish Sunil (`HavishJadav`)
 - Date: 2026-11-13
 - Verdict: approve
-- Notes and problems found: Reviewed every build and exit item against the merged code and tests on `main`. Drafts (#129) and tag protection (#130) are merged; `scripts/ci.sh` is green with line coverage ≥ 95%. No open gap.
+- Notes and problems found: Reviewed every build and exit item against the merged code and tests on `main`. Drafts (#129) and tag protection (#130) are merged; `scripts/ci.sh` is green with line coverage ≥ 95%. No open gap in the contracted behaviour; the candidate-binding gap is recorded above and scheduled in M6.
 
 ### Reviewer 2
 

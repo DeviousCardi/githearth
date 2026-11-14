@@ -119,6 +119,13 @@ watchdog:
   authorized against. Without this rule a partitioned former primary could
   authorize a Git write from facts that are about to disappear, while the Git
   group independently commits it.
+- **Schema compatibility for a rolling upgrade is M5's, not M11's.** `serve`
+  refuses to start when the database schema does not match the binary, so an
+  N/N+1 cluster is possible only when the migration is expand-only for the
+  releases M5 supports: additive columns and tables, no destructive change, and
+  a compatibility check that accepts the N and the N+1 schema for the upgrade
+  window. The roadmap's M5 exit and case U50 carry this; the general
+  expand/contract discipline for later releases stays M11's.
 
 Deferred, in this order of likelihood:
 
@@ -158,6 +165,9 @@ Deferred, in this order of likelihood:
    primary's position.
 8. Fail over under load and verify the pool drops and reconnects; verify a
    read-only error never becomes a write decision.
+9. Roll one node to N+1 while an N binary still serves: the N binary starts
+   against the N+1 schema, serves reads and writes, and a destructive migration
+   is refused.
 
 ## Open items
 

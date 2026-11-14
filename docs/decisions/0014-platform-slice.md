@@ -100,19 +100,25 @@ secrets and tokens, three incompatible limit schemes), or to defer them to M11
   job, records progress, and keeps the old KEK for decrypt-only until the
   re-wrap completes. A failed batch leaves each row readable by one of the two
   keys.
-- Deleting a per-account or per-organization data key destroys the plaintext
-  in every older backup (crypto-shredding); this is what makes the identity
-  slice's deletion promise achievable.
+- Deleting a per-account or per-organization data key destroys every secret and
+  encrypted column in older backups (crypto-shredding); it does not make a
+  plaintext profile column unreadable, and a backup predating the keys cannot
+  be shredded at all. The identity slice's disposal promise is scoped to
+  secrets and encrypted columns, with retention the control for the rest.
 
 ### 4. Backups: encrypted, fenced, and online on one node
 
 - Every archive is encrypted with an operator key or passphrase; the manifest
-  carries a key id, never the key. A decrypted archive contains no plaintext
-  credential because the configuration it includes is encrypted with it.
+  carries a key id, never the key. While encrypted, the archive contains no
+  plaintext secret. It includes the configuration and the SSH host key because
+  restore needs both, so after decryption the only private material present is
+  the database and SMTP values in that file and the SSH host key, all
+  operator-owned; every stored secret column is encrypted under the installation
+  key, which is not in the archive. The decryption claim is therefore about
+  stored secrets, not about the operator's own material.
 - The maintenance-window path has a mechanism, not a sentence. `backup`
   proceeds only when it can prove no writer can acknowledge a commit:
-  - the server is not running (its bind address refuses connections and the
-    storage lock is free), or
+  - the server is not running (its bind address refuses connections), or
   - the server is in maintenance mode: a control command sets a durable flag,
     the server rejects new writes with `503`, waits for in-flight requests to
     finish and reports drained.
@@ -162,8 +168,8 @@ Default values, recorded so the exit can be tested and later revised:
 
 | Limit | Default |
 | --- | --- |
-| Global Git concurrency | 4 slots |
-| Per-organization Git share | floor 1, ceiling 4, fair share of the rest |
+| Global Git concurrency | 8 slots |
+| Per-organization Git share | floor 1, ceiling 6, fair share of the rest |
 | API requests | 300/min per organization, 60/min per account |
 | Anonymous clone/fetch | 120/min per address, 2,000/min installation |
 | Anonymous login/search | 20/min per address |

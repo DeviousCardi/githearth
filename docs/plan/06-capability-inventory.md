@@ -81,7 +81,7 @@ Checked against the code on `main` at `747c65c`. "Delivered" means implemented w
 
 Rows added on 2026-11-15 and allocated in the table above: secrets at rest and key rotation, scoped short-lived tokens, per-organization rate limits and fairness (M4.2); self-service sign-up, email verification and recovery, and account and organization deletion (M11a); rolling upgrade with adjacent-version skew (M5).
 
-Two required rows still have no build list: repository restore and mirrors. They are allocated to no milestone, so M13's "every required inventory row" cannot close until they are either given a milestone or removed from the required set. This is recorded in the [review record](09-milestone-decisions.md#review-record). The per-repository storage quota does not count merge-created objects or fork copies; M4.1's housekeeping work makes it count total repository bytes.
+Two required rows still have no build list and no acceptance case: repository restore and mirrors. They are allocated — repository restore to M2/M4.1 in the table above, mirrors to M3–M5/M12 — so what is missing is a build list and a case, not a milestone, and M13's "every required inventory row" cannot close until both exist. This is recorded in the [review record](09-milestone-decisions.md#review-record). The per-repository storage quota does not count merge-created objects or fork copies; M4.1's housekeeping work makes it count total repository bytes.
 
 ## Cross-cutting completion contract
 

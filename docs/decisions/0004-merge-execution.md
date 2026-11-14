@@ -115,7 +115,7 @@ The merge's prepared record gains an optional `origin` field, `"merge"`, copied 
 | Crash point | Journal | Refs | Recovery |
 | --- | --- | --- | --- |
 | Before candidate | none | unchanged | A re-drives from `queued`/`executing` after lease expiry; intent eventually `merged`, `stale` or `failed` |
-| After candidate, before lock | none | unchanged | Candidate unreferenced (GC grace); re-drive rebuilds it |
+| After candidate, before lock | none | unchanged | Candidate unreferenced and no longer pinned once the intent leaves `executing`; re-drive rebuilds it |
 | Prepared only, ref at expected old | prepared, no marker | target at `expected_target_oid` | aborted (marker lost): reconciler appends the aborted marker; no metadata; worker may re-drive |
 | Committed, marker lost | prepared, no marker | target at candidate | committed-marker-lost: reconciler appends the committed marker and replays the merge record |
 | Committed before metadata | prepared + committed | target at candidate | reconciler replays the merge record into the intent + ref-update/outbox rows |
@@ -125,7 +125,7 @@ The merge's prepared record gains an optional `origin` field, `"merge"`, copied 
 
 - A merge is a compare-and-swap ref update journaled through the same `reference-transaction` path as pushes, satisfying ADR 0003's requirement that every non-receive-pack ref change be journaled and authorized identically.
 - The intent row is metadata; the journal record is the durable merge result. One idempotent function turns a merge record into a merged intent, on the normal path and on replay, so lost metadata self-heals.
-- Candidate objects are unreferenced until the ref moves; scheduled maintenance must honour the 48-hour grace period above.
+- Candidate objects are unreferenced until the ref moves; scheduled maintenance keeps every object a `validating` or `executing` intent references and applies no separate grace period.
 
 ## Open items
 

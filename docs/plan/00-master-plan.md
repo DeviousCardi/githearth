@@ -69,7 +69,7 @@ The first local comparison is now complete. [ADR 0001](../decisions/0001-metadat
 
 An acknowledged write has a documented durability boundary. Replication has a documented failure model. An interrupted request can return an unknown outcome; retries must discover or reuse the existing operation instead of blindly duplicating it.
 
-A successful merge identifies the exact target revision, source revision, policy generation, and tested candidate. The merge queue runs required checks on the candidate it will merge, not on the source head. Background worker duplication must never produce a second branch update for the same merge intent.
+A successful merge must identify the exact target revision, source revision, policy generation, and tested candidate: the merge queue must run required checks on the candidate it will merge, not on the source head. Today it binds checks to the source head; the [M3 sign-off](../verification/m3-signoff.md) records that gap and M6 closes it (see the [roadmap](04-forge-roadmap.md#m6--isolated-ci)). Background worker duplication must never produce a second branch update for the same merge intent.
 
 Authorization is checked by the service that owns the resource. Search indexes, cache contents, package digests, and replica placement do not confer access. Critical revocation behavior is explicit, including in-flight work.
 

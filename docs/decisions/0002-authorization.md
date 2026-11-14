@@ -2,7 +2,7 @@
 
 Date: 2026-10-27.
 
-Status: **accepted for implementation**. The engine, schema, built-in policies and role templates exist in `crates/githearth-authz`; the organization read path uses it. The M2/M3 teams, grants and protection tables are in place; M3 is signed off. The M4.2 platform slice adds non-account principal kinds (service accounts and CI run tokens) and the account administration actions M4.1 needs.
+Status: **accepted for implementation**. The engine, schema, built-in policies and role templates exist in `crates/githearth-authz`; the organization read path uses it. The M2/M3 teams, grants and protection tables are in place; M3 is signed off. The model below is amended on 2026-11-15 to include the non-account principal kinds and the account/invitation actions: M4.1 lands the account and invitation actions and the schema change that carries them, and M4.2 lands ServiceAccount and Run.
 
 ## Decision
 
@@ -18,7 +18,7 @@ The schema (`policies/githearth.cedarschema`) is the contract. Strict validation
 
 ## Model
 
-Hierarchy: `Account in [Team, Organization]`, `Team in [Team, Organization]`, `Repository in Organization`, and `Ref`, `Issue` and `PullRequest` in `Repository`. A grant on an organization reaches its repositories, and a grant to a team reaches the members of that team and of its descendant teams.
+Hierarchy: `Account in [Team, Organization]`, `Team in [Team, Organization]`, `ServiceAccount in Organization`, `Run in Organization`, `Repository in Organization`, and `Ref`, `Issue` and `PullRequest` in `Repository`. A grant on an organization reaches its repositories, and a grant to a team reaches the members of that team and of its descendant teams.
 
 Actions are named `object.verb` and grouped. Templates name only groups, so a new action joins a group in the schema and no template changes.
 
@@ -31,15 +31,19 @@ Actions are named `object.verb` and grouped. Templates name only groups, so a ne
 | `write` | `ref.push`, `ref.force_push`, `ref.delete`, `pull_request.approve`, `pull_request.merge` |
 | `maintain` | `repository.update` (branch and tag protection mutations) |
 | `admin` | `repository.manage_access`, `archive`, `unarchive`, `delete` |
-| `owner` | `organization.update`, `manage_members`, `delete`, `team.create` |
-| `site_admin` | `organization.suspend`, `organization.unsuspend` |
-| `sensitive` | sudo mode: an action here also sits in its functional group above — `organization.update`, `manage_members`, `delete`, `organization.suspend`, `unsuspend`, `team.create`, `repository.manage_access`, `archive`, `unarchive`, `delete`, `ref.force_push`, `ref.delete` |
+| `owner` | `organization.update`, `manage_members`, `delete`, `team.create`, `invitation.read`, `invitation.create`, `invitation.revoke` |
+| `site_admin` | `organization.suspend`, `organization.unsuspend`, `account.create`, `account.disable`, `account.enable`, `account.reset_password` |
+| `sensitive` | sudo mode: an action here also sits in its functional group above — `organization.update`, `manage_members`, `delete`, `organization.suspend`, `unsuspend`, `team.create`, `repository.manage_access`, `archive`, `unarchive`, `delete`, `ref.force_push`, `ref.delete`, `account.disable`, `account.enable`, `account.reset_password`, `invitation.create`, `invitation.revoke` |
 
 Built-in roles: `member` and `owner` (organization scope only), plus `read`, `triage`, `write`, `maintain` and `admin` (organization or repository scope). Each role includes the groups below it. The M1 membership values `owner`/`member` map onto the first two.
 
 Branch and tag protection are two halves of one feature and share a single gate: creating, editing and deleting either kind of rule is `repository.update`, so a `maintain` member can manage both. Tag protection was briefly gated on a separate `repository.manage_protection` action in the `admin` group; that action was removed (see #135) because it split the feature across two roles.
 
-The principal of every action is a signed-in `Account` or the unauthenticated `Anonymous`, which has no attributes, no parents and may carry no grants or teams.
+Every action has one of four principals: a signed-in `Account`, the unauthenticated `Anonymous`, a `ServiceAccount`, or a `Run`. `Anonymous` has no attributes, no parents and may carry no grants or teams. A `ServiceAccount` is an organization-owned non-human identity and carries its scopes and resource set as attributes; a `Run` is one CI run, resolves to its run and the account that triggered it, and expires with the run. Neither carries a password or a fresh-auth timestamp, so the `sensitive` forbid keeps them out of that group until a separate decision says otherwise. Each principal has its own audit actor: an account by `account_id`, a service account by its row ID, and a run by its run ID with its triggering account. This is the `actor_kind` column [ADR 0014](0014-platform-slice.md) adds to audit rows.
+
+**Invitations are not a Cedar decision.** An invitation token is the credential: a valid, unexpired, single-use token for the signed-in account's verified email creates the membership, and this is how the accepting user acts before being a member. `invitation.*` actions govern listing, creating and revoking invitations by organization owners, so no `Invitation` entity is loaded for acceptance.
+
+**Re-authentication is not a Cedar action either.** `POST /api/v1/me/reauthenticate` is the call that restores freshness, so it cannot require it; a closed loop would make the window unrecoverable. It authenticates the principal with its password (and a second factor once M11a ships), refreshes `sessions.authenticated_at`, and is audited. It is exempt from `sensitive-requires-fresh-auth`, and every other action that group covers still needs the refreshed session.
 
 ## Built-in forbids
 

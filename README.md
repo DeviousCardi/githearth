@@ -89,7 +89,13 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [Database experiment](experiments/metadata/README.md) | Reproducible lab setup, workload runner, and result interpretation |
 | [Database decision](docs/decisions/0001-metadata-database.md) | Provisional PostgreSQL selection, measured evidence, and remaining qualification gates |
 | [Authorization decision](docs/decisions/0002-authorization.md) | Cedar policy-based authorization: roles, built-in forbids, failing closed |
+| [Push and lifecycle decision](docs/decisions/0003-git-push-and-repository-lifecycle.md) | Push acknowledgement boundary, journal, lifecycle and 410 after rename, transfer or delete |
 | [Merge execution decision](docs/decisions/0004-merge-execution.md) | A/B merge contract: intents, methods, expected-ref execution, recovery |
+| [SSH transport decision](docs/decisions/0005-ssh-transport.md) | SSH admission, key handling and the shared push pipeline |
+| [Durable jobs decision](docs/decisions/0006-durable-jobs.md) | Jobs, leases, retry budgets and the M4.1 outbox relay |
+| [Signed commits decision](docs/decisions/0007-signed-commits-and-stale-approvals.md) | Signed-commit policy and stale-approval dismissal |
+| [Forks decision](docs/decisions/0008-forks.md) | Fork contributions, storage and pull-request policy |
+| [Drafts decision](docs/decisions/0009-pull-request-drafts.md) | Draft pull requests and their effect on merge eligibility |
 | [Git replication decision](docs/decisions/0010-git-replication.md) | M5 commit point, object manifests, replicated lifecycle and member rules |
 | [PostgreSQL HA decision](docs/decisions/0011-postgresql-ha.md) | Patroni topology, exact synchronous settings, fencing and the application contract |
 | [Placement and reads decision](docs/decisions/0012-placement-routing-and-expansion.md) | Placement, per-endpoint reads, the move protocol and expansion |
