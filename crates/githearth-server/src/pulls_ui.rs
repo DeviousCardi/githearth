@@ -60,6 +60,10 @@ pub(crate) fn router() -> Router<AppState> {
             axum::routing::post(merge_submit),
         )
         .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/merge/cancel",
+            axum::routing::post(merge_cancel_submit),
+        )
+        .route(
             "/organizations/{slug}/repositories/{name}/pulls/{number}/auto_merge",
             axum::routing::post(auto_merge_submit),
         )
@@ -999,7 +1003,7 @@ async fn render_pull(
 <label for=\"path\">File path</label><input id=\"path\" name=\"path\" required>\
 <label for=\"line\">Line number</label><input id=\"line\" name=\"line\" type=\"number\" min=\"1\" required>\
 <label for=\"side\">Side</label><select id=\"side\" name=\"side\"><option value=\"new\">New (head)</option><option value=\"old\">Old (base)</option></select>\
-<label for=\"comment\">Comment on this line</label><textarea id=\"comment\" name=\"body\" rows=\"3\" required style=\"width:100%;box-sizing:border-box\"></textarea>\
+<label for=\"inline-comment\">Comment on this line</label><textarea id=\"inline-comment\" name=\"body\" rows=\"3\" required style=\"width:100%;box-sizing:border-box\"></textarea>\
 <input type=\"hidden\" name=\"commit_id\" value=\"{}\">\
 <p><button type=\"submit\">Add inline comment</button></p></form>",
             form_fields(s, &new_key()),
@@ -1040,7 +1044,20 @@ async fn render_pull(
     // Auto-merge: enabled state with a cancel button, or an enable form for a
     // viewer with merge permission. Queue position for a live queue entry.
     let queue_notice = match queue_position {
-        Some(pos) => format!("<p class=\"muted\">Merge queue position: {pos}</p>"),
+        Some(pos) => {
+            // Cancelling a queued intent uses `PullRequestClose`; only viewers
+            // who could submit it see the control.
+            let cancel = if can_close {
+                format!(
+                    "<form method=\"post\" action=\"{base}/pulls/{number}/merge/cancel\">{}\
+<p><button type=\"submit\">Cancel queued merge</button></p></form>",
+                    form_fields(s, &new_key()),
+                )
+            } else {
+                String::new()
+            };
+            format!("<p class=\"muted\">Merge queue position: {pos}</p>{cancel}")
+        }
         None => String::new(),
     };
     let auto_merge_section = match (&auto_merge_row, detail.pull.state.as_str()) {
@@ -1717,6 +1734,30 @@ fn merge_notice(error: &crate::ApiError) -> &'static str {
         StatusCode::UNPROCESSABLE_ENTITY => "One of the branches is missing.",
         _ => "The merge could not be created. Try again.",
     }
+}
+
+#[derive(Deserialize)]
+struct MergeCancelForm {
+    #[serde(default)]
+    csrf_token: String,
+}
+
+async fn merge_cancel_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, String)>,
+    Form(form): Form<MergeCancelForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let Ok(number) = number.parse::<i32>() else {
+        return Err(ui::not_found_page(Some(&s.account.username)));
+    };
+    if let Err(e) =
+        merge_intents::cancel_intent(&state, s.account.id, s.auth_age, &slug, &name, number).await
+    {
+        return Err(api_error(&s, e));
+    }
+    Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
 }
 
 #[derive(Deserialize)]

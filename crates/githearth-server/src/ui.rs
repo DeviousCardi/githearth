@@ -175,16 +175,19 @@ pub(crate) fn render_page(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <title>{title}</title><style>\
-body{{font-family:system-ui,sans-serif;margin:0;background:#f7f7f8;color:#111}}\
+body{{font-family:system-ui,sans-serif;margin:0;background:#f7f7f8;color:#111;overflow-wrap:anywhere}}\
 main{{max-width:900px;margin:2rem auto;padding:0 1rem}}\
 nav{{background:#111;color:#fff;padding:.75rem 1rem;display:flex;gap:1rem;align-items:center}}\
 nav a{{color:#fff;text-decoration:none}}\
-.card{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}}\
+.card{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0;overflow-x:auto}}\
 label{{display:block;margin:.5rem 0 .25rem}}\
-input{{padding:.5rem;width:100%;box-sizing:border-box}}\
+input:not([type=checkbox]):not([type=radio]){{padding:.5rem;width:100%;box-sizing:border-box}}\
+input[type=checkbox],input[type=radio]{{width:auto;margin-right:.35rem}}\
+table{{border-collapse:collapse}}\
 button{{padding:.5rem 1rem;cursor:pointer}}\
 .error{{color:#b00020;margin:.5rem 0}}\
 .muted{{color:#666;font-size:.9rem}}\
+.badge{{display:inline-block;background:#111;color:#fff;border-radius:999px;padding:.1rem .5rem;font-size:.85rem}}\
 ul{{list-style:none;padding:0}}\
 li{{padding:.4rem 0;border-bottom:1px solid #eee}}\
 a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{{outline:3px solid #005fcc;outline-offset:2px}}\
@@ -973,5 +976,28 @@ mod tests {
         assert!(html.contains("a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible"));
         assert!(html.contains("outline:3px solid #005fcc"));
         assert!(html.contains(".skip-link:focus-visible"));
+    }
+
+    #[test]
+    fn render_page_wraps_long_text_and_scrolls_wide_tables() {
+        let html = render_page("Sign in", None, None, "");
+        assert!(html.contains("overflow-wrap:anywhere"), "{html}");
+        assert!(
+            html.contains(".card{") && html.contains("overflow-x:auto"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn render_page_does_not_stretch_checkboxes() {
+        let html = render_page("Sign in", None, None, "");
+        assert!(
+            html.contains("input:not([type=checkbox]):not([type=radio])"),
+            "{html}"
+        );
+        assert!(
+            html.contains("input[type=checkbox],input[type=radio]{width:auto"),
+            "{html}"
+        );
     }
 }

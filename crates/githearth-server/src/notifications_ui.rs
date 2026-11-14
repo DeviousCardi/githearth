@@ -173,15 +173,18 @@ async fn notifications_page(
     let rows = list_notifications(&state, s.account.id)
         .await
         .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
+    let unread: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL",
+    )
+    .bind(s.account.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
 
     let mut items = String::new();
-    let mut any_unread = false;
     for row in rows {
         let actor = row.actor_username.as_deref().unwrap_or("someone");
         let read = row.read_at.is_some();
-        if !read {
-            any_unread = true;
-        }
 
         // Every row can be marked read, accessible or not, so the form always carries the token.
         let muted = if read { " class=\"muted\"" } else { "" };
@@ -242,7 +245,7 @@ async fn notifications_page(
         items.push_str("<li>No notifications.</li>");
     }
 
-    let mark_all = if any_unread {
+    let mark_all = if unread > 0 {
         format!(
             "<form method=\"post\" action=\"/notifications/read-all\" class=\"card\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
@@ -253,8 +256,9 @@ async fn notifications_page(
         String::new()
     };
 
-    let body =
-        format!("<h1>Notifications</h1>{mark_all}<div class=\"card\"><ul>{items}</ul></div>");
+    let body = format!(
+        "<h1>Notifications</h1><p><span class=\"badge\" aria-label=\"Unread notifications\">{unread} unread</span></p>{mark_all}<div class=\"card\"><ul>{items}</ul></div>"
+    );
     Ok(page(&s, StatusCode::OK, "Notifications", &body))
 }
 

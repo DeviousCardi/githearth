@@ -286,6 +286,11 @@ async fn an_accessible_notification_shows_actor_target_and_escaped_title() {
     );
     assert!(page.contains("&lt;script&gt;&amp;&quot;title"), "{page}");
     assert!(!page.contains("<script>&\"title"), "{page}");
+    // The page shows a numeric unread badge, not just the Mark all read form.
+    assert!(
+        page.contains("<span class=\"badge\" aria-label=\"Unread notifications\">1 unread</span>"),
+        "{page}"
+    );
 
     finish(f).await;
 }

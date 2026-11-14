@@ -996,23 +996,26 @@ async fn unknown_intent_returns_failed() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn ff_only_on_diverged_branches_is_stale() {
+async fn ff_only_on_diverged_branches_is_refused_up_front() {
     // The conflict fixture diverges main and feature, so a fast-forward-only
-    // merge cannot advance main.
+    // merge cannot advance main. The intent is refused synchronously instead
+    // of being queued and later going stale.
     let f = build_fixture(true).await;
-    let (status, intent) = create_merge_intent(&f, "ff_only", &f.feature_head).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
-    set_intent_executing(&f.pool, op).await;
+    let (status, body) = create_merge_intent(&f, "ff_only", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "target is not an ancestor of the source");
 
     let before = main_tip(&f).await;
-    let outcome = execute_intent(&f.state, op).await.unwrap();
-    assert_eq!(
-        outcome,
-        MergeOutcome::Stale {
-            reason: "target is not an ancestor of the source".into()
-        }
-    );
+    let (status, _) = request(
+        &f.app,
+        "GET",
+        &merge_href(&f.org_slug, &f.repo_name, f.number),
+        Some(&f.token),
+        None,
+        serde_json::json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(main_tip(&f).await, before);
 
     finish(f).await;
