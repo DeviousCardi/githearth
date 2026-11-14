@@ -31,6 +31,7 @@ pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
 mod settings_ui;
+pub mod setup;
 pub mod ssh;
 pub mod ssh_keys;
 pub mod statuses;

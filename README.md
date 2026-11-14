@@ -63,6 +63,9 @@ development only; terminate TLS at a trusted proxy before any nonlocal use
 
 For the direct-binary path, the full configuration reference, the API exercise
 and the real-PostgreSQL test procedure, see [foundation.md](docs/foundation.md).
+A direct installation uses one command, `githearth-server setup`, which writes
+the configuration and generates the host key before migrating and creating the
+first administrator ([install.md](docs/operations/install.md)).
 For a production installation, the preflight `doctor` check and upgrades, see
 [install.md](docs/operations/install.md), [upgrade.md](docs/operations/upgrade.md)
 and [uninstall.md](docs/operations/uninstall.md).

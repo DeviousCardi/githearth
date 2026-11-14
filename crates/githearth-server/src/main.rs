@@ -3,10 +3,10 @@ use clap::{Parser, Subcommand};
 use githearth_server::audit_retention::{self, DEFAULT_BATCH_SIZE};
 use githearth_server::{
     AppState, MIGRATOR, bootstrap_admin, config::Config, connect, doctor, jobs, reconcile, router,
-    ssh,
+    setup, ssh,
 };
 use std::{
-    io::{self, Read},
+    io::{self, BufRead, IsTerminal, Read},
     net::SocketAddr,
     path::PathBuf,
 };
@@ -38,6 +38,27 @@ enum Command {
     },
     /// Generate an Ed25519 host key for the embedded SSH server.
     SshKeygen,
+    /// Install from a clean host: configuration, directories, host key, schema,
+    /// first administrator, then the doctor checks. Safe to run again.
+    /// The database URL comes from GITHEARTH_DATABASE_URL or stdin; the
+    /// administrator password from stdin (never from command arguments).
+    Setup {
+        /// Configuration file to write; when absent, the global --config is
+        /// used, and otherwise /etc/githearth/config.toml. The two flags are
+        /// mutually exclusive, so the tool never silently prefers one.
+        #[arg(long, conflicts_with = "config")]
+        config_path: Option<PathBuf>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        http_port: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        ssh_port: Option<u16>,
+        #[arg(long)]
+        no_ssh: bool,
+        #[arg(long)]
+        storage_root: Option<PathBuf>,
+        #[arg(long)]
+        ssh_host_key_path: Option<PathBuf>,
+    },
     /// Audit log IP retention management.
     Audit {
         #[command(subcommand)]
@@ -84,6 +105,26 @@ async fn main() {
     }
 }
 async fn run(args: Args) -> Result<()> {
+    if let Command::Setup {
+        config_path,
+        http_port,
+        ssh_port,
+        no_ssh,
+        storage_root,
+        ssh_host_key_path,
+    } = args.command
+    {
+        return run_setup(
+            args.config,
+            config_path,
+            http_port,
+            ssh_port,
+            no_ssh,
+            storage_root,
+            ssh_host_key_path,
+        )
+        .await;
+    }
     let config = Config::load(args.config.as_deref())?;
     if let Command::Doctor = args.command {
         let exit_code = doctor::run(&config).await;
@@ -100,6 +141,7 @@ async fn run(args: Args) -> Result<()> {
     let pool = connect(&config).await?;
     match args.command {
         Command::Doctor => unreachable!("handled above"),
+        Command::Setup { .. } => unreachable!("handled above"),
         Command::Migrate => {
             MIGRATOR.run(&pool).await.map_err(|_| {
                 anyhow::anyhow!(
@@ -222,6 +264,109 @@ async fn run(args: Args) -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// `githearth-server setup`: resolves the explicit settings, reads the
+/// database URL from the environment or stdin, then installs. The URL is never
+/// accepted as an argument, and it is never printed.
+async fn run_setup(
+    global_config: Option<PathBuf>,
+    config: Option<PathBuf>,
+    http_port: Option<u16>,
+    ssh_port: Option<u16>,
+    no_ssh: bool,
+    storage_root: Option<PathBuf>,
+    ssh_host_key_path: Option<PathBuf>,
+) -> Result<()> {
+    // clap only rejects the two flags when the global `--config` is parsed
+    // inside the subcommand; written before `setup` it is a separate scope. Both
+    // values are visible here, so the ambiguity is refused for either order.
+    let path = match (global_config, config) {
+        (Some(_), Some(_)) => {
+            // The same usage error clap reports for the other ordering, so a
+            // script sees exit 2 whichever flag is written first.
+            eprintln!("--config and --config-path were both given; pass only one of them");
+            std::process::exit(2);
+        }
+        (Some(path), None) | (None, Some(path)) => path,
+        (None, None) => PathBuf::from("/etc/githearth/config.toml"),
+    };
+    // Resolved against the working directory at the moment setup runs, before
+    // the file is inspected or its directory is created: `std::path::absolute`
+    // does not follow symlinks, so the recorded settings are CWD-independent
+    // without changing which file is used.
+    let path = setup::absolute_path(&path)?;
+    // The file is inspected and validated before anything is read from stdin:
+    // a resumed run uses its recorded URL and never waits for input, and a
+    // loose or symlinked file is refused before any prompt could appear.
+    let recorded = setup::recorded_database_url(&path)?;
+    let mut options = setup::Options::new(path, database_url_from_environment_or_stdin(recorded)?)?;
+    // Named in the report when an existing configuration overrides them, so a
+    // supplied value is never ignored without a word.
+    let mut supplied_flags = Vec::new();
+    if let Some(port) = http_port {
+        supplied_flags.push("--http-port");
+        options.bind = SocketAddr::from(([127, 0, 0, 1], port));
+    }
+    if let Some(port) = ssh_port {
+        supplied_flags.push("--ssh-port");
+        options.ssh_bind = SocketAddr::from(([127, 0, 0, 1], port));
+    }
+    options.ssh_enabled = !no_ssh;
+    if no_ssh {
+        supplied_flags.push("--no-ssh");
+    }
+    if let Some(root) = storage_root {
+        supplied_flags.push("--storage-root");
+        options.storage_root = setup::absolute_path(&root)?;
+    }
+    if let Some(key) = ssh_host_key_path {
+        supplied_flags.push("--ssh-host-key-path");
+        options.ssh_host_key_path = setup::absolute_path(&key)?;
+    }
+    options.supplied_flags = supplied_flags;
+    setup::run(&options, &mut setup::StdinPassword).await?;
+    println!(
+        "setup complete: start the server with `githearth-server serve --config {}`",
+        options.config.display()
+    );
+    Ok(())
+}
+
+/// GITHEARTH_DATABASE_URL wins, as it does for every other command. With no
+/// environment URL, a URL recorded in an existing configuration is used, so a
+/// resumed run neither re-reads nor prompts for one; stdin carries one line
+/// only on a first install. Either way the URL is never an argument and never
+/// printed. Stdin must be a pipe: a terminal would echo what is typed, so no
+/// interactive prompt is offered.
+fn database_url_from_environment_or_stdin(recorded: Option<String>) -> Result<String> {
+    if let Ok(url) = std::env::var("GITHEARTH_DATABASE_URL")
+        && !url.trim().is_empty()
+    {
+        return Ok(url.trim().to_owned());
+    }
+    if let Some(url) = recorded {
+        return Ok(url);
+    }
+    if io::stdin().is_terminal() {
+        bail!(
+            "GITHEARTH_DATABASE_URL is not set and stdin is a terminal, \
+             so the connection URL would be echoed; set the variable or pipe \
+             the URL to setup on stdin"
+        );
+    }
+    // One line only: the password reader takes the rest. `Stdin` buffers
+    // internally and keeps it across reads, so nothing is lost here.
+    let mut line = String::new();
+    io::stdin()
+        .lock()
+        .take(1025)
+        .read_line(&mut line)
+        .context("cannot read the database URL from stdin")?;
+    if !line.ends_with('\n') && line.len() >= 1024 {
+        bail!("database URL input exceeds limit");
+    }
+    Ok(line.trim().to_owned())
 }
 
 async fn shutdown() {
