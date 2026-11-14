@@ -31,7 +31,7 @@ CREATE INDEX pinned_commits_pull ON pinned_commits (pull_request_id);
 -- and auto-merge rows hold the head a merge was validated against; a review
 -- records the commit it reviewed. A pull request with none of these is pinned
 -- by its next housekeeping run from the live branch tip. The backfill uses the
--- default 30-day window; later pins and refreshes use
+-- default 90-day window; later pins and refreshes use
 -- `housekeeping_pin_retention_days`.
 INSERT INTO pinned_commits (repository_id, pull_request_id, commit_oid, reason, retain_until)
 SELECT pr.source_repository_id, pr.id, head.oid, 'backfill', now() + interval '30 days'

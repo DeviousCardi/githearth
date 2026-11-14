@@ -186,7 +186,7 @@ fn default_housekeeping_max_live_set_bytes() -> usize {
     1 << 26
 }
 fn default_housekeeping_pin_retention_days() -> u64 {
-    30
+    90
 }
 fn default_housekeeping_fork_fetch_limit_bytes() -> u64 {
     1 << 26
@@ -545,7 +545,7 @@ mod tests {
         // The new knobs default to the documented values and are bounded.
         let defaults = Config::default();
         assert_eq!(defaults.housekeeping_max_live_set_bytes, 1 << 26);
-        assert_eq!(defaults.housekeeping_pin_retention_days, 30);
+        assert_eq!(defaults.housekeeping_pin_retention_days, 90);
         let mut invalid = Config {
             database_url: "postgres://localhost/test".into(),
             ..Config::default()

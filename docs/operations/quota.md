@@ -45,7 +45,7 @@ keep point and a pull-request head pin are not governed by the grace period,
 because they are explicit and are held for as long as their row says.
 
 A pull request's head and base, and their reachable history, are kept by pins
-for `housekeeping_pin_retention_days` (30 by default) after the request closes
+for `housekeeping_pin_retention_days` (90 by default) after the request closes
 (open requests are re-pinned on every run; closing or merging starts the
 window). Those objects remain inside `objects/`, so they count toward the
 quota exactly like reachable objects; a pin protects them from pruning, it does

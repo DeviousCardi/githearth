@@ -111,7 +111,7 @@ and deletes only loose objects outside it:
      repository for a fork pull request). Every run extends the pin of each
      open request's current source branch, so a force push is followed; a
      closed or merged request keeps its last pin for
-     `housekeeping_pin_retention_days` (30 by default) from the close or merge,
+     `housekeeping_pin_retention_days` (90 by default) from the close or merge,
      and the read path resolves a missing source branch to that pin.
    - **Base** — the request's base commit, in the **target** repository,
      written at create. It lives while the request exists and for the same
@@ -337,7 +337,7 @@ how to run a repository by hand or disable the job.
   interval, so a waiting push cannot be starved by back-to-back runs; if its own
   deadline expires first it fails cleanly and can be retried.
 - A pull request's head survives a prune for `housekeeping_pin_retention_days`
-  (30 by default) after the request closes or merges, so its diff stays
+  (90 by default) after the request closes or merges, so its diff stays
   readable; its objects remain in `objects/` and count toward the quota. A
   live-set walk larger than `housekeeping_max_live_set_bytes` fails the run
   before any deletion rather than pruning against a partial set.

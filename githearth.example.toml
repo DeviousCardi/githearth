@@ -37,7 +37,7 @@ auth_concurrency = 2
 #                                        # journal replay before them is bounded by
 #                                        # git_timeout_seconds, not by this sum
 # housekeeping_max_live_set_bytes = 67108864  # refuse to prune if rev-list output is larger
-# housekeeping_pin_retention_days = 30   # keep a closed pull request's head and base,
+# housekeeping_pin_retention_days = 90   # keep a closed pull request's head and base,
 #                                        # and a superseded status's commit, this long
 # housekeeping_fork_fetch_limit_bytes = 67108864  # most bytes one fork pull request's
 #                                        # head may copy into its target (refused above)

@@ -1346,9 +1346,10 @@ async fn a_closed_pull_requests_pinned_head_renders_after_its_branch_is_pruned()
         "the close response already resolves the pin: {closed}"
     );
 
-    // Closing extended the pin from the close, not from its last refresh.
+    // Closing extended the pin from the close, not from its last refresh: a
+    // fresh default window (90 days) from now is what the assertion bounds.
     let extended: bool = sqlx::query_scalar(
-        "SELECT bool_and(retain_until > now() + interval '29 days') FROM pinned_commits \
+        "SELECT bool_and(retain_until > now() + interval '89 days') FROM pinned_commits \
          WHERE pull_request_id = $1",
     )
     .bind(pull_id)
@@ -1528,7 +1529,7 @@ async fn a_closed_pull_requests_base_survives_a_prune_after_its_target_branch_is
     .await;
     assert_eq!(status, StatusCode::OK, "{closed}");
     let extended: bool = sqlx::query_scalar(
-        "SELECT retain_until > now() + interval '29 days' FROM pinned_commits \
+        "SELECT retain_until > now() + interval '89 days' FROM pinned_commits \
          WHERE base_of_pull_request_id = $1",
     )
     .bind(pull_id)

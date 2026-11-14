@@ -72,7 +72,7 @@ to very large repositories must not wait longer than a few minutes.
 | `housekeeping_concurrency` | `GITHEARTH_HOUSEKEEPING_CONCURRENCY` | `2` | Runs in flight at once; 1–16 |
 | `housekeeping_timeout_seconds` | `GITHEARTH_HOUSEKEEPING_TIMEOUT_SECONDS` | `600` | Bound on each of the run's seven housekeeping phases separately. The job's own budget is seven of these plus 60 s; the journal replay before them is not part of that sum |
 | `housekeeping_max_live_set_bytes` | `GITHEARTH_HOUSEKEEPING_MAX_LIVE_SET_BYTES` | `67108864` (64 MiB) | Largest `rev-list --objects --all` output a run accepts; a larger walk fails before any deletion; 1048576–1073741824 |
-| `housekeeping_pin_retention_days` | `GITHEARTH_HOUSEKEEPING_PIN_RETENTION_DAYS` | `30` | How long a closed or merged pull request's head and base pins, and a superseded status's pin, stay live, counted from the close, merge or supersession; 1–3650 |
+| `housekeeping_pin_retention_days` | `GITHEARTH_HOUSEKEEPING_PIN_RETENTION_DAYS` | `90` | How long a closed or merged pull request's head and base pins, and a superseded status's pin, stay live, counted from the close, merge or supersession; 1–3650 |
 | `housekeeping_fork_fetch_limit_bytes` | `GITHEARTH_HOUSEKEEPING_FORK_FETCH_LIMIT_BYTES` | `67108864` (64 MiB) | Most bytes one fork pull request's head may add to its target repository; a larger head is refused before it is copied; 1048576–1073741824 |
 
 The grace period protects work that is real but not yet visible through a ref:
@@ -203,7 +203,7 @@ starts every walk from those pins as well, of every kind:
   candidate (and result), and the pin ends when the intent moves its ref.
 
 A closed or merged request keeps its head and base pins for
-`housekeeping_pin_retention_days` (30 by default), counted from the close or
+`housekeeping_pin_retention_days` (90 by default), counted from the close or
 merge, so its diff stays readable even after the source branch is deleted and a
 prune has run; the read path resolves a missing branch to the head pin and a
 missing target branch to the base pin. A pin is a database row, not a Git ref:
