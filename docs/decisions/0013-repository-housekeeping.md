@@ -96,20 +96,62 @@ and deletes only loose objects outside it:
    fetched. GitHearth creates no alternates between them, so no run can remove
    an object another repository still reads. This settles ADR 0008's open question: **object
    stores stay independent and maintenance preserves that**.
-7. **Pull-request head pins.** Opening a pull request writes a row in
+7. **Pulled-in object ids (pins).** Opening a pull request writes a row in
    `pinned_commits` in the same transaction, in the repository that owns the
-   head (the source repository for a fork pull request). The pin is a row, not a
-   Git ref, and is never advertised. Every housekeeping run extends the pin of
-   each open pull request's current source branch, so a force push is followed;
-   a closed or merged request keeps its last pin for
-   `housekeeping_pin_retention_days` (30 by default), counted from the close or
-   merge, and the read path resolves a missing source branch to that pin so the
-   diff remains readable after its branch is deleted. The live-set walk starts
-   from every live pin with `rev-list --objects --all <pins>`, so the pinned
-   commit's tree and ancestry are protected too. Pinned objects stay inside
-   `objects/` and therefore count toward the repository quota like any other
-   object. A fork whose repository is deleted loses its pins with it (the
-   foreign key cascades), so a deleted fork still reads as a null head.
+   subject. The pin is a row, not a Git ref, and is never advertised. The
+   live-set walk starts from every live pin of every kind with
+   `rev-list --objects --all <pins>`, so each pinned commit's tree and ancestry
+   are protected too. Pinned objects stay inside `objects/` and therefore count
+   toward the repository quota like any other object.
+
+   The kinds (migration `0046`), each written in the transaction that writes
+   the row referencing it, each with its own bound:
+
+   - **Head** — the request's head, in the repository that owns it (the source
+     repository for a fork pull request). Every run extends the pin of each
+     open request's current source branch, so a force push is followed; a
+     closed or merged request keeps its last pin for
+     `housekeeping_pin_retention_days` (30 by default) from the close or merge,
+     and the read path resolves a missing source branch to that pin.
+   - **Base** — the request's base commit, in the **target** repository,
+     written at create. It lives while the request exists and for the same
+     retention after it closes, so a deleted target branch does not cost a
+     closed request its `compare/base...head`. The read path resolves a
+     missing target branch to it. Requests that predate `0046` cannot have
+     their base recovered exactly (the row never stored it and there is no
+     branch table), so `serve` backfills each of them with the target
+     branch's current tip before the scheduler starts: for an unmoved branch
+     that *is* the base, and for a moved one it is a later commit that still
+     reaches the original base.
+   - **Review comment** — the `commit_id` an anchored comment names, while the
+     comment exists; it cascades with the comment. A reviewed commit is also
+     pinned while any review names it (the pre-`0046` backfill already pinned
+     reviews as head pins; this is the kind-owned row).
+   - **Status** — the `commit_id` a status names while it is the latest result
+     for its `(repository, commit, context)`, and for
+     `housekeeping_pin_retention_days` after a newer result supersedes it. This
+     is the bound U11 states, and it is what stops a status on a
+     since-unreachable commit from pinning its ancestry forever.
+
+   A fork whose repository is deleted loses its pins with it (the foreign key
+   cascades), so a deleted fork still reads as a null head. A pin keeps nothing
+   if the repository that owns it does not hold the objects: it is a keep-set
+   entry, not a fetch.
+
+8. **A fork pull request's target-side copy.** A fork pull request's head
+   objects are copied into the target repository whenever the target has to
+   resolve the head there (create, mergeability, code-owner checks), because
+   `compare` and mergeability run in the target. The copy is pinned in the
+   target as well, charged to the target organization — the bytes are in the
+   target's `objects/`, which is what the quota measures, and
+   `repository_fork_fetches` records the attribution. A copy is bounded by
+   `housekeeping_fork_fetch_limit_bytes` (64 MiB by default), measured before
+   anything is copied (the missing objects' stored size), so an oversized fork
+   head cannot fill the target; the request then renders from the fork's own
+   pin. If a target prune releases the copy, the next read re-copies the
+   objects from the fork under the same cap, so a target prune cannot turn a
+   readable fork request into `revision not found` while the fork still holds
+   the objects. The authoritative copy is always the fork's.
 
 Objects that are in no quarantine, reachable from no ref and reachable from no
 keep point or pin are the only deletion candidates.

@@ -44,12 +44,21 @@ protects an unreconciled push or a just-created object before it is reachable
 keep point and a pull-request head pin are not governed by the grace period,
 because they are explicit and are held for as long as their row says.
 
-A pull request's head, and everything it reaches, is kept by a pin for
-`housekeeping_pin_retention_days` (30 by default) after the request closes
+A pull request's head and base, and their reachable history, are kept by pins
+for `housekeeping_pin_retention_days` (30 by default) after the request closes
 (open requests are re-pinned on every run; closing or merging starts the
 window). Those objects remain inside `objects/`, so they count toward the
 quota exactly like reachable objects; a pin protects them from pruning, it does
 not exempt them from the limit.
+
+A fork pull request's head is also copied into the **target** repository (the
+target's `compare`, code-owner checks and mergeability resolve it there) and
+pinned there, so those bytes are charged to the **target organization**:
+they are part of the target's measured `objects/`, and
+`repository_fork_fetches` records how many bytes and fetches each fork has
+cost it. One copy may add at most `housekeeping_fork_fetch_limit_bytes`
+(64 MiB by default) to the target; a larger head is refused before it is
+copied, and the pull request renders from the fork's own pinned copy instead.
 
 The check happens in `pre-receive`, so a refused push writes no journal record
 and moves no ref. If the size cannot be measured the push is refused.

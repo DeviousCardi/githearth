@@ -12,8 +12,10 @@ For one repository, under its per-repository lock:
 
 1. Replays the push journal into the database (a journal that cannot be
    reconciled defers the run instead of deleting anything).
-2. Pins every merge candidate whose intent has not reached its ref update, and
-   refreshes the head pin of every open pull request whose branch lives here.
+2. Keeps every merge candidate whose intent has not reached its ref update,
+   refreshes the head pin of every open pull request whose branch lives here
+   (and, for a fork request, the target-side copy it already holds), and keeps
+   the base pin of every open request whose target lives here.
 3. Repacks reachable history with `git repack -A -d`. `-A` loosens an
    unreachable object that lives only in a pack into a fresh loose file, so its
    age can be measured per object. (`-a -d` would delete those objects
@@ -31,7 +33,20 @@ points. If that walk produces more than `housekeeping_max_live_set_bytes`
 live set is never used to decide what to delete, so a merge candidate or a
 pinned pull-request head cannot be removed by a truncated answer. Nothing is
 deleted in that run, and the job retries (which repeats the failure until the
-cap is raised).
+cap is raised). The failure is closed, never a partial prune: the run records
+`failed` with the cap in the message and the next run tries again.
+
+**Sizing the cap.** The walk prints one line per live object. Measured on this
+project's own repository, that is about **68.6 bytes of walk output per
+object**, so the 64 MiB default covers roughly **1 million** live objects and
+the 1 GiB maximum roughly **15 million**. A kernel-sized history (about 10
+million objects) needs roughly 650 MiB. If `doctor` or the log reports the
+live-set cap failure, raise `housekeeping_max_live_set_bytes` above
+`live_objects × 70` (and no higher than 1 GiB, the maximum), or stop and read
+[the ADR](../decisions/0013-repository-housekeeping.md): above about 15 million
+objects this version cannot prune at all, and streaming the walk is the fix
+that is not yet implemented. Until then such an installation keeps its objects
+and its space, which is the safe direction.
 
 A push or merge that arrives during a run waits for the lock and then either
 completes or is refused by Git exactly as it would be without housekeeping.
@@ -57,7 +72,8 @@ to very large repositories must not wait longer than a few minutes.
 | `housekeeping_concurrency` | `GITHEARTH_HOUSEKEEPING_CONCURRENCY` | `2` | Runs in flight at once; 1–16 |
 | `housekeeping_timeout_seconds` | `GITHEARTH_HOUSEKEEPING_TIMEOUT_SECONDS` | `600` | Bound on each of the run's seven housekeeping phases separately. The job's own budget is seven of these plus 60 s; the journal replay before them is not part of that sum |
 | `housekeeping_max_live_set_bytes` | `GITHEARTH_HOUSEKEEPING_MAX_LIVE_SET_BYTES` | `67108864` (64 MiB) | Largest `rev-list --objects --all` output a run accepts; a larger walk fails before any deletion; 1048576–1073741824 |
-| `housekeeping_pin_retention_days` | `GITHEARTH_HOUSEKEEPING_PIN_RETENTION_DAYS` | `30` | How long a closed or merged pull request's head pin stays live, counted from the close or merge; 1–3650 |
+| `housekeeping_pin_retention_days` | `GITHEARTH_HOUSEKEEPING_PIN_RETENTION_DAYS` | `30` | How long a closed or merged pull request's head and base pins, and a superseded status's pin, stay live, counted from the close, merge or supersession; 1–3650 |
+| `housekeeping_fork_fetch_limit_bytes` | `GITHEARTH_HOUSEKEEPING_FORK_FETCH_LIMIT_BYTES` | `67108864` (64 MiB) | Most bytes one fork pull request's head may add to its target repository; a larger head is refused before it is copied; 1048576–1073741824 |
 
 The grace period protects work that is real but not yet visible through a ref:
 objects a push or server operation has just written before a ref reaches them,
@@ -150,8 +166,8 @@ Every step is safe to interrupt:
 
 A restarted run (the job retry, or the operator command above) finishes the
 work. No reachable object is ever a candidate: the deletion set is computed
-from `git rev-list --objects --all` plus the pinned merge candidates and the
-pull-request head pins.
+from `git rev-list --objects --all` plus the pinned merge candidates and every
+kind of pin (heads, bases, review comments, statuses).
 
 The job has no lease heartbeat. Its claim lease is twice the run budget, so a
 run inside its own budget cannot lose the lease; a run that did outlive it
@@ -162,18 +178,60 @@ the operator sees the first attempt reported as a retry. A graceful shutdown
 also waits up to the longest run budget plus one second before returning an
 in-flight job to `pending`.
 
-## Pull-request head pins
+## Pinned commits: what a prune may not delete
 
-Opening a pull request records its head commit in `pinned_commits`, in the
-repository that owns the head, in the same transaction as the pull request.
-Every run refreshes the pin of an open request's current branch, so a force
-push is followed. A closed or merged request keeps its last pin for
+The keep-set is every ref plus every object ID PostgreSQL references. A run
+starts every walk from those pins as well, of every kind:
+
+- **Pull-request heads.** Opening a pull request records its head commit in
+  `pinned_commits`, in the repository that owns the head, in the same
+  transaction as the pull request. Every run refreshes the pin of an open
+  request's current branch, so a force push is followed.
+- **Pull-request bases.** The base commit of the request (the target branch's
+  tip when it opened) is pinned in the **target** repository in the same
+  transaction, so a closed request whose target branch is later deleted still
+  shows `compare/base...head`.
+- **Review comments.** An anchored comment pins the commit it names while the
+  comment exists; deleting the comment releases it.
+- **Commit statuses.** Posting a status pins its commit while that status is
+  the latest result for its context. A newer result for the same context
+  supersedes it, and its pin then expires after
+  `housekeeping_pin_retention_days` instead of living with the row. That is what
+  stops a status on a since-unreachable commit from pinning its whole ancestry
+  forever.
+- **Merge candidates.** An intent in `validating` or `executing` pins its
+  candidate (and result), and the pin ends when the intent moves its ref.
+
+A closed or merged request keeps its head and base pins for
 `housekeeping_pin_retention_days` (30 by default), counted from the close or
-merge, so its diff stays readable even after the source branch is deleted and
-a prune has run; the read path resolves the missing branch to that pin. A pin
-is a database row, not a Git ref: it is never advertised, and clients cannot
-fetch it. Pinned objects live in `objects/` and therefore count toward the
-quota.
+merge, so its diff stays readable even after the source branch is deleted and a
+prune has run; the read path resolves a missing branch to the head pin and a
+missing target branch to the base pin. A pin is a database row, not a Git ref:
+it is never advertised, and clients cannot fetch it. Pinned objects live in
+`objects/` and therefore count toward the quota.
+
+A pin is only a keep-set entry: it does not fetch anything. A commit whose
+objects are not in the repository a pin names keeps nothing (`cat-file` reports
+it missing and the walk skips it).
+
+### Fork pull requests
+
+A fork pull request's head objects are pinned in the **fork**, which holds the
+authoritative copy. The **target** also keeps a copy of the head, because its
+`compare`, code-owner checks and mergeability resolve the head there; that copy
+is pinned in the target too. The copied bytes live in the target repository and
+are charged to the target organization (they count toward its quota, and
+`repository_fork_fetches` records how much each fork has cost it). The copy is
+bounded by `housekeeping_fork_fetch_limit_bytes` (64 MiB by default): a head
+whose objects would add more than that to the target is refused **before**
+anything is copied, logged, and the pull request still renders from the fork's
+own pin.
+
+If a target prune releases the copy (the pin expired, or the request was
+deleted), the next read copies the objects from the fork again — under the same
+cap — instead of answering `revision not found`. The fork's pin is what makes
+that possible; deleting the fork ends it, and the request then reports no head,
+exactly as before pins existed.
 
 ## Disabling it
 
