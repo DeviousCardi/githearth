@@ -73,3 +73,5 @@ The next coding gate is specified in [M1](05-first-milestone.md). The full seque
 | Multi-region/federation | Deferred; separate requirements | After single-region qualification |
 
 These pending decisions do not block the current workload, database, and local Git experiments.
+
+Update 2026-11-14: this table is the 2026-10-27 snapshot. Revocation semantics for protected writes and merges are recorded in ADRs 0002 and 0004, and the UI is server-rendered. The maintained list, including the decisions due before M5 and M6, is the [decision register](07-qualification-and-decisions.md#decision-register). Gate C qualification of PostgreSQL (production-style load, HA, sustained open-loop runs) remains open and is due before a production release or HA claim.

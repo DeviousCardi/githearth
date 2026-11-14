@@ -1,6 +1,6 @@
 # Baseline capability inventory
 
-Baseline: 2026-10-27. All rows below are required unless marked optional. A milestone allocation is a scope commitment, not implementation status. Only the existing M0 experiments and reviewed M1 foundation are implemented; no future row is implicitly complete.
+Baseline: 2026-10-27. All rows below are required unless marked optional. A milestone allocation is a scope commitment, not implementation status. M1–M4 are verified experimental as of 2026-11-14; [the status section](#status-of-m1m4-allocations-2026-11-14) records which parts of rows allocated to them are delivered and which moved to M4.1. No future row is implicitly complete.
 
 A row closes when UI/API, permission boundaries, error/pagination behavior, data/export/restore, diagnostics and appropriate tests exist. Integrations may satisfy scanner/protocol outcomes if openly usable, documented and tested. Every compatibility target receives a source-version/feature fixture matrix.
 
@@ -47,6 +47,33 @@ A row closes when UI/API, permission boundaries, error/pagination behavior, data
 | Freedom/release | Permissive product license decision, notices, SBOM, standard protocols, no forced telemetry | M4, M13 | Distribution audit and independent install |
 | Capacity | 1/100/10k/100k-account fixtures with active load and full resources | M4, M5, M13 | Sustained SLO evidence, not account-count extrapolation |
 | Optional evolution | AI, workspaces, federation, multi-region, managed hosting | M14 | Separate scope/decision/qualification |
+
+## Status of M1–M4 allocations (2026-11-14)
+
+Checked against the code on `main` at `747c65c`. "Delivered" means implemented with tests and covered by the M2–M4 verification reports; it is experimental maturity, and rows that also name a later milestone stay open for that part.
+
+| Domain | Delivered | Not delivered from the M1–M4 allocation |
+| --- | --- | --- |
+| Runtime | Configuration, migrations, probes, logs, bounds, shutdown | — |
+| Local identity | Bootstrap, login/logout, expiry, tokens, SSH keys | Account provisioning, password change/reset, login throttling → M4.1; recovery → M11 |
+| Tenancy | Organizations, owner membership, roles in authorization, repository grants | Member administration, teams, invitations → M4.1 |
+| Repository management | Namespaces, visibility, create/rename/archive/delete | Transfer → M4.1 |
+| Git protocols | HTTP and SSH clone/fetch/push, tags, branches, multi-ref | — |
+| Git browsing | Files/trees, commits, diffs, compare | Blame, history, archives stay M9 |
+| Git operations | Forks, protected refs, signing policy | Housekeeping → M4.1; mirrors, imports stay M5/M12 |
+| Review | All listed capabilities | — |
+| Merge | Methods, conflicts, checks, queue, auto-merge | Cluster behavior stays M5 |
+| Issues | CRUD and comments | Remainder stays M8 |
+| Notifications | In-app from durable jobs | Email, preferences → M4.1; subscriptions/routing stay M8 |
+| Audit/compliance | Hash-chained audit, IP retention, per-repository storage quota | Usage accounting, export, legal hold stay M11 |
+| Installation | Runbook install, `doctor` preflight, Compose | One `setup` command with generated secrets → M4.1 |
+| Recovery | Maintenance-window backup, off-host copy, fresh restore (runbook procedure) | `backup`/`restore` commands → M4.1; online backup undecided |
+| Upgrades | Forward-only migrate with schema checks | Version window, expand/contract stay M11/M13 |
+| Operations | `doctor`, structured logs, measured hardware minimums | Metrics → M4.1; traces, alerts, support bundles stay M11 |
+| UX | Server-rendered accessible UI, WCAG 2.2 AA basics audit | Membership/administration flows → M4.1 |
+| Freedom/release | License, generated third-party notices | SBOM, signed artifacts stay M13 |
+| Capacity | One-host measurement with soak | Open-loop profile runs stay M5/M13 |
+| LFS/uploads | — | Local object-storage backend moved from M4 to M7 |
 
 ## Cross-cutting completion contract
 

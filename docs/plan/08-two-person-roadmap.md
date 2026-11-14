@@ -1,6 +1,6 @@
 # Two-person delivery roadmap
 
-Date: 2026-10-28. Status: proposed work allocation; implementation is not claimed complete.
+Date: 2026-10-28; updated 2026-11-14. Status: phases 0–5 are complete (M2 accepted 2026-10-29, M3 signed off 2026-11-13, M4 signed off 2026-11-14). Phase 6 (M4.1) is the current work allocation; see [Phase 6](#phase-6--m41-usable-team-alpha).
 
 Planning baseline: `f40a031`, reviewed on 2026-10-27. M1 has recorded experimental verification. M2 has storage layout, journal, authorization policies and persisted facts, but still needs an integrated Git-and-issues workflow. Recheck the current branch before assigning tasks; this document does not independently verify later changes.
 
@@ -86,9 +86,42 @@ Run `scripts/ci.sh` on the integrated revision before merging. It includes Postg
 - Record whole-workflow resource measurements and required comparison evidence, including unavailable comparison systems and limitations.
 - Record remaining scope against the [M2 specification](05-first-milestone.md) before declaring the milestone complete.
 
-## Beyond the single-node alpha
+## Phase 6 — M4.1 usable team alpha
 
-These are broad allocations, not implementation-ready tickets. Break them down after M4 using the dependencies and acceptance gates in the full roadmap.
+Scope and exit criteria are in the [roadmap](04-forge-roadmap.md#m41--usable-team-alpha). Ownership follows the same boundary as phases 0–5: A owns application behavior and metadata, B owns Git storage, execution and operator tooling. The conflict-prevention rules above apply unchanged.
+
+| Increment | Person A — Application | Person B — Git and infrastructure | Completion gate |
+| --- | --- | --- | --- |
+| 6.0 Contracts | Account/membership/team/invitation schema and authorization facts; outbox handler interface (event → handler, deduplication key) | Housekeeping safety design (locking against push, merge, quarantine, forks); outbox relay claim/retry design; `setup`/`backup`/`restore` command surface. Revise ADR 0006 | Schema, handler interface and ADR revision are merged; no caller is written against an unagreed interface |
+| 6.1 People | Administrator account create/disable, password change/reset, session revocation on credential change, failed-login throttling; member add/remove/role change with last-owner rule; API and UI | `setup` command (config, generated secrets, directory ownership, host key, migrate, first admin); SSH and Git HTTP admission honor disabled accounts and removed members | A clean install reaches a three-person organization with no SQL; a removed or disabled user is denied on HTTP, SSH, API and UI |
+| 6.2 Teams and maintenance | Teams with repository grants, invitations with expiry, repository transfer (metadata, grants, forks, open pull requests) | Repository housekeeping job (repack, prune, quota accounting) with fault injection; transfer review for storage and fork-network assumptions | Team grants authorize identically on both transports; interrupted housekeeping loses no reachable object; a transferred repository keeps ID and history |
+| 6.3 Delivery and operations | Email notification handler, preferences and deduplication; domain handlers on the outbox interface | Outbox relay execution (claim, `delivered_at`, retry, crash recovery); SMTP configuration and `doctor` check; metrics endpoint; `backup`/`restore` commands | Every committed event is delivered at least once after a crash; email failure retries and never blocks a request; `backup` → `restore` on a fresh host passes |
+| 6.4 Acceptance | Application acceptance cases U01–U08; runbook review | Operations acceptance cases U09–U14; rerun `verify-m4.py`; merge-error investigation; optional Gitea/Forgejo comparison | Every case has recorded evidence in `docs/verification/m4-1-signoff.md`; each person exercises the other's boundary; both sign off |
+
+### M4.1 acceptance cases
+
+| ID | Owner | Requirement |
+| --- | --- | --- |
+| U01 | A | Administrator creates, disables and re-enables accounts; a non-administrator cannot |
+| U02 | A | Password change and administrator reset revoke existing sessions; no default or emailed plaintext password |
+| U03 | A | Failed-login throttling bounds guessing and cannot permanently lock out the administrator |
+| U04 | A | Member add/remove/role change; the last owner cannot be removed or demoted; changes are audited |
+| U05 | A | Teams grant repository access; removing a team member or grant denies new admission |
+| U06 | A | Invitations expire, are single-use and reveal nothing about private organizations to the wrong account |
+| U07 | A | Repository transfer preserves ID, grants, forks and open pull requests; the old URL never resolves to another tenant's repository |
+| U08 | A | Email notifications deduplicate, honor preferences and retry from durable intents |
+| U09 | B | `setup` on a clean host yields a running, `doctor`-clean installation with generated secrets and correct ownership |
+| U10 | B | HTTP and SSH agree for disabled accounts, removed members and team grants |
+| U11 | B | Housekeeping interrupted at each step loses no reachable object; concurrent push/merge succeeds or is cleanly refused; quota reflects freed space |
+| U12 | B | Outbox relay delivers every committed event at least once across crash and restart; duplicates are harmless |
+| U13 | B | `backup` and `restore` commands reproduce the documented procedure; a corrupted or incomplete backup is detected |
+| U14 | B | Metrics endpoint is off or loopback-only by default and exposes no tenant content |
+
+Merge order: 6.0 contracts first; then 6.1 A and B in parallel; 6.2 and 6.3 may overlap once the 6.0 interfaces are merged. A allocates migration numbers as before.
+
+## Beyond M4.1
+
+These are broad allocations, not implementation-ready tickets. Break each one down into increments and acceptance cases, as phase 6 does, when it is selected. The milestone after M4.1 has not been selected; M5 and M6 are both unblocked by it. M5 implementation needs its three ADRs first (Git consensus, PostgreSQL HA manager, object store); Docker Compose serves M5 development, and qualification runs on the available independent machines.
 
 | Milestone | Person A leads | Person B leads |
 | --- | --- | --- |

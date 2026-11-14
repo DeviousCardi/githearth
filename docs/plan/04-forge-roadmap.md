@@ -26,16 +26,17 @@ Architectural rules:
 | --- | --- | --- | --- |
 | M0 | Contracts, local Git prototype, metadata screening | None | Screening complete; production qualification open |
 | M1 | Server, identity, tenant/database foundation | M0 provisional selection | Verified experimental |
-| M2 | Usable Git and issues workflow | M1 | Planned |
-| M3 | Reviews and safe merge coordination | M2 | Planned |
-| M4 | Recoverable single-node alpha | M2, M3 | Planned |
-| M5 | Single-region distributed foundation | M4 | Planned |
-| M6 | Isolated CI and workflow compatibility | M3, M4; cluster tests use M5 | Planned |
+| M2 | Usable Git and issues workflow | M1 | Verified experimental; accepted 2026-10-29 ([report](../verification/m2-workflow.md)) |
+| M3 | Reviews and safe merge coordination | M2 | Verified experimental; signed off 2026-11-13 ([sign-off](../verification/m3-signoff.md)) |
+| M4 | Recoverable single-node alpha | M2, M3 | Exit criteria verified; signed off 2026-11-14 ([sign-off](../verification/m4-signoff.md)). Build-list remainder moved to M4.1 |
+| M4.1 | Usable team alpha: accounts, membership, housekeeping and operator tooling | M4 | Planned; next milestone |
+| M5 | Single-region distributed foundation | M4.1 | Planned |
+| M6 | Isolated CI and workflow compatibility | M3, M4.1 (event delivery); cluster tests use M5 | Planned |
 | M7 | Packages, releases, sites and delivery | M6 | Planned |
 | M8 | Planning, documentation and community | M3, M4 | Planned |
 | M9 | Search and navigation | M2; cluster indexing uses M5 | Planned |
 | M10 | Application/supply-chain security | M6, M7, M9 | Planned |
-| M11 | Enterprise identity, policy and operations | M5; integrates M6–M10 | Planned |
+| M11 | Enterprise identity, policy and operations | Identity slice (OIDC/SAML/SCIM, MFA, service accounts) needs only M4.1; cluster operations need M5; integrates M6–M10 | Planned |
 | M12 | Portability and integration ecosystem | M4; qualification covers M5–M11 | Planned |
 | M13 | Complete baseline qualification/stable release | M5–M12 | Planned |
 | M14 | Optional extensions and regional evolution | Separate module decisions | Deferred |
@@ -48,8 +49,9 @@ flowchart TD
     M1 --> M2[Git and issues workflow]
     M2 --> M3[Review and merges]
     M3 --> M4[Recoverable single node]
-    M4 --> M5[Single region distributed]
-    M4 --> M6[Isolated CI]
+    M4 --> M41[Usable team alpha]
+    M41 --> M5[Single region distributed]
+    M41 --> M6[Isolated CI]
     M6 --> M7[Packages and delivery]
     M3 --> M8[Planning and community]
     M2 --> M9[Search and navigation]
@@ -106,7 +108,30 @@ Define consistent backup across metadata, Git journals/objects and large objects
 
 Exit: an independent user installs from the runbook on clean Linux; restart, disk-full behavior, bounded resources, off-host backup, fresh restore, upgrade and controlled uninstall pass. HTTP/SSH authorization agrees. Publish minimum hardware only after measurement. Resolve license files/notices before external distribution; review TLS/session defaults and accessibility.
 
+Status (2026-11-14): all thirteen exit items are verified and signed off in [m4-signoff.md](../verification/m4-signoff.md). The exit list was the acceptance gate; the following build-list and inventory items allocated to M4 or earlier were not delivered and move to M4.1: account provisioning beyond the first administrator, organization membership/teams/invitations, password change and login throttling, repository transfer, repository housekeeping, outbox delivery, email notifications, metrics, one setup command with generated secrets, and a backup/export command. Local object storage has no consumer yet and moves to M7 with LFS. Backup remains maintenance-window only.
+
+## M4.1 — Usable team alpha
+
+M4 proved that one installation survives restart, restore and upgrade. M4.1 makes that installation usable by a team without SQL and operable without hand-written scripts. It adds no new product domain.
+
+Build:
+
+- **Accounts:** administrator-created accounts, disable/re-enable, own password change, administrator password reset, session revocation on credential change, and bounded failed-login throttling.
+- **Membership:** organization member add/remove/role change with a last-owner rule, teams with repository grants, and invitations with expiry; API and UI.
+- **Repository transfer:** move a repository between namespaces the actor may create in; identity, storage path, grants, forks and open pull requests survive.
+- **Notifications by email:** SMTP delivery from durable intents with retry and deduplication, per-account preferences, no content in job payloads.
+- **Outbox delivery:** a relay claims `outbox_events`, dispatches to in-process handlers at least once and records `delivered_at`; revise [ADR 0006](../decisions/0006-durable-jobs.md), which currently leaves the outbox undelivered. Webhooks (M12) and CI triggers (M6) build on this.
+- **Repository housekeeping:** scheduled repack and pruning of unreachable objects as a durable job, safe against concurrent pushes, merges, quarantine and forks; quota accounting reflects the result.
+- **Operator tooling:** one `setup` command (configuration, generated secrets, directory ownership, host key, migrate, first administrator), `backup` and `restore` commands implementing the documented maintenance-window procedure with checksums, and a metrics endpoint that is off or loopback-only by default.
+- **Carried evidence:** investigate the unreproduced `storage operation failed` merge error from lab round 4, and run the M2 comparison against Gitea/Forgejo when an instance is available (optional, recorded either way).
+
+Exit: starting from a clean install, an administrator creates a second and third account, adds them to an organization and a team, and they push, review and merge without any direct database access. Removing a member or disabling an account denies new admission on HTTP, SSH, API and UI. The last owner cannot be removed. Repeated failed logins are throttled without locking out the administrator permanently. A transferred repository keeps its ID, history, grants and open pull requests, and its old URL does not resolve to another tenant's repository. Housekeeping interrupted at any step loses no reachable object, and a push or merge racing it succeeds or is cleanly refused. Every committed outbox event is delivered at least once after a crash, and handlers deduplicate. Email failure retries from the durable intent and never blocks the originating request. `setup` → `backup` → `restore` on a fresh host reproduces repositories, metadata and relationships. Metrics expose no tenant content. Runbooks in `docs/operations/` are updated, and the `verify-m4.py` drills still pass.
+
 ## M5 — Single-region distributed foundation
+
+Test environments: Docker Compose on one machine is the development and functional environment for routing, replication, catch-up, leader change and fencing logic. It is not qualification evidence: containers on one host share one failure domain ([qualification rules](07-qualification-and-decisions.md#correctness-and-fault-matrix)). The exit criteria below are run on the available independent machines with controlled network faults.
+
+Before implementation starts, record ADRs for Git consensus/journal replication, the PostgreSQL HA manager and topology, and the distributed object store; these are the three open M5 rows in the decision register.
 
 Build versioned placement/routing, storage RPC, consensus-based repository journal, membership, durable object replication/catch-up, snapshots, fencing, leader changes, repair, shard moves, distributed large objects, redundant gateways/workers and PostgreSQL HA.
 
@@ -128,7 +153,7 @@ Exit: compatibility fixtures pass; runner loss/duplicates cannot publish stale w
 
 ## M7 — Delivery
 
-Build releases/tags/assets, LFS, OCI registry, Cargo/npm/PyPI/Maven/NuGet/generic packages, digest verification, immutable publication, provenance/signatures, retention/GC, sites/custom domains, environments, deployment approvals/records/credentials and rollback workflows.
+Build the local object-storage backend (moved from M4; LFS is its first consumer), releases/tags/assets, LFS, OCI registry, Cargo/npm/PyPI/Maven/NuGet/generic packages, digest verification, immutable publication, provenance/signatures, retention/GC, sites/custom domains, environments, deployment approvals/records/credentials and rollback workflows.
 
 Exit: standard clients interoperate; unauthorized digest/LFS access denied; interrupted uploads resume or clean up; GC preserves referenced content; export/restore covers retained assets. Deployment approval binds exact artifacts and identities. External deployment success is distinct from CI job completion.
 
