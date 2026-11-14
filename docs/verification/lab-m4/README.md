@@ -30,6 +30,8 @@ cross-account tests. Git content was pushed over HTTP and SSH.
 | --- | --- | --- | --- | --- |
 | 1 — first build | 1,880 | 1,755 | 98 | 27 |
 | 2 — fixed build | 510 | 442 | 68 | 0 |
+| 3 — closure (PRs #161/#162) | 2,348 | 2,305 | 39 | 3 |
+| 4 — final verification (PRs #163/#165) | 1,408 | 1,375 | 33 | 0 |
 
 Round 1 found **1 blocker, 13 major findings and a long tail of minor ones**.
 The blocker and every major except two feature gaps — the branch-protection
@@ -40,6 +42,31 @@ not regressions. No domain reported a new blocker. Round 2 ran on `7e1ded3`;
 the three review fixes in `e638676` (SSH credential cleanup, worker retry
 spacing, change-request detail scope) were verified by the full CI and the
 affected suites, not by a third tester round.
+
+### Round 3 — closing #150–#159
+
+Eighteen testers covered the ten filed issues plus regression, adversarial,
+end-to-end, API-contract, performance and ops domains (reports in
+[round-3/](round-3/)). The two feature gaps from round 1 were closed by PR
+#161 (branch-protection settings page, browser cross-repo PR form, browse and
+UI polish) and PR #162 (NUL validation, uniform 404, Git HTTP, fork API, code
+owners). Round 3 found two medium UI defects and a set of low findings; PRs
+#163/#165 fixed them (reviewer controls only for approvers, new-repository form
+requires a readable org and create permission, always-visible clone URLs, JSON
+envelopes for extractor errors/405, pattern length cap).
+
+### Round 4 — final verification
+
+Eight testers (reports in [round-4/](round-4/)) re-ran the browser UX, security,
+API contract, full journey, regression, Git transport, operations (including the
+`verify-m4.py` S1 install drill) and an exploratory sweep. Security, API,
+regression, Git and operations were PASS; the browser UX found the two medium
+affordance defects fixed in PR #165, and the journey found the missing clone
+URLs and cross-repo source label, also fixed. The exploratory sweep's low
+findings (non-400 extractor rejections, empty 405s, unbounded patterns) were
+fixed in the same PR. A transient `storage operation failed` merge 500 was seen
+once by two testers and could not be reproduced in dedicated retries; it is
+recorded as an observation.
 
 ### Round 2 by domain
 
@@ -80,26 +107,41 @@ than bytes; zero-width-only titles/comments are refused; a self review request
 does not notify the requester; the image ships the `githearth` storage check CLI;
 install/ADR/TLS docs no longer describe the pre-2.40 or pre-UI state.
 
-## Remaining known defects
+## Issue status
 
-Filed from this campaign; none is a regression from the fix round.
+All ten issues filed from this campaign (#150–#159) are fixed and verified:
 
-| Issue | Severity | Summary |
+| Issue | Fixed by | Verified |
 | --- | --- | --- |
-| [#150](https://github.com/DeviousCardi/githearth/issues/150) | major | Branch protection has no settings UI (API-only); tag protection has one |
-| [#151](https://github.com/DeviousCardi/githearth/issues/151) | major | Cross-repository pull requests cannot be created from the browser |
-| [#152](https://github.com/DeviousCardi/githearth/issues/152) | minor | NUL byte in user text returns 503 instead of 400 |
-| [#153](https://github.com/DeviousCardi/githearth/issues/153) | minor | 404 bodies distinguish missing from unreadable org/repo (existence oracle) |
-| [#154](https://github.com/DeviousCardi/githearth/issues/154) | minor | Git HTTP: malformed bodies 200, no 100-continue on fetch, v2 advertisement, read-only push admitted to pack |
-| [#155](https://github.com/DeviousCardi/githearth/issues/155) | minor | Browse UI: 100-commit cap, cursor overflow 500, bare 404, captions/breadcrumbs |
-| [#156](https://github.com/DeviousCardi/githearth/issues/156) | minor | Fork list/count/parent link missing, fork PR list omits outgoing PRs, system-closed PR can be reopened |
-| [#157](https://github.com/DeviousCardi/githearth/issues/157) | minor | PR create/PATCH reports `code_owner_review_satisfied: true` before CODEOWNERS evaluation |
-| [#158](https://github.com/DeviousCardi/githearth/issues/158) | minor | UI polish: duplicate id, overflow, stretched checkboxes, unread badge, tag-form 503, queue cancel, ff-only precheck |
-| [#159](https://github.com/DeviousCardi/githearth/issues/159) | minor | Commenting on a >30-comment issue redirects to the first page |
+| #150 branch-protection settings UI | #161 | round 3, round 4 |
+| #151 browser cross-repo PR | #161 | round 3, round 4 |
+| #152 NUL validation | #162, #165 (remaining UI paths) | rounds 3–4 |
+| #153 uniform 404 | #162, #163 (merge write paths) | rounds 3–4 |
+| #154 Git HTTP | #162 | rounds 3–4 |
+| #155 browse UI | #161 | rounds 3–4 |
+| #156 fork API/PR list/reopen | #162, #163 (UI section) | rounds 3–4 |
+| #157 code-owner facts | #162 | rounds 3–4 |
+| #158 UI polish | #161, #165 | rounds 3–4 |
+| #159 comment redirect | #161 | rounds 3–4 |
+
+### Residual observations (not filed as defects)
+
+- Browser `Form`/`Query` extractor rejections (missing form field, malformed
+  `after`) still answer a plain 400/422 page; the JSON API is fully enveloped.
+- There is no organization-membership administration UI/API yet (documented as
+  later work); multi-actor tests used pre-seeded members.
+- A merged pull request does not display its merge commit SHA (merger and time
+  are shown).
+- `GET .../compare` without a spec returns the styled 404, and
+  `/settings/tokens`/`ssh-keys` are POST-only endpoints (no page links to them).
+- Idempotent replay of a PR create returns the recorded body, which can say
+  `open` after the PR merged; clients should re-GET (standard replay semantics).
 
 Historical note: the primary test database still holds 27 orphan
 `push_credentials` rows created by the pre-fix SSH build (21:19–21:24Z); the fix
-stops new orphans but does not backfill. The lab instance is disposable.
+stops new orphans but does not backfill. The lab instance is disposable. A
+single `storage operation failed` merge 500 was observed once by two testers
+during round 4 and was not reproducible in dedicated retries.
 
 ## Reproducing
 
