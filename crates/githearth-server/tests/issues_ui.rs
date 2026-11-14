@@ -359,6 +359,59 @@ async fn issue_and_comment_lists_paginate() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn comment_on_a_long_issue_redirects_to_its_page_and_anchor() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/issues", f.api_base),
+        &f.token,
+        json!({"title": "busy issue"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for i in 1..=30 {
+        let (status, _) = api(
+            &f.app,
+            "POST",
+            &format!("{}/issues/1/comments", f.api_base),
+            &f.token,
+            json!({"body": format!("comment {i}")}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    // The 31st comment lands on the second page; the form must redirect there
+    // with an anchor so the new comment is visible, not page one.
+    let (_, page) = get(&f.app, &format!("{}/issues/1", f.base), Some(&f.cookie)).await;
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/issues/1/comments", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", "k-new"),
+            ("body", "comment 31"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.unwrap(),
+        format!("{}/issues/1?after=30#comment-31", f.base)
+    );
+    let (_, target) = get(
+        &f.app,
+        &format!("{}/issues/1?after=30", f.base),
+        Some(&f.cookie),
+    )
+    .await;
+    assert!(target.contains("id=\"comment-31\""));
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn forms_require_session_csrf_and_valid_input() {
     let f = fixture().await;
     let (status, _) = get(&f.app, &format!("{}/issues", f.base), None).await;

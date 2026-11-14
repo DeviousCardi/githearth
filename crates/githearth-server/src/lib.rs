@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod audit_retention;
 pub mod auto_merge;
+pub mod branch_protection_ui;
 pub mod browse;
 mod browse_ui;
 pub mod client_ip;

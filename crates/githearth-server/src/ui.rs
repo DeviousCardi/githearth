@@ -175,16 +175,19 @@ pub(crate) fn render_page(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <title>{title}</title><style>\
-body{{font-family:system-ui,sans-serif;margin:0;background:#f7f7f8;color:#111}}\
+body{{font-family:system-ui,sans-serif;margin:0;background:#f7f7f8;color:#111;overflow-wrap:anywhere}}\
 main{{max-width:900px;margin:2rem auto;padding:0 1rem}}\
 nav{{background:#111;color:#fff;padding:.75rem 1rem;display:flex;gap:1rem;align-items:center}}\
 nav a{{color:#fff;text-decoration:none}}\
-.card{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}}\
+.card{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0;overflow-x:auto}}\
 label{{display:block;margin:.5rem 0 .25rem}}\
-input{{padding:.5rem;width:100%;box-sizing:border-box}}\
+input:not([type=checkbox]):not([type=radio]){{padding:.5rem;width:100%;box-sizing:border-box}}\
+input[type=checkbox],input[type=radio]{{width:auto;margin-right:.35rem}}\
+table{{border-collapse:collapse}}\
 button{{padding:.5rem 1rem;cursor:pointer}}\
 .error{{color:#b00020;margin:.5rem 0}}\
 .muted{{color:#666;font-size:.9rem}}\
+.badge{{display:inline-block;background:#111;color:#fff;border-radius:999px;padding:.1rem .5rem;font-size:.85rem}}\
 ul{{list-style:none;padding:0}}\
 li{{padding:.4rem 0;border-bottom:1px solid #eee}}\
 a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{{outline:3px solid #005fcc;outline-offset:2px}}\
@@ -232,6 +235,25 @@ pub(crate) fn not_found_page(username: Option<&str>) -> UiError {
         )
             .into_response(),
     ))
+}
+
+/// Styled 404 for paths no router matched. Without this fallback axum answers
+/// with a bare, header-less 404 for unknown browse URLs.
+async fn fallback_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let username = browser_auth(&state, &headers)
+        .await
+        .ok()
+        .map(|(account, _)| account.username);
+    (
+        StatusCode::NOT_FOUND,
+        Html(render_page(
+            "Not found",
+            username.as_deref(),
+            None,
+            "<h1>Not found</h1>",
+        )),
+    )
+        .into_response()
 }
 
 pub(crate) fn unavailable_page(username: Option<&str>) -> UiError {
@@ -598,6 +620,35 @@ async fn organization(
     .into_response())
 }
 
+/// The absolute HTTP clone URL for a repository. The scheme follows a
+/// validated `X-Forwarded-Proto` when present, otherwise the secure-cookie
+/// setting; the host comes from the request so a browser sees a copyable URL.
+fn absolute_clone_url(state: &AppState, headers: &HeaderMap, slug: &str, name: &str) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .filter(|p| p == "http" || p == "https")
+        .unwrap_or_else(|| {
+            if state.config.secure_cookies {
+                "https".to_owned()
+            } else {
+                "http".to_owned()
+            }
+        });
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| state.config.bind.to_string());
+    format!(
+        "{scheme}://{host}/{}/{}.git",
+        url_encode(slug),
+        url_encode(name)
+    )
+}
+
 async fn repository(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -663,7 +714,11 @@ async fn repository(
                     .unwrap_or_else(|| "main".to_owned());
                 browse_section = format!(
                     "<p><a href=\"/organizations/{}/repositories/{}/tree/{}\">Browse files</a> · \
+<a href=\"/organizations/{}/repositories/{}/commits/{}\">Commit history</a> · \
 <a href=\"/organizations/{}/repositories/{}/compare/{}...{}\">Compare</a></p>",
+                    url_encode(&slug),
+                    url_encode(&repo.name),
+                    url_encode(&branch),
                     url_encode(&slug),
                     url_encode(&repo.name),
                     url_encode(&branch),
@@ -675,9 +730,8 @@ async fn repository(
             }
             Some(_) => {
                 browse_section = format!(
-                    "<p>This repository is empty. Clone it with:</p><pre>git clone /{}/{}.git</pre>",
-                    url_encode(&slug),
-                    url_encode(&repo.name)
+                    "<p>This repository is empty. Clone it with:</p><pre>git clone {}</pre>",
+                    esc(&absolute_clone_url(&state, &headers, &slug, &repo.name))
                 );
             }
             None => {}
@@ -705,9 +759,12 @@ async fn repository(
         },
         _ => false,
     };
-    let tag_link = if can_manage_protection {
+    let protection_links = if can_manage_protection {
         format!(
-            " · <a href=\"/organizations/{}/repositories/{}/settings/tags\">Tag protection</a>",
+            " · <a href=\"/organizations/{}/repositories/{}/settings/branches\">Branch protection</a> · \
+<a href=\"/organizations/{}/repositories/{}/settings/tags\">Tag protection</a>",
+            url_encode(&slug),
+            url_encode(&repo.name),
             url_encode(&slug),
             url_encode(&repo.name)
         )
@@ -715,7 +772,7 @@ async fn repository(
         String::new()
     };
     browse_section.push_str(&format!(
-        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a>{tag_link}</p>",
+        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a>{protection_links}</p>",
         url_encode(&slug),
         url_encode(&repo.name),
         url_encode(&slug),
@@ -938,7 +995,9 @@ pub fn router() -> Router<AppState> {
         .merge(crate::browse_ui::router())
         .merge(crate::settings_ui::router())
         .merge(crate::tag_protection_ui::router())
+        .merge(crate::branch_protection_ui::router())
         .merge(crate::notifications_ui::router())
+        .fallback(fallback_page)
         .layer(axum::middleware::map_response(page_headers))
 }
 
@@ -973,5 +1032,28 @@ mod tests {
         assert!(html.contains("a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible"));
         assert!(html.contains("outline:3px solid #005fcc"));
         assert!(html.contains(".skip-link:focus-visible"));
+    }
+
+    #[test]
+    fn render_page_wraps_long_text_and_scrolls_wide_tables() {
+        let html = render_page("Sign in", None, None, "");
+        assert!(html.contains("overflow-wrap:anywhere"), "{html}");
+        assert!(
+            html.contains(".card{") && html.contains("overflow-x:auto"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn render_page_does_not_stretch_checkboxes() {
+        let html = render_page("Sign in", None, None, "");
+        assert!(
+            html.contains("input:not([type=checkbox]):not([type=radio])"),
+            "{html}"
+        );
+        assert!(
+            html.contains("input[type=checkbox],input[type=radio]{width:auto"),
+            "{html}"
+        );
     }
 }

@@ -529,7 +529,43 @@ async fn settings_page_lists_creates_and_deletes_rules() {
     .unwrap();
     assert_eq!(count, 1);
 
+    // An invalid pattern is a 400 with the form and its values, not a 503.
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&html, "csrf_token")),
+            ("idempotency_key", &hidden(&html, "idempotency_key")),
+            ("pattern", "bad//pattern"),
+            ("allowed_to_create", "write"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("role=\"alert\""), "{body}");
+    assert!(body.contains("Choose a valid pattern"), "{body}");
+    assert!(body.contains("value=\"bad//pattern\""), "{body}");
+
+    // A duplicate pattern is a 409 with an explanatory message.
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&html, "csrf_token")),
+            ("idempotency_key", &hidden(&html, "idempotency_key")),
+            ("pattern", "v*"),
+            ("allowed_to_create", "maintain"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("already exists"), "{body}");
+
     // Delete it.
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
     let csrf = hidden(&html, "csrf_token");
     let rule_id: String = sqlx::query_scalar(
         "SELECT id::text FROM tag_protection_rules WHERE repository_id = (SELECT id FROM repositories WHERE organization_id=$1 AND name='r')",

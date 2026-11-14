@@ -61,6 +61,12 @@ fn changes_requested() -> ApiError {
 fn executing() -> ApiError {
     ApiError(StatusCode::CONFLICT, "merge intent is already executing")
 }
+fn not_fast_forward() -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        "target is not an ancestor of the source",
+    )
+}
 
 const INTENT_COLUMNS: &str = "operation_id, repository_id, pull_request_id, source_ref, source_oid, \
  target_ref, expected_target_oid, method, candidate_oid, policy_generation, checks_approvals_digest, \
@@ -607,6 +613,21 @@ pub(crate) async fn create_intent(
 
             let digest = checks_approvals_digest(&head, &facts.review_ids, &check_states);
 
+            // `ff_only` has no mergeability row (the fast-forward build is
+            // cheap), so validate it here: a non-fast-forwardable pull is
+            // refused up front instead of being queued and then going stale.
+            if input.method == "ff_only"
+                && !crate::mergeability::is_fast_forwardable(
+                    state,
+                    loaded.repo.id,
+                    base.clone(),
+                    head.clone(),
+                )
+                .await?
+            {
+                return Err(not_fast_forward());
+            }
+
             // M3 conflicts: a conflicting merge is refused up front — nothing is
             // queued and no ref moves — but the reason is recorded on a
             // conflicted intent so the pull request page can show it.
@@ -851,19 +872,33 @@ async fn cancel(
     Path((org_slug, repo_name, number)): Path<(String, String, i32)>,
 ) -> Result<Json<MergeIntentJson>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    Ok(Json(
+        cancel_intent(&state, actor.id, auth_age, &org_slug, &repo_name, number).await?,
+    ))
+}
+
+/// Cancels the live merge intent for a pull request as `actor_id`; shared by
+/// the JSON handler and the browser merge-queue form.
+pub(crate) async fn cancel_intent(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    number: i32,
+) -> Result<MergeIntentJson, ApiError> {
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/pulls/{number}/merge");
-    let state = &state;
     let (_, value) = idempotency::run(
         &state.pool,
-        actor.id,
+        actor_id,
         "DELETE",
         &path_str,
         b"",
         None,
         |idem| async move {
             let loaded =
-                repository_api::load_current(state, actor.id, auth_age, &org_slug, &repo_name)
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
                     .await?;
             issues::require_readable_repo(&loaded)?;
 
@@ -902,7 +937,7 @@ async fn cancel(
             crate::event(
                 &mut tx,
                 Some(loaded.org_id),
-                actor.id,
+                actor_id,
                 "pull_request.merge_intent_cancelled",
             )
             .await?;
@@ -922,7 +957,7 @@ async fn cancel(
         },
     )
     .await?;
-    Ok(Json(serde_json::from_value(value).unwrap()))
+    Ok(serde_json::from_value(value).unwrap())
 }
 
 /// Records a merge whose Git ref move was journaled with this operation id.

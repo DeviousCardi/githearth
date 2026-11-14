@@ -2,7 +2,8 @@
 
 Date: 2026-11-11. Scope: every server-rendered HTML page — the shared shell in
 `ui.rs` and the page handlers in `browse_ui.rs`, `issues_ui.rs`,
-`notifications_ui.rs`, `pulls_ui.rs` and `settings_ui.rs`. All pages render
+`notifications_ui.rs`, `pulls_ui.rs`, `settings_ui.rs`,
+`tag_protection_ui.rs` and `branch_protection_ui.rs`. All pages render
 through one `render_page` shell, so the shell-level checks below apply to every
 page; the per-form checks were read against each form handler.
 
@@ -11,8 +12,8 @@ page; the per-form checks were read against each form handler.
 | Item | Result |
 | --- | --- |
 | `lang` attribute | **Pass.** `render_page` emits `<html lang="en">` on every page. |
-| Labels for every input | **Pass.** Every visible input, textarea and select has an associated `<label for="…">` (login, new/edit issue, new pull, comment, review, merge, token and SSH-key forms). Checkbox groups are wrapped in a `<label>` and grouped with a `<fieldset><legend>`. Hidden CSRF/idempotency inputs have no visible label by design. |
-| Landmarks | **Pass with recorded gaps.** Every page has `<nav aria-label="Primary">` (the top navigation) and `<main id="main">`. Breadcrumb navigation exists on the tree, issue and pull pages; blob, commits, commit and compare pages do not have one. Tables on the tree and compare pages have no `<caption>`. The gaps are tracked in #155. |
+| Labels for every input | **Pass.** Every visible input, textarea and select has an associated `<label for="…">` (login, new/edit issue, new pull, comment, review, merge, token, SSH-key, tag-rule and branch-rule forms). Every checkbox is wrapped in its own `<label>`; grouped controls use fieldsets where they exist. Per-rule delete buttons carry an `aria-label` naming the rule pattern. Hidden CSRF/idempotency inputs have no visible label by design. |
+| Landmarks | **Pass.** Every page has `<nav aria-label="Primary">` (the top navigation) and `<main id="main">`. Breadcrumb navigation exists on the tree, blob, commits, commit, compare, issue and pull pages. Tree and compare tables carry a `<caption>`; the repository page links to commit history and the tree breadcrumb links to `/commits/{rev}`. |
 | Heading order | **Pass.** Every page starts at `<h1>` and, where sections follow, uses `<h2>` in order (`Settings`, the pull page's Reviews/Comments, the issue page's Comments, the compare page's Files changed). No level is skipped. |
 | Focus visibility | **Fixed.** A `:focus-visible` outline (`3px solid #005fcc`, 2px offset) was added for links, buttons, inputs, textareas and selects. |
 | Colour contrast of the CSS | **Pass.** Measured ratios: body text `#111` on `#f7f7f8` 17.6:1; nav `#fff` on `#111` 18.9:1; nav muted `#ccc` on `#111` 11.8:1; `.muted` `#666` on white 5.7:1; `.error` `#b00020` on white 7.3:1. All exceed AA (4.5:1 text, 3:1 non-text); the focus outline is ≥ 3:1 against both the light page and the dark nav (3.155:1 on `#111`). |
@@ -25,9 +26,17 @@ page; the per-form checks were read against each form handler.
 - `ui.rs`: added the skip link, `id="main" tabindex="-1"`, an `aria-label` on the
   primary navigation, a `:focus-visible` outline and a visible-on-focus skip
   link style; tied the sign-in credential error to the username/password fields.
+- `branch_protection_ui.rs`: labelled rule fields, CSRF on every form, and
+  per-rule delete buttons named by pattern; the page hides controls from
+  viewers who cannot manage protection.
+- `browse_ui.rs`: added breadcrumbs to the blob, commits, commit and compare
+  pages, captions to the tree and compare tables, commits links from the
+  repository/tree pages, and an explicit notice when commit history reaches the
+  100-commit cap. Unknown paths now render the styled 404.
 - `tests/ui_login.rs` and `ui.rs` unit tests: assert the `lang` attribute, the
   skip link, the labelled `main`/`nav` landmarks, the focus-visible styles, and
-  the field-tied login error.
+  the field-tied login error. `tests/browse_ui.rs` covers the breadcrumbs,
+  captions, commit links and styled unmatched-path 404.
 
 ## Known limits
 

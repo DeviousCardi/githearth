@@ -102,14 +102,46 @@ fn api_error(s: &Session, slug: &str, name: &str, error: crate::ApiError) -> ui:
     }
 }
 
+#[derive(Default)]
+struct RuleDraft<'a> {
+    pattern: &'a str,
+    allowed_to_create: &'a str,
+    allow_update: bool,
+    allow_delete: bool,
+}
+
 async fn settings_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, ui::UiError> {
     let s = session(&state, &headers).await?;
+    render_settings(
+        &state,
+        &s,
+        &slug,
+        &name,
+        StatusCode::OK,
+        None,
+        &RuleDraft::default(),
+    )
+    .await
+}
+
+/// Renders the settings page, optionally with a rejected submission shown and
+/// its values preserved, so a validation error never discards the operator's
+/// input or turns into a generic 503.
+async fn render_settings(
+    state: &AppState,
+    s: &Session,
+    slug: &str,
+    name: &str,
+    status: StatusCode,
+    error: Option<&str>,
+    draft: &RuleDraft<'_>,
+) -> Result<Response, ui::UiError> {
     let (rules, _, can_manage) =
-        match tag_protection::list_rules(&state, s.account.id, s.auth_age, &slug, &name).await {
+        match tag_protection::list_rules(state, s.account.id, s.auth_age, slug, name).await {
             Ok(v) => v,
             Err(e) if e.status_code() == StatusCode::NOT_FOUND => {
                 return Err(ui::not_found_page(Some(&s.account.username)));
@@ -126,7 +158,7 @@ async fn settings_page(
                 "<td><form method=\"post\" action=\"{}/settings/tags/{}/delete\" style=\"display:inline\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
 <button type=\"submit\">Delete</button></form></td>",
-                ui::esc(&repo_href(&slug, &name)),
+                ui::esc(&repo_href(slug, name)),
                 rule.id,
                 ui::esc(&s.csrf),
             )
@@ -157,28 +189,44 @@ async fn settings_page(
         )
     };
 
+    let error = error
+        .map(|e| format!("<p class=\"error\" role=\"alert\">{}</p>", ui::esc(e)))
+        .unwrap_or_default();
     let add_form = if can_manage {
+        let selected_role = if draft.allowed_to_create.is_empty() {
+            "admin"
+        } else {
+            draft.allowed_to_create
+        };
+        let roles = tag_protection::CREATE_ROLES
+            .iter()
+            .map(|role| {
+                let selected = if *role == selected_role {
+                    " selected"
+                } else {
+                    ""
+                };
+                format!("<option value=\"{role}\"{selected}>{role}</option>")
+            })
+            .collect::<String>();
         format!(
-            "<div class=\"card\"><h2>Add a rule</h2>\
+            "<div class=\"card\"><h2>Add a rule</h2>{error}\
 <form method=\"post\" action=\"{}/settings/tags\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
 <input type=\"hidden\" name=\"idempotency_key\" value=\"{}\">\
 <label for=\"pattern\">Pattern</label>\
-<input id=\"pattern\" name=\"pattern\" required value=\"\">\
+<input id=\"pattern\" name=\"pattern\" required value=\"{}\">\
 <label for=\"allowed_to_create\">Create role</label>\
-<select id=\"allowed_to_create\" name=\"allowed_to_create\">\
-<option value=\"admin\" selected>admin</option>\
-<option value=\"maintain\">maintain</option>\
-<option value=\"write\">write</option>\
-<option value=\"triage\">triage</option>\
-<option value=\"read\">read</option>\
-</select>\
-<label><input type=\"checkbox\" name=\"allow_update\" value=\"1\"> Allow update (move)</label>\
-<label><input type=\"checkbox\" name=\"allow_delete\" value=\"1\"> Allow delete</label>\
+<select id=\"allowed_to_create\" name=\"allowed_to_create\">{roles}</select>\
+<label><input type=\"checkbox\" name=\"allow_update\" value=\"1\"{}> Allow update (move)</label>\
+<label><input type=\"checkbox\" name=\"allow_delete\" value=\"1\"{}> Allow delete</label>\
 <p><button type=\"submit\">Add rule</button></p></form></div>",
-            ui::esc(&repo_href(&slug, &name)),
+            ui::esc(&repo_href(slug, name)),
             ui::esc(&s.csrf),
             ui::esc(&new_key()),
+            ui::esc(draft.pattern),
+            if draft.allow_update { " checked" } else { "" },
+            if draft.allow_delete { " checked" } else { "" },
         )
     } else {
         String::new()
@@ -187,9 +235,9 @@ async fn settings_page(
     let body = format!(
         "<h1>Tag protection</h1><p><a href=\"{}\">Back to the repository</a></p>\
 <div class=\"card\">{table}</div>{add_form}",
-        ui::esc(&repo_href(&slug, &name)),
+        ui::esc(&repo_href(slug, name)),
     );
-    Ok(page(&s, StatusCode::OK, "Tag protection", &body))
+    Ok(page(s, status, "Tag protection", &body))
 }
 
 #[derive(Deserialize)]
@@ -225,11 +273,17 @@ async fn create_submit(
             "<h1>Tag protection</h1><p>Reload the page and submit the form again.</p>",
         )));
     };
+    let draft = RuleDraft {
+        pattern: &form.pattern,
+        allowed_to_create: &form.allowed_to_create,
+        allow_update: form.allow_update.is_some(),
+        allow_delete: form.allow_delete.is_some(),
+    };
     let body = serde_json::json!({
-        "pattern": form.pattern,
-        "allowed_to_create": form.allowed_to_create,
-        "allow_update": form.allow_update.is_some(),
-        "allow_delete": form.allow_delete.is_some(),
+        "pattern": &form.pattern,
+        "allowed_to_create": &form.allowed_to_create,
+        "allow_update": draft.allow_update,
+        "allow_delete": draft.allow_delete,
     })
     .to_string();
     match tag_protection::create_rule(
@@ -246,7 +300,20 @@ async fn create_submit(
         Ok(_) => {
             Ok(Redirect::to(&format!("{}/settings/tags", repo_href(&slug, &name))).into_response())
         }
-        Err(e) => Err(api_error(&s, &slug, &name, e)),
+        Err(e) => {
+            let (status, message) = match e.status_code() {
+                StatusCode::BAD_REQUEST => (
+                    StatusCode::BAD_REQUEST,
+                    "Choose a valid pattern and create role.",
+                ),
+                StatusCode::CONFLICT => (
+                    StatusCode::CONFLICT,
+                    "A rule with this pattern already exists.",
+                ),
+                _ => return Err(api_error(&s, &slug, &name, e)),
+            };
+            render_settings(&state, &s, &slug, &name, status, Some(message), &draft).await
+        }
     }
 }
 

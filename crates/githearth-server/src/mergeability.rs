@@ -162,6 +162,47 @@ async fn compute(
     .await
 }
 
+/// Whether `head` can fast-forward `target`: the synchronous check the
+/// `ff_only` merge method needs before an intent is queued. Unlike
+/// [`check_method`], a non-fast-forward is reported as a refusal rather than a
+/// mergeability row, and the result is not cached.
+pub(crate) async fn is_fast_forwardable(
+    state: &AppState,
+    repo_id: Uuid,
+    target: String,
+    head: String,
+) -> Result<bool, ApiError> {
+    browse::git_compare(state, repo_id, move |path, scratch, timeout| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let identity = Identity {
+            name: "GitHearth".into(),
+            email: "noreply@githearth.invalid".into(),
+            time: now,
+            offset: "+0000".into(),
+        };
+        let message = String::new();
+        let request = Request {
+            method: Method::FastForward,
+            target: &target,
+            source: &head,
+            message: &message,
+            author: &identity,
+            committer: &identity,
+        };
+        match merge::build_candidate(path, Some(scratch), &request, timeout)? {
+            Candidate::NotFastForward | Candidate::Unrelated => Ok(false),
+            Candidate::Ready { .. } | Candidate::UpToDate => Ok(true),
+            // A fast-forward build cannot produce conflicts or a rebase-refusal;
+            // treat anything else defensively as not fast-forwardable.
+            Candidate::Conflicts(_) | Candidate::RebaseMergeCommit => Ok(false),
+        }
+    })
+    .await
+}
+
 /// Compute (or fetch from the cache) the mergeability of one method.
 pub(crate) async fn check_method(
     state: &AppState,

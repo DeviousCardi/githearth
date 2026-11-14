@@ -249,7 +249,10 @@ async fn render_tree(
             ));
         }
     }
-    let nav = format!("<nav aria-label=\"Breadcrumb\">{crumbs}</nav>");
+    let nav = format!(
+        "<nav aria-label=\"Breadcrumb\">{crumbs} / <a href=\"{repo_href}/commits/{}\">Commits</a></nav>",
+        ui::url_encode(rev)
+    );
 
     let mut rows = String::new();
     for entry in &entries {
@@ -290,10 +293,11 @@ async fn render_tree(
     }
 
     let body = format!(
-        "<h1>{}</h1>{nav}<div class=\"card\"><table><thead><tr>\
+        "<h1>{}</h1>{nav}<div class=\"card\"><table><caption class=\"muted\">Files at {}</caption><thead><tr>\
 <th scope=\"col\">Name</th><th scope=\"col\">Type</th><th scope=\"col\">Size</th>\
 </tr></thead><tbody>{rows}</tbody></table></div>",
-        ui::esc(name)
+        ui::esc(name),
+        ui::esc(rev)
     );
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(headers).unwrap_or_default(),
@@ -329,8 +333,20 @@ async fn blob_page(
         let text = String::from_utf8_lossy(&blob.content);
         format!("<pre>{}</pre>", ui::esc(&text))
     };
+    let repo_href = format!(
+        "/organizations/{}/repositories/{}",
+        ui::url_encode(&slug),
+        ui::url_encode(&name)
+    );
+    let breadcrumb = format!(
+        "<nav aria-label=\"Breadcrumb\"><a href=\"{repo_href}\">{}</a> / \
+<a href=\"{repo_href}/tree/{}\">tree</a> / {}</nav>",
+        ui::esc(&name),
+        ui::url_encode(&rev),
+        ui::esc(&path)
+    );
     let body = format!(
-        "<h1>{}</h1><p class=\"muted\">{} bytes</p><div class=\"card\">{}</div>",
+        "<h1>{}</h1>{breadcrumb}<p class=\"muted\">{} bytes</p><div class=\"card\">{}</div>",
         ui::esc(&path),
         blob.size,
         content
@@ -380,8 +396,16 @@ async fn commits_page(
             ui::esc(&commit.author_name)
         ));
     }
+    let breadcrumb = format!(
+        "<nav aria-label=\"Breadcrumb\"><a href=\"{repo_href}\">{}</a> / \
+<a href=\"{repo_href}/tree/{}\">tree</a> / Commits</nav>",
+        ui::esc(&name),
+        ui::url_encode(&rev)
+    );
+    let cap_notice = log_cap_notice(commits.len()).unwrap_or_default();
     let body = format!(
-        "<h1>Commits</h1><p class=\"muted\">{} @ {}</p><div class=\"card\"><ul>{}</ul></div>",
+        "<h1>Commits</h1>{breadcrumb}{cap_notice}<p class=\"muted\">{} @ {}</p>\
+<div class=\"card\"><ul>{}</ul></div>",
         ui::esc(&name),
         ui::esc(&rev),
         items
@@ -390,6 +414,18 @@ async fn commits_page(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
     Ok(Html(ui::render_page("Commits", username, csrf.as_deref(), &body)).into_response())
+}
+
+/// The notice shown when the commit list reached the fixed log cap. The page
+/// cannot tell "exactly 100" from "more than 100" without a second query, so
+/// reaching the cap always explains that older history is not listed.
+fn log_cap_notice(shown: usize) -> Option<String> {
+    (shown >= browse::MAX_LOG_LIMIT).then(|| {
+        format!(
+            "<p class=\"muted\">Showing the first {} commits; older history is not listed.</p>",
+            browse::MAX_LOG_LIMIT
+        )
+    })
 }
 
 /// Render a diff exactly as the commit page does: binary notices, escaped
@@ -431,8 +467,20 @@ async fn commit_page(
     .await?
     .ok_or_else(|| ui::not_found_page(username))?;
 
+    let repo_href = format!(
+        "/organizations/{}/repositories/{}",
+        ui::url_encode(&slug),
+        ui::url_encode(&name)
+    );
+    let breadcrumb = format!(
+        "<nav aria-label=\"Breadcrumb\"><a href=\"{repo_href}\">{}</a> / \
+<a href=\"{repo_href}/commits/{}\">Commits</a> / {}</nav>",
+        ui::esc(&name),
+        ui::url_encode(&detail.id),
+        ui::esc(&detail.id)
+    );
     let body = format!(
-        "<h1>{}</h1><p class=\"muted\">{} &lt;{}&gt;</p>\
+        "<h1>{}</h1>{breadcrumb}<p class=\"muted\">{} &lt;{}&gt;</p>\
 <pre>{}</pre><div class=\"card\">{}</div>",
         ui::esc(&detail.id),
         ui::esc(&detail.author_name),
@@ -533,15 +581,19 @@ async fn compare_page(
     if comparison.commits_truncated {
         commits.push_str("<tr><td colspan=\"3\" class=\"muted\">Commit list truncated.</td></tr>");
     }
+    let breadcrumb = format!(
+        "<nav aria-label=\"Breadcrumb\"><a href=\"{repo_href}\">{}</a> / Compare</nav>",
+        ui::esc(&name)
+    );
     let body = format!(
-        "<h1>Compare {}...{}</h1>\
+        "<h1>Compare {}...{}</h1>{breadcrumb}\
 <p class=\"muted\">{} ahead, {} behind &middot; {}</p>\
 {conflict_html}\
 <form method=\"get\" action=\"{repo_href}/compare\">\
 <label for=\"base\">Base</label><input id=\"base\" name=\"base\" value=\"{}\">\
 <label for=\"head\">Head</label><input id=\"head\" name=\"head\" value=\"{}\">\
 <button type=\"submit\">Compare</button></form>\
-<div class=\"card\"><table><thead><tr>\
+<div class=\"card\"><table><caption class=\"muted\">Commits in this comparison</caption><thead><tr>\
 <th scope=\"col\">Commit</th><th scope=\"col\">Summary</th><th scope=\"col\">Author</th>\
 </tr></thead><tbody>{commits}</tbody></table></div>\
 <h2>Files changed</h2><div class=\"card\">{}</div>",
@@ -577,6 +629,14 @@ mod tests {
             let response = map_work_error(repo_id, Some("alice"), error).into_response();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
+    }
+
+    #[test]
+    fn the_log_cap_is_explained_once_reached() {
+        assert_eq!(log_cap_notice(0), None);
+        assert_eq!(log_cap_notice(browse::MAX_LOG_LIMIT - 1), None);
+        let notice = log_cap_notice(browse::MAX_LOG_LIMIT).unwrap();
+        assert!(notice.contains("Showing the first 100 commits"), "{notice}");
     }
 
     #[test]

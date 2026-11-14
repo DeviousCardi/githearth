@@ -914,10 +914,23 @@ async fn blob_and_log_bad_syntax_400() {
         format!("{}/commits/main?path=..", f.base()),
         format!("{}/commits/main?limit=0", f.base()),
         format!("{}/commits/main?limit=101", f.base()),
+        // Git's `--skip` takes an int; a larger cursor must not become a 500.
+        format!("{}/commits/main?cursor=2147483648", f.base()),
     ] {
         let (status, _) = request(&f.app, "GET", &path, Some(&f.token), Value::Null).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
     }
+    // The largest int cursor is a valid, empty page.
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &format!("{}/commits/main?cursor=2147483647", f.base()),
+        Some(&f.token),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["items"].as_array().unwrap().is_empty());
     finish(f).await;
 }
 

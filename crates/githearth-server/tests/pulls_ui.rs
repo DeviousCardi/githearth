@@ -80,6 +80,8 @@ struct Fixture {
     token: String,
     cookie: String,
     org_id: Uuid,
+    org_slug: String,
+    repo_name: String,
     repo_id: Uuid,
     work: PathBuf,
     feature_head: String,
@@ -308,6 +310,8 @@ async fn fixture() -> Fixture {
         cookie: format!("githearth_session={token}"),
         token,
         org_id,
+        org_slug: org,
+        repo_name: repo,
         repo_id,
         work,
         feature_head,
@@ -353,8 +357,13 @@ async fn create_view_comment_and_review_through_forms() {
 
     let (status, form) = get(&f.app, &format!("{}/pulls/new", f.base), Some(&f.cookie)).await;
     assert_eq!(status, StatusCode::OK);
+    assert!(form.contains("<label for=\"source_repository\">"));
     assert!(form.contains("<label for=\"source_branch\">"));
     assert!(form.contains("<label for=\"target_branch\">"));
+    assert!(
+        form.contains(&format!("This repository ({})", f.repo_name)),
+        "{form}"
+    );
     let token = csrf(&form);
     let (status, location, _) = post_form(
         &f.app,
@@ -384,6 +393,11 @@ async fn create_view_comment_and_review_through_forms() {
     assert!(page.contains(&f.feature_head));
     assert!(page.contains(&f.head));
     assert!(page.contains("<dt>Approvals</dt>"));
+    // The inline and general comment fields have distinct ids and labels.
+    assert_eq!(page.matches("id=\"comment\"").count(), 1, "{page}");
+    assert_eq!(page.matches("id=\"inline-comment\"").count(), 1, "{page}");
+    assert_eq!(page.matches("for=\"comment\"").count(), 1, "{page}");
+    assert_eq!(page.matches("for=\"inline-comment\"").count(), 1, "{page}");
 
     // Add a comment.
     let (status, location, _) = post_form(
@@ -1706,6 +1720,148 @@ async fn queue_position_is_shown_on_the_pull_request_page() {
     let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Merge queue position: 1"), "{page}");
+    assert!(page.contains("Cancel queued merge"), "{page}");
+
+    // The queued intent can be cancelled through the page.
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/merge/cancel", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{location:?}");
+    assert_eq!(location.unwrap(), format!("{}/pulls/1", f.base));
+    let (status, intent) = api(
+        &f.app,
+        "GET",
+        &format!("{}/pulls/1/merge", f.api_base),
+        &f.token,
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(intent["state"], "cancelled");
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn ff_only_on_a_non_fast_forwardable_pull_is_refused_up_front() {
+    let f = fixture().await;
+    open_pull(&f).await;
+
+    // Move main past the feature branch so it is no longer an ancestor of the
+    // pull request head.
+    let repo_path = state_repo_path(&f.storage_root, f.repo_id);
+    let tw = f.work.to_str().unwrap();
+    git_ok(git_cmd(&["-C", tw, "checkout", "-q", "main"])).await;
+    std::fs::write(f.work.join("main-only.txt"), "main\n").unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", "main-only.txt"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "advance main",
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]))
+    .await;
+
+    let (status, body) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls/1/merge", f.api_base),
+        &f.token,
+        json!({"method": "ff_only", "expected_head_oid": f.feature_head}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "target is not an ancestor of the source");
+
+    // No intent was queued.
+    let (status, _) = api(
+        &f.app,
+        "GET",
+        &format!("{}/pulls/1/merge", f.api_base),
+        &f.token,
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_fork_pull_request_can_be_created_from_the_browser_form() {
+    let f = fixture().await;
+    let fork_name = tag("fork");
+    let (status, fork) = api(
+        &f.app,
+        "POST",
+        &format!("{}/forks", f.api_base),
+        &f.token,
+        json!({"organization": f.org_slug, "name": fork_name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fork}");
+    let fork_id = fork["id"].as_str().unwrap();
+
+    let (status, form) = get(&f.app, &format!("{}/pulls/new", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let spec = format!("{}/{}", f.org_slug, fork_name);
+    assert!(form.contains("name=\"source_repository\""), "{form}");
+    assert!(
+        form.contains(&format!("value=\"{spec}\""))
+            || form.contains(&format!("value=\"{spec}\" selected")),
+        "{form}"
+    );
+
+    let (status, location, _) = post_form(
+        &f.app,
+        &format!("{}/pulls", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&form)),
+            ("idempotency_key", &key(&form)),
+            ("source_repository", &spec),
+            ("source_branch", "feature"),
+            ("target_branch", "main"),
+            ("title", "from a fork"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.unwrap(), format!("{}/pulls/1", f.base));
+
+    let (status, detail) = api(
+        &f.app,
+        "GET",
+        &format!("{}/pulls/1", f.api_base),
+        &f.token,
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["source_repository_id"], fork_id);
+    assert_ne!(detail["source_repository_id"], f.repo_id.to_string());
 
     finish(f).await;
 }
