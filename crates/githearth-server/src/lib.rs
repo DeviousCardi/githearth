@@ -399,7 +399,8 @@ async fn json_rejections(
 ) -> Response {
     use axum::body::Body;
     use axum::http::{HeaderValue, header};
-    let is_api = request.uri().path().starts_with("/api/");
+    let path = request.uri().path();
+    let is_api = path == "/api" || path.starts_with("/api/");
     let response = next.run(request).await;
     let plain = response
         .headers()
@@ -413,6 +414,9 @@ async fn json_rejections(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
+        parts
+            .headers
+            .insert("x-frame-options", HeaderValue::from_static("DENY"));
         parts
             .headers
             .insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
@@ -888,6 +892,7 @@ pub(crate) async fn create_organization(
         || input.slug.len() > 64
         || input.slug.starts_with('-')
         || input.slug.ends_with('-')
+        || input.slug == "new"
         || input.slug.contains("--")
         || !input
             .slug

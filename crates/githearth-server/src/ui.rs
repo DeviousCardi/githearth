@@ -249,7 +249,7 @@ async fn fallback_page(
     uri: axum::http::Uri,
 ) -> Response {
     // Unknown API paths keep the JSON envelope; only browser paths get a page.
-    if uri.path().starts_with("/api/") {
+    if uri.path() == "/api" || uri.path().starts_with("/api/") {
         return (
             StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({"error": "not found"})),
@@ -622,11 +622,27 @@ async fn organization(
     if !any {
         items.push_str("<li>No repositories you can read.</li>");
     }
+    let can_create = state
+        .authz
+        .authorize(&facts.request(
+            Action::RepositoryCreate,
+            Resource::Organization,
+            Some(Duration::from_secs(auth_age)),
+        ))
+        .is_allowed();
+    let new_repo_link = if can_create {
+        format!(
+            "<p><a href=\"/organizations/{}/repositories/new\">New repository</a></p>",
+            url_encode(&slug)
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        "<h1>{}</h1><p class=\"muted\">{}</p><p><a href=\"/organizations/{}/repositories/new\">New repository</a></p><div class=\"card\"><ul>{}</ul></div>",
+        "<h1>{}</h1><p class=\"muted\">{}</p>{}<div class=\"card\"><ul>{}</ul></div>",
         esc(&org_name),
         esc(&slug),
-        url_encode(&slug),
+        new_repo_link,
         items
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
@@ -673,8 +689,6 @@ fn absolute_clone_url(state: &AppState, headers: &HeaderMap, slug: &str, name: &
 struct NewOrgForm {
     #[serde(default)]
     csrf_token: String,
-    #[serde(default)]
-    idempotency_key: String,
     slug: String,
     name: String,
 }
@@ -710,11 +724,10 @@ fn error_form_page(username: &str, status: StatusCode, message: &str, body: &str
         .into_response()
 }
 
-fn organization_form(csrf: &str, key: &str, slug: &str, name: &str) -> String {
+fn organization_form(csrf: &str, slug: &str, name: &str) -> String {
     format!(
         "<form class=\"card\" method=\"post\" action=\"/organizations/new\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-<input type=\"hidden\" name=\"idempotency_key\" value=\"{key}\">\
 <label for=\"slug\">Slug</label><input id=\"slug\" name=\"slug\" required maxlength=\"64\" value=\"{}\" aria-describedby=\"slug-help\">\
 <p class=\"muted\" id=\"slug-help\">Lowercase letters, digits and single hyphens.</p>\
 <label for=\"name\">Name</label><input id=\"name\" name=\"name\" required maxlength=\"200\" value=\"{}\" placeholder=\"Acme Corporation\">\
@@ -737,7 +750,7 @@ async fn new_organization_page(
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"/\">Home</a> / New organization</nav>\
 <h1>New organization</h1>{}",
-        organization_form(&csrf, &form_key(), "", "")
+        organization_form(&csrf, "", "")
     );
     Ok(Html(render_page(
         "New organization",
@@ -762,29 +775,11 @@ async fn new_organization_submit(
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
         Err(_) => return Err(unavailable_page(None)),
     };
-    if !idempotency::valid_key(&form.idempotency_key) {
-        return Ok(error_form_page(
-            &account.username,
-            StatusCode::BAD_REQUEST,
-            "Reload the page and submit the form again.",
-            &organization_form(
-                &csrf_expected(&token_hash),
-                &form_key(),
-                &form.slug,
-                &form.name,
-            ),
-        ));
-    }
     let token = browser_token(&headers).ok_or_else(auth_required)?;
     let mut api_headers = HeaderMap::new();
     api_headers.insert(
         "authorization",
         HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| unavailable_page(Some(&account.username)))?,
-    );
-    api_headers.insert(
-        "idempotency-key",
-        HeaderValue::from_str(&form.idempotency_key)
             .map_err(|_| unavailable_page(Some(&account.username)))?,
     );
     match crate::create_organization(
@@ -804,12 +799,7 @@ async fn new_organization_submit(
             &account.username,
             e.status_code(),
             e.message(),
-            &organization_form(
-                &csrf_expected(&token_hash),
-                &form_key(),
-                &form.slug,
-                &form.name,
-            ),
+            &organization_form(&csrf_expected(&token_hash), &form.slug, &form.name),
         )),
     }
 }
@@ -1149,28 +1139,58 @@ async fn repository(
         }
         _ => String::new(),
     };
-    let fork_note = if let Some(parent_id) = repo.parent_repository_id {
-        sqlx::query_as::<_, (String, String)>(
-            "SELECT o.slug, r.name FROM repositories r \
-             JOIN organizations o ON o.id = r.organization_id WHERE r.id = $1",
-        )
-        .bind(parent_id)
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten()
-        .map(|(org_slug, repo_name)| {
-            format!(
-                "<p class=\"muted\">Forked from <a href=\"/organizations/{}/repositories/{}\">{}/{}</a></p>",
-                url_encode(&org_slug),
-                url_encode(&repo_name),
-                esc(&org_slug),
-                esc(&repo_name)
-            )
-        })
-        .unwrap_or_default()
-    } else {
-        String::new()
+    // Only name the parent when the viewer can read it (the API applies the
+    // same rule in forks.rs); an unreadable parent is omitted entirely.
+    let fork_note = match (repo.parent_repository_id, account_id, auth_age) {
+        (Some(parent_id), Some(actor_id), Some(age)) => {
+            let mut conn = match state.pool.acquire().await {
+                Ok(conn) => conn,
+                Err(_) => return Err(unavailable_page(username.as_deref())),
+            };
+            let parent = repositories::get(&mut conn, parent_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|p| p.status != githearth_core::RepositoryStatus::Deleted);
+            let parent_slug: Option<String> = match &parent {
+                Some(parent) => sqlx::query_scalar("SELECT slug FROM organizations WHERE id = $1")
+                    .bind(parent.organization_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let readable = match (&parent, &parent_slug) {
+                (Some(parent), Some(_)) => facts::load(&mut conn, actor_id, parent.organization_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|f| {
+                        state
+                            .authz
+                            .authorize(&f.request(
+                                Action::RepositoryRead,
+                                Resource::Repository(&repositories::authz_repository(parent)),
+                                Some(Duration::from_secs(age)),
+                            ))
+                            .is_allowed()
+                    }),
+                _ => false,
+            };
+            drop(conn);
+            match (parent, parent_slug, readable) {
+                (Some(parent), Some(parent_slug), true) => format!(
+                    "<p class=\"muted\">Forked from <a href=\"/organizations/{}/repositories/{}\">{}/{}</a></p>",
+                    url_encode(&parent_slug),
+                    url_encode(&parent.name),
+                    esc(&parent_slug),
+                    esc(&parent.name)
+                ),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
     };
     let body = format!(
         "<h1>{}</h1>{}<div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>{}",

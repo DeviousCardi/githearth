@@ -43,6 +43,7 @@ pub(crate) struct NewRepository {
 
 pub(crate) fn valid_repo_name(name: &str) -> bool {
     (1..=100).contains(&name.len())
+        && name != "new"
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')

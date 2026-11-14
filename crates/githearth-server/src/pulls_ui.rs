@@ -813,6 +813,9 @@ async fn render_pull(
     let can_merge = merge_intents::may_merge(state, s.account.id, s.auth_age, slug, name, number)
         .await
         .unwrap_or(false);
+    let merge_permission =
+        pulls::may_merge_permission(state, s.account.id, s.auth_age, slug, name, number).await;
+    let may_explain_block = merge_permission && !detail.pull.draft;
     let abilities = pulls::viewer_abilities(state, s.account.id, s.auth_age, slug, name, number)
         .await
         .unwrap_or(pulls::ViewerAbilities {
@@ -869,20 +872,21 @@ async fn render_pull(
             }
         ));
     }
-    let reviewers_section = if detail.pull.state == "open" && abilities.may_comment {
-        format!(
-            "<h2>Reviewers</h2><div class=\"card\"><ul>{reviewer_items}</ul>\
+    let reviewers_section =
+        if detail.pull.state == "open" && !detail.pull.draft && abilities.may_comment {
+            format!(
+                "<h2>Reviewers</h2><div class=\"card\"><ul>{reviewer_items}</ul>\
 <form method=\"post\" action=\"{base}/pulls/{number}/reviewers\">{}\
 <label for=\"reviewer\">Request a review from</label>\
 <input id=\"reviewer\" name=\"reviewer\" required placeholder=\"username\">\
 <p><button type=\"submit\">Request review</button></p></form></div>",
-            form_fields(s, &new_key())
-        )
-    } else if reviewer_items.is_empty() {
-        String::new()
-    } else {
-        format!("<h2>Reviewers</h2><div class=\"card\"><ul>{reviewer_items}</ul></div>")
-    };
+                form_fields(s, &new_key())
+            )
+        } else if reviewer_items.is_empty() {
+            String::new()
+        } else {
+            format!("<h2>Reviewers</h2><div class=\"card\"><ul>{reviewer_items}</ul></div>")
+        };
     let auto_merge_row: Option<auto_merge::AutoMergeJson> = match state.pool.acquire().await {
         Ok(mut conn) => auto_merge::find_auto_merge(&mut conn, detail.pull.id)
             .await
@@ -1184,7 +1188,7 @@ async fn render_pull(
                 ui::esc(head_id),
             )
         }
-    } else if detail.pull.state == "open" && !non_terminal {
+    } else if detail.pull.state == "open" && !non_terminal && may_explain_block {
         let reason = if detail.changes_requested > 0 {
             "A change request blocks the merge.".to_owned()
         } else {

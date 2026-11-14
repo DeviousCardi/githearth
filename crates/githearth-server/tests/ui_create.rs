@@ -111,6 +111,40 @@ async fn post_form(
     )
 }
 
+async fn read_member(pool: &PgPool, org_id: Uuid) -> String {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO accounts (id,username,password_hash) VALUES ($1,$2,$3)")
+        .bind(id)
+        .bind(tag("reader"))
+        .bind(hash_password("password123456").unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(org_id)
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,'read','account',$2,'organization',$3,$2)")
+        .bind(Uuid::new_v4())
+        .bind(id)
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO sessions (token_hash,account_id,expires_at) VALUES (sha256($1::bytea),$2,clock_timestamp() + interval '1 hour')")
+        .bind(&token)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    format!("githearth_session={token}")
+}
+
 fn urlencode(value: &str) -> String {
     value
         .bytes()
@@ -133,6 +167,8 @@ async fn create_organization_and_repository_through_the_browser() {
     // Signed out redirects to login.
     let (status, _) = get(&app, "/organizations/new", None).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, _) = get(&app, "/organizations/any/repositories/new", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
 
     let (status, form) = get(&app, "/organizations/new", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
@@ -143,7 +179,6 @@ async fn create_organization_and_repository_through_the_browser() {
         &cookie,
         &[
             ("csrf_token", &hidden(&form, "csrf_token")),
-            ("idempotency_key", &hidden(&form, "idempotency_key")),
             ("slug", &org_slug),
             ("name", "UI Created Org"),
         ],
@@ -211,13 +246,61 @@ async fn create_organization_and_repository_through_the_browser() {
         &cookie,
         &[
             ("csrf_token", "wrong"),
-            ("idempotency_key", &"a".repeat(32)),
             ("slug", "csrf-org"),
             ("name", "CSRF Org"),
         ],
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A read-only member sees the organization but not the creation link.
+    let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&org_slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let reader = read_member(&pool, org_id).await;
+    let (status, page) = get(&app, &format!("/organizations/{org_slug}"), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("New repository"), "{page}");
+
+    // Duplicate names surface the API's 409 as a form page.
+    let (_, form) = get(&app, "/organizations/new", Some(&cookie)).await;
+    let (status, _, body) = post_form(
+        &app,
+        "/organizations/new",
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&form, "csrf_token")),
+            ("slug", &org_slug),
+            ("name", "Duplicate"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("Create organization"), "{body}");
+
+    let (_, form) = get(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        Some(&cookie),
+    )
+    .await;
+    let (status, _, body) = post_form(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&form, "csrf_token")),
+            ("idempotency_key", &hidden(&form, "idempotency_key")),
+            ("name", &repo_name),
+            ("description", ""),
+            ("visibility", "private"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("Create repository"), "{body}");
 
     // NUL in a browser path is a styled 404, not a 503.
     let (status, _) = get(&app, "/organizations/%00", Some(&cookie)).await;
@@ -229,6 +312,106 @@ async fn create_organization_and_repository_through_the_browser() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Validation failures re-render the form with a 400, not a bare error.
+    let (_, form) = get(&app, "/organizations/new", Some(&cookie)).await;
+    let (status, _, body) = post_form(
+        &app,
+        "/organizations/new",
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&form, "csrf_token")),
+            ("slug", "UPPERCASE"),
+            ("name", "Bad Slug"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Create organization"), "{body}");
+
+    // Repository validation and NUL paths.
+    let (status, form) = get(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, body) = post_form(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&form, "csrf_token")),
+            ("idempotency_key", &hidden(&form, "idempotency_key")),
+            ("name", "bad name!"),
+            ("description", ""),
+            ("visibility", "private"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Create repository"), "{body}");
+
+    let (status, _, _) = post_form(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&form, "csrf_token")),
+            ("idempotency_key", "bad key"),
+            ("name", &tag("x-repo")),
+            ("visibility", "private"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = get(&app, "/organizations/%00/repositories/new", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // `new` is reserved for these routes, so it cannot be an org slug or repo
+    // name.
+    let (_, form) = get(&app, "/organizations/new", Some(&cookie)).await;
+    let (status, _, _) = post_form(
+        &app,
+        "/organizations/new",
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&form, "csrf_token")),
+            ("slug", "new"),
+            ("name", "Reserved"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, form) = get(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        Some(&cookie),
+    )
+    .await;
+    let (status, _, _) = post_form(
+        &app,
+        &format!("/organizations/{org_slug}/repositories/new"),
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&form, "csrf_token")),
+            ("idempotency_key", &hidden(&form, "idempotency_key")),
+            ("name", "new"),
+            ("visibility", "private"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Unknown API paths and malformed query strings keep the JSON envelope.
+    let (status, body) = get(&app, "/api/does-not-exist", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("\"error\""), "{body}");
+    let (status, body) = get(&app, "/api/v1/organizations?after=abc", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("\"error\""), "{body}");
 
     let _ = std::fs::remove_dir_all(storage);
     pool.close().await;

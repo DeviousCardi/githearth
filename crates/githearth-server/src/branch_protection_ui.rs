@@ -266,7 +266,7 @@ async fn render_settings(
 <label for=\"required_approvals\">Required approvals (0-10)</label>\
 <input id=\"required_approvals\" name=\"required_approvals\" type=\"number\" min=\"0\" max=\"10\" value=\"{}\">\
 <label for=\"required_status_checks\">Required status checks (comma or line separated)</label>\
-<textarea id=\"required_status_checks\" name=\"required_status_checks\" rows=\"2\" style=\"width:100%;box-sizing:border-box\">{}</textarea>>\
+<textarea id=\"required_status_checks\" name=\"required_status_checks\" rows=\"2\" style=\"width:100%;box-sizing:border-box\">{}</textarea>\
 <label><input type=\"checkbox\" name=\"allow_force_push\" value=\"1\"{}> Allow force push</label>\
 <label><input type=\"checkbox\" name=\"allow_deletion\" value=\"1\"{}> Allow deletion</label>\
 <label><input type=\"checkbox\" name=\"require_pull_request\" value=\"1\"{}> Require a pull request</label>\

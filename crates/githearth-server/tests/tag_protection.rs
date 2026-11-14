@@ -682,3 +682,60 @@ async fn insert_tag_rule(
     .await
     .map(|_| ())
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn delete_errors_render_permission_and_unavailable_pages() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let repo_id = fixture_repository(&pool, org_id, "r", owner).await;
+    let owner_token = fixture_session(&pool, owner).await;
+    let owner_cookie = format!("githearth_session={owner_token}");
+    let path = format!("/organizations/{slug}/repositories/r/settings/tags");
+    let rule_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tag_protection_rules (id, repository_id, pattern, allowed_to_create, created_by) \
+         VALUES ($1, $2, 'v*', 'maintain', $3)",
+    )
+    .bind(rule_id)
+    .bind(repo_id)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // A write member may read the page but not delete a rule: 403 page.
+    let writer = add_member(&pool, org_id, "write").await;
+    let writer_token = fixture_session(&pool, writer).await;
+    let writer_cookie = format!("githearth_session={writer_token}");
+    let (status, html) = get_html(&app, &path, Some(&writer_cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, body) = post_form(
+        &app,
+        &format!("{path}/{rule_id}/delete"),
+        &writer_cookie,
+        &[("csrf_token", &hidden(&html, "csrf_token"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("Not permitted"), "{body}");
+
+    // A repository that is no longer active maps to the unavailable page.
+    let (_, owner_html) = get_html(&app, &path, Some(&owner_cookie)).await;
+    let owner_csrf = hidden(&owner_html, "csrf_token");
+    sqlx::query("UPDATE repositories SET status = 'deleting' WHERE id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, body) = post_form(
+        &app,
+        &format!("{path}/{rule_id}/delete"),
+        &owner_cookie,
+        &[("csrf_token", &owner_csrf)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    cleanup(&storage);
+    pool.close().await;
+}

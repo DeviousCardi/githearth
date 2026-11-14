@@ -466,6 +466,56 @@ async fn create_view_comment_and_review_through_forms() {
     .unwrap();
     assert_eq!(count, 0);
 
+    // Unknown reviewer and unknown removal render their 404 pages; a bad CSRF
+    // token is refused before any lookup.
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    let (status, _, body) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/reviewers", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("reviewer", "no-such-reviewer"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, _, body) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/reviewers/no-such-reviewer/delete", f.base),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/reviewers", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", "wrong"),
+            ("idempotency_key", &key(&page)),
+            ("reviewer", &reviewer_name),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A protection rule that the pull request does not satisfy explains why
+    // the merge control is unavailable instead of hiding it silently.
+    sqlx::query(
+        "INSERT INTO branch_protection_rules (id, repository_id, pattern, required_approvals, created_by) \
+         VALUES ($1, $2, 'main', 1, (SELECT author_id FROM pull_requests WHERE repository_id = $2 AND number = 1))",
+    )
+    .bind(Uuid::new_v4())
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains("Merging is blocked"), "{page}");
+
     // Add a comment.
     let (status, location, _) = post_form(
         &f.app,
@@ -529,6 +579,35 @@ async fn create_view_comment_and_review_through_forms() {
     let (_, list) = get(&f.app, &format!("{}/pulls", f.base), Some(&f.cookie)).await;
     assert!(list.contains(&format!("{}/pulls/1\"", f.base)));
     assert!(list.contains("<th scope=\"col\">Title</th>"));
+
+    // A merged pull request shows who merged it and when.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'merged', merged_at = now(), \
+         merged_by = (SELECT author_id FROM pull_requests WHERE repository_id = $1 AND number = 1) \
+         WHERE repository_id = $1 AND number = 1",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    // A merged pull request can still list a reviewer, but offers no form.
+    sqlx::query(
+        "INSERT INTO pull_request_review_requests (id, pull_request_id, reviewer_id, requested_by) \
+         SELECT $1, pr.id, a.id, pr.author_id FROM pull_requests pr \
+         JOIN accounts a ON a.username = $2 WHERE pr.repository_id = $3 AND pr.number = 1",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&reviewer_name)
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Merged by"), "{page}");
+    assert!(page.contains(&reviewer_name), "{page}");
+    assert!(!page.contains("Request a review from"), "{page}");
+
     finish(f).await;
 }
 
@@ -1929,6 +2008,34 @@ async fn a_fork_pull_request_can_be_created_from_the_browser_form() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["source_repository_id"], fork_id);
     assert_ne!(detail["source_repository_id"], f.repo_id.to_string());
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn draft_and_read_only_pages_do_not_claim_a_protection_failure() {
+    let f = fixture().await;
+    let (status, _) = api(
+        &f.app,
+        "POST",
+        &format!("{}/pulls", f.api_base),
+        &f.token,
+        json!({"title": "draft", "source_branch": "feature", "target_branch": "main", "draft": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("Merging is blocked"), "{page}");
+    assert!(!page.contains("Request a review from"), "{page}");
+
+    // A read-only member may view but not merge; the page must not tell them
+    // the protection requirements failed.
+    let reader = member_cookie(&f, "read").await;
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("Merging is blocked"), "{page}");
 
     finish(f).await;
 }
