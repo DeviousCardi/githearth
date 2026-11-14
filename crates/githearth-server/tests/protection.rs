@@ -859,6 +859,66 @@ async fn branch_settings_page_lists_creates_and_deletes_rules() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn branch_settings_renders_validation_and_missing_rule_errors() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    fixture_repository(&pool, org_id, "r", owner).await;
+    let token = fixture_session(&pool, owner).await;
+    let cookie = format!("githearth_session={token}");
+    let path = branch_settings_path(&slug, "r");
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
+    let csrf = hidden(&html, "csrf_token");
+
+    // An invalid pattern is a 400 page with the API message.
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &csrf),
+            ("idempotency_key", "00112233445566778899aabbccddeeff"),
+            ("pattern", "../bad"),
+            ("required_approvals", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("Invalid pattern") || body.contains("invalid"),
+        "{body}"
+    );
+
+    // An out-of-range approval count is 422.
+    let (status, _, _) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &csrf),
+            ("idempotency_key", "ffeeddccbbaa99887766554433221101"),
+            ("pattern", "release/*"),
+            ("required_approvals", "0"),
+            ("required_status_checks", "githearth/legacy-require-checks"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Deleting an unknown rule is 404, not 503.
+    let (status, _, _) = post_form(
+        &app,
+        &format!("{path}/{}/delete", Uuid::new_v4()),
+        &cookie,
+        &[("csrf_token", &csrf)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn branch_settings_duplicate_is_409_and_delete_removes_the_rule() {
     let (app, pool, storage, owner, org_id, slug) = setup().await;
     let repo_id = fixture_repository(&pool, org_id, "r", owner).await;
