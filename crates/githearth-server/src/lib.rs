@@ -1,3 +1,5 @@
+pub mod accounts;
+mod accounts_ui;
 pub mod audit;
 pub mod audit_retention;
 pub mod auto_merge;
@@ -259,6 +261,7 @@ pub fn router(state: AppState) -> Router {
             post(create_organization).get(list_organizations),
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
+        .merge(accounts::router())
         .merge(issues::router())
         .merge(forks::router())
         .merge(pulls::router())

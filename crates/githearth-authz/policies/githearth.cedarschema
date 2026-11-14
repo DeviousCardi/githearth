@@ -138,6 +138,12 @@ namespace GitHearth {
 
   // Instance administration: account provisioning and lifecycle belong to site
   // administrators alone (see the `site-admin-only` forbid in builtin.cedar).
+  action "account.read" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Instance,
+      context: Auth,
+    };
   action "account.create" in ["site_admin", "sensitive"]
     appliesTo {
       principal: [Account, Anonymous],

@@ -529,8 +529,14 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<Respo
             ));
         }
     }
+    let admin_link = if account.is_admin {
+        " <a href=\"/admin/accounts\">Accounts</a>"
+    } else {
+        ""
+    };
     let body = format!(
-        "<h1>Your organizations</h1><div class=\"card\"><ul>{}</ul></div><p><a href=\"/organizations/new\">New organization</a></p>",
+        "<h1>Your organizations</h1><div class=\"card\"><ul>{}</ul></div>\
+<p><a href=\"/organizations/new\">New organization</a>{admin_link}</p>",
         items
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
@@ -1410,6 +1416,7 @@ pub fn router() -> Router<AppState> {
             "/organizations/{slug}/repositories/{name}/fork",
             axum::routing::post(fork_submit),
         )
+        .merge(crate::accounts_ui::router())
         .merge(crate::issues_ui::router())
         .merge(crate::pulls_ui::router())
         .merge(crate::browse_ui::router())

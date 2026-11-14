@@ -270,7 +270,7 @@ impl Site<'_> {
             | OrganizationUnsuspend
             | TeamCreate
             | RepositoryCreate => Resource::Organization,
-            AccountCreate | AccountDisable | AccountEnable | AccountResetPassword => {
+            AccountRead | AccountCreate | AccountDisable | AccountEnable | AccountResetPassword => {
                 Resource::Instance
             }
             RepositoryRead
@@ -547,6 +547,7 @@ fn account_administration_requires_a_site_admin() {
     let engine = Engine::new().unwrap();
     let w = World::new();
     let actions = [
+        Action::AccountRead,
         Action::AccountCreate,
         Action::AccountDisable,
         Action::AccountEnable,

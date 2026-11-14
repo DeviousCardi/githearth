@@ -71,6 +71,7 @@ actions! {
     OrganizationDelete => "organization.delete", sensitive,
     OrganizationSuspend => "organization.suspend", sensitive,
     OrganizationUnsuspend => "organization.unsuspend", sensitive,
+    AccountRead => "account.read", sensitive,
     AccountCreate => "account.create", sensitive,
     AccountDisable => "account.disable", sensitive,
     AccountEnable => "account.enable", sensitive,
@@ -127,7 +128,9 @@ impl Action {
             | OrganizationUnsuspend
             | TeamCreate
             | RepositoryCreate => Kind::Organization,
-            AccountCreate | AccountDisable | AccountEnable | AccountResetPassword => Kind::Instance,
+            AccountRead | AccountCreate | AccountDisable | AccountEnable | AccountResetPassword => {
+                Kind::Instance
+            }
             RepositoryRead
             | RepositoryClone
             | RepositoryUpdate
