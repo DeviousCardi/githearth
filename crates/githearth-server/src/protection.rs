@@ -65,7 +65,7 @@ const RULE_COLUMNS: &str = "id, repository_id, pattern, allow_force_push, allow_
 /// Returns the literal (`main`) and glob prefix (`release/`) parts, or `None`
 /// when the pattern is not valid.
 pub(crate) fn parse_pattern(pattern: &str) -> Option<(Option<&str>, Option<&str>)> {
-    if pattern.is_empty() {
+    if pattern.is_empty() || pattern.chars().count() > 256 {
         return None;
     }
     if let Some(prefix) = pattern.strip_suffix('*') {

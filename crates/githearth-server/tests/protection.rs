@@ -245,6 +245,18 @@ async fn create_list_update_delete_with_generation_bumps() {
     assert_eq!(body["generation"], 0);
     assert_eq!(body["items"].as_array().unwrap().len(), 0);
 
+    // A pattern longer than the limit is rejected.
+    let (status, _) = request(
+        &app,
+        "POST",
+        &base,
+        Some(&token),
+        None,
+        json!({"pattern": "a".repeat(300)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     // Create.
     let (status, body) = request(
         &app,

@@ -816,6 +816,8 @@ async fn render_pull(
     let merge_permission =
         pulls::may_merge_permission(state, s.account.id, s.auth_age, slug, name, number).await;
     let may_explain_block = merge_permission && !detail.pull.draft;
+    let may_request_review =
+        pulls::may_request_review(state, s.account.id, s.auth_age, slug, name, number).await;
     let abilities = pulls::viewer_abilities(state, s.account.id, s.auth_age, slug, name, number)
         .await
         .unwrap_or(pulls::ViewerAbilities {
@@ -851,7 +853,7 @@ async fn render_pull(
     };
     let mut reviewer_items = String::new();
     for reviewer in &reviewer_names {
-        let remove = if detail.pull.state == "open" && abilities.may_comment {
+        let remove = if detail.pull.state == "open" && may_request_review {
             format!(
                 "<form method=\"post\" action=\"{base}/pulls/{number}/reviewers/{}/delete\" style=\"display:inline\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
@@ -873,7 +875,7 @@ async fn render_pull(
         ));
     }
     let reviewers_section =
-        if detail.pull.state == "open" && !detail.pull.draft && abilities.may_comment {
+        if detail.pull.state == "open" && !detail.pull.draft && may_request_review {
             format!(
                 "<h2>Reviewers</h2><div class=\"card\"><ul>{reviewer_items}</ul>\
 <form method=\"post\" action=\"{base}/pulls/{number}/reviewers\">{}\

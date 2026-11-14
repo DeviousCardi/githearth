@@ -656,6 +656,24 @@ async fn organization(
     .into_response())
 }
 
+/// The SSH clone URL shown next to the HTTP one when SSH is enabled.
+fn ssh_clone_url(state: &AppState, headers: &HeaderMap, slug: &str, name: &str) -> Option<String> {
+    if !state.config.ssh_enabled {
+        return None;
+    }
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.rsplit_once(':').map_or(h, |(h, _)| h))
+        .unwrap_or("127.0.0.1");
+    Some(format!(
+        "ssh://git@{host}:{}/{}/{}.git",
+        state.config.ssh_bind.port(),
+        url_encode(slug),
+        url_encode(name)
+    ))
+}
+
 /// The absolute HTTP clone URL for a repository. The scheme follows a
 /// validated `X-Forwarded-Proto` when present, otherwise the secure-cookie
 /// setting; the host comes from the request so a browser sees a copyable URL.
@@ -837,13 +855,46 @@ async fn new_repository_page(
     headers: HeaderMap,
     Path(slug): Path<String>,
 ) -> Result<Response, UiError> {
-    let (account, _) = match browser_auth(&state, &headers).await {
+    let (account, auth_age) = match browser_auth(&state, &headers).await {
         Ok(v) => v,
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
         Err(_) => return Err(unavailable_page(None)),
     };
     if !crate::valid_path_param(&slug) {
         return Err(not_found_page(Some(&account.username)));
+    }
+    // The form is only for an organization the viewer can read and create in.
+    let mut conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(|_| unavailable_page(Some(&account.username)))?;
+    let org_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1 AND NOT suspended")
+            .bind(&slug)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|_| unavailable_page(Some(&account.username)))?;
+    let Some(org_id) = org_id else {
+        return Err(not_found_page(Some(&account.username)));
+    };
+    let Some(org_facts) = facts::load(&mut conn, account.id, org_id)
+        .await
+        .map_err(|_| unavailable_page(Some(&account.username)))?
+    else {
+        return Err(not_found_page(Some(&account.username)));
+    };
+    drop(conn);
+    let can_create = state
+        .authz
+        .authorize(&org_facts.request(
+            Action::RepositoryCreate,
+            Resource::Organization,
+            Some(Duration::from_secs(auth_age)),
+        ))
+        .is_allowed();
+    if !can_create {
+        return Err(forbidden_page());
     }
     let csrf = csrf_expected(&browser_token_hash(&headers).unwrap_or_default());
     let body = format!(
@@ -1192,10 +1243,24 @@ async fn repository(
         }
         _ => String::new(),
     };
+    let http_clone = absolute_clone_url(&state, &headers, &slug, &repo.name);
+    let ssh_clone = ssh_clone_url(&state, &headers, &slug, &repo.name);
+    let clone_line = match ssh_clone {
+        Some(ssh) => format!(
+            "<p class=\"muted\">Clone: <code>git clone {}</code> or <code>git clone {}</code></p>",
+            esc(&http_clone),
+            esc(&ssh)
+        ),
+        None => format!(
+            "<p class=\"muted\">Clone: <code>git clone {}</code></p>",
+            esc(&http_clone)
+        ),
+    };
     let body = format!(
-        "<h1>{}</h1>{}<div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>{}",
+        "<h1>{}</h1>{}{}<div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>{}",
         esc(&repo.name),
         fork_note,
+        clone_line,
         esc(&slug),
         esc(&repo.visibility),
         esc(repo.status.as_str()),

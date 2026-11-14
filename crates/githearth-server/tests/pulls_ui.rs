@@ -2037,5 +2037,15 @@ async fn draft_and_read_only_pages_do_not_claim_a_protection_failure() {
     assert_eq!(status, StatusCode::OK);
     assert!(!page.contains("Merging is blocked"), "{page}");
 
+    // A reader cannot request reviewers, so the controls are not offered.
+    sqlx::query("UPDATE pull_requests SET draft = false WHERE repository_id = $1 AND number = 1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (status, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&reader)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("Request a review from"), "{page}");
+
     finish(f).await;
 }
