@@ -508,6 +508,14 @@ async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, 
 }
 type Tips = (Option<String>, Option<String>);
 
+/// Attaches the live code-owner facts to a detail response so create/PATCH
+/// report the same fields as GET .../pulls/{n} (#157).
+fn apply_codeowner_review(detail: &mut PullDetail, review: crate::codeowners::CodeOwnerReview) {
+    detail.required_code_owners = review.required;
+    detail.code_owner_review_satisfied = review.satisfied;
+    detail.code_owner_errors = review.errors;
+}
+
 /// Builds the detail on `conn`, so a caller inside a transaction needs no
 /// second connection; `tips` are resolved beforehand, outside it.
 async fn detail(
@@ -709,9 +717,21 @@ pub(crate) async fn create_pull(
             };
             let head = branch_tip(state, source_repository_id, &input.source_branch).await?;
             let base = branch_tip(state, loaded.repo.id, &input.target_branch).await?;
-            if head.is_none() || base.is_none() {
+            let (Some(head), Some(base)) = (head, base) else {
                 return Err(branch_missing());
-            }
+            };
+            // Read the code-owner facts from the same head and base the detail
+            // endpoint uses, before opening the transaction that stores the
+            // response.
+            fetch_cross_repo_head(
+                state,
+                loaded.repo.id,
+                source_repository_id,
+                &input.source_branch,
+            )
+            .await?;
+            let codeowners =
+                crate::codeowners::load(state, loaded.repo.id, &base, &head).await?;
 
             let mut tx = state.pool.begin().await?;
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
@@ -767,9 +787,24 @@ pub(crate) async fn create_pull(
 
             let pull = fetch_pull(&mut tx, id).await?.unwrap();
             let status = StatusCode::CREATED;
-            let body =
-                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, (head, base)).await?)
-                    .unwrap();
+            let mut detail = detail(
+                &mut tx,
+                loaded.repo.id,
+                pull,
+                (Some(head.clone()), Some(base.clone())),
+            )
+            .await?;
+            let review = crate::codeowners::review_loaded(
+                &mut tx,
+                loaded.org_id,
+                org_slug,
+                detail.pull.id,
+                &head,
+                codeowners,
+            )
+            .await?;
+            apply_codeowner_review(&mut detail, review);
+            let body = serde_json::to_value(detail).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
                 return Err(idempotency::claim_lost());
             }
@@ -972,6 +1007,22 @@ async fn update(
                 return Err(not_active());
             }
             let tips = tips(state, loaded.repo.id, &pull).await?;
+            let codeowners = match (&tips.0, &tips.1) {
+                (Some(head), Some(base)) => {
+                    fetch_cross_repo_head(
+                        state,
+                        loaded.repo.id,
+                        pull.source_repository_id,
+                        &pull.source_branch,
+                    )
+                    .await?;
+                    Some((
+                        head.clone(),
+                        crate::codeowners::load(state, loaded.repo.id, base, head).await?,
+                    ))
+                }
+                _ => None,
+            };
 
             let mut tx = state.pool.begin().await?;
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
@@ -1039,8 +1090,20 @@ async fn update(
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
             let status = StatusCode::OK;
-            let body =
-                serde_json::to_value(detail(&mut tx, loaded.repo.id, pull, tips).await?).unwrap();
+            let mut detail = detail(&mut tx, loaded.repo.id, pull, tips).await?;
+            if let Some((head, codeowners)) = codeowners {
+                let review = crate::codeowners::review_loaded(
+                    &mut tx,
+                    loaded.org_id,
+                    &org_slug,
+                    detail.pull.id,
+                    &head,
+                    codeowners,
+                )
+                .await?;
+                apply_codeowner_review(&mut detail, review);
+            }
+            let body = serde_json::to_value(detail).unwrap();
             if !idem.store(&mut tx, status, &body).await? {
                 return Err(idempotency::claim_lost());
             }

@@ -272,6 +272,7 @@ struct Fixture {
     repo_name: String,
     repo_id: Uuid,
     number: i64,
+    create_body: Value,
 }
 
 fn repo_href(org: &str, repo: &str) -> String {
@@ -385,6 +386,7 @@ async fn build_fixture(database_url: &str, codeowners_line: &str) -> Fixture {
         repo_name,
         repo_id,
         number,
+        create_body: pull,
     }
 }
 
@@ -597,6 +599,38 @@ async fn a_team_code_owner_requests_each_member() {
 // ---------------------------------------------------------------------------
 // Merge gate
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn create_and_patch_report_code_owner_facts() {
+    let db = TestDb::new().await;
+    let f = build_fixture(&db.url, "feat.txt @nobody\n").await;
+
+    // The create response must not claim a false green before CODEOWNERS is
+    // evaluated: the required owner is reported and not yet approved (#157).
+    assert_eq!(f.create_body["code_owner_review_satisfied"], false);
+    let owners = f.create_body["required_code_owners"].as_array().unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0]["name"], "@nobody");
+    assert_eq!(owners[0]["approved"], false);
+
+    let (status, patched) = request(
+        &f.app,
+        "PATCH",
+        &format!("{}/{}", repo_href(&f.org_slug, &f.repo_name), f.number),
+        Some(&f.owner_token),
+        json!({"title": "renamed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["code_owner_review_satisfied"], false);
+    let owners = patched["required_code_owners"].as_array().unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0]["name"], "@nobody");
+    assert_eq!(owners[0]["approved"], false);
+
+    finish(f).await;
+}
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
