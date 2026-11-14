@@ -48,12 +48,17 @@ impl Options {
     /// Defaults derived from the configuration path only: nothing is read from
     /// the process environment here, so a `setup` run is fully explained by
     /// its flags and stdin.
-    pub fn new(config: PathBuf, database_url: String) -> Self {
+    ///
+    /// The configuration path is made absolute first, so the default host key
+    /// path derived from its directory is absolute too and `serve` can load
+    /// the key from any working directory.
+    pub fn new(config: PathBuf, database_url: String) -> Result<Self> {
+        let config = absolute_path(&config)?;
         let directory = config
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Self {
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Ok(Self {
             config,
             database_url,
             storage_root: PathBuf::from("/var/lib/githearth/repositories"),
@@ -63,7 +68,7 @@ impl Options {
             ssh_host_key_path: directory.join(DEFAULT_HOST_KEY_FILE),
             git_push_limit_bytes: Config::default().git_push_limit_bytes,
             supplied_flags: Vec::new(),
-        }
+        })
     }
 
     /// The configuration `setup` writes and every later step uses. It is
@@ -95,6 +100,16 @@ impl Options {
         }
         Ok(config)
     }
+}
+
+/// Resolves `path` against the working directory at the moment `setup` runs.
+/// [`std::path::absolute`] normalises the path text without reading the
+/// filesystem, so no symlink is followed and the file that is written does not
+/// change. The recorded setting then works from any directory a later
+/// `serve` or `doctor` happens to run in.
+pub fn absolute_path(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path)
+        .with_context(|| format!("cannot resolve {} to an absolute path", path.display()))
 }
 
 /// HTTP binds first in `serve`, so a shared port would leave the SSH listener
@@ -164,7 +179,8 @@ impl Outcome {
     }
 }
 
-/// Steps that completed before a failure, so a resumed run reports them too.
+/// Steps that finished before a failure, so a resumed run reports them too.
+/// A step that found its work already done or skipped still counts as done.
 pub struct Report {
     pub completed: Vec<String>,
 }
@@ -243,9 +259,10 @@ impl Report {
             }
         };
         outcome.report();
-        if matches!(outcome, Outcome::Created(_)) {
-            self.completed.push(name.to_owned());
-        }
+        // Every successful step is recorded, not only the ones that created
+        // something: on a resumed run the configuration, directories and host
+        // key are already present, and a later failure must still name them.
+        self.completed.push(name.to_owned());
         Ok(())
     }
 }
@@ -340,7 +357,9 @@ fn recorded_settings(
     if recorded.database_url != options.database_url {
         bail!(
             "{} records a different database URL from the one supplied for this run; \
-             it was not changed. Use the URL in the file, or edit the file",
+             it was not changed. If the supplied URL is the intended one, correct \
+             `database_url` in the file and run the command again; otherwise use the \
+             recorded URL",
             path.display()
         );
     }
@@ -622,6 +641,12 @@ fn create_private_dir_for(path: &Path, uid: u32) -> Result<DirOutcome> {
     let mut created = None;
     let mut missing = Vec::new();
     for ancestor in path.ancestors() {
+        // A relative path's ancestors end with the empty path. Creating it
+        // fails with `cannot create : No such file or directory`, which names
+        // nothing; every real component below it is created instead.
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
         match std::fs::symlink_metadata(ancestor) {
             Ok(_) => break,
             Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(ancestor),
@@ -721,6 +746,20 @@ fn host_key(path: &Path) -> Result<Outcome> {
         bail!("{} exists and is not a file", path.display());
     }
     check_owner(path, current_uid())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The host key is a private key: the same rule as the configuration,
+        // which holds the database URL. A generated key is always 0600.
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{} has mode {mode:04o}; group or others could read the private host key. \
+                 Fix it with `chmod 0600 {}` and run the command again",
+                path.display(),
+                path.display()
+            );
+        }
+    }
     if rustix::fs::access(path, rustix::fs::Access::READ_OK).is_err() {
         bail!(
             "{} exists but is not readable by the current user; it was not changed",
@@ -885,7 +924,8 @@ mod tests {
         let options = Options::new(
             PathBuf::from("/etc/githearth/config.toml"),
             "postgres://db".into(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             options.ssh_host_key_path,
             Path::new("/etc/githearth/ssh_host_key")
@@ -898,9 +938,13 @@ mod tests {
             Path::new("/var/lib/githearth/repositories")
         );
 
-        // A configuration with no parent keeps its host key in the working directory.
-        let options = Options::new(PathBuf::from("config.toml"), "postgres://db".into());
-        assert_eq!(options.ssh_host_key_path, Path::new("ssh_host_key"));
+        // A relative configuration path is resolved against the working
+        // directory at the moment setup runs, and the default host key path
+        // follows the resolved configuration so it is CWD-independent too.
+        let cwd = std::env::current_dir().unwrap();
+        let options = Options::new(PathBuf::from("config.toml"), "postgres://db".into()).unwrap();
+        assert_eq!(options.config, cwd.join("config.toml"));
+        assert_eq!(options.ssh_host_key_path, cwd.join("ssh_host_key"));
     }
 
     #[test]
@@ -909,7 +953,8 @@ mod tests {
         let mut options = Options::new(
             directory.path().join("config.toml"),
             "postgres://db/name".into(),
-        );
+        )
+        .unwrap();
         options.ssh_bind = "127.0.0.1:2299".parse().unwrap();
         options.bind = "127.0.0.1:18081".parse().unwrap();
         let config = options.configuration().unwrap();
@@ -929,7 +974,8 @@ mod tests {
         let mut options = Options::new(
             directory.path().join("config.toml"),
             "postgres://db/name".into(),
-        );
+        )
+        .unwrap();
         options.bind = "127.0.0.1:18080".parse().unwrap();
         options.ssh_bind = "127.0.0.1:18080".parse().unwrap();
         // The message names both flags, so the operator knows what to change.
@@ -949,7 +995,7 @@ mod tests {
 
     #[test]
     fn an_empty_database_url_is_refused_before_anything_is_written() {
-        let options = Options::new(PathBuf::from("config.toml"), String::new());
+        let options = Options::new(PathBuf::from("config.toml"), String::new()).unwrap();
         let error = match options.configuration() {
             Ok(_) => panic!("an empty database URL must be refused"),
             Err(error) => error.to_string(),
@@ -963,7 +1009,8 @@ mod tests {
         let mut options = Options::new(
             directory.path().join("config.toml"),
             "postgres://db/name".into(),
-        );
+        )
+        .unwrap();
         options.ssh_enabled = false;
         let config = options.configuration().unwrap();
         assert!(!config.ssh_enabled);
@@ -1222,7 +1269,7 @@ mod tests {
             &path,
             &config,
             0o600,
-            &Options::new(path.clone(), config.database_url.clone()),
+            &Options::new(path.clone(), config.database_url.clone()).unwrap(),
         )
         .unwrap();
         let Outcome::AlreadyPresent(detail) = outcome else {
@@ -1262,14 +1309,14 @@ mod tests {
         let directory = temp();
         let path = directory.path().join("config.toml");
         let recorded = config_for(directory.path(), "postgres://host/first");
-        let options = Options::new(path.clone(), "postgres://host/first".into());
+        let options = Options::new(path.clone(), "postgres://host/first".into()).unwrap();
         let outcome = recorded_settings(&path, &recorded, 0o600, &options).unwrap();
         let Outcome::AlreadyPresent(detail) = outcome else {
             panic!("the same database is accepted");
         };
         assert!(detail.contains("mode 0600"), "{detail}");
 
-        let options = Options::new(path.clone(), "postgres://host/second".into());
+        let options = Options::new(path.clone(), "postgres://host/second".into()).unwrap();
         let error = recorded_settings(&path, &recorded, 0o600, &options)
             .unwrap_err()
             .to_string();
@@ -1289,7 +1336,7 @@ mod tests {
         let path = directory.path().join("config.toml");
         let mut recorded = config_for(directory.path(), "postgres://host/db");
         recorded.ssh_bind = recorded.bind;
-        let options = Options::new(path.clone(), "postgres://host/db".into());
+        let options = Options::new(path.clone(), "postgres://host/db".into()).unwrap();
         let error = recorded_settings(&path, &recorded, 0o600, &options)
             .unwrap_err()
             .to_string();
@@ -1308,7 +1355,7 @@ mod tests {
         let directory = temp();
         let path = directory.path().join("config.toml");
         let recorded = config_for(directory.path(), "postgres://host/db");
-        let mut options = Options::new(path.clone(), "postgres://host/db".into());
+        let mut options = Options::new(path.clone(), "postgres://host/db".into()).unwrap();
         options.supplied_flags = vec!["--http-port", "--storage-root"];
         let outcome = recorded_settings(&path, &recorded, 0o600, &options).unwrap();
         let Outcome::AlreadyPresent(detail) = outcome else {
@@ -1359,6 +1406,9 @@ mod tests {
         let directory = temp();
         let path = directory.path().join("ssh_host_key");
         std::fs::write(&path, "not a key").unwrap();
+        // A private mode, so this reaches the key-loading check rather than the
+        // mode refusal that a fresh file's umask-derived 0644 would trigger.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let error = host_key(&path).unwrap_err().to_string();
         assert!(error.contains("is not a private SSH host key"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a key");
@@ -1372,6 +1422,28 @@ mod tests {
         std::fs::create_dir(&as_directory).unwrap();
         let error = host_key(&as_directory).unwrap_err().to_string();
         assert!(error.contains("is not a file"), "{error}");
+    }
+
+    #[test]
+    fn a_group_or_other_readable_host_key_is_refused_with_the_mode_read() {
+        let directory = temp();
+        let path = directory.path().join("ssh_host_key");
+        assert!(matches!(host_key(&path).unwrap(), Outcome::Created(_)));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let error = host_key(&path).unwrap_err().to_string();
+        assert!(error.contains("has mode 0644"), "{error}");
+        assert!(error.contains("chmod 0600"), "{error}");
+        assert_eq!(mode(&path), 0o644, "the mode is refused, not changed");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // The remedy works and the existing key is then kept.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            host_key(&path).unwrap(),
+            Outcome::AlreadyPresent(_)
+        ));
     }
 
     #[test]
@@ -1399,6 +1471,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no step completed"), "{error}");
+    }
+
+    #[test]
+    fn a_resumed_failure_names_the_steps_that_were_already_done() {
+        let mut report = Report {
+            completed: Vec::new(),
+        };
+        report
+            .step("configuration", Ok(Outcome::AlreadyPresent("cfg".into())))
+            .unwrap();
+        report
+            .step(
+                "storage directory",
+                Ok(Outcome::AlreadyPresent("store".into())),
+            )
+            .unwrap();
+        report
+            .step("SSH host key", Ok(Outcome::Skipped("ssh off".into())))
+            .unwrap();
+        let error = report
+            .step("schema", Err(anyhow::anyhow!("cannot connect")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("completed: configuration, storage directory, SSH host key"),
+            "{error}"
+        );
+        assert!(!error.contains("no step completed"), "{error}");
     }
 
     #[tokio::test]

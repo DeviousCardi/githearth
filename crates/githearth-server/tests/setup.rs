@@ -5,7 +5,8 @@
 //! `--ignored` like the other real-PostgreSQL tests in this crate.
 use std::{
     fs,
-    net::{SocketAddr, TcpListener},
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -299,19 +300,55 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Waits until something accepts a TCP connection on `address`.
-fn wait_until_listening(address: SocketAddr) -> bool {
+/// The HTTP status for `path`, or `None` when the listener is not answering yet.
+fn http_status(port: u16, path: &str) -> Option<u16> {
+    let address: SocketAddr = format!("127.0.0.1:{port}").parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Waits for `GET /health/ready` to return 200, giving up early if `serve`
+/// exits. Returns false on timeout or an exited child.
+fn wait_for_ready(child: &mut std::process::Child, port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok() {
+    loop {
+        if http_status(port, "/health/ready") == Some(200) {
             return true;
+        }
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    false
 }
 
-fn snapshot(path: &Path) -> Vec<(PathBuf, Vec<u8>, u32, i64, u64)> {
+/// Reads the server's SSH identification line from a fresh connection.
+fn ssh_banner(address: SocketAddr) -> Option<String> {
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut banner = String::new();
+    BufReader::new(stream).read_line(&mut banner).ok()?;
+    Some(banner)
+}
+
+fn snapshot(path: &Path) -> Vec<(PathBuf, Vec<u8>, u32, i64, i64, u64)> {
     let mut entries = Vec::new();
     let mut todo = vec![path.to_path_buf()];
     while let Some(directory) = todo.pop() {
@@ -328,6 +365,7 @@ fn snapshot(path: &Path) -> Vec<(PathBuf, Vec<u8>, u32, i64, u64)> {
                 contents,
                 metadata.permissions().mode(),
                 metadata.mtime_nsec(),
+                metadata.mtime(),
                 metadata.ino(),
             ));
             if metadata.is_dir() {
@@ -631,23 +669,136 @@ fn clean_host_reaches_a_doctor_clean_running_installation() {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = serve.spawn().unwrap();
-    let address: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let http_ready = wait_until_listening(address);
+    let ready = wait_for_ready(&mut child, port);
     let ssh_address: SocketAddr = format!("127.0.0.1:{}", installation.ssh_port)
         .parse()
         .unwrap();
-    let ssh_ready = wait_until_listening(ssh_address);
+    let banner = ssh_banner(ssh_address);
+    let running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(ready, "GET /health/ready never returned 200 on {port}");
+    assert!(
+        banner
+            .as_deref()
+            .is_some_and(|banner| banner.starts_with("SSH-2.0-")),
+        "the SSH listener never sent a banner on {}: {banner:?}",
+        installation.ssh_port
+    );
+    assert!(
+        running,
+        "the serve child exited after both listeners accepted"
+    );
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn relative_paths_are_recorded_absolute_and_work_from_another_directory() {
+    let installation = Installation::new();
+    let database = Database::new();
+
+    // Run from inside the installation with the relative values the sample
+    // configuration suggests. Both `conf/` and `data/` are missing, so setup
+    // must create them rather than fail on the empty ancestor.
+    let _one = exclusive();
+    let mut command = server();
+    command.current_dir(&installation.path);
+    command.env("GITHEARTH_DATABASE_URL", &database.url);
+    command.args([
+        "setup",
+        "--config-path",
+        "conf/config.toml",
+        "--storage-root",
+        "data/repositories",
+        "--http-port",
+        &installation.http_port.to_string(),
+        "--ssh-port",
+        &installation.ssh_port.to_string(),
+    ]);
+    let output = run_with_stdin(command, PASSWORD.as_bytes());
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_no_secrets(&output, &database.url);
+
+    let config_path = installation.join("conf/config.toml");
+    let storage = installation.join("data/repositories");
+    let key = installation.join("conf/ssh_host_key");
+    assert_eq!(mode(&config_path), 0o600);
+    assert_eq!(mode(&storage), 0o700);
+    assert_eq!(mode(&key), 0o600);
+    // getcwd resolves the temp-directory symlink, so compare with the resolved
+    // base; the product deliberately does not resolve symlinks itself.
+    let base = fs::canonicalize(&installation.path).unwrap();
+    let text = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        text.contains(&format!(
+            "storage_root = {:?}",
+            base.join("data/repositories").to_str().unwrap()
+        )),
+        "the storage root is recorded as an absolute path: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "ssh_host_key_path = {:?}",
+            base.join("conf/ssh_host_key").to_str().unwrap()
+        )),
+        "the host key path is recorded as an absolute path: {text}"
+    );
+
+    // A different working directory: doctor and serve use only the absolute
+    // path in the file, so both must still work.
+    let elsewhere = installation.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut command = server();
+    command.current_dir(&elsewhere);
+    command.args(["--config", config_path.to_str().unwrap(), "doctor"]);
+    let doctor = run(command);
+    assert!(
+        doctor.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&doctor),
+        stderr(&doctor)
+    );
+
+    let mut serve = server();
+    serve.current_dir(&elsewhere);
+    serve.args(["--config", config_path.to_str().unwrap(), "serve"]);
+    serve
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = serve.spawn().unwrap();
+    let ready = wait_for_ready(&mut child, installation.http_port);
+    let ssh_address: SocketAddr = format!("127.0.0.1:{}", installation.ssh_port)
+        .parse()
+        .unwrap();
+    let banner = ssh_banner(ssh_address);
+    let running = child.try_wait().unwrap().is_none();
     let _ = child.kill();
     let _ = child.wait();
     assert!(
-        http_ready,
-        "the configured server never accepted connections on {port}"
+        ready,
+        "GET /health/ready never returned 200 on {}",
+        installation.http_port
     );
     assert!(
-        ssh_ready,
-        "the SSH listener never accepted connections on {}",
+        banner
+            .as_deref()
+            .is_some_and(|banner| banner.starts_with("SSH-2.0-")),
+        "the SSH listener never sent a banner on {}: {banner:?}",
         installation.ssh_port
     );
+    assert!(
+        running,
+        "the serve child exited after both listeners accepted"
+    );
+    assert_eq!(admin_count(&database), 1);
 }
 
 #[test]
@@ -830,6 +981,21 @@ fn interrupted_run_resumes_and_finishes_only_the_missing_steps() {
         1
     );
 
+    // The same failure again: the configuration, storage and host key are
+    // already present, so the resumed failure must name them instead of
+    // claiming that no step completed.
+    let mut again = setup(&installation, &database.url);
+    again.env("GITHEARTH_DATABASE_TIMEOUT_SECONDS", "1");
+    let failed_again = run_with_stdin(again, PASSWORD.as_bytes());
+    assert_eq!(failed_again.status.code(), Some(1));
+    let err = stderr(&failed_again);
+    assert!(err.contains("stopped during the schema step"), "{err}");
+    assert!(
+        err.contains("completed: configuration, storage directory, SSH host key"),
+        "{err}"
+    );
+    assert!(!err.contains("no step completed"), "{err}");
+
     // The operator fixes the database and runs the same command again.
     database.create();
     let config_before = fs::read(installation.config()).unwrap();
@@ -934,7 +1100,7 @@ fn group_or_world_writable_directories_are_refused() {
 
 #[test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-fn a_missing_database_reports_a_sanitized_error_and_leaves_the_host_prepared() {
+fn a_missing_database_reports_a_sanitized_error_and_the_url_can_be_corrected() {
     let installation = Installation::new();
     let database = Database::new();
     let missing = with_database(&database.url, "githearth_setup_missing_database");
@@ -960,6 +1126,31 @@ fn a_missing_database_reports_a_sanitized_error_and_leaves_the_host_prepared() {
             .count(),
         1
     );
+
+    // A corrected URL in the environment alone cannot repair the run: the
+    // recorded value is authoritative, and the error says to edit the file.
+    let refused = run(setup(&installation, &database.url));
+    assert_eq!(refused.status.code(), Some(1));
+    let err = stderr(&refused);
+    assert!(err.contains("records a different database URL"), "{err}");
+    assert!(err.contains("correct `database_url` in the file"), "{err}");
+
+    // The documented recovery: correct `database_url` in the configuration
+    // file, then run the same command again.
+    let text = fs::read_to_string(installation.config()).unwrap();
+    let corrected = text.replace(&missing, &database.url);
+    assert_ne!(corrected, text, "the recorded URL was replaced");
+    fs::write(installation.config(), corrected).unwrap();
+    fs::set_permissions(installation.config(), fs::Permissions::from_mode(0o600)).unwrap();
+    let resumed = run_with_stdin(setup(&installation, &database.url), PASSWORD.as_bytes());
+    assert!(
+        resumed.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&resumed),
+        stderr(&resumed)
+    );
+    assert_eq!(admin_count(&database), 1);
+    assert_no_secrets(&resumed, &database.url);
 }
 
 #[test]

@@ -62,6 +62,11 @@ whose `bind` and `ssh_bind` share a port, both on a first install and when it
 resumes from an existing file. The rule compares ports only, so two different
 interfaces on the same port are refused as well.
 
+Relative `--config-path`, `--storage-root` and `--ssh-host-key-path` values
+resolve against the working directory where `setup` runs and are written to the
+configuration as absolute paths. Symlinks are not followed, and `serve` and
+`doctor` therefore work from any directory afterwards.
+
 Re-running `setup` is safe and is the documented way to finish an interrupted
 run: every step detects completed work, prints `created`, `unchanged` or
 `skipped`, and leaves an existing configuration file, host key or administrator
@@ -69,7 +74,11 @@ untouched. When `GITHEARTH_DATABASE_URL` is not set, a run with an existing
 configuration uses the URL recorded in it and reads nothing from stdin, so a
 resumed install needs only the password (and none once the administrator
 exists). A run that fails names the step that stopped it and lists the steps
-already completed; fix the reported problem and run the same command again.
+already completed. Fix the reported problem and run the same command again,
+except when the problem is the database URL itself: the URL recorded in the
+configuration file is authoritative, so correct `database_url` there (or remove
+the file and start again) before rerunning. Passing a corrected URL only in the
+environment cannot repair the run.
 
 Once the configuration file exists it is the source of truth: its settings are
 used for the remaining steps, so an operator's later edits (`bind`,

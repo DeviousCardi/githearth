@@ -291,11 +291,16 @@ async fn run_setup(
         (Some(path), None) | (None, Some(path)) => path,
         (None, None) => PathBuf::from("/etc/githearth/config.toml"),
     };
+    // Resolved against the working directory at the moment setup runs, before
+    // the file is inspected or its directory is created: `std::path::absolute`
+    // does not follow symlinks, so the recorded settings are CWD-independent
+    // without changing which file is used.
+    let path = setup::absolute_path(&path)?;
     // The file is inspected and validated before anything is read from stdin:
     // a resumed run uses its recorded URL and never waits for input, and a
     // loose or symlinked file is refused before any prompt could appear.
     let recorded = setup::recorded_database_url(&path)?;
-    let mut options = setup::Options::new(path, database_url_from_environment_or_stdin(recorded)?);
+    let mut options = setup::Options::new(path, database_url_from_environment_or_stdin(recorded)?)?;
     // Named in the report when an existing configuration overrides them, so a
     // supplied value is never ignored without a word.
     let mut supplied_flags = Vec::new();
@@ -313,11 +318,11 @@ async fn run_setup(
     }
     if let Some(root) = storage_root {
         supplied_flags.push("--storage-root");
-        options.storage_root = root;
+        options.storage_root = setup::absolute_path(&root)?;
     }
     if let Some(key) = ssh_host_key_path {
         supplied_flags.push("--ssh-host-key-path");
-        options.ssh_host_key_path = key;
+        options.ssh_host_key_path = setup::absolute_path(&key)?;
     }
     options.supplied_flags = supplied_flags;
     setup::run(&options, &mut setup::StdinPassword).await?;
