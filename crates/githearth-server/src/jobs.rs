@@ -29,8 +29,16 @@ pub enum JobOutcome {
     Failed { reason: String },
 }
 
+struct Registered {
+    handler: Handler,
+    /// How long this kind may run. A kind whose work is several bounded steps
+    /// (housekeeping) is longer than the generic `job_timeout_seconds`; without
+    /// its own budget the runner would time it out mid-step and retry forever.
+    budget: Option<Duration>,
+}
+
 pub struct Registry {
-    handlers: HashMap<String, Handler>,
+    handlers: HashMap<String, Registered>,
 }
 
 impl Registry {
@@ -40,12 +48,60 @@ impl Registry {
         }
     }
 
+    /// Registers a handler under the generic `job_timeout_seconds`.
     pub fn register(&mut self, kind: &str, handler: Handler) {
-        self.handlers.insert(kind.to_string(), handler);
+        self.handlers.insert(
+            kind.to_string(),
+            Registered {
+                handler,
+                budget: None,
+            },
+        );
+    }
+
+    /// Registers a handler with its own run budget. The claim lease is twice
+    /// the budget, so a lease can never expire while its handler is running.
+    pub fn register_with_budget(&mut self, kind: &str, handler: Handler, budget: Duration) {
+        self.handlers.insert(
+            kind.to_string(),
+            Registered {
+                handler,
+                budget: Some(budget),
+            },
+        );
     }
 
     fn get(&self, kind: &str) -> Option<&Handler> {
-        self.handlers.get(kind)
+        self.handlers
+            .get(kind)
+            .map(|registered| &registered.handler)
+    }
+
+    fn budget(&self, kind: &str) -> Option<Duration> {
+        self.handlers
+            .get(kind)
+            .and_then(|registered| registered.budget)
+    }
+
+    /// Per-kind claim lease in seconds. A lease is twice the budget, so
+    /// `recover_leases` never reclaims a job whose handler is still inside a
+    /// bounded step.
+    fn leases(&self) -> HashMap<String, f64> {
+        self.handlers
+            .iter()
+            .filter_map(|(kind, registered)| {
+                registered
+                    .budget
+                    .map(|budget| (kind.clone(), (budget * 2).as_secs_f64()))
+            })
+            .collect()
+    }
+
+    fn longest_budget(&self) -> Option<Duration> {
+        self.handlers
+            .values()
+            .filter_map(|registered| registered.budget)
+            .max()
     }
 }
 
@@ -123,23 +179,54 @@ async fn recover_leases(state: &AppState) {
     .await;
 }
 
-async fn claim_one(state: &AppState, holder: Uuid, lease_secs: f64) -> Option<RunnerClaim> {
+/// Claims one due job and leases it for the job kind's own budget (twice the
+/// budget), falling back to the generic `default_lease_secs`. Selecting the
+/// row and updating it happen in one transaction, so the kind is known before
+/// the lease is chosen without opening a window another worker could claim in.
+async fn claim_one(
+    state: &AppState,
+    holder: Uuid,
+    default_lease_secs: f64,
+    leases: &HashMap<String, f64>,
+) -> Option<RunnerClaim> {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(error = %e, "job claim transaction failed");
+            return None;
+        }
+    };
+    let selected = sqlx::query(
+        "SELECT id, kind FROM jobs WHERE state = 'pending' AND not_before <= now() \
+         ORDER BY not_before FOR UPDATE SKIP LOCKED LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await;
+    let (id, kind): (Uuid, String) = match selected {
+        Ok(Some(row)) => (row.get("id"), row.get("kind")),
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "job claim query failed");
+            return None;
+        }
+    };
+    let lease_secs = leases.get(&kind).copied().unwrap_or(default_lease_secs);
     let row = sqlx::query(
         "UPDATE jobs SET state = 'running', attempt = attempt + 1, lease_holder = $1, \
          lease_expires_at = now() + $2 * interval '1 second', updated_at = now() \
-         WHERE id = (SELECT id FROM jobs WHERE state = 'pending' AND not_before <= now() \
-         ORDER BY not_before FOR UPDATE SKIP LOCKED LIMIT 1) \
+         WHERE id = $3 \
          RETURNING id, organization_id, kind, payload, attempt, max_attempts, lease_holder",
     )
     .bind(holder)
     .bind(lease_secs)
-    .fetch_optional(&state.pool)
+    .bind(id)
+    .fetch_optional(&mut *tx)
     .await;
 
-    match row {
+    let claim = match row {
         Ok(Some(row)) => {
             let payload: serde_json::Value = row.get("payload");
-            Some(RunnerClaim {
+            RunnerClaim {
                 id: row.get("id"),
                 organization_id: row.get("organization_id"),
                 kind: row.get("kind"),
@@ -147,14 +234,23 @@ async fn claim_one(state: &AppState, holder: Uuid, lease_secs: f64) -> Option<Ru
                 attempt: row.get("attempt"),
                 max_attempts: row.get("max_attempts"),
                 lease_holder: row.get("lease_holder"),
-            })
+            }
         }
-        Ok(None) => None,
+        Ok(None) => {
+            let _ = tx.rollback().await;
+            return None;
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "job claim query failed");
-            None
+            tracing::warn!(error = %e, "job claim update failed");
+            let _ = tx.rollback().await;
+            return None;
         }
+    };
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(error = %e, "job claim commit failed");
+        return None;
     }
+    Some(claim)
 }
 
 async fn apply_outcome(state: &AppState, claim: &RunnerClaim, outcome: &JobOutcome) {
@@ -177,14 +273,16 @@ async fn apply_outcome(state: &AppState, claim: &RunnerClaim, outcome: &JobOutco
         };
 
     let fenced = if let Some(not_before) = not_before {
-        let delay_ms = not_before.as_millis() as i64;
+        // `make_interval` has no `millis` parameter (only `secs`, a double);
+        // passing milliseconds to it failed every retry before this fix.
+        let delay_secs = not_before.as_secs_f64();
         sqlx::query(
-            "UPDATE jobs SET state = $1, not_before = now() + make_interval(millis => $2), \
+            "UPDATE jobs SET state = $1, not_before = now() + make_interval(secs => $2), \
              last_error = $3, updated_at = now() \
              WHERE id = $4 AND state = 'running' AND lease_holder = $5 AND attempt = $6",
         )
         .bind(new_state)
-        .bind(delay_ms)
+        .bind(delay_secs)
         .bind(&last_error)
         .bind(claim.id)
         .bind(claim.lease_holder)
@@ -210,7 +308,15 @@ async fn apply_outcome(state: &AppState, claim: &RunnerClaim, outcome: &JobOutco
     }
 }
 
-async fn run_job(state: AppState, registry: Arc<Registry>, claim: RunnerClaim, timeout: Duration) {
+async fn run_job(
+    state: AppState,
+    registry: Arc<Registry>,
+    claim: RunnerClaim,
+    default_timeout: Duration,
+) {
+    // A kind with its own budget (housekeeping: every bounded phase of a run)
+    // must not be cut off by the generic `job_timeout_seconds`.
+    let timeout = registry.budget(&claim.kind).unwrap_or(default_timeout);
     let handler = match registry.get(&claim.kind) {
         Some(h) => h.clone(),
         None => {
@@ -278,8 +384,16 @@ pub fn spawn(
         let registry = Arc::new(registry);
         let holder = Uuid::new_v4();
         let poll = Duration::from_millis(state.config.job_poll_interval_ms);
-        let timeout = Duration::from_secs(state.config.job_timeout_seconds);
-        let lease = (timeout * 2).as_secs_f64();
+        let default_timeout = Duration::from_secs(state.config.job_timeout_seconds);
+        let default_lease = (default_timeout * 2).as_secs_f64();
+        let leases = registry.leases();
+        // A shutdown waits for the longest budget any handler may use, not
+        // just the generic one, before returning its jobs to `pending`.
+        let shutdown_wait = registry
+            .longest_budget()
+            .unwrap_or(default_timeout)
+            .max(default_timeout)
+            + Duration::from_secs(1);
         let slots = Arc::new(tokio::sync::Semaphore::new(state.config.job_concurrency));
         let mut tasks = tokio::task::JoinSet::new();
         let mut last_retention: Option<Instant> = None;
@@ -288,13 +402,13 @@ pub fn spawn(
             recover_leases(&state).await;
             let mut claimed = false;
             while let Ok(permit) = slots.clone().try_acquire_owned() {
-                let Some(claim) = claim_one(&state, holder, lease).await else {
+                let Some(claim) = claim_one(&state, holder, default_lease, &leases).await else {
                     break;
                 };
                 claimed = true;
                 let (state, registry) = (state.clone(), registry.clone());
                 tasks.spawn(async move {
-                    run_job(state, registry, claim, timeout).await;
+                    run_job(state, registry, claim, default_timeout).await;
                     drop(permit);
                 });
             }
@@ -311,8 +425,9 @@ pub fn spawn(
             }
         }
 
-        // Handlers run under `timeout`, so in-flight work ends by then.
-        let _ = tokio::time::timeout(timeout + Duration::from_secs(1), async {
+        // Handlers run under their kind's budget, so in-flight work ends by
+        // the longest of them.
+        let _ = tokio::time::timeout(shutdown_wait, async {
             while tasks.join_next().await.is_some() {}
         })
         .await;

@@ -593,6 +593,7 @@ mod tests {
             },
             auth_slots: Arc::new(tokio::sync::Semaphore::new(10)),
             git_slots: Arc::new(tokio::sync::Semaphore::new(10)),
+            housekeeping_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(engine),
             storage: Arc::new(storage),

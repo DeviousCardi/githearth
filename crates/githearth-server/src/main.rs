@@ -70,6 +70,11 @@ enum Command {
         #[command(subcommand)]
         action: AuditCommand,
     },
+    /// Repack one repository and prune unreachable objects now (ADR 0013).
+    Housekeeping {
+        #[arg(long)]
+        repository: uuid::Uuid,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,6 +209,8 @@ async fn run(args: Args) -> Result<()> {
             let mut registry = jobs::Registry::new();
             githearth_server::notifications::register(&mut registry);
             githearth_server::codeowners::register(&mut registry);
+            githearth_server::housekeeping::register(&mut registry, &config);
+            let _housekeeping = githearth_server::housekeeping::spawn(state.clone());
             let jobs = jobs::spawn(state.clone(), registry, jobs_shutdown.clone());
             let _ssh = if config.ssh_enabled {
                 ssh::load_host_key(&config.ssh_host_key_path)?;
@@ -230,6 +237,40 @@ async fn run(args: Args) -> Result<()> {
         }
         // Handled in `main` before any configuration is loaded.
         Command::GitHook { .. } => unreachable!("git-hook is dispatched in main"),
+        Command::Housekeeping { repository } => {
+            // The operator command runs the same code the job runs. It takes
+            // the same in-process lock, which a separate process does NOT
+            // share with a running server: stop the server first (see
+            // docs/operations/housekeeping.md). It also runs even when
+            // `housekeeping_enabled = false`, because it is explicit.
+            let state = AppState::new(pool, config.clone())
+                .await
+                .context("cannot initialize repository storage")?;
+            match githearth_server::housekeeping::run_repository_now(&state, repository).await? {
+                githearth_server::housekeeping::Outcome::Completed(report) => println!(
+                    "housekeeping completed for {repository}: {} -> {} bytes, {} expired object(s), {}, {}",
+                    report.bytes_before,
+                    report.bytes_after,
+                    report.expired,
+                    if report.repacked {
+                        "repacked"
+                    } else {
+                        "not repacked"
+                    },
+                    if report.truncated {
+                        "scan/deletion stopped at its deadline; the next run continues"
+                    } else {
+                        "scan/deletion complete"
+                    }
+                ),
+                githearth_server::housekeeping::Outcome::Skipped(reason) => {
+                    println!("housekeeping skipped for {repository}: {reason}")
+                }
+                githearth_server::housekeeping::Outcome::Deferred(deferred) => {
+                    println!("housekeeping deferred for {repository}: {deferred}")
+                }
+            }
+        }
         Command::Audit { action } => match action {
             AuditCommand::PruneIps {
                 older_than,

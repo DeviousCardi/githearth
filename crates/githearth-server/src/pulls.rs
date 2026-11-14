@@ -574,6 +574,59 @@ async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, 
 }
 type Tips = (Option<String>, Option<String>);
 
+/// The head a closed or merged pull request shows when its source branch no
+/// longer exists: the newest live pin in the repository that owns the head
+/// (ADR 0013 "What is live", 7). The pin is why the diff survives the branch
+/// delete; without this fallback the product would refuse to show it while the
+/// objects were still there.
+///
+/// An open pull request, or a source repository that is gone (a deleted fork's
+/// pins cascade with it), reads as `None` exactly as before.
+async fn pinned_head(state: &AppState, pull: &PullJson) -> Result<Option<String>, ApiError> {
+    let mut conn = state.pool.acquire().await?;
+    pinned_head_on(&mut conn, pull).await
+}
+
+/// The pin lookup on an existing connection or transaction, so a close can
+/// see the retention it just extended in the same transaction.
+async fn pinned_head_on(
+    conn: &mut PgConnection,
+    pull: &PullJson,
+) -> Result<Option<String>, ApiError> {
+    if !matches!(pull.state.as_str(), "closed" | "merged") {
+        return Ok(None);
+    }
+    let oid: Option<String> = sqlx::query_scalar(
+        "SELECT p.commit_oid FROM pinned_commits p \
+         JOIN repositories r ON r.id = p.repository_id AND r.status = 'active' \
+         WHERE p.pull_request_id = $1 AND p.repository_id = $2 AND p.retain_until > now() \
+         ORDER BY p.created_at DESC, p.id DESC LIMIT 1",
+    )
+    .bind(pull.id)
+    .bind(pull.source_repository_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(oid)
+}
+
+/// Replaces a missing head with the pull request's live pin when it is closed
+/// or merged. Returns whether the pin supplied the head, so the caller can
+/// skip paths that need objects in the target repository (a fork's pinned
+/// head lives in the fork).
+async fn tips_with_pin(
+    state: &AppState,
+    pull: &PullJson,
+    mut tips: Tips,
+) -> Result<(Tips, bool), ApiError> {
+    if tips.0.is_none()
+        && let Some(oid) = pinned_head(state, pull).await?
+    {
+        tips.0 = Some(oid);
+        return Ok((tips, true));
+    }
+    Ok((tips, false))
+}
+
 /// Attaches the live code-owner facts to a detail response so create/PATCH
 /// report the same fields as GET .../pulls/{n} (#157).
 fn apply_codeowner_review(detail: &mut PullDetail, review: crate::codeowners::CodeOwnerReview) {
@@ -828,6 +881,18 @@ pub(crate) async fn create_pull(
             if inserted.rows_affected() == 0 {
                 return Err(already_open());
             }
+            // Pin the head in the repository that owns it, in this same
+            // transaction: a closed pull request's diff must survive a prune
+            // after its branch is deleted (ADR 0013 "What is live", 7). The
+            // pin is a row, never a Git ref, and is never advertised.
+            crate::pins::pin_head(
+                &mut tx,
+                source_repository_id,
+                id,
+                &head,
+                state.config.housekeeping_pin_retention_days,
+            )
+            .await?;
             event(
                 &mut tx,
                 Some(loaded.org_id),
@@ -1077,9 +1142,12 @@ pub(crate) async fn read_pull(
     let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
-    let tips = tips(state, loaded.repo.id, &pull).await?;
+    let (tips, pinned) =
+        tips_with_pin(state, &pull, tips(state, loaded.repo.id, &pull).await?).await?;
     let mergeability = match &tips {
-        (Some(head), Some(base)) => {
+        // A pinned head is unreachable by design and may live only in a fork;
+        // mergeability is not meaningful for a closed request anyway.
+        (Some(head), Some(base)) if !pinned => {
             fetch_cross_repo_head(
                 state,
                 loaded.repo.id,
@@ -1094,8 +1162,11 @@ pub(crate) async fn read_pull(
     let mut conn = state.pool.acquire().await?;
     let mut detail = detail(&mut conn, loaded.repo.id, pull, tips).await?;
     detail.mergeability = mergeability;
-    // Attach the live code-owner requirements for the pull request page.
-    if let (Some(head), Some(base)) = (detail.head_id.as_deref(), detail.base_id.as_deref()) {
+    // Attach the live code-owner requirements for the pull request page. A
+    // pinned head may live only in a fork, so that path is skipped.
+    if !pinned
+        && let (Some(head), Some(base)) = (detail.head_id.as_deref(), detail.base_id.as_deref())
+    {
         let review = crate::codeowners::review(
             state,
             loaded.repo.id,
@@ -1170,9 +1241,10 @@ async fn update(
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
             }
-            let tips = tips(state, loaded.repo.id, &pull).await?;
+            let (tips, pinned) =
+                tips_with_pin(state, &pull, tips(state, loaded.repo.id, &pull).await?).await?;
             let codeowners = match (&tips.0, &tips.1) {
-                (Some(head), Some(base)) => {
+                (Some(head), Some(base)) if !pinned => {
                     fetch_cross_repo_head(
                         state,
                         loaded.repo.id,
@@ -1265,11 +1337,28 @@ async fn update(
                     Some("pull request closed"),
                 )
                 .await?;
+                // The retention window starts at the close. A request that
+                // stayed open longer than the window keeps its diff for the
+                // configured period from now, not from its last refresh.
+                crate::pins::extend_for_closed(
+                    &mut tx,
+                    locked.id,
+                    state.config.housekeeping_pin_retention_days,
+                )
+                .await?;
             }
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
             let status = StatusCode::OK;
-            let mut detail = detail(&mut tx, loaded.repo.id, pull, tips).await?;
+            // Closing a request whose branch is already gone must return the
+            // same head a later GET will: the pin that was just extended.
+            let mut detail_tips = tips;
+            if detail_tips.0.is_none()
+                && let Some(oid) = pinned_head_on(&mut tx, &pull).await?
+            {
+                detail_tips.0 = Some(oid);
+            }
+            let mut detail = detail(&mut tx, loaded.repo.id, pull, detail_tips).await?;
             if let Some((head, codeowners)) = codeowners {
                 let review = crate::codeowners::review_loaded(
                     &mut tx,

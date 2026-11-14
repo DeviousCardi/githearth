@@ -15,6 +15,7 @@ pub mod forks;
 pub mod git_admission;
 pub mod git_hooks;
 pub mod git_http;
+pub mod housekeeping;
 pub mod idempotency;
 pub mod issues;
 mod issues_ui;
@@ -28,6 +29,7 @@ pub mod merge_worker;
 mod mergeability;
 pub mod notifications;
 mod notifications_ui;
+pub mod pins;
 pub mod protection;
 pub mod pulls;
 mod pulls_ui;
@@ -90,6 +92,9 @@ pub struct AppState {
     pub auth_slots: Arc<Semaphore>,
     // pub so the concurrency-exhaustion integration test can hold a permit.
     pub git_slots: Arc<Semaphore>,
+    /// Bounds simultaneous housekeeping runs (`housekeeping_concurrency`),
+    /// including direct enqueues that bypass the scheduler's allowance.
+    pub(crate) housekeeping_slots: Arc<Semaphore>,
     dummy_hash: Arc<String>,
     pub authz: Arc<Engine>,
     pub storage: Arc<githearth_git::layout::Storage>,
@@ -158,6 +163,7 @@ impl AppState {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
             git_slots: Arc::new(Semaphore::new(config.git_concurrency)),
+            housekeeping_slots: Arc::new(Semaphore::new(config.housekeeping_concurrency)),
             config,
             dummy_hash: Arc::new(dummy_hash),
             authz: Arc::new(Engine::new()?),

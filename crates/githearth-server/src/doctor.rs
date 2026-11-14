@@ -83,6 +83,7 @@ pub async fn report(config: &Config) -> Vec<Check> {
                 },
             );
             checks.push(jobs_check(&pool, config.job_timeout_seconds).await);
+            checks.push(housekeeping_check(&pool, config).await);
             pool.close().await;
         }
         Err(e) => {
@@ -90,6 +91,7 @@ pub async fn report(config: &Config) -> Vec<Check> {
             checks.push(Check::skip("schema"));
             checks.push(Check::skip("lifecycle"));
             checks.push(Check::skip("jobs"));
+            checks.push(Check::skip("housekeeping"));
         }
     }
 
@@ -306,6 +308,39 @@ async fn jobs_check(pool: &PgPool, timeout_seconds: u64) -> Check {
             format_args!("{late} pending job(s) more than 60 s late"),
         ),
         Ok(_) => Check::ok("jobs", "no dead, late or stuck jobs"),
+    }
+}
+
+/// Warns when active repositories are overdue for maintenance or the last run
+/// failed. Read-only, like every doctor check (ADR 0013).
+async fn housekeeping_check(pool: &PgPool, config: &Config) -> Check {
+    if !config.housekeeping_enabled {
+        return Check::ok("housekeeping", "disabled by configuration");
+    }
+    // Two intervals of slack: a run is only late if the scheduler itself has
+    // stopped, not because a large repository is still in progress.
+    let overdue_after = (config.housekeeping_interval_seconds as i64) * 2;
+    let counts: Result<(i64, i64), _> = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE h.last_run_at IS NULL \
+                 OR h.last_run_at < now() - make_interval(secs => $1)), \
+                count(*) FILTER (WHERE h.last_outcome IN ('failed', 'deferred')) \
+         FROM repositories r LEFT JOIN repository_housekeeping h ON h.repository_id = r.id \
+         WHERE r.status = 'active' AND NOT r.archived",
+    )
+    .bind(overdue_after as f64)
+    .fetch_one(pool)
+    .await;
+    match counts {
+        Err(_) => Check::fail("housekeeping", "cannot query housekeeping results"),
+        Ok((overdue, _)) if overdue > 0 => Check::warn(
+            "housekeeping",
+            format_args!("{overdue} active repo(s) overdue for maintenance"),
+        ),
+        Ok((_, troubled)) if troubled > 0 => Check::warn(
+            "housekeeping",
+            format_args!("{troubled} repo(s) with a failed or deferred run"),
+        ),
+        Ok(_) => Check::ok("housekeeping", "repositories are up to date"),
     }
 }
 

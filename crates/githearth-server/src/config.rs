@@ -47,6 +47,29 @@ pub struct Config {
     /// Poll interval in ms when no work is found (ADR 0006).
     #[serde(default = "default_job_poll_interval_ms")]
     pub job_poll_interval_ms: u64,
+    /// Whether scheduled repository housekeeping runs (ADR 0013).
+    #[serde(default = "default_housekeeping_enabled")]
+    pub housekeeping_enabled: bool,
+    /// How often each repository is due for housekeeping, in seconds.
+    #[serde(default = "default_housekeeping_interval_seconds")]
+    pub housekeeping_interval_seconds: u64,
+    /// Minimum age of an unreachable object before it may be deleted.
+    #[serde(default = "default_housekeeping_grace_seconds")]
+    pub housekeeping_grace_seconds: u64,
+    /// How many housekeeping runs may be in flight at once.
+    #[serde(default = "default_housekeeping_concurrency")]
+    pub housekeeping_concurrency: usize,
+    /// Per-step Git timeout for a housekeeping run, in seconds.
+    #[serde(default = "default_housekeeping_timeout_seconds")]
+    pub housekeeping_timeout_seconds: u64,
+    /// Largest `rev-list --objects --all` output a run will accept. A larger
+    /// walk refuses to prune rather than using a partial live set.
+    #[serde(default = "default_housekeeping_max_live_set_bytes")]
+    pub housekeeping_max_live_set_bytes: usize,
+    /// How long a closed or merged pull request's head pin stays live, in
+    /// days. The pin is what keeps the diff readable after the branch goes.
+    #[serde(default = "default_housekeeping_pin_retention_days")]
+    pub housekeeping_pin_retention_days: u64,
     /// Completed jobs retention in days (ADR 0006).
     #[serde(default = "default_job_retention_days")]
     pub job_retention_days: u64,
@@ -94,6 +117,13 @@ impl Default for Config {
             job_timeout_seconds: default_job_timeout_seconds(),
             job_poll_interval_ms: default_job_poll_interval_ms(),
             job_retention_days: default_job_retention_days(),
+            housekeeping_enabled: default_housekeeping_enabled(),
+            housekeeping_interval_seconds: default_housekeeping_interval_seconds(),
+            housekeeping_grace_seconds: default_housekeeping_grace_seconds(),
+            housekeeping_concurrency: default_housekeeping_concurrency(),
+            housekeeping_timeout_seconds: default_housekeeping_timeout_seconds(),
+            housekeeping_max_live_set_bytes: default_housekeeping_max_live_set_bytes(),
+            housekeeping_pin_retention_days: default_housekeeping_pin_retention_days(),
             trusted_proxies: Vec::new(),
             login_throttle_max_per_username: default_login_throttle_max_per_username(),
             login_throttle_max_per_client: default_login_throttle_max_per_client(),
@@ -128,6 +158,47 @@ fn default_job_poll_interval_ms() -> u64 {
 fn default_job_retention_days() -> u64 {
     7
 }
+fn default_housekeeping_enabled() -> bool {
+    true
+}
+fn default_housekeeping_interval_seconds() -> u64 {
+    86_400
+}
+fn default_housekeeping_grace_seconds() -> u64 {
+    691_200
+}
+fn default_housekeeping_concurrency() -> usize {
+    2
+}
+fn default_housekeeping_timeout_seconds() -> u64 {
+    600
+}
+fn default_housekeeping_max_live_set_bytes() -> usize {
+    1 << 26
+}
+fn default_housekeeping_pin_retention_days() -> u64 {
+    30
+}
+
+/// The bounded phases of one housekeeping run, each covered by one
+/// `housekeeping_timeout_seconds`:
+///
+/// 1. refresh the open pull-request pins (the journal replay before it is
+///    bounded per Git step, not by this budget),
+/// 2. the pre-repack live-set walk,
+/// 3. the size walk before the snapshot,
+/// 4. the snapshot (`repack`),
+/// 5. the post-repack live-set walk,
+/// 6. the scan and deletion pass,
+/// 7. the verification (`fsck` and the final size walk share it).
+///
+/// The job budget is this many step timeouts plus slack.
+pub const HOUSEKEEPING_STEPS: u64 = 7;
+/// Extra time for the parts of a run that are not a single Git command.
+pub const HOUSEKEEPING_JOB_SLACK_SECONDS: u64 = 60;
+/// No job budget (and therefore no lease) may exceed seven days, so a stuck
+/// lease is always recoverable long before job retention.
+pub const MAX_JOB_BUDGET_SECONDS: u64 = 604_800;
 
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -224,6 +295,31 @@ impl Config {
             login_throttle_window_seconds,
             "GITHEARTH_LOGIN_THROTTLE_WINDOW_SECONDS"
         );
+        env!(housekeeping_enabled, "GITHEARTH_HOUSEKEEPING_ENABLED");
+        env!(
+            housekeeping_interval_seconds,
+            "GITHEARTH_HOUSEKEEPING_INTERVAL_SECONDS"
+        );
+        env!(
+            housekeeping_grace_seconds,
+            "GITHEARTH_HOUSEKEEPING_GRACE_SECONDS"
+        );
+        env!(
+            housekeeping_concurrency,
+            "GITHEARTH_HOUSEKEEPING_CONCURRENCY"
+        );
+        env!(
+            housekeeping_timeout_seconds,
+            "GITHEARTH_HOUSEKEEPING_TIMEOUT_SECONDS"
+        );
+        env!(
+            housekeeping_max_live_set_bytes,
+            "GITHEARTH_HOUSEKEEPING_MAX_LIVE_SET_BYTES"
+        );
+        env!(
+            housekeeping_pin_retention_days,
+            "GITHEARTH_HOUSEKEEPING_PIN_RETENTION_DAYS"
+        );
         if let Ok(value) = std::env::var("GITHEARTH_TRUSTED_PROXIES") {
             c.trusted_proxies = value
                 .split(',')
@@ -234,7 +330,29 @@ impl Config {
         c.validate()?;
         Ok(c)
     }
+
+    /// The `repository.housekeeping` job's own run budget. One housekeeping
+    /// run has [`HOUSEKEEPING_STEPS`] bounded phases, so the generic
+    /// `job_timeout_seconds` (60 s by default) cannot be its limit: a run cut
+    /// off mid-step records no result and its blocking Git work outlives the
+    /// job.
+    pub fn housekeeping_job_timeout_seconds(&self) -> u64 {
+        self.housekeeping_timeout_seconds
+            .saturating_mul(HOUSEKEEPING_STEPS)
+            .saturating_add(HOUSEKEEPING_JOB_SLACK_SECONDS)
+    }
+
+    /// The smallest budget that covers every bounded phase of a run. Validation
+    /// refuses a configuration whose budget is below this, so a setting the
+    /// code cannot honour is never accepted.
+    pub fn min_housekeeping_job_budget_seconds(&self) -> u64 {
+        self.housekeeping_timeout_seconds
+            .saturating_mul(HOUSEKEEPING_STEPS)
+            .saturating_add(HOUSEKEEPING_JOB_SLACK_SECONDS)
+    }
+
     pub fn validate(&self) -> Result<()> {
+        let housekeeping_budget = self.housekeeping_job_timeout_seconds();
         if !(self.database_url.starts_with("postgres://")
             || self.database_url.starts_with("postgresql://"))
         {
@@ -263,9 +381,20 @@ impl Config {
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_username)
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_client)
             || !(1..=86_400).contains(&self.login_throttle_window_seconds)
+            || !(60..=2_592_000).contains(&self.housekeeping_interval_seconds)
+            || self.housekeeping_grace_seconds > 31_536_000
+            || !(1..=16).contains(&self.housekeeping_concurrency)
+            || !(10..=86_400).contains(&self.housekeeping_timeout_seconds)
+            || !(1_048_576..=1_073_741_824).contains(&self.housekeeping_max_live_set_bytes)
+            || !(1..=3650).contains(&self.housekeeping_pin_retention_days)
+            // The per-kind job budget covers every bounded phase plus slack,
+            // and its lease is twice that; keep both within a recoverable
+            // maximum.
+            || housekeeping_budget < self.min_housekeeping_job_budget_seconds()
+            || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping job budget (7*timeout+60s) <= 604800s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -339,6 +468,54 @@ mod tests {
         assert!(c.validate().is_ok());
         c.database_max_connections = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn housekeeping_job_budget_covers_every_phase() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            c.housekeeping_job_timeout_seconds(),
+            HOUSEKEEPING_STEPS * 600 + HOUSEKEEPING_JOB_SLACK_SECONDS
+        );
+        assert_eq!(
+            c.housekeeping_job_timeout_seconds(),
+            c.min_housekeeping_job_budget_seconds(),
+            "the formula and the validated minimum are the same relation"
+        );
+        assert!(
+            c.housekeeping_job_timeout_seconds() > 6 * c.housekeeping_timeout_seconds,
+            "the budget covers more than the old four-phase count"
+        );
+        assert!(
+            c.housekeeping_job_timeout_seconds() > c.job_timeout_seconds,
+            "the kind's budget is longer than the generic timeout"
+        );
+        assert!(c.validate().is_ok());
+
+        // The largest permitted step timeout still fits the budget maximum.
+        c.housekeeping_timeout_seconds = 86_400;
+        assert!(c.validate().is_ok());
+        assert!(c.housekeeping_job_timeout_seconds() <= MAX_JOB_BUDGET_SECONDS);
+
+        c.housekeeping_timeout_seconds = 0; // below the 10 s bound
+        assert!(c.validate().is_err());
+
+        // The new knobs default to the documented values and are bounded.
+        let defaults = Config::default();
+        assert_eq!(defaults.housekeeping_max_live_set_bytes, 1 << 26);
+        assert_eq!(defaults.housekeeping_pin_retention_days, 30);
+        let mut invalid = Config {
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        };
+        invalid.housekeeping_max_live_set_bytes = 0;
+        assert!(invalid.validate().is_err());
+        invalid.housekeeping_max_live_set_bytes = 1 << 26;
+        invalid.housekeeping_pin_retention_days = 0;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

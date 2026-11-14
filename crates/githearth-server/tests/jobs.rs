@@ -265,7 +265,9 @@ async fn backoff_bounds() {
             Box::pin(async move {
                 r.fetch_add(1, Ordering::SeqCst);
                 JobOutcome::Retry {
-                    after: Duration::ZERO,
+                    // A known delay so the test can assert `not_before`
+                    // instead of only "it ran again".
+                    after: Duration::from_secs(10),
                     reason: "test retry".into(),
                 }
             })
@@ -277,7 +279,36 @@ async fn backoff_bounds() {
 
     enqueue_test(&pool, "test.backoff", "bo-1", None).await;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for the first attempt, then read `not_before` straight away: the
+    // handler asked for 10 s plus at most 25% jitter, so the next attempt must
+    // be scheduled between 5 and 20 seconds from now. This catches a delay
+    // written in the wrong unit, which "it ran again" cannot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let attempt: i32 =
+            sqlx::query_scalar("SELECT COALESCE(attempt, 0) FROM jobs WHERE dedupe_key = 'bo-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if attempt >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the job never made its first attempt"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let (in_window, state_col): (bool, String) = sqlx::query_as(
+        "SELECT not_before BETWEEN now() + interval '5 seconds' \
+                              AND now() + interval '20 seconds', state \
+         FROM jobs WHERE dedupe_key = 'bo-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(in_window, "the retry delay is not the requested seconds");
+    assert_eq!(state_col, "pending", "a retry returns the job to pending");
     shutdown.cancel();
     let _ = h.await;
 
@@ -287,17 +318,7 @@ async fn backoff_bounds() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(n > 1, "should have retried at least once");
     assert_eq!(n, attempt, "runs should match attempt count");
-
-    let state_col: String = sqlx::query_scalar("SELECT state FROM jobs WHERE dedupe_key = 'bo-1'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(
-        state_col == "pending" || state_col == "dead",
-        "job should be retried"
-    );
 
     pool.close().await;
 }

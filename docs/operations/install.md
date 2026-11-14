@@ -134,7 +134,8 @@ its password.
 See [accounts.md](accounts.md) for account administration,
 [upgrade.md](upgrade.md) for the upgrade runbook,
 [uninstall.md](uninstall.md) for removal, [tls.md](tls.md) for TLS setup,
-[audit-retention.md](audit-retention.md) for audit IP retention, and
+[audit-retention.md](audit-retention.md) for audit IP retention,
+[housekeeping.md](housekeeping.md) for scheduled repacking and pruning, and
 [hardware.md](hardware.md) for the measured minimum and recommended hardware.
 
 ## Preflight check
