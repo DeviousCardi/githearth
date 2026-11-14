@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 use crate::{
     AppState, authenticate_token_hash, facts, forks, idempotency, repositories, repository_api,
-    verify_password,
 };
 
 #[derive(Deserialize)]
@@ -25,6 +24,18 @@ struct LoginForm {
     password: String,
     #[serde(default)]
     csrf_token: String,
+}
+
+#[derive(Deserialize)]
+struct ResetForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    new_password: String,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +48,8 @@ struct LogoutForm {
 struct LoginQuery {
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    reset: Option<String>,
 }
 
 pub(crate) struct UiError(Box<Response>);
@@ -58,6 +71,12 @@ pub(crate) fn esc(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// The fresh-auth window rounded to the minute for prompt text, always at
+/// least one so an unusually short configured window still reads sensibly.
+pub(crate) fn fresh_auth_minutes(window: Duration) -> u64 {
+    (window.as_secs() / 60).max(1)
 }
 
 pub(crate) fn url_encode(value: &str) -> String {
@@ -82,6 +101,30 @@ fn csrf_cookie(headers: &HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+/// A well-formed CSRF token from the cookie, or a fresh one for a public page
+/// such as the sign-in and reset forms.
+fn page_csrf_token(headers: &HeaderMap) -> String {
+    csrf_cookie(headers)
+        .filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| {
+            let mut bytes = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+            hex::encode(bytes)
+        })
+}
+
+fn csrf_cookie_header(state: &AppState, token: &str) -> String {
+    let secure = if state.config.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "githearth_csrf={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}{secure}",
+        ttl = state.config.token_ttl_seconds
+    )
 }
 
 pub(crate) fn browser_token(headers: &HeaderMap) -> Option<String> {
@@ -151,18 +194,27 @@ pub(crate) fn render_page(
     title: &str,
     username: Option<&str>,
     csrf: Option<&str>,
+    is_admin: bool,
     body: &str,
 ) -> String {
     let nav = if let Some(name) = username {
         if let Some(token) = csrf {
+            // Only a site administrator is offered the accounts surface; the
+            // pages themselves still refuse anyone else.
+            let admin_link = if is_admin {
+                crate::account_admin_ui::nav_link()
+            } else {
+                ""
+            };
             format!(
                 "<nav aria-label=\"Primary\"><a href=\"/\">GitHearth</a><span class=\"muted\" style=\"color:#ccc\">{}</span>\
-<a href=\"/notifications\" style=\"margin-left:auto\">Notifications</a>\
+<a href=\"/notifications\" style=\"margin-left:auto\">Notifications</a>{}\
 <a href=\"/settings\">Settings</a>\
 <form method=\"post\" action=\"/logout\" style=\"display:inline\">\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
 <button type=\"submit\">Sign out</button></form></nav>",
                 esc(name),
+                admin_link,
                 esc(token)
             )
         } else {
@@ -234,6 +286,7 @@ pub(crate) fn not_found_page(username: Option<&str>) -> UiError {
                 "Not found",
                 username,
                 None,
+                false,
                 "<h1>Not found</h1>",
             )),
         )
@@ -266,6 +319,7 @@ async fn fallback_page(
             "Not found",
             username.as_deref(),
             None,
+            false,
             "<h1>Not found</h1>",
         )),
     )
@@ -280,6 +334,7 @@ pub(crate) fn unavailable_page(username: Option<&str>) -> UiError {
                 "Unavailable",
                 username,
                 None,
+                false,
                 "<h1>Unavailable</h1>",
             )),
         )
@@ -295,7 +350,26 @@ fn busy_page() -> UiError {
                 "Busy",
                 None,
                 None,
+                false,
                 "<h1>Busy</h1><p>Too many sign-ins in progress. Try again in a moment.</p>",
+            )),
+        )
+            .into_response(),
+    ))
+}
+
+/// A failed sign-in throttle (M4.1 U03). The wording is the same for a real and
+/// an unknown username, so it never reveals which accounts exist.
+fn too_many_attempts_page() -> UiError {
+    UiError(Box::new(
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(render_page(
+                "Too many attempts",
+                None,
+                None,
+                false,
+                "<h1>Too many sign-in attempts</h1><p>Wait a few minutes and try again.</p>",
             )),
         )
             .into_response(),
@@ -310,6 +384,7 @@ pub(crate) fn forbidden_page() -> UiError {
                 "Forbidden",
                 None,
                 None,
+                false,
                 "<h1>Forbidden</h1><p>Invalid CSRF token.</p>",
             )),
         )
@@ -361,33 +436,26 @@ async fn login_page(
         ("", "", "")
     };
     // Reuse a well-formed token so a second sign-in tab does not invalidate the first.
-    let token = csrf_cookie(&headers)
-        .filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()))
-        .unwrap_or_else(|| {
-            let mut bytes = [0u8; 16];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
-            hex::encode(bytes)
-        });
+    let token = page_csrf_token(&headers);
+    let notice = if q.reset.as_deref() == Some("1") {
+        "<p role=\"status\">Password changed. Sign in with your new password.</p>"
+    } else {
+        ""
+    };
     let body = format!(
-        "<h1>Sign in</h1><div class=\"card\">{error}<form method=\"post\" action=\"/login\"{form_describedby}>\
+        "<h1>Sign in</h1><div class=\"card\">{notice}{error}<form method=\"post\" action=\"/login\"{form_describedby}>\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
 <label for=\"username\">Username</label><input id=\"username\" name=\"username\" autocomplete=\"username\" required{credential_invalid}>\
 <label for=\"password\">Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required{credential_invalid}>\
-<button type=\"submit\">Sign in</button></form></div>",
+<button type=\"submit\">Sign in</button></form></div>\
+<p><a href=\"/reset\">Have a reset code?</a></p>",
+        notice = notice,
         error = error,
         csrf = esc(&token),
         form_describedby = form_describedby
     );
-    let secure = if state.config.secure_cookies {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "githearth_csrf={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}{secure}",
-        ttl = state.config.token_ttl_seconds
-    );
-    let mut response = Html(render_page("Sign in", None, None, &body)).into_response();
+    let cookie = csrf_cookie_header(&state, &token);
+    let mut response = Html(render_page("Sign in", None, None, false, &body)).into_response();
     if let Ok(value) = cookie.parse() {
         response.headers_mut().insert(SET_COOKIE, value);
     }
@@ -404,10 +472,25 @@ async fn login_submit(
         return Err(forbidden_page());
     }
     // Only a definite mismatch is reported as bad credentials; an outage must not look like one.
-    let id = match verify_password(&state, &input.username, &input.password).await {
+    let id = match crate::sign_in(
+        &state,
+        &input.username,
+        &input.password,
+        crate::login_throttle::Request::from_current(),
+    )
+    .await
+    {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(Redirect::to("/login?error=1").into_response()),
-        Err(e) if e.status_code() == StatusCode::TOO_MANY_REQUESTS => return Err(busy_page()),
+        Err(e) if e.status_code() == StatusCode::TOO_MANY_REQUESTS => {
+            // A failed-sign-in throttle and an overloaded hasher are different
+            // situations and get different pages.
+            return Err(if e.message() == crate::too_many_attempts().message() {
+                too_many_attempts_page()
+            } else {
+                busy_page()
+            });
+        }
         Err(_) => return Err(unavailable_page(None)),
     };
     let mut bytes = [0u8; 32];
@@ -451,6 +534,96 @@ async fn login_submit(
         }
     }
     Ok(response)
+}
+
+/// The fixed refusal text the public reset page shows, regardless of whether
+/// the code was wrong, used or expired, so the page never becomes an oracle.
+fn reset_notice(error: &crate::ApiError) -> &'static str {
+    match error.status_code() {
+        StatusCode::UNAUTHORIZED => "Invalid or expired reset code.",
+        StatusCode::BAD_REQUEST => "Use a password of 12 to 1024 characters.",
+        StatusCode::TOO_MANY_REQUESTS => {
+            "Too many password changes are in progress. Try again in a moment."
+        }
+        _ => "The password could not be changed. Try again.",
+    }
+}
+
+fn reset_page_html(csrf: &str, username: &str, error: &str) -> String {
+    format!(
+        "<h1>Reset your password</h1>\
+<p>Enter the one-time code an administrator gave you and choose a new password.</p>{error}\
+<div class=\"card\"><form method=\"post\" action=\"/reset\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+<label for=\"reset_username\">Username</label>\
+<input id=\"reset_username\" name=\"username\" autocomplete=\"username\" required value=\"{username}\">\
+<label for=\"reset_code\">Reset code</label>\
+<input id=\"reset_code\" name=\"code\" autocomplete=\"one-time-code\" required minlength=\"64\" maxlength=\"64\">\
+<label for=\"reset_password\">New password</label>\
+<input id=\"reset_password\" name=\"new_password\" type=\"password\" autocomplete=\"new-password\" required minlength=\"12\" maxlength=\"1024\">\
+<p><button type=\"submit\">Set new password</button></p></form></div>\
+<p><a href=\"/login\">Back to sign in</a></p>",
+        csrf = esc(csrf),
+        username = esc(username),
+        error = error,
+    )
+}
+
+/// A public page for the browser-only account owner: a flagged account cannot
+/// sign in, so it must be able to redeem its administrator-issued code without
+/// an API client.
+async fn reset_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let token = page_csrf_token(&headers);
+    let body = reset_page_html(&token, "", "");
+    let cookie = csrf_cookie_header(&state, &token);
+    let mut response =
+        Html(render_page("Reset password", None, None, false, &body)).into_response();
+    if let Ok(value) = cookie.parse() {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
+}
+
+async fn reset_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ResetForm>,
+) -> Response {
+    let cookie_token = csrf_cookie(&headers).unwrap_or_default();
+    if !csrf_matches(&form.csrf_token, &cookie_token) {
+        return forbidden_page().into_response();
+    }
+    let token = page_csrf_token(&headers);
+    let password = crate::account_admin::Secret::new(form.new_password);
+    match crate::account_admin::redeem_password_reset_inner(
+        &state,
+        &form.username,
+        &form.code,
+        password,
+    )
+    .await
+    {
+        Ok(()) => {
+            let mut response = Redirect::to("/login?reset=1").into_response();
+            if let Ok(value) = clear_csrf_cookie(&state).parse() {
+                response.headers_mut().append(SET_COOKIE, value);
+            }
+            response
+        }
+        Err(error) => {
+            let status = error.status_code();
+            let error_html = format!(
+                "<p class=\"error\" role=\"alert\">{}</p>",
+                esc(reset_notice(&error))
+            );
+            let body = reset_page_html(&token, &form.username, &error_html);
+            (
+                status,
+                Html(render_page("Reset password", None, None, false, &body)),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn logout_submit(
@@ -539,6 +712,7 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<Respo
         "Home",
         Some(&account.username),
         csrf.as_deref(),
+        account.is_admin,
         &body,
     ))
     .into_response())
@@ -670,6 +844,7 @@ async fn organization(
         "Organization",
         Some(&account.username),
         csrf.as_deref(),
+        account.is_admin,
         &body,
     ))
     .into_response())
@@ -756,7 +931,13 @@ fn error_form_page(username: &str, status: StatusCode, message: &str, body: &str
     );
     (
         status,
-        Html(render_page("Invalid request", Some(username), None, &body)),
+        Html(render_page(
+            "Invalid request",
+            Some(username),
+            None,
+            false,
+            &body,
+        )),
     )
         .into_response()
 }
@@ -793,6 +974,7 @@ async fn new_organization_page(
         "New organization",
         Some(&account.username),
         Some(&csrf),
+        account.is_admin,
         &body,
     ))
     .into_response())
@@ -927,6 +1109,7 @@ async fn new_repository_page(
         "New repository",
         Some(&account.username),
         Some(&csrf),
+        account.is_admin,
         &body,
     ))
     .into_response())
@@ -1014,43 +1197,45 @@ async fn repository(
     headers: HeaderMap,
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, UiError> {
-    let (repo, username, csrf, account_id, auth_age) = match browser_auth(&state, &headers).await {
-        Ok((account, auth_age)) => {
-            let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
-                .await
-                .map_err(|e| {
-                    if matches!(
-                        e.status_code(),
-                        StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
-                    ) {
-                        not_found_page(Some(&account.username))
-                    } else {
-                        unavailable_page(Some(&account.username))
-                    }
-                })?;
-            if repository_api::require(&state, &loaded, githearth_authz::Action::RepositoryRead)
-                .is_err()
-            {
-                return Err(not_found_page(Some(&account.username)));
+    let (repo, username, csrf, account_id, auth_age, is_admin) =
+        match browser_auth(&state, &headers).await {
+            Ok((account, auth_age)) => {
+                let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
+                    .await
+                    .map_err(|e| {
+                        if matches!(
+                            e.status_code(),
+                            StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+                        ) {
+                            not_found_page(Some(&account.username))
+                        } else {
+                            unavailable_page(Some(&account.username))
+                        }
+                    })?;
+                if repository_api::require(&state, &loaded, githearth_authz::Action::RepositoryRead)
+                    .is_err()
+                {
+                    return Err(not_found_page(Some(&account.username)));
+                }
+                let hash = browser_token_hash(&headers).unwrap_or_default();
+                (
+                    loaded.repo,
+                    Some(account.username),
+                    Some(csrf_expected(&hash)),
+                    Some(account.id),
+                    Some(auth_age),
+                    account.is_admin,
+                )
             }
-            let hash = browser_token_hash(&headers).unwrap_or_default();
-            (
-                loaded.repo,
-                Some(account.username),
-                Some(csrf_expected(&hash)),
-                Some(account.id),
-                Some(auth_age),
-            )
-        }
-        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
-            // An anonymous visitor may read public repositories only.
-            match repository_api::load_public_anonymous(&state, &slug, &name).await {
-                Some(repo) => (repo, None, None, None, None),
-                None => return Err(auth_required()),
+            Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
+                // An anonymous visitor may read public repositories only.
+                match repository_api::load_public_anonymous(&state, &slug, &name).await {
+                    Some(repo) => (repo, None, None, None, None, false),
+                    None => return Err(auth_required()),
+                }
             }
-        }
-        Err(_) => return Err(unavailable_page(None)),
-    };
+            Err(_) => return Err(unavailable_page(None)),
+        };
     let repo = &repo;
     let mut browse_section = String::new();
     if repo.status == githearth_core::RepositoryStatus::Active {
@@ -1291,6 +1476,7 @@ async fn repository(
         "Repository",
         username.as_deref(),
         csrf.as_deref(),
+        is_admin,
         &body,
     ))
     .into_response())
@@ -1339,6 +1525,7 @@ async fn fork_submit(
                     "Invalid request",
                     Some(&account.username),
                     None,
+                    account.is_admin,
                     "<h1>Invalid request</h1><p>Reload the page and submit the form again.</p>",
                 )),
             )
@@ -1393,6 +1580,7 @@ fn fork_error(username: &str, error: crate::ApiError) -> UiError {
                 "Fork",
                 Some(username),
                 None,
+                false,
                 &format!("<h1>Fork failed</h1><p>{}</p>", esc(message)),
             )),
         )
@@ -1412,6 +1600,7 @@ async fn page_headers(mut response: Response) -> Response {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/login", get(login_page).post(login_submit))
+        .route("/reset", get(reset_page).post(reset_submit))
         .route("/logout", axum::routing::post(logout_submit))
         .route("/", get(home))
         .route(
@@ -1436,6 +1625,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::tag_protection_ui::router())
         .merge(crate::branch_protection_ui::router())
         .merge(crate::notifications_ui::router())
+        .merge(crate::account_admin_ui::router())
         .merge(crate::membership_ui::router())
         .fallback(fallback_page)
         .layer(axum::middleware::map_response(page_headers))
@@ -1447,7 +1637,7 @@ mod tests {
 
     #[test]
     fn render_page_declares_lang_skip_link_and_landmarks() {
-        let html = render_page("Sign in", None, None, "<h1>Sign in</h1>");
+        let html = render_page("Sign in", None, None, false, "<h1>Sign in</h1>");
         assert!(
             html.contains("<html lang=\"en\">"),
             "missing lang attribute"
@@ -1468,7 +1658,7 @@ mod tests {
 
     #[test]
     fn render_page_ships_focus_visible_styles() {
-        let html = render_page("Sign in", None, None, "");
+        let html = render_page("Sign in", None, None, false, "");
         assert!(html.contains("a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible"));
         assert!(html.contains("outline:3px solid #005fcc"));
         assert!(html.contains(".skip-link:focus-visible"));
@@ -1476,7 +1666,7 @@ mod tests {
 
     #[test]
     fn render_page_wraps_long_text_and_scrolls_wide_tables() {
-        let html = render_page("Sign in", None, None, "");
+        let html = render_page("Sign in", None, None, false, "");
         assert!(html.contains("overflow-wrap:anywhere"), "{html}");
         assert!(
             html.contains(".card{") && html.contains("overflow-x:auto"),
@@ -1486,7 +1676,7 @@ mod tests {
 
     #[test]
     fn render_page_does_not_stretch_checkboxes() {
-        let html = render_page("Sign in", None, None, "");
+        let html = render_page("Sign in", None, None, false, "");
         assert!(
             html.contains("input:not([type=checkbox]):not([type=radio])"),
             "{html}"

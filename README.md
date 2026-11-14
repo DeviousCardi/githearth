@@ -4,7 +4,7 @@ A home for your code.
 
 GitHearth is a planned source-available development platform for repositories, code review, project planning, CI/CD, packages, security, and collaboration. The long-term goal is broad GitHub/GitLab-style capability with customer control over hosting and data.
 
-**Current status: verified experimental single-node application.** The repository contains a Rust server with PostgreSQL migrations, administrator bootstrap, bearer sessions and membership-scoped organizations with API and browser membership administration, Git hosting over Smart HTTP and SSH, repository browsing, issues and pull requests (threaded inline reviews, suggestions, drafts, reviewers and code owners, commit checks, branch and tag protection, signed-commit policy, merge methods, conflict handling, merge queue and auto-merge), forks, notifications, a server-rendered UI, and installation, backup/restore, upgrade and uninstall runbooks with executable drills. Replication, CI integration, packages, security scanning and production hardening remain planned. The repository remains private during initial development.
+**Current status: verified experimental single-node application.** The repository contains a Rust server with PostgreSQL migrations, administrator bootstrap, administrator-created accounts with disable/re-enable and password reset, failed sign-in throttling, bearer sessions and membership-scoped organizations with API and browser membership administration, Git hosting over Smart HTTP and SSH, repository browsing, issues and pull requests (threaded inline reviews, suggestions, drafts, reviewers and code owners, commit checks, branch and tag protection, signed-commit policy, merge methods, conflict handling, merge queue and auto-merge), forks, notifications, a server-rendered UI, and installation, backup/restore, upgrade and uninstall runbooks with executable drills. Replication, CI integration, packages, security scanning and production hardening remain planned. The repository remains private during initial development.
 
 ## Product commitments
 
@@ -53,7 +53,10 @@ printf '%s' "$ADMIN_PASSWORD" | docker compose exec -T app githearth-server boot
 unset ADMIN_PASSWORD
 ```
 
-Open <http://127.0.0.1:8080/> and sign in as `admin`. Git clients use
+Open <http://127.0.0.1:8080/> and sign in as `admin`. Create the rest of the team
+under **Accounts** (`/admin/accounts`): an administrator supplies each account's
+initial password, can disable and re-enable accounts, and can reset passwords.
+Git clients use
 `http://127.0.0.1:8080/<org>/<repo>.git` or `ssh://127.0.0.1:2222/<org>/<repo>.git`.
 
 Stop while keeping data with `docker compose down`. **`docker compose down --volumes`
@@ -88,6 +91,7 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [Metadata contract](docs/plan/01-metadata-contract.md) | Data ownership, transactions, workload definitions, and account-scale profiles |
 | [Decision gates](docs/plan/02-decision-gates.md) | Agreed requirements, unresolved decisions, and the implementation sequence |
 | [Deployment contract](docs/plan/03-deployment-contract.md) | Single-node/cluster behavior, failure semantics, expansion, and merge requirements |
+| [Accounts](docs/operations/accounts.md) | Creating, disabling and re-enabling accounts; password change and reset; failed sign-in bounds |
 | [Backup and restore](docs/operations/backup-restore.md) | Concrete backup/restore procedure and storage verification |
 | [Database experiment](experiments/metadata/README.md) | Reproducible lab setup, workload runner, and result interpretation |
 | [Database decision](docs/decisions/0001-metadata-database.md) | Provisional PostgreSQL selection, measured evidence, and remaining qualification gates |

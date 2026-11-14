@@ -54,6 +54,15 @@ pub struct Config {
     /// Empty by default; every entry is validated at load.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Failed sign-ins allowed per username inside the window (M4.1 U03).
+    #[serde(default = "default_login_throttle_max_per_username")]
+    pub login_throttle_max_per_username: u64,
+    /// Failed sign-ins allowed per client address inside the window.
+    #[serde(default = "default_login_throttle_max_per_client")]
+    pub login_throttle_max_per_client: u64,
+    /// Length of the sliding sign-in window in seconds.
+    #[serde(default = "default_login_throttle_window_seconds")]
+    pub login_throttle_window_seconds: u64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -86,8 +95,20 @@ impl Default for Config {
             job_poll_interval_ms: default_job_poll_interval_ms(),
             job_retention_days: default_job_retention_days(),
             trusted_proxies: Vec::new(),
+            login_throttle_max_per_username: default_login_throttle_max_per_username(),
+            login_throttle_max_per_client: default_login_throttle_max_per_client(),
+            login_throttle_window_seconds: default_login_throttle_window_seconds(),
         }
     }
+}
+fn default_login_throttle_max_per_username() -> u64 {
+    10
+}
+fn default_login_throttle_max_per_client() -> u64 {
+    50
+}
+fn default_login_throttle_window_seconds() -> u64 {
+    900
 }
 fn default_secure_cookies() -> bool {
     true
@@ -191,6 +212,18 @@ impl Config {
         env!(job_timeout_seconds, "GITHEARTH_JOB_TIMEOUT_SECONDS");
         env!(job_poll_interval_ms, "GITHEARTH_JOB_POLL_INTERVAL_MS");
         env!(job_retention_days, "GITHEARTH_JOB_RETENTION_DAYS");
+        env!(
+            login_throttle_max_per_username,
+            "GITHEARTH_LOGIN_THROTTLE_MAX_PER_USERNAME"
+        );
+        env!(
+            login_throttle_max_per_client,
+            "GITHEARTH_LOGIN_THROTTLE_MAX_PER_CLIENT"
+        );
+        env!(
+            login_throttle_window_seconds,
+            "GITHEARTH_LOGIN_THROTTLE_WINDOW_SECONDS"
+        );
         if let Ok(value) = std::env::var("GITHEARTH_TRUSTED_PROXIES") {
             c.trusted_proxies = value
                 .split(',')
@@ -227,9 +260,12 @@ impl Config {
             || !(1..=3600).contains(&self.job_timeout_seconds)
             || !(50..=60000).contains(&self.job_poll_interval_ms)
             || !(1..=365).contains(&self.job_retention_days)
+            || !(1..=1_000_000).contains(&self.login_throttle_max_per_username)
+            || !(1..=1_000_000).contains(&self.login_throttle_max_per_client)
+            || !(1..=86_400).contains(&self.login_throttle_window_seconds)
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -317,6 +353,27 @@ mod tests {
         c.storage_root = PathBuf::from(fits + "a");
         let error = c.validate().unwrap_err().to_string();
         assert!(error.contains("storage_root is too long"), "{error}");
+    }
+
+    #[test]
+    fn login_throttle_defaults_are_bounded_and_configurable() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        };
+        assert_eq!(c.login_throttle_max_per_username, 10);
+        assert_eq!(c.login_throttle_max_per_client, 50);
+        assert_eq!(c.login_throttle_window_seconds, 900);
+        assert!(c.validate().is_ok());
+        for (limit, window) in [(0, 900), (10, 0), (10, 86_401), (1_000_001, 900)] {
+            c.login_throttle_max_per_username = limit;
+            c.login_throttle_window_seconds = window;
+            assert!(c.validate().is_err(), "{limit} {window} must be refused");
+        }
+        c.login_throttle_max_per_username = 1;
+        c.login_throttle_window_seconds = 1;
+        c.login_throttle_max_per_client = 1;
+        assert!(c.validate().is_ok(), "the smallest bounds are accepted");
     }
 
     #[test]

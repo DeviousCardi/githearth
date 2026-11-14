@@ -117,7 +117,11 @@ its database first, as in the manual path below.
    `doctor` — it must exit 0.
 6. Bootstrap the first administrator (password on stdin only, 12+ bytes):
    `printf '%s' "$PASSWORD" | githearth-server bootstrap-admin --username admin`.
-   Repeating this command never changes an existing account.
+   Repeating this command never changes an existing account. Sign in as that
+   administrator and create every further account under **Accounts**
+   (`/admin/accounts`); no SQL is needed. See [accounts.md](accounts.md) for
+   account creation, disable/re-enable, password reset and the failed sign-in
+   bounds.
 7. `githearth-server ssh-keygen --config /etc/githearth/config.toml`. It is
    idempotent: an existing host key is kept and the command succeeds.
 8. `githearth-server serve --config /etc/githearth/config.toml`, then confirm
@@ -127,7 +131,8 @@ Each command prints only paths, statuses and reasons: a configuration error, a
 refused directory or an unreachable database never echoes the database URL or
 its password.
 
-See [upgrade.md](upgrade.md) for the upgrade runbook,
+See [accounts.md](accounts.md) for account administration,
+[upgrade.md](upgrade.md) for the upgrade runbook,
 [uninstall.md](uninstall.md) for removal, [tls.md](tls.md) for TLS setup,
 [audit-retention.md](audit-retention.md) for audit IP retention, and
 [hardware.md](hardware.md) for the measured minimum and recommended hardware.

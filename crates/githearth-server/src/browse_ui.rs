@@ -76,7 +76,7 @@ async fn load_repo_ui(
     headers: &HeaderMap,
     slug: &str,
     name: &str,
-) -> Result<(Option<String>, Uuid), ui::UiError> {
+) -> Result<(Option<String>, bool, Uuid), ui::UiError> {
     match ui::browser_auth(state, headers).await {
         Ok((account, auth_age)) => {
             let loaded = repository_api::load_repo(state, account.id, auth_age, slug, name)
@@ -88,11 +88,11 @@ async fn load_repo_ui(
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(ui::not_found_page(Some(&account.username)));
             }
-            Ok((Some(account.username), loaded.repo.id))
+            Ok((Some(account.username), account.is_admin, loaded.repo.id))
         }
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
             match repository_api::load_public_anonymous(state, slug, name).await {
-                Some(repo) => Ok((None, repo.id)),
+                Some(repo) => Ok((None, false, repo.id)),
                 None => Err(ui::auth_required()),
             }
         }
@@ -204,7 +204,7 @@ async fn render_tree(
     rev: &str,
     path: Option<&str>,
 ) -> Result<Response, ui::UiError> {
-    let (username, repo_id) = load_repo_ui(state, headers, slug, name).await?;
+    let (username, is_admin, repo_id) = load_repo_ui(state, headers, slug, name).await?;
     let username = username.as_deref();
     let path = path.filter(|p| !p.is_empty());
     if !browse::valid_rev(rev) {
@@ -302,7 +302,14 @@ async fn render_tree(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page("Tree", username, csrf.as_deref(), &body)).into_response())
+    Ok(Html(ui::render_page(
+        "Tree",
+        username,
+        csrf.as_deref(),
+        is_admin,
+        &body,
+    ))
+    .into_response())
 }
 
 async fn blob_page(
@@ -310,7 +317,7 @@ async fn blob_page(
     headers: HeaderMap,
     Path((slug, name, rev, path)): Path<(String, String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     if !browse::valid_rev(&rev) || !browse::valid_path(&path) {
         return Err(ui::not_found_page(username));
@@ -354,7 +361,14 @@ async fn blob_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page("File", username, csrf.as_deref(), &body)).into_response())
+    Ok(Html(ui::render_page(
+        "File",
+        username,
+        csrf.as_deref(),
+        is_admin,
+        &body,
+    ))
+    .into_response())
 }
 
 async fn commits_page(
@@ -362,7 +376,7 @@ async fn commits_page(
     headers: HeaderMap,
     Path((slug, name, rev)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     if !browse::valid_rev(&rev) {
         return Err(ui::not_found_page(username));
@@ -413,7 +427,14 @@ async fn commits_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page("Commits", username, csrf.as_deref(), &body)).into_response())
+    Ok(Html(ui::render_page(
+        "Commits",
+        username,
+        csrf.as_deref(),
+        is_admin,
+        &body,
+    ))
+    .into_response())
 }
 
 /// The notice shown when the commit list reached the fixed log cap. The page
@@ -455,7 +476,7 @@ async fn commit_page(
     headers: HeaderMap,
     Path((slug, name, id)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     if !crate::browse::is_commit_id(&id) {
         return Err(ui::not_found_page(username));
@@ -491,7 +512,14 @@ async fn commit_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page("Commit", username, csrf.as_deref(), &body)).into_response())
+    Ok(Html(ui::render_page(
+        "Commit",
+        username,
+        csrf.as_deref(),
+        is_admin,
+        &body,
+    ))
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -510,7 +538,7 @@ async fn compare_form(
     Path((slug, name)): Path<(String, String)>,
     Query(query): Query<CompareQuery>,
 ) -> Result<Response, ui::UiError> {
-    let (username, _repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, _is_admin, _repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     let spec = format!("{}...{}", query.base, query.head);
     let Some((base, head)) = crate::browse::split_spec(&spec) else {
@@ -531,7 +559,7 @@ async fn compare_page(
     headers: HeaderMap,
     Path((slug, name, spec)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     let Some((base, head)) = crate::browse::split_spec(&spec) else {
         return Err(ui::not_found_page(username));
@@ -609,7 +637,14 @@ async fn compare_page(
     let csrf = Some(ui::csrf_expected(
         &ui::browser_token_hash(&headers).unwrap_or_default(),
     ));
-    Ok(Html(ui::render_page("Compare", username, csrf.as_deref(), &body)).into_response())
+    Ok(Html(ui::render_page(
+        "Compare",
+        username,
+        csrf.as_deref(),
+        is_admin,
+        &body,
+    ))
+    .into_response())
 }
 
 #[cfg(test)]

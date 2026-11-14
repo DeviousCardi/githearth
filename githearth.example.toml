@@ -28,3 +28,8 @@ auth_concurrency = 2
 # job_retention_days = 7
 # WARNING: listing an untrusted address here lets clients spoof their IP.
 # trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
+# Failed sign-ins allowed per username and per client address inside the window.
+# See docs/operations/accounts.md; no account is ever locked permanently.
+# login_throttle_max_per_username = 10
+# login_throttle_max_per_client = 50
+# login_throttle_window_seconds = 900
