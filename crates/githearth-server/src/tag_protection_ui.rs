@@ -143,7 +143,12 @@ async fn render_settings(
     let (rules, _, can_manage) =
         match tag_protection::list_rules(state, s.account.id, s.auth_age, slug, name).await {
             Ok(v) => v,
-            Err(e) if e.status_code() == StatusCode::NOT_FOUND => {
+            Err(e)
+                if matches!(
+                    e.status_code(),
+                    StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+                ) =>
+            {
                 return Err(ui::not_found_page(Some(&s.account.username)));
             }
             Err(_) => return Err(ui::unavailable_page(Some(&s.account.username))),

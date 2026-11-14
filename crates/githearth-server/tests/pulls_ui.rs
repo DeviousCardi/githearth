@@ -325,6 +325,28 @@ async fn finish(f: Fixture) {
     f.pool.close().await;
 }
 
+/// Adds a browser-session account with the given organization role.
+async fn member_with_username(f: &Fixture, role: &str) -> (String, String) {
+    let (id, username, token) = account(&f.pool).await;
+    sqlx::query(
+        "INSERT INTO memberships (organization_id,account_id,role) VALUES ($1,$2,'member')",
+    )
+    .bind(f.org_id)
+    .bind(id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) VALUES ($1,$2,'account',$3,'organization',$4,$3)")
+        .bind(Uuid::new_v4())
+        .bind(role)
+        .bind(id)
+        .bind(f.org_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    (username, format!("githearth_session={token}"))
+}
+
 /// Adds a browser-session account with the given organization role, returning its cookie.
 async fn member_cookie(f: &Fixture, role: &str) -> String {
     let (id, _, token) = account(&f.pool).await;
@@ -398,6 +420,51 @@ async fn create_view_comment_and_review_through_forms() {
     assert_eq!(page.matches("id=\"inline-comment\"").count(), 1, "{page}");
     assert_eq!(page.matches("for=\"comment\"").count(), 1, "{page}");
     assert_eq!(page.matches("for=\"inline-comment\"").count(), 1, "{page}");
+
+    // Request and remove a reviewer through the page.
+    let (reviewer_name, _reviewer_cookie) = member_with_username(&f, "write").await;
+    assert!(page.contains("Request a review from"), "{page}");
+    let (status, location, body) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/reviewers", f.base),
+        &f.cookie,
+        &[
+            ("csrf_token", &csrf(&page)),
+            ("idempotency_key", &key(&page)),
+            ("reviewer", &reviewer_name),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(location.unwrap(), format!("{}/pulls/1", f.base));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pull_request_review_requests WHERE pull_request_id = \
+         (SELECT id FROM pull_requests WHERE repository_id = $1 AND number = 1)",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    let (_, page) = get(&f.app, &format!("{}/pulls/1", f.base), Some(&f.cookie)).await;
+    assert!(page.contains(&reviewer_name), "{page}");
+    let (status, _, _) = post_form(
+        &f.app,
+        &format!("{}/pulls/1/reviewers/{}/delete", f.base, reviewer_name),
+        &f.cookie,
+        &[("csrf_token", &csrf(&page))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pull_request_review_requests WHERE pull_request_id = \
+         (SELECT id FROM pull_requests WHERE repository_id = $1 AND number = 1)",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
 
     // Add a comment.
     let (status, location, _) = post_form(

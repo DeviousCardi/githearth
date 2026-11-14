@@ -768,6 +768,8 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         created_at: String::new(),
         updated_at: String::new(),
         closed_at: None,
+        merged_at: None,
+        merged_by: None,
     };
 
     for reviewer_id in account_ids {

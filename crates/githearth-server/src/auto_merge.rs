@@ -232,6 +232,7 @@ pub(crate) async fn enable_auto_merge(
             let pull = pulls::find_pull(&mut conn, loaded.repo.id, number)
                 .await?
                 .ok_or_else(not_found)?;
+            pulls::require_pull(state, &loaded, &pull, Action::PullRequestRead)?;
             drop(conn);
             if pull.state != "open" {
                 return Err(pulls::not_open());

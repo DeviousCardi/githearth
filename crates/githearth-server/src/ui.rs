@@ -84,7 +84,7 @@ fn csrf_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-pub(crate) fn browser_token_hash(headers: &HeaderMap) -> Option<Vec<u8>> {
+pub(crate) fn browser_token(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get("cookie")?.to_str().ok()?;
     let mut found = None;
     for part in cookie.split(';') {
@@ -98,8 +98,12 @@ pub(crate) fn browser_token_hash(headers: &HeaderMap) -> Option<Vec<u8>> {
     if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    Some(token)
+}
+
+pub(crate) fn browser_token_hash(headers: &HeaderMap) -> Option<Vec<u8>> {
     use sha2::{Digest, Sha256};
-    Some(Sha256::digest(token.as_bytes()).to_vec())
+    Some(Sha256::digest(browser_token(headers)?.as_bytes()).to_vec())
 }
 
 pub(crate) async fn browser_auth(
@@ -239,7 +243,19 @@ pub(crate) fn not_found_page(username: Option<&str>) -> UiError {
 
 /// Styled 404 for paths no router matched. Without this fallback axum answers
 /// with a bare, header-less 404 for unknown browse URLs.
-async fn fallback_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn fallback_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    // Unknown API paths keep the JSON envelope; only browser paths get a page.
+    if uri.path().starts_with("/api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response();
+    }
     let username = browser_auth(&state, &headers)
         .await
         .ok()
@@ -514,7 +530,7 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<Respo
         }
     }
     let body = format!(
-        "<h1>Your organizations</h1><div class=\"card\"><ul>{}</ul></div>",
+        "<h1>Your organizations</h1><div class=\"card\"><ul>{}</ul></div><p><a href=\"/organizations/new\">New organization</a></p>",
         items
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
@@ -607,9 +623,10 @@ async fn organization(
         items.push_str("<li>No repositories you can read.</li>");
     }
     let body = format!(
-        "<h1>{}</h1><p class=\"muted\">{}</p><div class=\"card\"><ul>{}</ul></div>",
+        "<h1>{}</h1><p class=\"muted\">{}</p><p><a href=\"/organizations/{}/repositories/new\">New repository</a></p><div class=\"card\"><ul>{}</ul></div>",
         esc(&org_name),
         esc(&slug),
+        url_encode(&slug),
         items
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
@@ -652,6 +669,286 @@ fn absolute_clone_url(state: &AppState, headers: &HeaderMap, slug: &str, name: &
     )
 }
 
+#[derive(Deserialize)]
+struct NewOrgForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    slug: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct NewRepoForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    visibility: String,
+}
+
+fn form_key() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+fn error_form_page(username: &str, status: StatusCode, message: &str, body: &str) -> Response {
+    let body = format!(
+        "<h1>{}</h1><p class=\"error\" role=\"alert\">{}</p>{}",
+        esc(message),
+        esc(message),
+        body
+    );
+    (
+        status,
+        Html(render_page("Invalid request", Some(username), None, &body)),
+    )
+        .into_response()
+}
+
+fn organization_form(csrf: &str, key: &str, slug: &str, name: &str) -> String {
+    format!(
+        "<form class=\"card\" method=\"post\" action=\"/organizations/new\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+<input type=\"hidden\" name=\"idempotency_key\" value=\"{key}\">\
+<label for=\"slug\">Slug</label><input id=\"slug\" name=\"slug\" required maxlength=\"64\" value=\"{}\" aria-describedby=\"slug-help\">\
+<p class=\"muted\" id=\"slug-help\">Lowercase letters, digits and single hyphens.</p>\
+<label for=\"name\">Name</label><input id=\"name\" name=\"name\" required maxlength=\"200\" value=\"{}\" placeholder=\"Acme Corporation\">\
+<p><button type=\"submit\">Create organization</button></p></form>",
+        esc(slug),
+        esc(name)
+    )
+}
+
+async fn new_organization_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    let (account, _) = match browser_auth(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
+        Err(_) => return Err(unavailable_page(None)),
+    };
+    let csrf = csrf_expected(&browser_token_hash(&headers).unwrap_or_default());
+    let body = format!(
+        "<nav aria-label=\"Breadcrumb\"><a href=\"/\">Home</a> / New organization</nav>\
+<h1>New organization</h1>{}",
+        organization_form(&csrf, &form_key(), "", "")
+    );
+    Ok(Html(render_page(
+        "New organization",
+        Some(&account.username),
+        Some(&csrf),
+        &body,
+    ))
+    .into_response())
+}
+
+async fn new_organization_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<NewOrgForm>,
+) -> Result<Response, UiError> {
+    let token_hash = browser_token_hash(&headers).ok_or_else(auth_required)?;
+    if !csrf_matches(&form.csrf_token, &csrf_expected(&token_hash)) {
+        return Err(forbidden_page());
+    }
+    let (account, _) = match browser_auth(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
+        Err(_) => return Err(unavailable_page(None)),
+    };
+    if !idempotency::valid_key(&form.idempotency_key) {
+        return Ok(error_form_page(
+            &account.username,
+            StatusCode::BAD_REQUEST,
+            "Reload the page and submit the form again.",
+            &organization_form(
+                &csrf_expected(&token_hash),
+                &form_key(),
+                &form.slug,
+                &form.name,
+            ),
+        ));
+    }
+    let token = browser_token(&headers).ok_or_else(auth_required)?;
+    let mut api_headers = HeaderMap::new();
+    api_headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| unavailable_page(Some(&account.username)))?,
+    );
+    api_headers.insert(
+        "idempotency-key",
+        HeaderValue::from_str(&form.idempotency_key)
+            .map_err(|_| unavailable_page(Some(&account.username)))?,
+    );
+    match crate::create_organization(
+        State(state.clone()),
+        api_headers,
+        axum::Json(crate::NewOrganization {
+            slug: form.slug.clone(),
+            name: form.name.clone(),
+        }),
+    )
+    .await
+    {
+        Ok((_, axum::Json(org))) => {
+            Ok(Redirect::to(&format!("/organizations/{}", url_encode(&org.slug))).into_response())
+        }
+        Err(e) => Ok(error_form_page(
+            &account.username,
+            e.status_code(),
+            e.message(),
+            &organization_form(
+                &csrf_expected(&token_hash),
+                &form_key(),
+                &form.slug,
+                &form.name,
+            ),
+        )),
+    }
+}
+
+fn repository_form(
+    csrf: &str,
+    key: &str,
+    name: &str,
+    description: &str,
+    visibility: &str,
+) -> String {
+    let selected = |value: &str| {
+        if visibility == value { " selected" } else { "" }
+    };
+    format!(
+        "<form class=\"card\" method=\"post\" action=\"\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+<input type=\"hidden\" name=\"idempotency_key\" value=\"{key}\">\
+<label for=\"name\">Name</label><input id=\"name\" name=\"name\" required maxlength=\"100\" value=\"{}\" aria-describedby=\"name-help\">\
+<p class=\"muted\" id=\"name-help\">Letters, digits, dots, underscores and hyphens.</p>\
+<label for=\"description\">Description</label><textarea id=\"description\" name=\"description\" rows=\"3\" maxlength=\"1000\">{}</textarea>\
+<label for=\"visibility\">Visibility</label><select id=\"visibility\" name=\"visibility\">\
+<option value=\"private\"{}>Private</option><option value=\"internal\"{}>Internal</option><option value=\"public\"{}>Public</option></select>\
+<p><button type=\"submit\">Create repository</button></p></form>",
+        esc(name),
+        esc(description),
+        selected("private"),
+        selected("internal"),
+        selected("public")
+    )
+}
+
+async fn new_repository_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Response, UiError> {
+    let (account, _) = match browser_auth(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
+        Err(_) => return Err(unavailable_page(None)),
+    };
+    if !crate::valid_path_param(&slug) {
+        return Err(not_found_page(Some(&account.username)));
+    }
+    let csrf = csrf_expected(&browser_token_hash(&headers).unwrap_or_default());
+    let body = format!(
+        "<nav aria-label=\"Breadcrumb\"><a href=\"/\">Home</a> / <a href=\"/organizations/{}\">{}</a> / New repository</nav>\
+<h1>New repository</h1>{}",
+        url_encode(&slug),
+        esc(&slug),
+        repository_form(&csrf, &form_key(), "", "", "private")
+    );
+    Ok(Html(render_page(
+        "New repository",
+        Some(&account.username),
+        Some(&csrf),
+        &body,
+    ))
+    .into_response())
+}
+
+async fn new_repository_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<NewRepoForm>,
+) -> Result<Response, UiError> {
+    let token_hash = browser_token_hash(&headers).ok_or_else(auth_required)?;
+    if !csrf_matches(&form.csrf_token, &csrf_expected(&token_hash)) {
+        return Err(forbidden_page());
+    }
+    let (account, _) = match browser_auth(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
+        Err(_) => return Err(unavailable_page(None)),
+    };
+    if !idempotency::valid_key(&form.idempotency_key) {
+        return Ok(error_form_page(
+            &account.username,
+            StatusCode::BAD_REQUEST,
+            "Reload the page and submit the form again.",
+            &repository_form(
+                &csrf_expected(&token_hash),
+                &form_key(),
+                &form.name,
+                &form.description,
+                &form.visibility,
+            ),
+        ));
+    }
+    let token = browser_token(&headers).ok_or_else(auth_required)?;
+    let mut api_headers = HeaderMap::new();
+    api_headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| unavailable_page(Some(&account.username)))?,
+    );
+    api_headers.insert(
+        "idempotency-key",
+        HeaderValue::from_str(&form.idempotency_key)
+            .map_err(|_| unavailable_page(Some(&account.username)))?,
+    );
+    api_headers.insert("content-type", HeaderValue::from_static("application/json"));
+    let payload = serde_json::json!({
+        "name": form.name,
+        "description": form.description,
+        "visibility": form.visibility,
+    })
+    .to_string();
+    match crate::repository_api::create(
+        State(state.clone()),
+        api_headers,
+        Path(slug.clone()),
+        axum::body::Bytes::from(payload),
+    )
+    .await
+    {
+        Ok(_) => Ok(Redirect::to(&format!(
+            "/organizations/{}/repositories/{}",
+            url_encode(&slug),
+            url_encode(&form.name)
+        ))
+        .into_response()),
+        Err(e) => Ok(error_form_page(
+            &account.username,
+            e.status_code(),
+            e.message(),
+            &repository_form(
+                &csrf_expected(&token_hash),
+                &form_key(),
+                &form.name,
+                &form.description,
+                &form.visibility,
+            ),
+        )),
+    }
+}
+
 async fn repository(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -662,7 +959,10 @@ async fn repository(
             let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
                 .await
                 .map_err(|e| {
-                    if e.status_code() == StatusCode::NOT_FOUND {
+                    if matches!(
+                        e.status_code(),
+                        StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+                    ) {
                         not_found_page(Some(&account.username))
                     } else {
                         unavailable_page(Some(&account.username))
@@ -849,9 +1149,33 @@ async fn repository(
         }
         _ => String::new(),
     };
+    let fork_note = if let Some(parent_id) = repo.parent_repository_id {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT o.slug, r.name FROM repositories r \
+             JOIN organizations o ON o.id = r.organization_id WHERE r.id = $1",
+        )
+        .bind(parent_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|(org_slug, repo_name)| {
+            format!(
+                "<p class=\"muted\">Forked from <a href=\"/organizations/{}/repositories/{}\">{}/{}</a></p>",
+                url_encode(&org_slug),
+                url_encode(&repo_name),
+                esc(&org_slug),
+                esc(&repo_name)
+            )
+        })
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let body = format!(
-        "<h1>{}</h1><div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>{}",
+        "<h1>{}</h1>{}<div class=\"card\"><p><strong>Organization:</strong> {}</p><p><strong>Visibility:</strong> {}</p><p><strong>Status:</strong> {}</p><p>{}</p>{}</div>{}",
         esc(&repo.name),
+        fork_note,
         esc(&slug),
         esc(&repo.visibility),
         esc(repo.status.as_str()),
@@ -986,7 +1310,15 @@ pub fn router() -> Router<AppState> {
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", axum::routing::post(logout_submit))
         .route("/", get(home))
+        .route(
+            "/organizations/new",
+            get(new_organization_page).post(new_organization_submit),
+        )
         .route("/organizations/{slug}", get(organization))
+        .route(
+            "/organizations/{slug}/repositories/new",
+            get(new_repository_page).post(new_repository_submit),
+        )
         .route("/organizations/{slug}/repositories", get(organization))
         .route("/organizations/{slug}/repositories/{name}", get(repository))
         .route(

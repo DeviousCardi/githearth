@@ -521,6 +521,9 @@ pub(crate) async fn create_intent(
             let pull = pulls::find_pull(&mut conn, loaded.repo.id, number)
                 .await?
                 .ok_or_else(not_found)?;
+            // Authorize read before reporting the pull request's state: an
+            // unreadable pull must not reveal open/merged/draft through 409s.
+            pulls::require_pull(state, &loaded, &pull, Action::PullRequestRead)?;
             // A closed or merged pull request must fail here, before branch
             // lookups or merge authorization, with the shared "not open" error.
             if pull.state != "open" {

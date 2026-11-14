@@ -320,6 +320,7 @@ class M4Harness(_m2.Harness):
 
         # ssh-keygen (needs no DB; rerun does not overwrite)
         self.generate_ssh_host_key()
+        before = self.ssh_host_key_path.read_bytes()
         p = subprocess.run(
             [self.binary, "ssh-keygen"],
             env={**os.environ,
@@ -327,7 +328,12 @@ class M4Harness(_m2.Harness):
                  "GITHEARTH_DATABASE_URL": "postgres://nobody@127.0.0.1:1/none",
                  "GITHEARTH_STORAGE_ROOT": str(self.tmp / "dummy-storage")},
             capture_output=True, text=True)
-        if p.returncode == 0: raise HarnessError("ssh-keygen rerun should refuse to overwrite")
+        # The Compose one-shot service reruns this on every `up`; it must succeed
+        # without replacing an existing key (install.md, ssh.rs).
+        if p.returncode != 0:
+            raise HarnessError("ssh-keygen rerun must exit 0 (idempotent)")
+        if self.ssh_host_key_path.read_bytes() != before:
+            raise HarnessError("ssh-keygen rerun must not overwrite the host key")
 
         # doctor exits 0
         p = subprocess.run([self.binary, "doctor"], env=env, capture_output=True, text=True)

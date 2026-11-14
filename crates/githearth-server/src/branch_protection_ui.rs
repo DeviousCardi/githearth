@@ -193,7 +193,12 @@ async fn render_settings(
     let (rules, _, can_manage) =
         match protection::list_rules(state, s.account.id, s.auth_age, slug, name).await {
             Ok(v) => v,
-            Err(e) if e.status_code() == StatusCode::NOT_FOUND => {
+            Err(e)
+                if matches!(
+                    e.status_code(),
+                    StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+                ) =>
+            {
                 return Err(ui::not_found_page(Some(&s.account.username)));
             }
             Err(_) => return Err(ui::unavailable_page(Some(&s.account.username))),
@@ -215,13 +220,14 @@ async fn render_settings(
             String::new()
         };
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>{delete}</tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>{delete}</tr>",
             ui::esc(&rule.pattern),
             yes_no(rule.allow_force_push),
             yes_no(rule.allow_deletion),
             yes_no(rule.require_pull_request),
             rule.required_approvals,
             ui::esc(&rule.required_status_checks.join(", ")),
+            yes_no(rule.dismiss_stale_approvals),
             yes_no(rule.require_signed_commits),
             yes_no(rule.require_merge_queue),
             yes_no(rule.require_code_owner_review),
@@ -239,7 +245,8 @@ async fn render_settings(
             "<table><caption class=\"muted\">Branch protection rules</caption><thead><tr>\
 <th scope=\"col\">Pattern</th><th scope=\"col\">Force push</th><th scope=\"col\">Deletion</th>\
 <th scope=\"col\">Require PR</th><th scope=\"col\">Approvals</th>\
-<th scope=\"col\">Status checks</th><th scope=\"col\">Signed</th>\
+<th scope=\"col\">Status checks</th><th scope=\"col\">Dismiss stale</th>\
+<th scope=\"col\">Signed</th>\
 <th scope=\"col\">Merge queue</th><th scope=\"col\">Code owners</th>\
 {action_header}</tr></thead><tbody>{rows}</tbody></table>"
         )
@@ -259,7 +266,7 @@ async fn render_settings(
 <label for=\"required_approvals\">Required approvals (0-10)</label>\
 <input id=\"required_approvals\" name=\"required_approvals\" type=\"number\" min=\"0\" max=\"10\" value=\"{}\">\
 <label for=\"required_status_checks\">Required status checks (comma or line separated)</label>\
-<input id=\"required_status_checks\" name=\"required_status_checks\" value=\"{}\">\
+<textarea id=\"required_status_checks\" name=\"required_status_checks\" rows=\"2\" style=\"width:100%;box-sizing:border-box\">{}</textarea>>\
 <label><input type=\"checkbox\" name=\"allow_force_push\" value=\"1\"{}> Allow force push</label>\
 <label><input type=\"checkbox\" name=\"allow_deletion\" value=\"1\"{}> Allow deletion</label>\
 <label><input type=\"checkbox\" name=\"require_pull_request\" value=\"1\"{}> Require a pull request</label>\

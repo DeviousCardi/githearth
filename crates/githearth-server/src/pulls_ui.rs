@@ -46,6 +46,14 @@ pub(crate) fn router() -> Router<AppState> {
             axum::routing::post(review_submit),
         )
         .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/reviewers",
+            axum::routing::post(reviewer_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/pulls/{number}/reviewers/{username}/delete",
+            axum::routing::post(reviewer_remove_submit),
+        )
+        .route(
             "/organizations/{slug}/repositories/{name}/pulls/{number}/comments/{comment_id}/resolve",
             axum::routing::post(resolve_submit),
         )
@@ -771,6 +779,9 @@ async fn render_pull(
     let mut ids: Vec<Uuid> = comments.items.iter().map(|c| c.author_id).collect();
     ids.extend(reviews.items.iter().map(|r| r.reviewer_id));
     ids.push(detail.pull.author_id);
+    if let Some(merged_by) = detail.pull.merged_by {
+        ids.push(merged_by);
+    }
     let names = usernames(state, ids)
         .await
         .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
@@ -810,6 +821,68 @@ async fn render_pull(
             may_apply: false,
         });
 
+    let merged_note = if detail.pull.state == "merged" {
+        match (&detail.pull.merged_at, detail.pull.merged_by) {
+            (Some(at), Some(by)) => format!(
+                "<p class=\"muted\">Merged by {} at {}</p>",
+                who(&names, &by),
+                ui::esc(at)
+            ),
+            (Some(at), None) => format!("<p class=\"muted\">Merged at {}</p>", ui::esc(at)),
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    let reviewer_names: Vec<String> = match state.pool.acquire().await {
+        Ok(mut conn) => sqlx::query_scalar(
+            "SELECT a.username FROM pull_request_review_requests rr \
+             JOIN accounts a ON a.id = rr.reviewer_id \
+             WHERE rr.pull_request_id = $1 ORDER BY a.username",
+        )
+        .bind(detail.pull.id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let mut reviewer_items = String::new();
+    for reviewer in &reviewer_names {
+        let remove = if detail.pull.state == "open" && abilities.may_comment {
+            format!(
+                "<form method=\"post\" action=\"{base}/pulls/{number}/reviewers/{}/delete\" style=\"display:inline\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<button type=\"submit\" aria-label=\"Remove reviewer {}\">Remove</button></form>",
+                ui::url_encode(reviewer),
+                ui::esc(&s.csrf),
+                ui::esc(reviewer)
+            )
+        } else {
+            String::new()
+        };
+        reviewer_items.push_str(&format!(
+            "<li>{}</li>",
+            if remove.is_empty() {
+                ui::esc(reviewer)
+            } else {
+                format!("{} {remove}", ui::esc(reviewer))
+            }
+        ));
+    }
+    let reviewers_section = if detail.pull.state == "open" && abilities.may_comment {
+        format!(
+            "<h2>Reviewers</h2><div class=\"card\"><ul>{reviewer_items}</ul>\
+<form method=\"post\" action=\"{base}/pulls/{number}/reviewers\">{}\
+<label for=\"reviewer\">Request a review from</label>\
+<input id=\"reviewer\" name=\"reviewer\" required placeholder=\"username\">\
+<p><button type=\"submit\">Request review</button></p></form></div>",
+            form_fields(s, &new_key())
+        )
+    } else if reviewer_items.is_empty() {
+        String::new()
+    } else {
+        format!("<h2>Reviewers</h2><div class=\"card\"><ul>{reviewer_items}</ul></div>")
+    };
     let auto_merge_row: Option<auto_merge::AutoMergeJson> = match state.pool.acquire().await {
         Ok(mut conn) => auto_merge::find_auto_merge(&mut conn, detail.pull.id)
             .await
@@ -1111,6 +1184,13 @@ async fn render_pull(
                 ui::esc(head_id),
             )
         }
+    } else if detail.pull.state == "open" && !non_terminal {
+        let reason = if detail.changes_requested > 0 {
+            "A change request blocks the merge.".to_owned()
+        } else {
+            "Merging is blocked: the protection requirements (approvals, checks or code owners) are not met.".to_owned()
+        };
+        format!("<p class=\"muted\">{reason}</p>")
     } else {
         String::new()
     };
@@ -1227,7 +1307,7 @@ async fn render_pull(
     let body = format!(
         "<nav aria-label=\"Breadcrumb\"><a href=\"{base}\">{}</a> / <a href=\"{base}/pulls\">Pull requests</a> / #{number}</nav>\
 <h1>{} <span class=\"muted\">#{number}</span></h1>\
-<p class=\"muted\">{} · {} → {} · by {} at {}</p>\
+<p class=\"muted\">{} · {} → {} · by {} at {}</p>{merged_note}\
 <div class=\"card\"><dl>\
 <dt>Head</dt><dd>{}</dd>\
 <dt>Base</dt><dd>{}</dd>\
@@ -1243,7 +1323,7 @@ async fn render_pull(
 <h2>Comments</h2>{comment_list}<p>{pager}</p>\
 <h2>Files changed</h2><div class=\"card\">{files_html}</div>{inline_form}\
 {error}{review_error}{merge_error}\
-{merge_form}{auto_merge_section}\
+{reviewers_section}{merge_form}{auto_merge_section}\
 <form class=\"card\" method=\"post\" action=\"{base}/pulls/{number}/comments\">{}\
 <label for=\"comment\">Add a comment</label><textarea id=\"comment\" name=\"body\" rows=\"5\" required style=\"width:100%;box-sizing:border-box\">{}</textarea>\
 <p><button type=\"submit\">Comment</button></p></form>\
@@ -1729,6 +1809,108 @@ async fn review_submit(
         return Err(api_error(&s, e));
     }
     Ok(Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response())
+}
+
+#[derive(Deserialize)]
+struct ReviewerForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
+    reviewer: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewerDeleteForm {
+    #[serde(default)]
+    csrf_token: String,
+}
+
+async fn reviewer_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number)): Path<(String, String, i32)>,
+    Form(form): Form<ReviewerForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let token = ui::browser_token(&headers).ok_or_else(ui::auth_required)?;
+    let mut api_headers = HeaderMap::new();
+    api_headers.insert(
+        "authorization",
+        axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?,
+    );
+    api_headers.insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    if idempotency::valid_key(&form.idempotency_key) {
+        api_headers.insert(
+            "idempotency-key",
+            axum::http::HeaderValue::from_str(&form.idempotency_key)
+                .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?,
+        );
+    }
+    let body = serde_json::json!({"reviewer": form.reviewer}).to_string();
+    match pulls::add_review_request(
+        State(state.clone()),
+        api_headers,
+        Path((slug.clone(), name.clone(), number)),
+        axum::body::Bytes::from(body),
+    )
+    .await
+    {
+        Ok(_) => Ok(
+            Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response(),
+        ),
+        Err(e) => Ok(page(
+            &s,
+            e.status_code(),
+            "Pull request",
+            &format!(
+                "<h1>Cannot request that reviewer</h1><p class=\"error\" role=\"alert\">{}</p><p><a href=\"{}/pulls/{number}\">Back to the pull request</a></p>",
+                ui::esc(e.message()),
+                repo_href(&slug, &name)
+            ),
+        )),
+    }
+}
+
+async fn reviewer_remove_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name, number, username)): Path<(String, String, i32, String)>,
+    Form(form): Form<ReviewerDeleteForm>,
+) -> Result<Response, ui::UiError> {
+    let s = form_session(&state, &headers, &form.csrf_token).await?;
+    let token = ui::browser_token(&headers).ok_or_else(ui::auth_required)?;
+    let mut api_headers = HeaderMap::new();
+    api_headers.insert(
+        "authorization",
+        axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?,
+    );
+    match pulls::remove_review_request(
+        State(state.clone()),
+        api_headers,
+        Path((slug.clone(), name.clone(), number, username)),
+    )
+    .await
+    {
+        Ok(_) => Ok(
+            Redirect::to(&format!("{}/pulls/{number}", repo_href(&slug, &name))).into_response(),
+        ),
+        Err(e) => Ok(page(
+            &s,
+            e.status_code(),
+            "Pull request",
+            &format!(
+                "<h1>Cannot remove that reviewer</h1><p class=\"error\" role=\"alert\">{}</p><p><a href=\"{}/pulls/{number}\">Back to the pull request</a></p>",
+                ui::esc(e.message()),
+                repo_href(&slug, &name)
+            ),
+        )),
+    }
 }
 
 #[derive(Deserialize)]

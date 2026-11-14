@@ -317,6 +317,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             client_ip_middleware,
         ))
+        .layer(axum::middleware::from_fn(json_rejections))
         .with_state(state)
 }
 
@@ -388,6 +389,36 @@ async fn client_ip_middleware(
         return CLIENT_IP.scope(ip, next.run(request)).await;
     }
     next.run(request).await
+}
+
+/// Extractor rejections (a malformed query string or path id) answer
+/// `text/plain`; the JSON API must keep its envelope, so rewrite those 400s.
+async fn json_rejections(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, header};
+    let is_api = request.uri().path().starts_with("/api/");
+    let response = next.run(request).await;
+    let plain = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/plain"));
+    if is_api && response.status() == StatusCode::BAD_REQUEST && plain {
+        let (mut parts, _body) = response.into_parts();
+        let body = r#"{"error":"invalid input"}"#;
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        parts
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+        return Response::from_parts(parts, Body::from(body));
+    }
+    response
 }
 
 async fn observe(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -837,18 +868,18 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NewOrganization {
-    slug: String,
-    name: String,
+pub(crate) struct NewOrganization {
+    pub(crate) slug: String,
+    pub(crate) name: String,
 }
 #[derive(Serialize, sqlx::FromRow)]
-struct Organization {
-    id: Uuid,
-    slug: String,
-    name: String,
-    role: String,
+pub(crate) struct Organization {
+    pub(crate) id: Uuid,
+    pub(crate) slug: String,
+    pub(crate) name: String,
+    pub(crate) role: String,
 }
-async fn create_organization(
+pub(crate) async fn create_organization(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<NewOrganization>,

@@ -766,6 +766,8 @@ async fn branch_settings_page_lists_creates_and_deletes_rules() {
     assert!(html.contains("main"), "{html}");
     assert!(html.contains("ci, lint"), "{html}");
     assert!(html.contains(">2</td>"), "{html}");
+    assert!(html.contains("Dismiss stale"), "{html}");
+    assert!(html.contains("id=\"required_status_checks\""), "{html}");
 
     let (pattern, approvals, checks, require_pr, require_signed, require_queue, require_owners): (
         String,
