@@ -198,6 +198,20 @@ async fn create(
             .bind(actor.id)
             .fetch_one(&mut *tx)
             .await?;
+            // Pin the commit this status names while it is the latest result
+            // for its context, and give the previous latest status of that
+            // context a retention window instead (U11). Without the first pin a
+            // status on a commit a force push made unreachable would be lost;
+            // without the second a stale status would pin its ancestry forever.
+            crate::pins::pin_status(
+                &mut tx,
+                loaded.repo.id,
+                &sha,
+                &input.context,
+                id,
+                state.config.housekeeping_pin_retention_days,
+            )
+            .await?;
             event_with(
                 &mut tx,
                 Some(loaded.org_id),

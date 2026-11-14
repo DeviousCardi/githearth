@@ -104,6 +104,35 @@ pub struct AppState {
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
 }
 impl AppState {
+    /// Records that `added` bytes of a fork head were copied into `target`,
+    /// charged to the target repository's organization: the objects live in
+    /// the target's `objects/`, which is what the push quota measures, and the
+    /// ledger in `repository_fork_fetches` is the audit trail for the cap.
+    /// Best effort: the read that triggered the copy does not depend on it.
+    pub(crate) async fn metrics_fork_fetched(&self, target: Uuid, source: Uuid, added: u64) {
+        let result: Result<(), sqlx::Error> = async {
+            let mut conn = self.pool.acquire().await?;
+            sqlx::query(
+                "INSERT INTO repository_fork_fetches \
+                 (repository_id, source_repository_id, bytes, fetches) \
+                 VALUES ($1, $2, $3, 1) \
+                 ON CONFLICT (repository_id, source_repository_id) DO UPDATE SET \
+                   bytes = repository_fork_fetches.bytes + EXCLUDED.bytes, \
+                   fetches = repository_fork_fetches.fetches + 1, updated_at = now()",
+            )
+            .bind(target)
+            .bind(source)
+            .bind(i64::try_from(added).unwrap_or(i64::MAX))
+            .execute(&mut *conn)
+            .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%target, %source, error = %error, "fork fetch charge not recorded");
+        }
+    }
+
     pub async fn new(pool: PgPool, config: Config) -> anyhow::Result<Self> {
         config.validate()?;
         let dummy_hash =

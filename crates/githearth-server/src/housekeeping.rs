@@ -420,9 +420,105 @@ async fn keep_points(
     Ok(KeepPoints { commits })
 }
 
-/// Extend the pin of every open pull request whose source branch lives in this
-/// repository. A branch that has been deleted keeps its last pin until the
-/// retention timestamp; a force push gets the new head pinned immediately.
+/// Backfills a base pin for every open or recently closed pull request that
+/// has none, at server start and before the scheduler can enqueue a run.
+///
+/// A pull request row does not record the commit its target branch pointed at
+/// when it was opened, and 0046 cannot read Git, so this is the one pin the
+/// migration cannot write. It reads each repository's branch tips once and
+/// pins the target branch's current tip for every such request: for a request
+/// whose target branch has not moved, that *is* the base; for one that has
+/// moved, it is a later commit that still reaches the original base (a branch
+/// tip reaches all of its ancestors). Requests opened after this version pin
+/// their exact base in their own create transaction.
+///
+/// Runs over every active repository once, best effort per repository: a
+/// repository whose storage is unreadable is reported and skipped, and the
+/// next start retries it. Returns how many pins it wrote.
+pub async fn backfill_bases(state: &AppState) -> Result<usize, sqlx::Error> {
+    let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT pr.id, pr.repository_id, pr.target_branch FROM pull_requests pr \
+         WHERE (pr.state = 'open' \
+                OR (pr.state = 'closed' AND pr.closed_at > now() - make_interval(days => $1))) \
+           AND NOT EXISTS (SELECT 1 FROM pinned_commits p WHERE p.base_of_pull_request_id = pr.id)",
+    )
+    .bind(days(state.config.housekeeping_pin_retention_days))
+    .fetch_all(&state.pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let timeout = Duration::from_secs(
+        state
+            .config
+            .git_timeout_seconds
+            .min(state.config.housekeeping_timeout_seconds),
+    );
+    let mut tips: HashMap<Uuid, HashMap<String, String>> = HashMap::new();
+    for (_, repository_id, _) in &rows {
+        if tips.contains_key(repository_id) {
+            continue;
+        }
+        let path = state.storage.repository_path(*repository_id);
+        match tokio::task::spawn_blocking(move || {
+            githearth_git::browse::branch_tips(&path, timeout)
+        })
+        .await
+        {
+            Ok(Ok(read)) => {
+                tips.insert(*repository_id, read);
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%repository_id, error = %error, "base pin backfill skipped a repository");
+                tips.insert(*repository_id, HashMap::new());
+            }
+            Err(error) => {
+                tracing::warn!(%repository_id, error = %error, "base pin backfill skipped a repository");
+                tips.insert(*repository_id, HashMap::new());
+            }
+        }
+    }
+    let mut conn = state.pool.acquire().await?;
+    let mut written = 0;
+    for (pull_id, repository_id, branch) in rows {
+        let Some(oid) = tips
+            .get(&repository_id)
+            .and_then(|read| read.get(&branch))
+            .cloned()
+        else {
+            continue;
+        };
+        crate::pins::pin_base(
+            &mut conn,
+            repository_id,
+            pull_id,
+            &oid,
+            "open",
+            state.config.housekeeping_pin_retention_days,
+        )
+        .await?;
+        written += 1;
+    }
+    if written > 0 {
+        tracing::info!(written, "pull-request base pins backfilled");
+    }
+    Ok(written)
+}
+
+fn days(retention_days: u64) -> i32 {
+    i32::try_from(retention_days).unwrap_or(i32::MAX)
+}
+
+/// Extend the pins of every open pull request this repository is part of. A
+/// branch that has been deleted keeps its last pin until the retention
+/// timestamp; a force push gets the new head pinned immediately.
+///
+/// A run on the **source** repository pins the head, and, for a fork pull
+/// request whose head one read or merge already copied into the target, the
+/// target-side copy as well (charged to the target organization). A run on the
+/// **target** repository pins the base of every open request into it. Each
+/// statement is a no-op when the repository holds no such pin, so both runs
+/// can call it.
 ///
 /// The whole refresh is bounded by one step timeout. Branch tips are read in
 /// one `for-each-ref` call rather than one `rev-parse` per request, so the
@@ -431,12 +527,28 @@ async fn keep_points(
 /// pins in place; they are still live, so skipping the rest only delays
 /// following a force push, it never unprotects a head.
 async fn refresh_open_pins(state: &AppState, repository_id: Uuid) -> Result<(), HousekeepingError> {
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, source_branch FROM pull_requests \
-         WHERE state = 'open' AND source_repository_id = $1",
+    let retention_days = state.config.housekeeping_pin_retention_days;
+    let mut conn = state.pool.acquire().await?;
+    // The base pins of every open request into this repository (its target
+    // side): an extended window from a close that was later reopened goes back
+    // to living with the request. A no-op when this repository is no open
+    // request's target.
+    sqlx::query(
+        "UPDATE pinned_commits SET retain_until = NULL \
+         FROM pull_requests pr \
+         WHERE pr.id = pinned_commits.base_of_pull_request_id \
+           AND pr.state = 'open' AND pr.repository_id = $1 \
+           AND pinned_commits.retain_until IS NOT NULL",
     )
     .bind(repository_id)
-    .fetch_all(&state.pool)
+    .execute(&mut *conn)
+    .await?;
+    let rows: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
+        "SELECT pr.id, pr.source_branch, pr.repository_id FROM pull_requests pr \
+         WHERE pr.state = 'open' AND pr.source_repository_id = $1",
+    )
+    .bind(repository_id)
+    .fetch_all(&mut *conn)
     .await?;
     if rows.is_empty() {
         return Ok(());
@@ -454,8 +566,7 @@ async fn refresh_open_pins(state: &AppState, repository_id: Uuid) -> Result<(), 
             .await
             .map_err(|e| HousekeepingError::Join(e.to_string()))?
             .map_err(|e| HousekeepingError::Storage(e.to_string()))?;
-    let mut conn = state.pool.acquire().await?;
-    for (pull_request_id, branch) in rows {
+    for (pull_request_id, branch, target_repository_id) in rows {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 repository_id = %repository_id,
@@ -463,18 +574,58 @@ async fn refresh_open_pins(state: &AppState, repository_id: Uuid) -> Result<(), 
             );
             break;
         }
-        if let Some(oid) = tips.get(&branch) {
+        if let Some(oid) = tips.get(&branch).cloned() {
             crate::pins::pin_head(
                 &mut conn,
                 repository_id,
                 pull_request_id,
-                oid,
-                state.config.housekeeping_pin_retention_days,
+                &oid,
+                retention_days,
             )
             .await?;
+            if target_repository_id != repository_id {
+                // The target keeps a copy of the fork's head (a read or merge
+                // copied it). Pin that copy where it lives; the INSERT selects
+                // nothing when the target does not hold the object.
+                let target_path = state.storage.repository_path(target_repository_id);
+                let probe = oid.clone();
+                let has_copy =
+                    tokio::task::spawn_blocking(move || state_copy_probe(&target_path, &probe))
+                        .await
+                        .map_err(|e| HousekeepingError::Join(e.to_string()))?;
+                if has_copy {
+                    crate::pins::pin_target_copy(
+                        &mut conn,
+                        target_repository_id,
+                        pull_request_id,
+                        &oid,
+                        retention_days,
+                    )
+                    .await?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Whether a bare repository stores object `oid`. A missing directory reads as
+/// `false`: a target that is gone has nothing to pin.
+fn state_copy_probe(path: &std::path::Path, oid: &str) -> bool {
+    std::process::Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("--git-dir")
+        .arg(path)
+        .args(["cat-file", "-e", oid])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The row write for one run: `repository_housekeeping` plus the audit/outbox

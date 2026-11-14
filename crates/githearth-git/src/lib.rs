@@ -30,6 +30,13 @@ pub enum StorageError {
     /// A run was stopped at a fault-injection point (ADR 0013); never
     /// constructed outside a run with [`maintenance::Faults`].
     Injected(&'static str),
+    /// A fetch into a repository would add (or did add) more bytes than the
+    /// caller's cap allows: the fork pull request fetched-bytes cap
+    /// (`Storage::mirror_objects`).
+    FetchLimit {
+        incoming: u64,
+        max: u64,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -43,6 +50,10 @@ impl fmt::Display for StorageError {
             Self::RefMoved(e) => write!(f, "ref moved: {e}"),
             Self::Deferred(e) => write!(f, "maintenance deferred: {e}"),
             Self::Injected(point) => write!(f, "run interrupted at {point}"),
+            Self::FetchLimit { incoming, max } => write!(
+                f,
+                "fetch would add {incoming} bytes; the fork pull request cap is {max}"
+            ),
         }
     }
 }

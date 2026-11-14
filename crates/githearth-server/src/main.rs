@@ -202,6 +202,12 @@ async fn run(args: Args) -> Result<()> {
             let state = AppState::new(pool, config.clone())
                 .await
                 .context("cannot initialize authentication")?;
+            // The one pin 0046 cannot write (a base is not stored in
+            // PostgreSQL) is backfilled before any housekeeping run can be
+            // scheduled, so no prune ever races it.
+            if let Err(error) = githearth_server::housekeeping::backfill_bases(&state).await {
+                tracing::warn!(error = %error, "pull-request base pin backfill failed; will retry on the next start");
+            }
             let _reconciler = reconcile::spawn(state.clone());
             let _merge_worker = githearth_server::merge_worker::spawn(state.clone());
             // Handlers are registered by their owners (ADR 0006).

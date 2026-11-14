@@ -1039,6 +1039,9 @@ pub async fn record_merge_result(
             // Merging is the point the retention window starts from: the
             // head may be about to become unreachable behind a deleted branch.
             crate::pins::extend_for_closed(&mut tx, pull_id, pin_retention_days).await?;
+        } else {
+            // A retry over an already-merged request: the first call extended
+            // every pin of it, so there is nothing to extend again.
         }
 
         let organization_id: Option<Uuid> =
