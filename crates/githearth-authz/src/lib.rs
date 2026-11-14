@@ -71,6 +71,11 @@ actions! {
     OrganizationDelete => "organization.delete", sensitive,
     OrganizationSuspend => "organization.suspend", sensitive,
     OrganizationUnsuspend => "organization.unsuspend", sensitive,
+    AccountRead => "account.read", sensitive,
+    AccountCreate => "account.create", sensitive,
+    AccountDisable => "account.disable", sensitive,
+    AccountEnable => "account.enable", sensitive,
+    AccountResetPassword => "account.reset_password", sensitive,
     TeamCreate => "team.create", sensitive,
     RepositoryCreate => "repository.create", routine,
     RepositoryRead => "repository.read", routine,
@@ -123,6 +128,9 @@ impl Action {
             | OrganizationUnsuspend
             | TeamCreate
             | RepositoryCreate => Kind::Organization,
+            AccountRead | AccountCreate | AccountDisable | AccountEnable | AccountResetPassword => {
+                Kind::Instance
+            }
             RepositoryRead
             | RepositoryClone
             | RepositoryUpdate
@@ -143,6 +151,9 @@ impl Action {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    /// The instance itself: site-level administration that no organization
+    /// scope covers (account provisioning and lifecycle).
+    Instance,
     Organization,
     Repository,
     Ref,
@@ -327,6 +338,9 @@ pub struct PullRequest {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Resource<'a> {
+    /// The instance: used for site administration that is not scoped to an
+    /// organization, such as creating an account.
+    Instance,
     Organization,
     Repository(&'a Repository),
     Ref(&'a Repository, &'a Ref),
@@ -336,6 +350,7 @@ pub enum Resource<'a> {
 impl Resource<'_> {
     fn kind(&self) -> Kind {
         match self {
+            Resource::Instance => Kind::Instance,
             Resource::Organization => Kind::Organization,
             Resource::Repository(_) => Kind::Repository,
             Resource::Ref(..) => Kind::Ref,
@@ -637,7 +652,7 @@ fn check_facts(request: &Request<'_>) -> Result<(), &'static str> {
     }
     let org = request.organization.id;
     let repository = match request.resource {
-        Resource::Organization => None,
+        Resource::Instance | Resource::Organization => None,
         Resource::Repository(r) => Some(r),
         Resource::Ref(r, reference) => (reference.repository == r.id)
             .then_some(r)
@@ -800,6 +815,11 @@ fn build_entities(request: &Request<'_>) -> (EntityUid, Vec<Entity>) {
         ]
     };
     let resource = match request.resource {
+        Resource::Instance => {
+            let id = uid("Instance", String::new());
+            entities.push(entity(id.clone(), [], []));
+            id
+        }
         Resource::Organization => org_uid.clone(),
         Resource::Repository(r) => {
             entities.push(repository(r));

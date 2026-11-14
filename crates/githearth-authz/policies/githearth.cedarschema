@@ -22,6 +22,11 @@ namespace GitHearth {
 
   // Unauthenticated visitor: no attributes, no parents.
   entity Anonymous;
+  // The instance: the resource for site administration that is not scoped to an
+  // organization (account provisioning and lifecycle). It has no attributes and
+  // no parents; only the caller's site-administrator fact and the built-in
+  // site-admin policies decide it.
+  entity Instance;
   entity Organization = {
     suspended: Bool,
   };
@@ -128,6 +133,39 @@ namespace GitHearth {
     appliesTo {
       principal: [Account, Anonymous],
       resource: Organization,
+      context: Auth,
+    };
+
+  // Instance administration: account provisioning and lifecycle belong to site
+  // administrators alone (see the `site-admin-only` forbid in builtin.cedar).
+  action "account.read" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Instance,
+      context: Auth,
+    };
+  action "account.create" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Instance,
+      context: Auth,
+    };
+  action "account.disable" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Instance,
+      context: Auth,
+    };
+  action "account.enable" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Instance,
+      context: Auth,
+    };
+  action "account.reset_password" in ["site_admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Instance,
       context: Auth,
     };
 

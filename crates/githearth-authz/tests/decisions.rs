@@ -270,6 +270,9 @@ impl Site<'_> {
             | OrganizationUnsuspend
             | TeamCreate
             | RepositoryCreate => Resource::Organization,
+            AccountRead | AccountCreate | AccountDisable | AccountEnable | AccountResetPassword => {
+                Resource::Instance
+            }
             RepositoryRead
             | RepositoryClone
             | RepositoryUpdate
@@ -534,6 +537,57 @@ fn suspended_organization_blocks_everyone_but_site_admins() {
         None,
     );
     assert!(d.is_allowed(), "{d:?}");
+}
+
+/// Account administration is instance administration: a site administrator may
+/// create, disable, enable and reset accounts; no organization role can, and a
+/// disabled account can do nothing at all.
+#[test]
+fn account_administration_requires_a_site_admin() {
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let actions = [
+        Action::AccountRead,
+        Action::AccountCreate,
+        Action::AccountDisable,
+        Action::AccountEnable,
+        Action::AccountResetPassword,
+    ];
+    for action in actions {
+        let allowed = w.decide(
+            &engine,
+            &w.site_admin,
+            action,
+            &w.acme,
+            Resource::Instance,
+            None,
+        );
+        assert!(allowed.is_allowed(), "{action:?}: {allowed:?}");
+        // An organization owner is not a site administrator.
+        let denied = w.decide(&engine, &w.owner, action, &w.acme, Resource::Instance, None);
+        assert!(
+            matches!(&denied, Decision::Deny(ids) if ids.iter().any(|id| id == "site-admin-only")),
+            "{action:?}: expected site-admin-only, got {denied:?}"
+        );
+    }
+    // A disabled account has no active principal, even if it is a site admin.
+    let disabled = Account {
+        suspended: true,
+        site_admin: true,
+        ..account(&[], &[])
+    };
+    let denied = w.decide(
+        &engine,
+        &disabled,
+        Action::AccountCreate,
+        &w.acme,
+        Resource::Instance,
+        None,
+    );
+    assert!(
+        matches!(&denied, Decision::Deny(ids) if ids.iter().any(|id| id == "suspended-account")),
+        "expected suspended-account, got {denied:?}"
+    );
 }
 
 /// An organization role that permits every action on everything it scopes

@@ -61,12 +61,15 @@ Skip bootstrap when the Compose installation already has its administrator. Use 
 | `body_limit_bytes` | `GITHEARTH_BODY_LIMIT_BYTES` | 524288 / 1024–1048576 bytes |
 | `auth_concurrency` | `GITHEARTH_AUTH_CONCURRENCY` | 2 / 1–16 concurrent password verifications |
 | `trusted_proxies` | `GITHEARTH_TRUSTED_PROXIES` | Empty (no trusted proxies) / comma-separated IPs or CIDRs |
+| `login_throttle_account_limit` | `GITHEARTH_LOGIN_THROTTLE_ACCOUNT_LIMIT` | 5 / 1–100 failed logins per account in the window |
+| `login_throttle_client_limit` | `GITHEARTH_LOGIN_THROTTLE_CLIENT_LIMIT` | 20 / 1–1000, never below the account limit |
+| `login_throttle_window_seconds` | `GITHEARTH_LOGIN_THROTTLE_WINDOW_SECONDS` | 900 / 1–86400 seconds |
 
 `trusted_proxies` is a TOML array of IP addresses or CIDR ranges. When a request arrives from a trusted proxy, `X-Forwarded-For` is walked from right to left to find the first untrusted entry, which becomes the client IP. When the peer is not trusted, the header is ignored entirely. A malformed header, an empty header, or an all-trusted chain falls back to the peer address. `X-Real-IP` and the structured `Forwarded` header are not implemented.
 
 **WARNING:** listing an address that is not actually a trusted reverse proxy lets anyone who can reach that address spoof their client IP.
 
-Every connection sets a 5-second statement timeout, 3-second lock timeout, and 10-second idle-transaction timeout. Password verification uses blocking workers with a bounded permit held until hashing finishes, even when its HTTP caller times out. Busy authentication returns 429. The pool is bounded; HTTP bodies and total request duration are bounded. This is resource protection, not a distributed brute-force prevention service; per-account/IP throttling is a later production requirement.
+Every connection sets a 5-second statement timeout, 3-second lock timeout, and 10-second idle-transaction timeout. Password verification uses blocking workers with a bounded permit held until hashing finishes, even when its HTTP caller times out. Busy authentication returns 429. The pool is bounded; HTTP bodies and total request duration are bounded. Failed logins are additionally throttled per account and per client address over a configurable window ([login-throttling.md](operations/login-throttling.md)); the window expires on its own, so no account can be locked out permanently.
 
 ## API exercise
 

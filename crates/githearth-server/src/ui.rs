@@ -214,7 +214,7 @@ fn clear_csrf_cookie(state: &AppState) -> String {
 }
 
 /// Redirect to sign-in and drop the browser's session cookie, which the server no longer honours.
-fn signed_out(state: &AppState) -> UiError {
+pub(crate) fn signed_out(state: &AppState) -> UiError {
     let mut response = Redirect::to("/login").into_response();
     if let Ok(value) = clear_session_cookie(state).parse() {
         response.headers_mut().insert(SET_COOKIE, value);
@@ -295,7 +295,7 @@ fn busy_page() -> UiError {
                 "Busy",
                 None,
                 None,
-                "<h1>Busy</h1><p>Too many sign-ins in progress. Try again in a moment.</p>",
+                "<h1>Busy</h1><p>Too many sign-in attempts right now. Try again in a few minutes.</p>",
             )),
         )
             .into_response(),
@@ -529,8 +529,14 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<Respo
             ));
         }
     }
+    let admin_link = if account.is_admin {
+        " <a href=\"/admin/accounts\">Accounts</a>"
+    } else {
+        ""
+    };
     let body = format!(
-        "<h1>Your organizations</h1><div class=\"card\"><ul>{}</ul></div><p><a href=\"/organizations/new\">New organization</a></p>",
+        "<h1>Your organizations</h1><div class=\"card\"><ul>{}</ul></div>\
+<p><a href=\"/organizations/new\">New organization</a>{admin_link}</p>",
         items
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
@@ -1410,6 +1416,8 @@ pub fn router() -> Router<AppState> {
             "/organizations/{slug}/repositories/{name}/fork",
             axum::routing::post(fork_submit),
         )
+        .merge(crate::accounts_ui::router())
+        .merge(crate::passwords_ui::router())
         .merge(crate::issues_ui::router())
         .merge(crate::pulls_ui::router())
         .merge(crate::browse_ui::router())

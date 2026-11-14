@@ -1,3 +1,5 @@
+pub mod accounts;
+mod accounts_ui;
 pub mod audit;
 pub mod audit_retention;
 pub mod auto_merge;
@@ -23,6 +25,9 @@ pub mod merge_worker;
 mod mergeability;
 pub mod notifications;
 mod notifications_ui;
+pub mod outbox;
+pub mod passwords;
+mod passwords_ui;
 pub mod protection;
 pub mod pulls;
 mod pulls_ui;
@@ -258,6 +263,8 @@ pub fn router(state: AppState) -> Router {
             post(create_organization).get(list_organizations),
         )
         .route("/api/v1/organizations/{id}", get(read_organization))
+        .merge(accounts::router())
+        .merge(passwords::router())
         .merge(issues::router())
         .merge(forks::router())
         .merge(pulls::router())
@@ -642,19 +649,33 @@ pub(crate) async fn verify_password(
             StatusCode::TOO_MANY_REQUESTS,
             "authentication busy",
         ))?;
-    let row = sqlx::query("SELECT id, password_hash, suspended FROM accounts WHERE username = $1")
-        .bind(username)
-        .fetch_optional(&state.pool)
-        .await?;
-    // A suspended account still pays for the hash, so timing does not reveal the suspension.
+    let row = sqlx::query(
+        "SELECT id, password_hash, (suspended OR disabled_at IS NOT NULL) AS inactive \
+         FROM accounts WHERE username = $1",
+    )
+    .bind(username)
+    .fetch_optional(&state.pool)
+    .await?;
+    // A suspended or disabled account still pays for the hash, so timing does
+    // not reveal the account's state; only an active account can succeed.
     let id = row
         .as_ref()
-        .filter(|r| !r.get::<bool, _>("suspended"))
+        .filter(|r| !r.get::<bool, _>("inactive"))
         .map(|r| r.get::<Uuid, _>("id"));
     let hash = row
         .as_ref()
         .map(|r| r.get::<String, _>("password_hash"))
         .unwrap_or_else(|| state.dummy_hash.to_string());
+    // Bounded failed-login throttling. A throttled attempt is refused before the
+    // password is hashed; the window expires on its own, so no account (an
+    // administrator included) is ever permanently locked out.
+    let client = CLIENT_IP.try_with(|ip| ip.to_string()).ok();
+    if login_throttled(state, id, client.as_deref()).await? {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed attempts",
+        ));
+    }
     let password_owned = password.to_owned();
     let valid = password_work(permit, move || {
         PasswordHash::new(&hash).is_ok_and(|parsed| {
@@ -665,7 +686,75 @@ pub(crate) async fn verify_password(
     })
     .await
     .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"))?;
-    Ok(id.filter(|_| valid))
+    let success = id.filter(|_| valid);
+    match success {
+        Some(id) => clear_login_failures(state, id).await,
+        None => record_login_failure(state, id, client.as_deref()).await,
+    }
+    Ok(success)
+}
+
+/// Whether this account or client address already has `limit` failures inside
+/// the throttle window. Either hit refuses the attempt.
+async fn login_throttled(
+    state: &AppState,
+    account: Option<Uuid>,
+    client: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let window = state.config.login_throttle_window_seconds as f64;
+    let row = sqlx::query(
+        "SELECT \
+         (SELECT count(*) FROM login_failures WHERE account_id = $1 \
+            AND attempted_at > clock_timestamp() - make_interval(secs => $3))::bigint AS account_fails, \
+         (SELECT count(*) FROM login_failures WHERE client_addr = $2::inet \
+            AND attempted_at > clock_timestamp() - make_interval(secs => $3))::bigint AS client_fails",
+    )
+    .bind(account)
+    .bind(client)
+    .bind(window)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(
+        row.get::<i64, _>("account_fails") >= i64::from(state.config.login_throttle_account_limit)
+            || row.get::<i64, _>("client_fails")
+                >= i64::from(state.config.login_throttle_client_limit),
+    )
+}
+
+/// Records one failed attempt and prunes rows that have fallen out of the
+/// window, so the table stays bounded by the failure rate times the window. A
+/// recording failure is logged, never surfaced: the attempt is already denied.
+async fn record_login_failure(state: &AppState, account: Option<Uuid>, client: Option<&str>) {
+    let window = state.config.login_throttle_window_seconds as f64;
+    let result: Result<(), sqlx::Error> = async {
+        let mut tx = state.pool.begin().await?;
+        sqlx::query("INSERT INTO login_failures (account_id, client_addr) VALUES ($1, $2::inet)")
+            .bind(account)
+            .bind(client)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM login_failures \
+             WHERE attempted_at < clock_timestamp() - make_interval(secs => $1)",
+        )
+        .bind(window)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+    .await;
+    if result.is_err() {
+        tracing::warn!(category = "database", "recording a failed login failed");
+    }
+}
+
+/// A successful login clears the account's failures, so a mistyped password
+/// does not count toward a later lockout.
+async fn clear_login_failures(state: &AppState, account: Uuid) {
+    let _ = sqlx::query("DELETE FROM login_failures WHERE account_id = $1")
+        .bind(account)
+        .execute(&state.pool)
+        .await;
 }
 
 async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> ApiResult<Json<Token>> {
