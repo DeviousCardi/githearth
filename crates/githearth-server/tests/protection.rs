@@ -1,7 +1,7 @@
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
 };
 use githearth_server::{AppState, MIGRATOR, config::Config, connect, router};
 use http_body_util::BodyExt;
@@ -159,6 +159,76 @@ fn cleanup(storage_root: &PathBuf) {
 
 fn protection_path(org: &str, repo: &str) -> String {
     format!("/api/v1/organizations/{org}/repositories/{repo}/protection")
+}
+
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn hidden(html: &str, name: &str) -> String {
+    let marker = format!("name=\"{name}\" value=\"");
+    let rest = &html[html.find(&marker).unwrap() + marker.len()..];
+    rest[..rest.find('"').unwrap()].to_owned()
+}
+
+async fn get_html(app: &Router, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+    let mut builder = Request::builder().method("GET").uri(path);
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn post_form(
+    app: &Router,
+    path: &str,
+    cookie: &str,
+    form: &[(&str, &str)],
+) -> (StatusCode, Option<String>, String) {
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", cookie)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .map(|v| v.to_str().unwrap().to_owned());
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        location,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
 }
 
 #[tokio::test]
@@ -632,6 +702,188 @@ async fn stale_and_signed_flags_default_and_round_trip() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["dismiss_stale_approvals"], false);
     assert_eq!(body["require_signed_commits"], false);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+fn branch_settings_path(org: &str, repo: &str) -> String {
+    format!("/organizations/{org}/repositories/{repo}/settings/branches")
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn branch_settings_page_lists_creates_and_deletes_rules() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let repo_id = fixture_repository(&pool, org_id, "r", owner).await;
+    let token = fixture_session(&pool, owner).await;
+    let cookie = format!("githearth_session={token}");
+    let path = branch_settings_path(&slug, "r");
+
+    // Signed out redirects to login.
+    let (status, _) = get_html(&app, &path, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // The owner sees the empty page and the rule fields.
+    let (status, html) = get_html(&app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Branch protection"), "{html}");
+    assert!(html.contains("No branch protection rules yet."), "{html}");
+    assert!(html.contains("name=\"required_approvals\""), "{html}");
+    assert!(html.contains("name=\"required_status_checks\""), "{html}");
+    assert!(html.contains("name=\"require_merge_queue\""), "{html}");
+
+    // The repository page links to the new settings page.
+    let (_, repo_page) = get_html(
+        &app,
+        &format!("/organizations/{slug}/repositories/r"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(repo_page.contains("/settings/branches"), "{repo_page}");
+
+    let (status, location, _) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&html, "csrf_token")),
+            ("idempotency_key", &hidden(&html, "idempotency_key")),
+            ("pattern", "main"),
+            ("required_approvals", "2"),
+            ("required_status_checks", "ci, lint"),
+            ("require_pull_request", "1"),
+            ("require_signed_commits", "1"),
+            ("require_merge_queue", "1"),
+            ("require_code_owner_review", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location.as_deref().unwrap().ends_with("/settings/branches"));
+
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
+    assert!(html.contains("main"), "{html}");
+    assert!(html.contains("ci, lint"), "{html}");
+    assert!(html.contains(">2</td>"), "{html}");
+
+    let (pattern, approvals, checks, require_pr, require_signed, require_queue, require_owners): (
+        String,
+        i32,
+        Vec<String>,
+        bool,
+        bool,
+        bool,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT pattern, required_approvals, required_status_checks, require_pull_request, \
+                require_signed_commits, require_merge_queue, require_code_owner_review \
+         FROM branch_protection_rules WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pattern, "main");
+    assert_eq!(approvals, 2);
+    assert_eq!(checks, vec!["ci", "lint"]);
+    assert!(require_pr && require_signed && require_queue && require_owners);
+
+    // Invalid input is a re-rendered 400 with the submitted values kept.
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&html, "csrf_token")),
+            ("idempotency_key", &hidden(&html, "idempotency_key")),
+            ("pattern", "bad//pattern"),
+            ("required_approvals", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("role=\"alert\""), "{body}");
+    assert!(body.contains("value=\"bad//pattern\""), "{body}");
+
+    // A duplicate pattern is a 409 with an explanatory message.
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
+    let (status, _, body) = post_form(
+        &app,
+        &path,
+        &cookie,
+        &[
+            ("csrf_token", &hidden(&html, "csrf_token")),
+            ("idempotency_key", &hidden(&html, "idempotency_key")),
+            ("pattern", "main"),
+            ("required_approvals", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("already exists"), "{body}");
+
+    // Delete through the page.
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
+    let rule_id: String =
+        sqlx::query_scalar("SELECT id::text FROM branch_protection_rules WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (status, _, _) = post_form(
+        &app,
+        &format!("{path}/{rule_id}/delete"),
+        &cookie,
+        &[("csrf_token", &hidden(&html, "csrf_token"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (_, html) = get_html(&app, &path, Some(&cookie)).await;
+    assert!(html.contains("No branch protection rules yet."), "{html}");
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE organization_id = $1 \
+         AND kind IN ('branch_protection.created','branch_protection.deleted')",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 2);
+
+    cleanup(&storage);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn branch_settings_page_hides_forms_from_viewers_who_cannot_manage() {
+    let (app, pool, storage, owner, org_id, slug) = setup().await;
+    let repo_id = fixture_repository(&pool, org_id, "r", owner).await;
+    sqlx::query(
+        "INSERT INTO branch_protection_rules (id, repository_id, pattern, created_by) \
+         VALUES ($1, $2, 'main', $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let reader = add_member(&pool, org_id, "read").await;
+    let token = fixture_session(&pool, reader).await;
+    let cookie = format!("githearth_session={token}");
+    let path = branch_settings_path(&slug, "r");
+
+    let (status, html) = get_html(&app, &path, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Branch protection"), "{html}");
+    assert!(html.contains("main"), "{html}");
+    assert!(!html.contains("Add a rule"), "{html}");
+    assert!(!html.contains(">Delete</button>"), "{html}");
 
     cleanup(&storage);
     pool.close().await;

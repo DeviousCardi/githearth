@@ -708,9 +708,12 @@ async fn repository(
         },
         _ => false,
     };
-    let tag_link = if can_manage_protection {
+    let protection_links = if can_manage_protection {
         format!(
-            " · <a href=\"/organizations/{}/repositories/{}/settings/tags\">Tag protection</a>",
+            " · <a href=\"/organizations/{}/repositories/{}/settings/branches\">Branch protection</a> · \
+<a href=\"/organizations/{}/repositories/{}/settings/tags\">Tag protection</a>",
+            url_encode(&slug),
+            url_encode(&repo.name),
             url_encode(&slug),
             url_encode(&repo.name)
         )
@@ -718,7 +721,7 @@ async fn repository(
         String::new()
     };
     browse_section.push_str(&format!(
-        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a>{tag_link}</p>",
+        "<p><a href=\"/organizations/{}/repositories/{}/issues\">Issues</a> · <a href=\"/organizations/{}/repositories/{}/pulls\">Pull requests</a>{protection_links}</p>",
         url_encode(&slug),
         url_encode(&repo.name),
         url_encode(&slug),
@@ -941,6 +944,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::browse_ui::router())
         .merge(crate::settings_ui::router())
         .merge(crate::tag_protection_ui::router())
+        .merge(crate::branch_protection_ui::router())
         .merge(crate::notifications_ui::router())
         .layer(axum::middleware::map_response(page_headers))
 }

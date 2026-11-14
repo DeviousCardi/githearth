@@ -245,15 +245,32 @@ async fn list(
     Path((org_slug, repo_name)): Path<(String, String)>,
 ) -> Result<Json<ProtectionList>, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    let loaded =
-        repository_api::load_repo(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
-    repository_api::require(&state, &loaded, Action::RepositoryRead)?;
+    let (items, generation, _) =
+        list_rules(&state, actor.id, auth_age, &org_slug, &repo_name).await?;
+    Ok(Json(ProtectionList { generation, items }))
+}
+
+/// Loads a repository's branch rules plus the current protection generation
+/// for a read-capable actor. The third element reports whether the actor may
+/// manage the rules (`RepositoryUpdate`, the same `maintain` gate as tag
+/// protection), so the settings page can hide controls the viewer could not
+/// submit. Shared by the JSON listing and the settings page.
+pub(crate) async fn list_rules(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+) -> Result<(Vec<ProtectionRule>, i64, bool), ApiError> {
+    let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
+    repository_api::require(state, &loaded, Action::RepositoryRead)?;
     if loaded.repo.status != RepositoryStatus::Active {
         return Err(not_found());
     }
+    let can_manage = repository_api::require(state, &loaded, Action::RepositoryUpdate).is_ok();
     let mut conn = state.pool.acquire().await?;
     let (items, generation) = load_rules_with_generation(&mut conn, loaded.repo.id).await?;
-    Ok(Json(ProtectionList { generation, items }))
+    Ok((items, generation, can_manage))
 }
 
 #[derive(Deserialize)]
@@ -341,12 +358,30 @@ async fn create(
 ) -> Result<(StatusCode, Json<ProtectionRule>), ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let key = idempotency::extract_key(&headers).transpose()?;
+    let (status, value) = create_rule(
+        &state, actor.id, auth_age, &org_slug, &repo_name, &body, key,
+    )
+    .await?;
+    Ok((status, Json(serde_json::from_value(value).unwrap())))
+}
+
+/// Creates a branch protection rule as `actor_id`; shared by the JSON handler
+/// and the browser settings page. Validation, authorization and audit happen
+/// once here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_rule(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    body: &[u8],
+    key: Option<&str>,
+) -> Result<(StatusCode, serde_json::Value), ApiError> {
     let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/protection");
-    let state = &state;
-    let body = &body;
-    let (status, value) = idempotency::run(
+    idempotency::run(
         &state.pool,
-        actor.id,
+        actor_id,
         "POST",
         &path_str,
         body,
@@ -355,7 +390,7 @@ async fn create(
             let input: NewRule = serde_json::from_slice(body).map_err(|_| invalid())?;
             validate_rule(&input)?;
             let loaded =
-                repository_api::load_current(state, actor.id, auth_age, &org_slug, &repo_name)
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
                     .await?;
             repository_api::require(state, &loaded, Action::RepositoryUpdate)?;
             if loaded.repo.status != RepositoryStatus::Active {
@@ -387,7 +422,7 @@ async fn create(
             .bind(input.require_signed_commits)
             .bind(input.require_merge_queue)
             .bind(input.require_code_owner_review)
-            .bind(actor.id)
+            .bind(actor_id)
             .execute(&mut *tx)
             .await;
             if let Err(e) = inserted {
@@ -402,7 +437,7 @@ async fn create(
             event(
                 &mut tx,
                 Some(loaded.org_id),
-                actor.id,
+                actor_id,
                 "branch_protection.created",
             )
             .await?;
@@ -422,8 +457,7 @@ async fn create(
             Ok((status, body))
         },
     )
-    .await?;
-    Ok((status, Json(serde_json::from_value(value).unwrap())))
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -620,19 +654,33 @@ async fn delete(
 ) -> Result<StatusCode, ApiError> {
     let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
     let key = idempotency::extract_key(&headers).transpose()?;
+    delete_rule(&state, actor.id, auth_age, &org_slug, &repo_name, id, key).await
+}
+
+/// Deletes a branch protection rule as `actor_id`; shared by the JSON handler
+/// and the browser settings page.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn delete_rule(
+    state: &AppState,
+    actor_id: Uuid,
+    auth_age: u64,
+    org_slug: &str,
+    repo_name: &str,
+    id: Uuid,
+    key: Option<&str>,
+) -> Result<StatusCode, ApiError> {
     let path_str =
         format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/protection/{id}");
-    let state = &state;
     let (status, _) = idempotency::run(
         &state.pool,
-        actor.id,
+        actor_id,
         "DELETE",
         &path_str,
         b"",
         key,
         |idem| async move {
             let loaded =
-                repository_api::load_current(state, actor.id, auth_age, &org_slug, &repo_name)
+                repository_api::load_current(state, actor_id, auth_age, org_slug, repo_name)
                     .await?;
             repository_api::require(state, &loaded, Action::RepositoryUpdate)?;
             if loaded.repo.status != RepositoryStatus::Active {
@@ -657,7 +705,7 @@ async fn delete(
             event(
                 &mut tx,
                 Some(loaded.org_id),
-                actor.id,
+                actor_id,
                 "branch_protection.deleted",
             )
             .await?;
