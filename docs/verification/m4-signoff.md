@@ -50,6 +50,8 @@ per-domain reports, exact repros and residual defects are in
 | --- | --- | --- | --- | --- |
 | 1 — `main` `b820454` | 1,880 | 1,755 | 98 | 27 |
 | 2 — fixed build (`7e1ded3`; review fixes `e638676`; merged as PR #149) | 510 | 442 | 68 | 0 |
+| 3 — closure (`526e47c`, `800cad4`; PRs #161/#162) | 2,348 | 2,305 | 39 | 3 |
+| 4 — final verification (`cd7946b`; PRs #163/#165) | 1,408 | 1,375 | 33 | 0 |
 
 The campaign found one **blocker** and thirteen major findings. The blocker —
 every changed pull-request detail returned 500/503 because the shipped Git
@@ -70,9 +72,18 @@ feature gaps were fixed and re-verified by the same testers:
   notify; the image ships `githearth check`; install/ADR/TLS docs updated.
 
 Round 2 verdicts: 3 domains PASS (auth, repositories, SSH), 12 PASS WITH
-DEFECTS, no FAIL. The remaining defects are known minors plus two feature gaps
-(the branch-protection settings UI #150 and the browser cross-repo PR form
-#151), all filed as #150–#159 and listed in [lab-m4/README.md](lab-m4/README.md).
+DEFECTS, no FAIL.
+
+Rounds 3 and 4 closed the remaining gaps: PR #161 added the branch-protection
+settings page and the browser cross-repo PR form and fixed the browse/UI
+minors; PR #162 fixed NUL validation, uniform 404 bodies, the Git HTTP
+findings, the fork API and the code-owner facts; PRs #163/#165 fixed the
+round-3/4 UI affordances, clone URLs, API envelopes and the merge/auto-merge
+read-authorization ordering. **All ten issues #150–#159 are fixed and verified**
+(round 3: 18 testers, 2,348 checks; round 4: 8 testers, 1,408 checks). The
+remaining observations are documented in
+[lab-m4/README.md](lab-m4/README.md#residual-observations-not-filed-as-defects);
+none is a correctness or access-control defect.
 
 ## Independent installation checklist
 
@@ -118,11 +129,11 @@ completed installation checklist.
 - Notes and problems found: Reviewed the merged code, the 15 per-domain lab
   reports and the round-2 re-verification on the fixed image. The blocker and
   every fixable major are closed and re-tested; `scripts/ci.sh` is green at
-  ≥ 95% line coverage on `00607bb`. Remaining defects are the two feature gaps
-  (#150 branch-protection UI, #151 browser cross-repo PR) and the minors filed
-  as #152–#159; none blocks the M4 exit. The install drill was performed by an
-  agent, so a human independent install is still recommended before public
-  distribution.
+  ≥ 95% line coverage through `bbf5ee6`. All issues filed by the campaign
+  (#150–#159) are fixed and re-verified by rounds 3 and 4; the residual
+  observations are documented and none is a correctness or access-control
+  defect. The install drill was performed by an agent, so a human independent
+  install is still recommended before public distribution.
 
 ### Reviewer 2
 
