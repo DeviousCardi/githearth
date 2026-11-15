@@ -83,15 +83,18 @@ can therefore authorize the merge.
 The gap is in which revision a merge decision is bound to. An intent records the
 source head, the expected target tip and a digest over the approvals and required
 checks taken at that source head (`merge_intents.rs:617`). The worker re-reads
-both refs and refuses the intent unless they still equal the recorded values
-(`merge.rs:370–383` for the target, `merge.rs:408–416` for the source), builds
-the merge candidate from exactly those two commits under the repository lock
-(`merge.rs:560–593`), and moves the ref with a compare-and-swap on the expected
-target (`merge.rs:637`). The content that is merged is therefore the candidate
-for the recorded target and head. A moved ref never merges something else, but
-the two cases differ: a direct merge whose target moved goes stale, while a
-queued entry is re-targeted to the current tip and revalidated before it merges
-(`merge.rs:370–383`); a moved source goes stale in both cases (`merge.rs:408–416`).
+both refs and will not merge against revisions other than the recorded ones —
+a moved source, or a moved target on a direct merge, makes the intent stale,
+while a queued entry whose target moved is re-targeted and revalidated rather
+than refused (`merge.rs:370–383` for the target, `merge.rs:408–416` for the
+source). It then builds the merge candidate from exactly those two commits
+under the repository lock (`merge.rs:560–593`) and moves the ref with a
+compare-and-swap on the expected target (`merge.rs:637`). The content that is
+merged is therefore the candidate for the recorded target and head. A moved ref
+never merges something else, because the two cases differ: a direct merge whose
+target moved goes stale, while a queued entry is re-targeted to the current tip
+and revalidated before it merges (`merge.rs:370–383`); a moved source goes
+stale in both cases (`merge.rs:408–416`).
 
 What is not bound is the **decision** to that candidate. The mergeability check
 that lets the merge through builds a candidate of its own at intent creation and
