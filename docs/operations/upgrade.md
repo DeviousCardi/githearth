@@ -5,16 +5,20 @@ Upgrades are forward-only; an older binary refuses a newer schema.
 
 ## Steps
 
-1. **Back up**
-   Follow [backup-restore.md](backup-restore.md) and keep the old binary
-   alongside the backup.
-
-2. **Stop the server**
+1. **Stop the server**
    ```
    systemctl stop githearth-server   # or your process manager
    ```
-   No pushes may be in flight. A `warn lifecycle` line from `doctor` later is fine:
-   the reconciler retries those repositories when the server starts again.
+   Alternatively enter maintenance mode
+   (`githearth-server maintenance start`) and wait for it to report drained.
+   No push may be acknowledged from this point until the backup is complete.
+   A `warn lifecycle` line from `doctor` later is fine: the reconciler retries
+   those repositories when the server starts again.
+
+2. **Back up**
+   Follow [backup-restore.md](backup-restore.md). `backup` proves and prints
+   the `not-running` or `maintenance` fence itself. Keep the old binary
+   alongside the encrypted archive.
 
 3. **Install the new binary** — replace the old binary file.
 

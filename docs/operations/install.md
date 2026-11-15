@@ -132,6 +132,9 @@ refused directory or an unreachable database never echoes the database URL or
 its password.
 
 See [accounts.md](accounts.md) for account administration,
+[teams.md](teams.md) for teams and invitations,
+[repositories.md](repositories.md) for repository deletion and restore,
+[backup-restore.md](backup-restore.md) for encrypted backups,
 [upgrade.md](upgrade.md) for the upgrade runbook,
 [uninstall.md](uninstall.md) for removal, [tls.md](tls.md) for TLS setup,
 [audit-retention.md](audit-retention.md) for audit IP retention,
@@ -152,11 +155,12 @@ before any check runs. One such error: `storage_root` must be short enough (at m
 107-byte Unix socket path limit. The checks below are only reached when the configuration
 is valid.
 
-This runs nine read-only checks:
+This runs ten read-only checks:
 
 - **git** — verifies Git ≥ 2.40 is available
 - **storage** — checks the storage root exists, is a writable directory, is not a symlink, is not world-writable, and every subdirectory (`repositories/`, `tmp/`, `trash/`, `orphans/`) that already exists is a real writable directory
 - **disk** — reports free space on the filesystem holding the storage root; warns below 10% free or below twice `git_push_limit_bytes`. It does not see PostgreSQL's disk: monitor that separately, because a full database disk leaves `doctor` and `/health/ready` reporting ok while writes fail (see [db-disk-full](../verification/db-disk-full.md))
+- **email** — reports whether SMTP is configured. With no `smtp_host` it says delivery is disabled; with one it checks that `smtp_from` is a valid address, that the credential file is configured and readable (or names `-` on stdin, which `doctor` cannot verify without consuming it), and warns when `smtp_tls` does not match the port (`implicit` expects 465; `starttls` and `none` do not). It opens no socket and sends no mail
 - **database** — connects to PostgreSQL and verifies connectivity
 - **schema** — compares applied migrations against the binary; detects pending, failed, or tampered migrations
 - **lifecycle** — warns about repositories stuck in `creating` or `deleting` past the reconcile grace period (the reconciler retries them)
@@ -164,10 +168,10 @@ This runs nine read-only checks:
 - **outbox** — warns when an outbox delivery is `dead` (names `jobs requeue`, see [outbox.md](outbox.md)); warns when a registered consumer has no handler; otherwise reports the pending, delivering and delivered counts
 - **housekeeping** — warns when an active repository has never run housekeeping or is more than two `housekeeping_interval_seconds` overdue (the scheduler has stopped), or when a repository's last run failed or was deferred; reports ok when housekeeping is disabled by configuration
 
-A tenth **base backfill** check appears only when a pull request's base could not
-be reconstructed because its target branch was deleted before the upgrade; it is
-a warning naming the affected requests. A clean install therefore prints
-`9 checks`, and an installation with recorded skips prints `10 checks`.
+An eleventh **base backfill** check appears only when a pull request's base could
+not be reconstructed because its target branch was deleted before the upgrade;
+it is a warning naming the affected requests. A clean install therefore prints
+`10 checks`, and an installation with recorded skips prints `11 checks`.
 
 When the database cannot be reached the `schema`, `lifecycle`, `jobs`, `outbox`
 and `housekeeping` checks are skipped (`skip <name>: database unavailable`) rather than counted
@@ -182,11 +186,12 @@ The last line prints a summary: `N checks, F failed, W warnings, S skipped`.
 ok   git: 2.50
 ok   storage: /data/githearth/repositories writable
 ok   disk: 47.82 GiB free
+ok   email: not configured (smtp_host is empty); no mail is sent
 ok   database: connected
 ok   schema: latest v51
 ok   lifecycle: no stuck repositories
 ok   jobs: no dead, late or stuck jobs
 ok   outbox: 0 pending, 0 delivering, 0 delivered delivery(ies)
 ok   housekeeping: repositories are up to date
-9 checks, 0 failed, 0 warnings, 0 skipped
+10 checks, 0 failed, 0 warnings, 0 skipped
 ```

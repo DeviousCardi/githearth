@@ -1,6 +1,6 @@
 # Audit IP retention
 
-The `githearth audit` subcommands let you manage IP retention in the
+The `githearth-server audit` subcommands let you manage IP retention in the
 tamper-evident audit log.  Events created since migration 0022 carry a per-row
 HMAC digest of the client IP instead of hashing the raw IP into the chain.
 The raw IP stays in the row (`client_ip` column) so operators can look it up
@@ -23,7 +23,9 @@ database still exists:
 
 If your backup retention is longer than your IP retention window, prune and
 drop on the live database will not remove the IPs or keys from the backups.
-Set backup retention to match your IP retention requirements.
+The M4.1 archive is encrypted, so an attacker also needs its key, but the
+values are still present inside every retained archive. Set backup retention to
+match your IP retention requirements.
 
 ## Suggested order
 
@@ -40,7 +42,7 @@ first, then the keys can be dropped.
 
 ## Commands
 
-### `githearth audit prune-ips --older-than <DAYS> [--dry-run]`
+### `githearth-server audit prune-ips --older-than <DAYS> [--dry-run]`
 
 Sets `client_ip = NULL` on rows that have a digest, are older than DAYS, and
 still have a raw IP.  Rows without a digest (legacy v1/v2) are never touched
@@ -52,7 +54,7 @@ because the trigger refuses to change them.
 - `--dry-run` prints the same counts without writing.
 - DAYS must be >= 1.
 
-### `githearth audit rotate-ip-key [--dry-run]`
+### `githearth-server audit rotate-ip-key [--dry-run]`
 
 Inserts a new key row with 32 random bytes.  New events will use this key
 because `current_or_new_ip_key` picks the most recent `audit_ip_keys` row.
@@ -60,7 +62,7 @@ because `current_or_new_ip_key` picks the most recent `audit_ip_keys` row.
 - Prints the new key id, never the key bytes.
 - `--dry-run` prints the id it would create without writing.
 
-### `githearth audit drop-ip-keys --older-than <DAYS> [--dry-run]`
+### `githearth-server audit drop-ip-keys --older-than <DAYS> [--dry-run]`
 
 Deletes key rows older than DAYS, with two safeguards:
 
@@ -81,9 +83,9 @@ were skipped because they are still in use.
 ```
 # Run daily at 03:00 UTC: prune IPs older than 90 days, rotate the key monthly,
 # and drop keys older than 90 days that are no longer in use.
-0 3 * * * /usr/local/bin/githearth --config /etc/githearth/config.toml audit prune-ips --older-than 90
-0 3 1 * * /usr/local/bin/githearth --config /etc/githearth/config.toml audit rotate-ip-key
-0 3 * * * /usr/local/bin/githearth --config /etc/githearth/config.toml audit drop-ip-keys --older-than 90
+0 3 * * * /usr/local/bin/githearth-server --config /etc/githearth/config.toml audit prune-ips --older-than 90
+0 3 1 * * /usr/local/bin/githearth-server --config /etc/githearth/config.toml audit rotate-ip-key
+0 3 * * * /usr/local/bin/githearth-server --config /etc/githearth/config.toml audit drop-ip-keys --older-than 90
 ```
 
 ### systemd timer
@@ -103,7 +105,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/githearth --config /etc/githearth/config.toml audit prune-ips --older-than 90
+ExecStart=/usr/local/bin/githearth-server --config /etc/githearth/config.toml audit prune-ips --older-than 90
 User=githearth
 ```
 
@@ -130,7 +132,7 @@ After pruning and dropping keys, verify the audit chain is still intact:
 curl -H "Authorization: Bearer <token>" https://<host>/api/v1/organizations/<slug>/audit/verify
 
 # Or check the site chain directly (only with database access):
-psql -c "..."   # or run githearth migrate first, then verify from the application
+psql -c "..."   # or run githearth-server migrate first, then verify from the application
 ```
 
 The chain hashes never contained the raw IP (only `key_id || digest` for v3

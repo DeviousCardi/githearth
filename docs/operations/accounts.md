@@ -154,3 +154,10 @@ transaction as the change (`account.created`, `account.disabled`,
 account id and, where applicable, how many sessions, access tokens, SSH keys
 and reset codes were revoked — never a password, a reset code or a password
 hash.
+
+## Related
+
+- [Teams and invitations](teams.md): adding an account to a team or an
+  organization by invitation; an invitation only accepts a verified address.
+- [Email](email.md): verifying an address and the `email` doctor check.
+- [Repository restore](repositories.md): the `--actor` account a restore names.
