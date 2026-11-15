@@ -279,36 +279,42 @@ async fn backoff_bounds() {
 
     enqueue_test(&pool, "test.backoff", "bo-1", None).await;
 
-    // Wait for the first attempt, then read `not_before` straight away: the
-    // handler asked for 10 s plus at most 25% jitter, so the next attempt must
-    // be scheduled between 5 and 20 seconds from now. This catches a delay
-    // written in the wrong unit, which "it ran again" cannot.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let attempt: i32 =
-            sqlx::query_scalar("SELECT COALESCE(attempt, 0) FROM jobs WHERE dedupe_key = 'bo-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        if attempt >= 1 {
-            break;
+    // Wait for the first attempt to have been *settled*, not merely started:
+    // `attempt >= 1` is already true while the job is `running`, before
+    // `apply_outcome` writes `not_before`, so reading the row on that condition
+    // races the runner under load. The first row back in `pending` is the one
+    // `apply_outcome` wrote for the first attempt: the handler asked for 10 s
+    // plus at most 25% jitter, so it must be scheduled between 5 and 20 seconds
+    // from now, which catches a delay in the wrong unit.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let waited: (bool, String) = loop {
+        let row: Option<(bool, String, i32)> = sqlx::query_as(
+            "SELECT not_before BETWEEN now() + interval '5 seconds' \
+                                   AND now() + interval '20 seconds', \
+                    state, COALESCE(attempt, 0) \
+             FROM jobs WHERE dedupe_key = 'bo-1'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        // `attempt >= 1` alone is true while the job is `running`, before
+        // `apply_outcome` writes `not_before`; before the first claim it is
+        // still 0 in `pending` with the enqueue time. Both together are the
+        // first attempt settled back to `pending` (the claim moves them into
+        // `running` and `attempt + 1` in one statement).
+        if let Some((in_window, state_col, attempt)) = row
+            && attempt >= 1
+            && state_col == "pending"
+        {
+            break (in_window, state_col);
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "the job never made its first attempt"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let (in_window, state_col): (bool, String) = sqlx::query_as(
-        "SELECT not_before BETWEEN now() + interval '5 seconds' \
-                              AND now() + interval '20 seconds', state \
-         FROM jobs WHERE dedupe_key = 'bo-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(in_window, "the retry delay is not the requested seconds");
-    assert_eq!(state_col, "pending", "a retry returns the job to pending");
+    };
+    assert!(waited.0, "the retry delay is not the requested seconds");
     shutdown.cancel();
     let _ = h.await;
 

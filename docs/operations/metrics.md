@@ -110,7 +110,7 @@ refused by the acceptance test: `outcome="completed"` is published on
 | `state` (`githearth_jobs`) | `pending`, `running`, `done`, `dead` |
 | `state` (`githearth_jobs_by_kind`) | `pending`, `running` |
 | `state` (`githearth_outbox_events`) | `undelivered`, `delivered` |
-| `kind` | `codeowners.request_reviews`, `notification.pull_request_merged`, `notification.pull_request_reviewed`, `notification.pull_request_review_requested`, `repository.housekeeping`, `other` |
+| `kind` | `codeowners.request_reviews`, `notification.outbox`, `notification.pull_request_merged`, `notification.pull_request_reviewed`, `notification.pull_request_review_requested`, `repository.housekeeping`, `other` |
 
 `OTHER` on `method` and `status`, and `other` on `reason` and `kind`, are
 deliberate buckets: a method token the list does not name lands in `OTHER`

@@ -183,13 +183,17 @@ What changes:
   for the undelivered scan. The `audit_events` sequence is per chain (one per
   organization plus the site chain), so a cutover watermark is one value per
   chain, not one value.
-- A `consumers` table holds each consumer's name, start position and event
-  filter. A consumer registered after the cutover starts at its registration
-  position and receives nothing older; an upgrade writes one watermark per
-  chain, so nothing from before the upgrade is delivered.
-- A per-consumer delivery row records attempts, next attempt and completion, so
-  `delivered_at` on the event means "the fan-out committed", not "every
-  consumer succeeded".
+- A `consumers` table holds each consumer's name, job kind, attempt budget and
+  event filter, and one position row per chain records its start position. A
+  consumer registered after the cutover starts at its registration position and
+  receives nothing older; an upgrade writes one watermark per chain, so nothing
+  from before the upgrade is delivered. A chain created after a consumer
+  registers has no position row and is delivered from its own first event.
+- A per-consumer delivery row records attempts, next attempt time and state
+  (`pending`, `delivering`, `delivered`, `dead`), so `delivered_at` on the event
+  means "the fan-out committed", not "every consumer succeeded". The job key is
+  deterministic per `(event, consumer)`, `outbox-deliver:<event>:<consumer>`, so
+  two consumers sharing a job kind cannot absorb each other's job.
 - The retry budget is a per-enqueue parameter, and the outbox delivery job
   uses a budget that spans hours. The relay enqueues one job per
   `(event, consumer)` with the delivery row's `max_attempts` (default 30) and
@@ -204,6 +208,24 @@ What changes:
   prevent another consumer from receiving the same event.
 - The relay filters by event kind; session events are not fanned out to every
   consumer at scale.
+- The three pre-M4.1 notification job kinds stay registered for one release so
+  a job queued by the previous release drains after an upgrade. Nothing enqueues
+  them any more: the outbox event is the only input to a notification.
+- A consumer must have a handler. `outbox::register` refuses one with no job
+  kind, so every delivery is enqueued as a job that can run and the event's
+  `delivered_at` always has a consumer that can reach it. The schema keeps
+  `job_kind` nullable for a consumer that never runs a handler (an audit-only
+  record), but registering one is refused: that would be an unbounded queue
+  nothing drains, and it would hold `delivered_at` for every future event. The
+  notification keys are the source rows the events name (the merge intent's
+  `operation_id`, the `review_id`, the `request_id`), not the event id, because
+  one source row can produce more than one event (a replayed journal entry) and
+  the handler must write one notification for it. This holds for every row this
+  release writes, **not** for rows a pre-`0050` release wrote: those keep the
+  audit event id in `notifications.event_id`, are not backfilled, and their
+  uniqueness is still one notification per event, not per source row. Two
+  releases of a merge can therefore still notify twice for a replay that
+  happened before the upgrade. A backfill is a follow-up, not part of U12.
 
 A defect found while building M4.1 is recorded here as a requirement: the
 `Retry` outcome's reschedule used a PostgreSQL `make_interval(millis => …)`

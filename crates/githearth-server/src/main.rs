@@ -75,6 +75,31 @@ enum Command {
         #[arg(long)]
         repository: uuid::Uuid,
     },
+    /// Durable job operations (ADR 0006).
+    Jobs {
+        #[command(subcommand)]
+        action: JobsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobsCommand {
+    /// Re-enqueue outbox deliveries that exhausted their budget (state
+    /// `dead`) under a new job key, using the delivery row's own attempt
+    /// budget. Without filters, every dead delivery is requeued.
+    Requeue {
+        /// Only this consumer (for example `notification.outbox`).
+        #[arg(long)]
+        consumer: Option<String>,
+        /// Only this delivery's job key, as `doctor` or `jobs list` shows it.
+        #[arg(long)]
+        job_key: Option<String>,
+        /// Report what would be requeued and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List dead deliveries, which `jobs requeue` recovers.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -210,10 +235,16 @@ async fn run(args: Args) -> Result<()> {
             }
             let _reconciler = reconcile::spawn(state.clone());
             let _merge_worker = githearth_server::merge_worker::spawn(state.clone());
+            // The outbox consumers are registered before the relay starts, so
+            // every event the relay sees has a registration position.
+            if let Err(error) = githearth_server::outbox::register_builtin(&state).await {
+                tracing::warn!(error = %error, "outbox consumer registration failed; will retry on the next start");
+            }
             // Handlers are registered by their owners (ADR 0006).
             let jobs_shutdown = tokio_util::sync::CancellationToken::new();
             let mut registry = jobs::Registry::new();
             githearth_server::notifications::register(&mut registry);
+            registry.mark_outbox_delivery(githearth_server::notifications::OUTBOX_JOB_KIND);
             githearth_server::codeowners::register(&mut registry);
             githearth_server::housekeeping::register(&mut registry, &config);
             // `/metrics` labels a job only by a kind this runner registered, so
@@ -221,6 +252,7 @@ async fn run(args: Args) -> Result<()> {
             // binary.
             state.record_job_kinds(&registry.kinds());
             let _housekeeping = githearth_server::housekeeping::spawn(state.clone());
+            let _outbox = githearth_server::outbox::spawn(state.clone(), jobs_shutdown.clone());
             let jobs = jobs::spawn(state.clone(), registry, jobs_shutdown.clone());
             let _ssh = if config.ssh_enabled {
                 ssh::load_host_key(&config.ssh_host_key_path)?;
@@ -330,6 +362,64 @@ async fn run(args: Args) -> Result<()> {
                 }
                 for id in &result.skipped_in_use {
                     println!("skipped key still in use (id: {id})");
+                }
+            }
+        },
+        Command::Jobs { action } => match action {
+            JobsCommand::Requeue {
+                consumer,
+                job_key,
+                dry_run,
+            } => {
+                let results = githearth_server::outbox::requeue(
+                    &pool,
+                    consumer.as_deref(),
+                    job_key.as_deref(),
+                    dry_run,
+                )
+                .await?;
+                let prefix = if dry_run {
+                    "DRY RUN: would requeue"
+                } else {
+                    "requeued"
+                };
+                let mut done = 0;
+                for (delivery_id, event_id, outcome) in &results {
+                    match outcome {
+                        githearth_server::outbox::RequeueOutcome::Requeued { job_key, .. } => {
+                            done += 1;
+                            println!(
+                                "{prefix} delivery {delivery_id} (event {event_id}) as job key {job_key}"
+                            );
+                        }
+                        githearth_server::outbox::RequeueOutcome::Skipped(reason) => {
+                            println!("skipped delivery {delivery_id} (event {event_id}): {reason}");
+                        }
+                    }
+                }
+                if dry_run {
+                    println!("would requeue {done} dead delivery(ies)");
+                } else {
+                    println!("requeued {done} dead delivery(ies)");
+                }
+            }
+            JobsCommand::List => {
+                let rows: Vec<(uuid::Uuid, String, String, Option<String>, i32, i32)> =
+                    sqlx::query_as(
+                        "SELECT d.id, c.name, d.job_key, d.last_error, d.attempts, d.max_attempts \
+                         FROM outbox_deliveries d JOIN outbox_consumers c ON c.id = d.consumer_id \
+                         WHERE d.state = 'dead' ORDER BY d.chain, d.seq, c.name",
+                    )
+                    .fetch_all(&pool)
+                    .await?;
+                if rows.is_empty() {
+                    println!("no dead deliveries");
+                }
+                for (id, consumer, key, error, attempts, max) in rows {
+                    println!(
+                        "{id}  {consumer}  key={key}  attempts={attempts}/{max}  error={}",
+                        error.as_deref().unwrap_or("-")
+                    );
                 }
             }
         },

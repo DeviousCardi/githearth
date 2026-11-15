@@ -32,6 +32,7 @@ mod mergeability;
 pub mod metrics;
 pub mod notifications;
 mod notifications_ui;
+pub mod outbox;
 pub mod pins;
 pub mod protection;
 pub mod pulls;

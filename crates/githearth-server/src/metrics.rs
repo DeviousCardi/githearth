@@ -70,8 +70,9 @@ const OUTCOMES: [&str; 5] = ["succeeded", "refused", "deferred", "skipped", "fai
 /// label set is fixed by the binary rather than by the database. It is checked
 /// against the registry by `serve_registers_only_published_kinds`;
 /// `src/main.rs` passes the registry's own list at start-up.
-pub const JOB_KINDS: [&str; 5] = [
+pub const JOB_KINDS: [&str; 6] = [
     "codeowners.request_reviews",
+    "notification.outbox",
     "notification.pull_request_merged",
     "notification.pull_request_reviewed",
     "notification.pull_request_review_requested",
