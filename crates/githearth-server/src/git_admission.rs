@@ -584,13 +584,14 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
+        let config = crate::config::Config {
+            storage_root: root,
+            database_url: "postgres://localhost/unused".into(),
+            ..crate::config::Config::default()
+        };
         AppState {
             pool,
-            config: crate::config::Config {
-                storage_root: root,
-                database_url: "postgres://localhost/unused".into(),
-                ..crate::config::Config::default()
-            },
+            config,
             auth_slots: Arc::new(tokio::sync::Semaphore::new(10)),
             git_slots: Arc::new(tokio::sync::Semaphore::new(10)),
             housekeeping_slots: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -600,6 +601,8 @@ mod tests {
             hook_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             hook_socket_path: std::path::PathBuf::from("/nonexistent/hook.sock"),
             trusted_proxies: Vec::new(),
+            recorder: None,
+            job_kinds: None,
         }
     }
 

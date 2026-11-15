@@ -94,6 +94,16 @@ pub struct Config {
     /// Length of the sliding sign-in window in seconds.
     #[serde(default = "default_login_throttle_window_seconds")]
     pub login_throttle_window_seconds: u64,
+    /// Answer `GET /metrics` (M4.1 U14). Off by default: until an operator asks
+    /// for it the handler refuses every scrape, loopback or not.
+    #[serde(default)]
+    pub metrics_enabled: bool,
+    /// Answer `GET /metrics` to a client that is not loopback after all. The
+    /// default refusal is a `404`; turning this on exposes the scrape to every
+    /// client that can reach the listener, so prefer proxying a scrape to a
+    /// loopback address.
+    #[serde(default)]
+    pub metrics_allow_non_loopback: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -137,6 +147,8 @@ impl Default for Config {
             login_throttle_max_per_username: default_login_throttle_max_per_username(),
             login_throttle_max_per_client: default_login_throttle_max_per_client(),
             login_throttle_window_seconds: default_login_throttle_window_seconds(),
+            metrics_enabled: false,
+            metrics_allow_non_loopback: false,
         }
     }
 }
@@ -317,6 +329,11 @@ impl Config {
             login_throttle_window_seconds,
             "GITHEARTH_LOGIN_THROTTLE_WINDOW_SECONDS"
         );
+        env!(metrics_enabled, "GITHEARTH_METRICS_ENABLED");
+        env!(
+            metrics_allow_non_loopback,
+            "GITHEARTH_METRICS_ALLOW_NON_LOOPBACK"
+        );
         env!(housekeeping_enabled, "GITHEARTH_HOUSEKEEPING_ENABLED");
         env!(
             housekeeping_interval_seconds,
@@ -445,6 +462,15 @@ impl Config {
                     "trusted_proxies: invalid entry \"{entry}\"; expected IP address or CIDR range"
                 );
             }
+        }
+        // Exposing the metrics endpoint to every client is a decision, so a
+        // setting that does nothing without it is refused rather than silently
+        // ignored.
+        if self.metrics_allow_non_loopback && !self.metrics_enabled {
+            bail!(
+                "metrics_allow_non_loopback requires metrics_enabled = true; \
+                 the metrics endpoint is off"
+            );
         }
         Ok(())
     }
@@ -590,6 +616,63 @@ mod tests {
         c.login_throttle_window_seconds = 1;
         c.login_throttle_max_per_client = 1;
         assert!(c.validate().is_ok(), "the smallest bounds are accepted");
+    }
+
+    #[test]
+    fn metrics_are_off_by_default_and_the_override_needs_them_on() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        };
+        assert!(!c.metrics_enabled, "the endpoint is off by default");
+        assert!(!c.metrics_allow_non_loopback, "and loopback-only when on");
+        assert!(c.validate().is_ok());
+        c.metrics_enabled = true;
+        assert!(c.validate().is_ok(), "loopback-only needs nothing else");
+        // The override without the endpoint is a setting that does nothing.
+        c.metrics_enabled = false;
+        c.metrics_allow_non_loopback = true;
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("metrics_allow_non_loopback"), "{error}");
+        c.metrics_enabled = true;
+        assert!(c.validate().is_ok());
+    }
+
+    /// The shipped example must not trap an operator: every commented setting
+    /// it suggests, uncommented as written (with the preconditions its comment
+    /// states), has to load. `metrics_allow_non_loopback` is the one that was
+    /// shipped as `false` under an invariant that refused it.
+    #[test]
+    fn the_example_file_suggests_only_values_the_validator_accepts() {
+        const EXAMPLE: &str = include_str!("../../../githearth.example.toml");
+        // The metrics block, as an operator would uncomment it line by line.
+        let metrics: Vec<&str> = EXAMPLE
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('#'))
+            .map(str::trim)
+            .filter(|line| line.starts_with("metrics_"))
+            .collect();
+        assert!(
+            metrics.iter().any(|l| l.starts_with("metrics_enabled = ")),
+            "the example no longer shows metrics_enabled: {metrics:?}"
+        );
+        let toml = metrics.join("\n");
+        assert!(
+            !toml.contains("metrics_allow_non_loopback = false"),
+            "the example ships the flag as false, which the validator refuses"
+        );
+        // The block as written, the way an operator uncomments it.
+        let mut config: Config = toml::from_str(&toml)
+            .unwrap_or_else(|e| panic!("the example's metrics settings do not parse: {e}"));
+        config.database_url = "postgres://localhost/test".into();
+        assert!(
+            config.validate().is_ok(),
+            "uncommenting the example's metrics block does not load"
+        );
+        assert!(
+            config.metrics_enabled && config.metrics_allow_non_loopback,
+            "the example's block was not the override with the endpoint on: {toml}"
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ struct Registered {
 }
 
 pub struct Registry {
-    handlers: HashMap<String, Registered>,
+    handlers: HashMap<&'static str, Registered>,
 }
 
 impl Registry {
@@ -48,10 +48,13 @@ impl Registry {
         }
     }
 
-    /// Registers a handler under the generic `job_timeout_seconds`.
-    pub fn register(&mut self, kind: &str, handler: Handler) {
+    /// Registers a handler under the generic `job_timeout_seconds`. The kind is
+    /// a `&'static str` (every caller passes a literal) because `/metrics`
+    /// publishes one series per registered kind: the set must be fixed at build
+    /// time, never by a value read from the database.
+    pub fn register(&mut self, kind: &'static str, handler: Handler) {
         self.handlers.insert(
-            kind.to_string(),
+            kind,
             Registered {
                 handler,
                 budget: None,
@@ -61,14 +64,23 @@ impl Registry {
 
     /// Registers a handler with its own run budget. The claim lease is twice
     /// the budget, so a lease can never expire while its handler is running.
-    pub fn register_with_budget(&mut self, kind: &str, handler: Handler, budget: Duration) {
+    pub fn register_with_budget(&mut self, kind: &'static str, handler: Handler, budget: Duration) {
         self.handlers.insert(
-            kind.to_string(),
+            kind,
             Registered {
                 handler,
                 budget: Some(budget),
             },
         );
+    }
+
+    /// The registered kinds, sorted, for `githearth_jobs_by_kind`. The label set
+    /// is what this binary registers plus `other`, never what the database
+    /// happens to hold.
+    pub fn kinds(&self) -> Vec<&'static str> {
+        let mut kinds: Vec<&'static str> = self.handlers.keys().copied().collect();
+        kinds.sort_unstable();
+        kinds
     }
 
     fn get(&self, kind: &str) -> Option<&Handler> {
@@ -86,13 +98,13 @@ impl Registry {
     /// Per-kind claim lease in seconds. A lease is twice the budget, so
     /// `recover_leases` never reclaims a job whose handler is still inside a
     /// bounded step.
-    fn leases(&self) -> HashMap<String, f64> {
+    fn leases(&self) -> HashMap<&'static str, f64> {
         self.handlers
             .iter()
             .filter_map(|(kind, registered)| {
                 registered
                     .budget
-                    .map(|budget| (kind.clone(), (budget * 2).as_secs_f64()))
+                    .map(|budget| (*kind, (budget * 2).as_secs_f64()))
             })
             .collect()
     }
@@ -187,7 +199,7 @@ async fn claim_one(
     state: &AppState,
     holder: Uuid,
     default_lease_secs: f64,
-    leases: &HashMap<String, f64>,
+    leases: &HashMap<&'static str, f64>,
 ) -> Option<RunnerClaim> {
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -210,7 +222,10 @@ async fn claim_one(
             return None;
         }
     };
-    let lease_secs = leases.get(&kind).copied().unwrap_or(default_lease_secs);
+    let lease_secs = leases
+        .get(kind.as_str())
+        .copied()
+        .unwrap_or(default_lease_secs);
     let row = sqlx::query(
         "UPDATE jobs SET state = 'running', attempt = attempt + 1, lease_holder = $1, \
          lease_expires_at = now() + $2 * interval '1 second', updated_at = now() \

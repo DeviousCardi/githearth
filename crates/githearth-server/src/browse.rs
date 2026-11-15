@@ -706,6 +706,8 @@ mod tests {
             hook_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             hook_socket_path: std::path::PathBuf::from("/nonexistent/hook.sock"),
             trusted_proxies: Vec::new(),
+            recorder: None,
+            job_kinds: None,
         };
         let error = git_read(&state, repo_id, |_, _| -> Result<Vec<u8>, StorageError> {
             panic!("worker panic")

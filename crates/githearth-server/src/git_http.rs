@@ -81,19 +81,22 @@ async fn info_refs(
     };
 
     let repo_id = match want {
-        git_admission::Want::Fetch => {
-            git_admission::admit_fetch(&state, &headers, &org, repo_name)
-                .await
-                .map_err(|e| GitHttpError::Auth(e.0, e.1))?
-                .id
-        }
-        git_admission::Want::Push => {
-            git_admission::admit(&state, &headers, &org, repo_name, want)
-                .await
-                .map_err(|e| GitHttpError::Auth(e.0, e.1))?
-                .repository
-                .id
-        }
+        git_admission::Want::Fetch => git_admission::admit_fetch(&state, &headers, &org, repo_name)
+            .await
+            .inspect(|_| record_admission(&state, Ok(())))
+            .map(|r| r.id)
+            .map_err(|e| {
+                record_admission(&state, Err(e.1));
+                GitHttpError::Auth(e.0, e.1)
+            })?,
+        git_admission::Want::Push => git_admission::admit(&state, &headers, &org, repo_name, want)
+            .await
+            .inspect(|_| record_admission(&state, Ok(())))
+            .map(|a| a.repository.id)
+            .map_err(|e| {
+                record_admission(&state, Err(e.1));
+                GitHttpError::Auth(e.0, e.1)
+            })?,
     };
 
     let permit = acquire_git_permit(&state).await?;
@@ -191,7 +194,11 @@ async fn upload_pack(
 
     let repo_row = git_admission::admit_fetch(&state, &headers, &org, repo_name)
         .await
-        .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
+        .inspect(|_| record_admission(&state, Ok(())))
+        .map_err(|e| {
+            record_admission(&state, Err(e.1));
+            GitHttpError::Auth(e.0, e.1)
+        })?;
     let repo_id = repo_row.id;
 
     let permit = acquire_git_permit(&state).await?;
@@ -354,7 +361,11 @@ async fn receive_pack(
     let admitted =
         git_admission::admit(&state, &headers, &org, repo_name, git_admission::Want::Push)
             .await
-            .map_err(|e| GitHttpError::Auth(e.0, e.1))?;
+            .inspect(|_| record_admission(&state, Ok(())))
+            .map_err(|e| {
+                record_admission(&state, Err(e.1));
+                GitHttpError::Auth(e.0, e.1)
+            })?;
 
     let permit = acquire_git_permit(&state).await?;
     // Per-repository lock BEFORE any pool connection (see reconcile.rs lock
@@ -748,6 +759,16 @@ async fn handle_hook_connection(mut stream: tokio::net::UnixStream, state: AppSt
     })
     .await;
 
+    // Count every ref-update decision by its outcome only. The reason text is
+    // deliberately not a label here: it can name a ref or an object id.
+    if let Some(recorder) = &state.recorder {
+        let outcome = match &decision {
+            Ok(Ok(())) => "succeeded",
+            Ok(Err(_)) => "refused",
+            Err(_) => "failed",
+        };
+        recorder.push_admission(outcome);
+    }
     let response = match decision {
         Ok(Ok(())) => "OK\n".to_owned(),
         Ok(Err(reason)) => format!("DENIED {reason}\n"),
@@ -755,6 +776,17 @@ async fn handle_hook_connection(mut stream: tokio::net::UnixStream, state: AppSt
     };
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
+}
+
+/// Counts one Git admission decision, labelling a refusal by its reason
+/// category (never by its message).
+fn record_admission(state: &AppState, outcome: Result<(), &'static str>) {
+    if let Some(recorder) = &state.recorder {
+        match outcome {
+            Ok(()) => recorder.admission(true, "none"),
+            Err(message) => recorder.admission(false, crate::metrics::admission_reason(message)),
+        }
+    }
 }
 
 /// Parse the ref-update lines after the leading token line.
