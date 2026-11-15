@@ -69,6 +69,29 @@ auth_concurrency = 2
 # is accepted only together with `metrics_enabled = true` above (on its own it
 # is refused at load, because it would do nothing).
 # metrics_allow_non_loopback = true
+# Outbound request client (ADR 0014 section 7, case U30c). Every HTTP request
+# the server itself makes -- OIDC discovery, external action sources, webhooks,
+# mirrors, importers -- goes through this one client. The allowlist is empty by
+# default, so nothing is callable until an operator names the destination; an
+# unlisted host is refused. Loopback, link-local, private-range and
+# cloud-metadata answers are refused too. `outbound_allow_private` opens the
+# private ranges for internal services; metadata endpoints need their own
+# `outbound_allow_metadata`, so opening an internal network never exposes cloud
+# credentials. A redirect to a different host is always refused; a same-host
+# redirect is followed up to the limit and may not change the scheme. The DNS
+# answer is checked and then pinned for the connection, so a changed answer
+# cannot redirect it. Every allow and refusal is recorded with its reason.
+# Entries are `host`, `host:port` or `*.domain` (subdomains only, not the apex).
+# A host without a port covers only the standard ports 80 and 443; name another
+# port explicitly. An IP literal is refused: every destination is a DNS name.
+# A loopback SMTP relay also needs `outbound_allow_private = true` below.
+# outbound_allowlist = ["api.example.com", "*.hooks.example.com"]
+# outbound_allow_private = false
+# outbound_allow_metadata = false
+# outbound_timeout_seconds = 30          # whole request, DNS, redirects and body
+# outbound_max_response_bytes = 5242880  # 5 MiB
+# outbound_max_request_bytes = 1048576   # 1 MiB
+# outbound_max_redirects = 5             # same-host hops; 0 refuses all redirects
 # Outbound email (docs/operations/email.md). Disabled while smtp_host is empty.
 # The verification link and notification mail are queued durably; when SMTP is
 # configured they are delivered from the outbox consumer, never from a request.

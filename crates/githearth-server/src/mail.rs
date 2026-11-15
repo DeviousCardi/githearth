@@ -175,6 +175,7 @@ pub fn transport_from_config(config: &Config) -> anyhow::Result<Arc<dyn MailTran
         from: config.smtp_from.clone(),
         username: config.smtp_username.clone(),
         password,
+        allow_private: config.outbound_allow_private,
     }))
 }
 
@@ -191,6 +192,10 @@ pub struct SmtpTransport {
     from: String,
     username: Option<String>,
     password: Option<String>,
+    /// The installation-wide private-range opt-in. The connect uses the same
+    /// address policy as the outbound HTTP client, so a metadata endpoint is
+    /// never contacted and loopback/private answers need this switch.
+    allow_private: bool,
 }
 
 impl std::fmt::Debug for SmtpTransport {
@@ -217,6 +222,7 @@ impl MailTransport for SmtpTransport {
                 from: self.from.clone(),
                 username: self.username.clone(),
                 password: self.password.clone(),
+                allow_private: self.allow_private,
             };
             tokio::task::spawn_blocking(move || send_blocking(&settings, &message))
                 .await
@@ -233,10 +239,25 @@ struct Settings {
     from: String,
     username: Option<String>,
     password: Option<String>,
+    allow_private: bool,
 }
 
 fn send_blocking(settings: &Settings, message: &EmailMessage) -> Result<(), MailError> {
-    let tcp = TcpStream::connect((settings.host.as_str(), settings.port))
+    // SMTP is not HTTP, so it cannot use the outbound client's transport, but
+    // it uses the same resolution and address policy: resolve once, refuse a
+    // metadata answer (and a private one without the opt-in), then connect to
+    // the returned address. The name is never handed to the socket layer.
+    let address = crate::outbound::resolve_operator_destination(
+        &settings.host,
+        settings.port,
+        settings.allow_private,
+    )
+    .map_err(|reason| {
+        tracing::warn!(target: "outbound", %reason, "SMTP destination refused");
+        MailError::Connect
+    })?;
+    // outbound-exempt: SMTP connects to the one address the shared policy checked and pinned
+    let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(30))
         .map_err(|_| MailError::Connect)?;
     tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
@@ -506,6 +527,7 @@ mod tests {
             from: "githearth@example.com".into(),
             username: Some("githearth".into()),
             password: Some("smtp-credential-must-not-appear".into()),
+            allow_private: false,
         };
         let debug = format!("{transport:?}");
         assert!(
@@ -564,6 +586,7 @@ mod tests {
             from: "githearth@example.com".into(),
             username: None,
             password: None,
+            allow_private: false,
         };
         let id = Uuid::new_v4();
         let message = EmailMessage {

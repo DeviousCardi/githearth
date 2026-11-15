@@ -447,6 +447,7 @@ fn extract_token(message: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn http_request(url: &str, method: &str, token: Option<&str>, body: Option<&str>) -> (u16, String) {
+    // outbound-exempt: test-only client of the test server's own socket
     let mut command = Command::new("curl");
     command.args([
         "-sS",

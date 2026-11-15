@@ -27,6 +27,21 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 
+# No second HTTP client: the server's egress policy is only as strong as the one
+# client that enforces it (ADR 0014 §7, case U30c). It is not part of the
+# per-increment gate, but an added dependency fails a release check.
+[[bans.deny]]
+name = "reqwest"
+
+[[bans.deny]]
+name = "ureq"
+
+[[bans.deny]]
+name = "isahc"
+
+[[bans.deny]]
+name = "curl"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

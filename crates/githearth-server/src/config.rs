@@ -127,6 +127,36 @@ pub struct Config {
     /// loopback address.
     #[serde(default)]
     pub metrics_allow_non_loopback: bool,
+    /// Destinations the server's one outbound client may call (ADR 0014 §7,
+    /// case U30c). An entry is `host`, `host:port` or `*.domain`; a host-only
+    /// entry covers only the standard ports 80 and 443. Empty by default, so
+    /// the server calls nothing until an operator names it. An IP-literal entry
+    /// is refused: every destination is a DNS name.
+    #[serde(default)]
+    pub outbound_allowlist: Vec<String>,
+    /// Permit loopback, link-local and private-range answers. Off by default.
+    /// Cloud-metadata endpoints stay refused even when this is on; they have
+    /// their own option so opening an internal network never exposes cloud
+    /// credentials. SMTP uses the same option for its operator-configured
+    /// relay, so a loopback development relay needs this on.
+    #[serde(default)]
+    pub outbound_allow_private: bool,
+    /// Permit the known cloud-metadata endpoints by address. Off by default.
+    #[serde(default)]
+    pub outbound_allow_metadata: bool,
+    /// Whole-request budget in seconds, covering DNS, every redirect and the
+    /// body read.
+    #[serde(default = "default_outbound_timeout_seconds")]
+    pub outbound_timeout_seconds: u64,
+    /// Largest response body the outbound client will read.
+    #[serde(default = "default_outbound_max_response_bytes")]
+    pub outbound_max_response_bytes: usize,
+    /// Largest request body the outbound client will send.
+    #[serde(default = "default_outbound_max_request_bytes")]
+    pub outbound_max_request_bytes: usize,
+    /// Same-host redirects followed before the request is refused.
+    #[serde(default = "default_outbound_max_redirects")]
+    pub outbound_max_redirects: usize,
     /// Outbound SMTP host. Empty (the default) disables email delivery; the
     /// verification link and notifications then queue and retry, but no socket
     /// is opened. See docs/operations/email.md.
@@ -263,6 +293,13 @@ impl Default for Config {
             login_throttle_delay_max_ms: default_login_throttle_delay_max_ms(),
             metrics_enabled: false,
             metrics_allow_non_loopback: false,
+            outbound_allowlist: Vec::new(),
+            outbound_allow_private: false,
+            outbound_allow_metadata: false,
+            outbound_timeout_seconds: default_outbound_timeout_seconds(),
+            outbound_max_response_bytes: default_outbound_max_response_bytes(),
+            outbound_max_request_bytes: default_outbound_max_request_bytes(),
+            outbound_max_redirects: default_outbound_max_redirects(),
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_tls: SmtpTls::Starttls,
@@ -355,6 +392,18 @@ fn default_login_throttle_delay_max_ms() -> u64 {
 }
 fn default_secure_cookies() -> bool {
     true
+}
+fn default_outbound_timeout_seconds() -> u64 {
+    30
+}
+fn default_outbound_max_response_bytes() -> usize {
+    5_242_880
+}
+fn default_outbound_max_request_bytes() -> usize {
+    1_048_576
+}
+fn default_outbound_max_redirects() -> usize {
+    5
 }
 fn default_ssh_bind() -> SocketAddr {
     "127.0.0.1:2222".parse().unwrap()
@@ -547,6 +596,28 @@ impl Config {
             metrics_allow_non_loopback,
             "GITHEARTH_METRICS_ALLOW_NON_LOOPBACK"
         );
+        if let Ok(value) = std::env::var("GITHEARTH_OUTBOUND_ALLOWLIST") {
+            c.outbound_allowlist = value
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        env!(outbound_allow_private, "GITHEARTH_OUTBOUND_ALLOW_PRIVATE");
+        env!(outbound_allow_metadata, "GITHEARTH_OUTBOUND_ALLOW_METADATA");
+        env!(
+            outbound_timeout_seconds,
+            "GITHEARTH_OUTBOUND_TIMEOUT_SECONDS"
+        );
+        env!(
+            outbound_max_response_bytes,
+            "GITHEARTH_OUTBOUND_MAX_RESPONSE_BYTES"
+        );
+        env!(
+            outbound_max_request_bytes,
+            "GITHEARTH_OUTBOUND_MAX_REQUEST_BYTES"
+        );
+        env!(outbound_max_redirects, "GITHEARTH_OUTBOUND_MAX_REDIRECTS");
         env!(smtp_host, "GITHEARTH_SMTP_HOST");
         env!(smtp_port, "GITHEARTH_SMTP_PORT");
         env!(smtp_tls, "GITHEARTH_SMTP_TLS");
@@ -770,6 +841,22 @@ impl Config {
                 "metrics_allow_non_loopback requires metrics_enabled = true; \
                  the metrics endpoint is off"
             );
+        }
+        if !(1..=300).contains(&self.outbound_timeout_seconds) {
+            bail!("outbound_timeout_seconds must be between 1 and 300");
+        }
+        if !(1024..=67_108_864).contains(&self.outbound_max_response_bytes) {
+            bail!("outbound_max_response_bytes must be between 1024 and 67108864 bytes");
+        }
+        if !(1024..=16_777_216).contains(&self.outbound_max_request_bytes) {
+            bail!("outbound_max_request_bytes must be between 1024 and 16777216 bytes");
+        }
+        if self.outbound_max_redirects > 10 {
+            bail!("outbound_max_redirects must be between 0 and 10");
+        }
+        for entry in &self.outbound_allowlist {
+            crate::outbound::validate_allowlist_entry(entry)
+                .map_err(|reason| anyhow::anyhow!("outbound_allowlist: {reason}"))?;
         }
         if self.public_url.len() > 2048
             || !(self.public_url.starts_with("http://") || self.public_url.starts_with("https://"))
@@ -1045,6 +1132,86 @@ mod tests {
         c.login_throttle_delay_base_ms = 100;
         c.login_throttle_delay_max_ms = 100;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn outbound_client_limits_and_allowlist_are_validated() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        };
+        // The published defaults: nothing is callable until an operator names
+        // it; 30 s, 5 MiB response, 1 MiB request, 5 redirects.
+        assert!(c.outbound_allowlist.is_empty());
+        assert!(!c.outbound_allow_private);
+        assert!(!c.outbound_allow_metadata);
+        assert_eq!(c.outbound_timeout_seconds, 30);
+        assert_eq!(c.outbound_max_response_bytes, 5_242_880);
+        assert_eq!(c.outbound_max_request_bytes, 1_048_576);
+        assert_eq!(c.outbound_max_redirects, 5);
+        assert!(c.validate().is_ok(), "an empty allowlist is a valid config");
+
+        for bad in [0, 301] {
+            c.outbound_timeout_seconds = bad;
+            assert!(c.validate().is_err(), "timeout {bad} must be refused");
+        }
+        c.outbound_timeout_seconds = 30;
+        for bad in [0, 1023, 67_108_865] {
+            c.outbound_max_response_bytes = bad;
+            assert!(
+                c.validate().is_err(),
+                "response bound {bad} must be refused"
+            );
+        }
+        c.outbound_max_response_bytes = 5_242_880;
+        c.outbound_max_request_bytes = 1023;
+        assert!(c.validate().is_err());
+        c.outbound_max_request_bytes = 1_048_576;
+        c.outbound_max_redirects = 11;
+        assert!(c.validate().is_err());
+        c.outbound_max_redirects = 0;
+        assert!(c.validate().is_ok(), "zero redirects is a valid policy");
+
+        c.outbound_allowlist = vec!["api.example.com".into(), "*.hooks.example.com".into()];
+        assert!(c.validate().is_ok());
+        for bad in [
+            "https://api.example.com".to_owned(),
+            "api.example.com/path".to_owned(),
+            "api example.com".to_owned(),
+            "*.*.example.com".to_owned(),
+        ] {
+            c.outbound_allowlist = vec![bad.clone()];
+            assert!(c.validate().is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// The shipped example's outbound block, uncommented as written, must load.
+    #[test]
+    fn the_example_file_suggests_only_outbound_values_the_validator_accepts() {
+        const EXAMPLE: &str = include_str!("../../../githearth.example.toml");
+        let outbound: Vec<&str> = EXAMPLE
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('#'))
+            .map(str::trim)
+            .filter(|line| line.starts_with("outbound_"))
+            .collect();
+        assert!(
+            outbound
+                .iter()
+                .any(|line| line.starts_with("outbound_allowlist = ")),
+            "the example no longer shows the allowlist: {outbound:?}"
+        );
+        let toml = outbound.join("\n");
+        let mut config: Config = toml::from_str(&toml)
+            .unwrap_or_else(|e| panic!("the example's outbound settings do not parse: {e}"));
+        config.database_url = "postgres://localhost/test".into();
+        assert!(
+            config.validate().is_ok(),
+            "uncommenting the example's outbound block does not load"
+        );
+        assert!(!config.outbound_allow_private);
+        assert!(!config.outbound_allow_metadata);
+        assert_eq!(config.outbound_timeout_seconds, 30);
     }
 
     #[test]
