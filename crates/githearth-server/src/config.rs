@@ -27,6 +27,16 @@ pub struct Config {
     pub git_request_limit_bytes: usize,
     pub git_push_limit_bytes: usize,
     pub repository_quota_bytes: u64,
+    /// Per-organization byte limit across the object store. `0` disables it,
+    /// matching `repository_quota_bytes`. Objects are charged to the
+    /// organization that owns their tenant prefix, and the bytes of an open
+    /// multipart upload count until the upload is completed or swept.
+    #[serde(default)]
+    pub organization_quota_bytes: u64,
+    /// How long a multipart upload may sit without activity before the
+    /// reconciler removes it, in seconds (ADR 0014 §1).
+    #[serde(default = "default_object_upload_deadline_seconds")]
+    pub object_upload_deadline_seconds: u64,
     /// Path of the binary the Git hooks `exec`; empty means the current executable.
     #[serde(default)]
     pub hook_program: PathBuf,
@@ -201,6 +211,8 @@ impl Default for Config {
             git_request_limit_bytes: 10_485_760,
             git_push_limit_bytes: 1_073_741_824,
             repository_quota_bytes: 0,
+            organization_quota_bytes: 0,
+            object_upload_deadline_seconds: default_object_upload_deadline_seconds(),
             hook_program: PathBuf::new(),
             secure_cookies: true,
             ssh_enabled: false,
@@ -251,6 +263,9 @@ fn default_backup_directory() -> PathBuf {
 }
 fn default_maintenance_drain_timeout_seconds() -> u64 {
     300
+}
+fn default_object_upload_deadline_seconds() -> u64 {
+    86_400
 }
 fn default_login_throttle_max_per_username() -> u64 {
     5
@@ -384,6 +399,14 @@ impl Config {
         env!(git_request_limit_bytes, "GITHEARTH_GIT_REQUEST_LIMIT_BYTES");
         env!(git_push_limit_bytes, "GITHEARTH_GIT_PUSH_LIMIT_BYTES");
         env!(repository_quota_bytes, "GITHEARTH_REPOSITORY_QUOTA_BYTES");
+        env!(
+            organization_quota_bytes,
+            "GITHEARTH_ORGANIZATION_QUOTA_BYTES"
+        );
+        env!(
+            object_upload_deadline_seconds,
+            "GITHEARTH_OBJECT_UPLOAD_DEADLINE_SECONDS"
+        );
         env!(ssh_enabled, "GITHEARTH_SSH_ENABLED");
         if std::env::var("GITHEARTH_SSH_BIND")
             .ok()
@@ -565,6 +588,9 @@ impl Config {
             || !(1024..=10737418240).contains(&self.git_push_limit_bytes)
             || (self.repository_quota_bytes != 0
                 && !(1_048_576..=1_099_511_627_776).contains(&self.repository_quota_bytes))
+            || (self.organization_quota_bytes != 0
+                && !(1_048_576..=1_099_511_627_776).contains(&self.organization_quota_bytes))
+            || !(60..=2_592_000).contains(&self.object_upload_deadline_seconds)
             || !(1..=64).contains(&self.job_concurrency)
             || !(1..=3600).contains(&self.job_timeout_seconds)
             || !(50..=60000).contains(&self.job_poll_interval_ms)
@@ -592,7 +618,7 @@ impl Config {
             || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, login throttle delay base 1..60000ms and max 1..600000ms (max >= base), backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, organization quota bytes 0 or 1MiB..1TiB, object upload deadline 60..2592000s, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, login throttle delay base 1..60000ms and max 1..600000ms (max >= base), backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -772,6 +798,29 @@ mod tests {
         invalid.housekeeping_max_live_set_bytes = 1 << 26;
         invalid.housekeeping_pin_retention_days = 0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn object_store_limits_default_to_unlimited_and_a_day_and_are_bounded() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        };
+        assert_eq!(c.organization_quota_bytes, 0, "unlimited by default");
+        assert_eq!(c.object_upload_deadline_seconds, 86_400, "one day");
+        assert!(c.validate().is_ok());
+        c.organization_quota_bytes = 1;
+        assert!(c.validate().is_err(), "a sub-1MiB quota is refused");
+        c.organization_quota_bytes = 1_048_576;
+        assert!(c.validate().is_ok());
+        c.object_upload_deadline_seconds = 59;
+        assert!(c.validate().is_err());
+        c.object_upload_deadline_seconds = 60;
+        assert!(c.validate().is_ok());
+        c.object_upload_deadline_seconds = 2_592_000;
+        assert!(c.validate().is_ok());
+        c.object_upload_deadline_seconds = 2_592_001;
+        assert!(c.validate().is_err());
     }
 
     #[test]

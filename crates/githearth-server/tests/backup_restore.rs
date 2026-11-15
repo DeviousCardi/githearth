@@ -5,6 +5,9 @@
 //! create and drop each case's scratch database, and to ask whether a restore
 //! left a destination database behind; assertions about repositories, metadata
 //! and keys go through the API, Git or the restored files.
+use githearth_git::object_store::{
+    ByteRange, FsObjectStore, ObjectKey, ObjectStore, ObjectStoreError, TenantId,
+};
 use serde_json::Value;
 use std::{
     fs,
@@ -1151,6 +1154,142 @@ fn restore_reproduces_repositories_metadata_keys_and_relationships() {
     assert!(
         !both(&output).contains(PASSWORD) && !both(&output).contains("reproduce-passphrase"),
         "the restore output contains a secret"
+    );
+}
+
+/// U24: an object written through the interface survives restart and
+/// `backup` → `restore` into a fresh installation; a ranged read and an
+/// appended log are correct after the restart; a corrupted object is refused.
+#[test]
+fn objects_survive_restart_and_backup_restore_and_corruption_is_refused() {
+    let installation = Installation::new("objects");
+    installation.setup();
+    // `serve` normally creates the storage root's repository directories on
+    // first start; this case uses the object store only, so open the same
+    // layout the server would.
+    githearth_git::layout::Storage::open(installation.storage()).unwrap();
+    let tenant = TenantId::new(Uuid::new_v4());
+    let artifact = ObjectKey::parse("ci/artifacts/release.bin").unwrap();
+    let log = ObjectKey::parse("ci/logs/run-1.log").unwrap();
+    let mut data = vec![7u8; githearth_git::object_store::CHUNK_BYTES];
+    data.extend_from_slice(b"tail-after-the-boundary");
+    let boundary = githearth_git::object_store::CHUNK_BYTES as u64;
+    let range = ByteRange::new(boundary - 4, boundary + 4).unwrap();
+    let expected_range = data[(boundary - 4) as usize..=(boundary + 4) as usize].to_vec();
+    let object_root = installation.storage().join("objects");
+
+    {
+        let store = FsObjectStore::open(&object_root).unwrap();
+        store.put(tenant, &artifact, &data).unwrap();
+        store.create_appendable(tenant, &log).unwrap();
+        store.append(tenant, &log, b"first line\n").unwrap();
+        store.append(tenant, &log, b"second line\n").unwrap();
+        assert_eq!(
+            store.get(tenant, &artifact, Some(range)).unwrap(),
+            expected_range
+        );
+    }
+
+    // Restart: a fresh handle over the same files, then append again.
+    {
+        let store = FsObjectStore::open(&object_root).unwrap();
+        assert_eq!(store.get(tenant, &artifact, None).unwrap(), data);
+        assert_eq!(
+            store.get(tenant, &artifact, Some(range)).unwrap(),
+            expected_range
+        );
+        assert_eq!(
+            store.get(tenant, &log, None).unwrap(),
+            b"first line\nsecond line\n"
+        );
+        store.append(tenant, &log, b"third line\n").unwrap();
+    }
+
+    // A crash between the payload and sidecar writes leaves an orphan. It must
+    // not fail the backup; the tar still carries its bytes (M3).
+    let orphan = ObjectKey::parse("ci/artifacts/orphan.bin").unwrap();
+    {
+        let store = FsObjectStore::open(&object_root).unwrap();
+        store
+            .put(tenant, &orphan, b"uncommitted orphan bytes")
+            .unwrap();
+    }
+    let orphan_meta = object_root
+        .join("meta")
+        .join(tenant.as_uuid().simple().to_string())
+        .join("ci/artifacts/orphan.bin.json");
+    fs::remove_file(&orphan_meta).unwrap();
+
+    let key = key_file(&installation.path, "objects.key", "objects-passphrase");
+    let archive = installation.path.join("objects.ghbackup");
+    let output = installation.backup(&archive, &key);
+    assert!(output.status.success(), "{}", both(&output));
+    // The manifest carries every object's key, checksum and size; the archive
+    // is not only a blind tar of the storage root.
+    let (manifest_root, _) = open_archive(&archive, "objects-passphrase");
+    let manifest = githearth_server::backup::read_manifest(&manifest_root).unwrap();
+    assert_eq!(manifest.objects.len(), 2);
+    assert!(
+        manifest
+            .objects
+            .iter()
+            .any(|record| record.key == artifact.as_str())
+    );
+    assert!(
+        manifest
+            .objects
+            .iter()
+            .any(|record| record.key == log.as_str())
+    );
+
+    let mut destination = Installation::reserve("objects-dest");
+    let restored_storage = destination.path.join("restored-storage");
+    let restored_config = destination.path.join("restored-config.toml");
+    destination.database.created = true;
+    let output = run(restore_command(
+        &restored_config,
+        &archive,
+        &destination.database.url,
+        &restored_storage,
+        &destination.path.join("restored-ssh-host-key"),
+        Some(&key),
+    ));
+    assert!(output.status.success(), "restore: {}", both(&output));
+
+    let restored = FsObjectStore::open(restored_storage.join("objects")).unwrap();
+    assert_eq!(
+        restored.get(tenant, &artifact, None).unwrap(),
+        data,
+        "the object must survive backup and restore"
+    );
+    assert_eq!(
+        restored.get(tenant, &artifact, Some(range)).unwrap(),
+        expected_range
+    );
+    assert_eq!(
+        restored.get(tenant, &log, None).unwrap(),
+        b"first line\nsecond line\nthird line\n",
+        "an appended log must survive backup and restore"
+    );
+    // The orphan's bytes travelled in the archive but it is not part of the
+    // manifest or the inventory; verification reports it without failing.
+    assert_eq!(restored.inventory().unwrap().len(), 2);
+    let problems = restored.verify_all().unwrap();
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert_eq!(
+        problems[0].kind,
+        githearth_git::object_store::ObjectProblemKind::Orphan
+    );
+
+    // Damage the restored payload; a read must refuse it, not return bytes.
+    let path = restored.data_path(tenant, &artifact);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] ^= 0xff;
+    fs::write(&path, &bytes).unwrap();
+    let error = restored.get(tenant, &artifact, None).unwrap_err();
+    assert!(
+        matches!(error, ObjectStoreError::ChecksumMismatch { .. }),
+        "{error}"
     );
 }
 

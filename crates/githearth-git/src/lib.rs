@@ -5,6 +5,7 @@ pub mod journal;
 pub mod layout;
 pub mod maintenance;
 pub mod merge;
+pub mod object_store;
 pub mod signature;
 pub mod suggestion;
 

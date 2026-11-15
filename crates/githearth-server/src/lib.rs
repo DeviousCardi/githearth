@@ -92,6 +92,28 @@ use uuid::Uuid;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Opens `<storage_root>/objects` with the configured deadline and quota.
+async fn open_object_store(
+    storage_root: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<Arc<dyn githearth_git::object_store::ObjectStore + Send + Sync>> {
+    let root = storage_root.join("objects");
+    let deadline = std::time::Duration::from_secs(config.object_upload_deadline_seconds);
+    let quota = config.organization_quota_bytes;
+    let store = tokio::task::spawn_blocking(move || {
+        githearth_git::object_store::FsObjectStore::open_with(
+            root,
+            githearth_git::object_store::ObjectStoreOptions {
+                upload_deadline: deadline,
+                quota_bytes: quota,
+                ..githearth_git::object_store::ObjectStoreOptions::default()
+            },
+        )
+    })
+    .await??;
+    Ok(Arc::new(store))
+}
+
 tokio::task_local! {
     static ADMITTED_TOKEN: (Vec<u8>, Account, u64);
     // Work spawned onto other tasks (tokio::spawn, job runner, push replay)
@@ -113,6 +135,9 @@ pub struct AppState {
     dummy_hash: Arc<String>,
     pub authz: Arc<Engine>,
     pub storage: Arc<githearth_git::layout::Storage>,
+    /// The S3-shaped object store every large-object feature uses. Its root is
+    /// `<storage_root>/objects`, so the storage backup carries it.
+    pub objects: Arc<dyn githearth_git::object_store::ObjectStore + Send + Sync>,
     // pub so the disconnect integration test can assert the token is released.
     pub hook_tokens: Arc<std::sync::Mutex<HashMap<String, git_admission::Admitted>>>,
     pub(crate) hook_socket_path: std::path::PathBuf,
@@ -198,6 +223,8 @@ impl AppState {
         })
         .await??;
 
+        let objects = open_object_store(&config.storage_root, &config).await?;
+
         // The hook scripts exec the server binary so the hooks talk to this
         // process's admission socket; tests point this at the real binary.
         let hook_program = if config.hook_program.as_os_str().is_empty() {
@@ -262,6 +289,7 @@ impl AppState {
             dummy_hash: Arc::new(dummy_hash),
             authz: Arc::new(Engine::new()?),
             storage: Arc::new(storage),
+            objects,
             hook_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hook_socket_path: socket_path,
             trusted_proxies,

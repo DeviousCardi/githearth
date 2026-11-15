@@ -52,6 +52,7 @@ pub struct Summary {
     pub tmp_cleaned: usize,
     pub trash_purged: usize,
     pub push_credentials_purged: usize,
+    pub uploads_cleaned: usize,
     pub errors: usize,
 }
 
@@ -65,6 +66,7 @@ impl Summary {
             || self.tmp_cleaned > 0
             || self.trash_purged > 0
             || self.push_credentials_purged > 0
+            || self.uploads_cleaned > 0
             || self.errors > 0
     }
 }
@@ -287,6 +289,35 @@ pub async fn reconcile_once(
     if purged > 0 {
         tracing::info!(purged, "push credential retention swept rows");
     }
+
+    // ---- abandoned object uploads ------------------------------------------
+    // A multipart upload's deadline comes from
+    // `object_upload_deadline_seconds`; the pass is the durable sweep, so a
+    // restart finishes the cleanup rather than waiting for a new request.
+    let objects = state.objects.clone();
+    let cleaned = tokio::task::spawn_blocking(move || {
+        objects.cleanup_abandoned(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("upload cleanup task panicked: {error}"))??;
+    summary.uploads_cleaned = cleaned.len();
+    if !cleaned.is_empty() {
+        tracing::info!(
+            cleaned = cleaned.len(),
+            "reconciler removed abandoned object uploads"
+        );
+    }
+    // The quota counter is a cache; one scan per pass repairs any drift a
+    // crash left behind. Writes read the counter, never the whole tenant.
+    let objects = state.objects.clone();
+    tokio::task::spawn_blocking(move || objects.reconcile_usage())
+        .await
+        .map_err(|error| anyhow::anyhow!("usage reconciliation task panicked: {error}"))??;
 
     Ok(summary)
 }
@@ -723,6 +754,7 @@ async fn run_pass(state: &AppState, attempts: &mut HashMap<Uuid, u32>) {
                     tmp_cleaned = summary.tmp_cleaned,
                     trash_purged = summary.trash_purged,
                     push_credentials_purged = summary.push_credentials_purged,
+                    uploads_cleaned = summary.uploads_cleaned,
                     errors = summary.errors,
                     "reconciler pass complete"
                 );

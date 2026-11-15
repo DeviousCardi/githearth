@@ -22,6 +22,7 @@ use aes_gcm::{
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use githearth_git::object_store::{FsObjectStore, ObjectProblemKind, ObjectRecord, ObjectStore};
 use githearth_git::{journal, layout::Storage};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,10 @@ use std::{
 use uuid::Uuid;
 
 const MAGIC: &str = "GITHEARTH-BACKUP1";
-const FORMAT_VERSION: u32 = 1;
+/// Version 2 added the required object manifest. Version 1 archives are still
+/// read (they predate objects); this binary only writes 2.
+const FORMAT_VERSION: u32 = 2;
+const MIN_FORMAT_VERSION: u32 = 1;
 const CHUNK_BYTES: usize = 1 << 20;
 const CIPHER: &str = "AES-256-GCM";
 const KDF: &str = "Argon2id-v19";
@@ -112,6 +116,10 @@ pub struct Manifest {
     pub fence: FenceRecord,
     pub postgres: PostgresPosition,
     pub repositories: Vec<RepositoryPosition>,
+    /// Every stored object's key, checksum and size (ADR 0014 §1). Empty for
+    /// an archive taken before the object store existed.
+    #[serde(default)]
+    pub objects: Vec<ObjectRecord>,
     pub config: ConfigPart,
     pub ssh_host_key: Option<Part>,
     pub parts: Vec<Part>,
@@ -339,9 +347,9 @@ pub fn decrypt_file(input: &Path, output: &Path, passphrase: &[u8]) -> Result<Ar
     read_line_limited(&mut reader, &mut header_text)?;
     let header: ArchiveHeader = serde_json::from_str(&header_text)
         .map_err(|_| ArchiveError::Corrupt("the unencrypted header is not valid JSON".into()))?;
-    if header.format_version != FORMAT_VERSION {
+    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&header.format_version) {
         return Err(ArchiveError::Corrupt(format!(
-            "unsupported archive format version {} (this binary reads {FORMAT_VERSION})",
+            "unsupported archive format version {} (this binary reads {MIN_FORMAT_VERSION}..={FORMAT_VERSION})",
             header.format_version
         ))
         .into());
@@ -985,12 +993,15 @@ pub fn read_manifest(directory: &Path) -> Result<Manifest> {
         .map_err(|_| ArchiveError::Corrupt("manifest.json is missing".into()))?;
     let manifest: Manifest = serde_json::from_str(&text)
         .map_err(|_| ArchiveError::Corrupt("manifest.json is not valid JSON".into()))?;
-    if manifest.format_version != FORMAT_VERSION {
+    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&manifest.format_version) {
         return Err(ArchiveError::Corrupt(format!(
-            "unsupported manifest format version {} (this binary reads {FORMAT_VERSION})",
+            "unsupported manifest format version {} (this binary reads {MIN_FORMAT_VERSION}..={FORMAT_VERSION})",
             manifest.format_version
         ))
         .into());
+    }
+    if manifest.format_version < 2 && !manifest.objects.is_empty() {
+        return Err(ArchiveError::Corrupt("a pre-2 manifest cannot carry objects".into()).into());
     }
     Ok(manifest)
 }
@@ -1100,12 +1111,24 @@ async fn build_backup(
     // writer during the tar would otherwise produce an archive whose
     // `storage.tar` and manifest disagree, discovered only at restore.
     let before_snapshot = repository_positions(config, pool).await?;
+    let objects_before = object_positions(config)?;
     create_tar(
         &staging.join("storage.tar"),
         &config.storage_root,
-        &["./run", "./tmp", "./hooks"],
+        &[
+            "./run",
+            "./tmp",
+            "./hooks",
+            "./objects/tmp",
+            "./objects/locks",
+            // Derived or ephemeral: rebuilt after a restore, and an upload is
+            // not part of a published object set.
+            "./objects/usage",
+            "./objects/uploads",
+        ],
     )?;
     let after_snapshot = repository_positions(config, pool).await?;
+    let objects_after = object_positions(config)?;
     if before_snapshot != after_snapshot {
         let changed = before_snapshot
             .iter()
@@ -1118,7 +1141,14 @@ async fn build_backup(
              publish an inconsistent backup"
         );
     }
+    if objects_before != objects_after {
+        bail!(
+            "object store inventory changed during the storage snapshot; refusing to publish an \
+             inconsistent backup"
+        );
+    }
     let repositories = after_snapshot;
+    let objects = objects_after;
 
     // The effective configuration is the one this backup was taken under.
     let config_text = toml::to_string(config)?;
@@ -1180,6 +1210,7 @@ async fn build_backup(
         },
         postgres,
         repositories,
+        objects,
         config: config_part,
         ssh_host_key: host_key_part,
         parts,
@@ -1271,6 +1302,7 @@ fn verify_written_archive(archive: &Path, passphrase: &[u8], staging: &Path) -> 
     let storage_dir = verify.join("storage");
     extract_tar(&root.join("storage.tar"), &storage_dir)?;
     let storage = Storage::open_existing(&storage_dir)?;
+    verify_objects(&storage_dir, &manifest.objects)?;
     let (_, problems) = storage.check()?;
     if let Some(first) = problems.first() {
         bail!(
@@ -1322,6 +1354,79 @@ async fn repository_positions(config: &Config, pool: &PgPool) -> Result<Vec<Repo
         });
     }
     Ok(positions)
+}
+
+/// Every object the installation stores, or an empty list when the object
+/// store has never been opened (a fresh install before M4.2's first write).
+fn object_positions(config: &Config) -> Result<Vec<ObjectRecord>> {
+    let root = config.storage_root.join("objects");
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let store = FsObjectStore::open_existing(&root)?;
+    Ok(store.inventory()?)
+}
+
+/// Verifies a storage snapshot's object store against the manifest: every
+/// object's recorded checksum and chunk table, then exact inventory equality.
+fn verify_objects(storage_root: &Path, expected: &[ObjectRecord]) -> Result<()> {
+    let root = storage_root.join("objects");
+    if !root.is_dir() {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        return Err(ArchiveError::Corrupt(format!(
+            "the archive's manifest lists {} object(s) but the storage snapshot has no object store",
+            expected.len()
+        ))
+        .into());
+    }
+    let store = FsObjectStore::open_existing(&root)?;
+    let problems = store.verify_all()?;
+    // An orphan (a payload without a sidecar, or a sidecar without a payload)
+    // is crash residue, not damage to a committed object. It is carried inside
+    // the archive's tar so an operator can repair it, but it is not part of
+    // the manifest or of the exact inventory comparison (ADR 0014, "Crash
+    // consistency").
+    if let Some(first) = problems
+        .iter()
+        .find(|problem| problem.kind == ObjectProblemKind::Corrupt)
+    {
+        let corrupt = problems
+            .iter()
+            .filter(|problem| problem.kind == ObjectProblemKind::Corrupt)
+            .count();
+        bail!(
+            "the archive's object store fails verification: {corrupt} problem(s); first: {}: {}",
+            first.key,
+            first.message
+        );
+    }
+    let actual = store.inventory()?;
+    if actual != expected {
+        let message = if actual.len() != expected.len() {
+            format!(
+                "the archive's manifest lists {} object(s) but the snapshot holds {}",
+                expected.len(),
+                actual.len()
+            )
+        } else {
+            let first = expected
+                .iter()
+                .zip(&actual)
+                .find(|(expected, actual)| expected != actual)
+                .map(|(expected, actual)| {
+                    format!(
+                        "object {} ({} vs {})",
+                        expected.key, expected.sha256, actual.sha256
+                    )
+                })
+                .unwrap_or_else(|| "the object inventory".to_owned());
+            format!("the archive's object inventory disagrees with the manifest at {first}")
+        };
+        return Err(ArchiveError::Corrupt(message).into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1540,9 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
         let verification = verify_restored(&pool, &storage, &manifest).await;
         pool.close().await;
         verification?;
+        // Every object's recorded checksum, and the manifest's inventory,
+        // before the storage tree is published to the destination.
+        verify_objects(&staged_storage, &manifest.objects)?;
 
         publish_storage(&staged_storage, &destination_storage)?;
         storage_published = true;
@@ -1749,6 +1857,7 @@ mod tests {
                 dump_lsn: "0/0".into(),
             },
             repositories: Vec::new(),
+            objects: Vec::new(),
             config: ConfigPart {
                 source: None,
                 sha256: sha256_file(&staging.join("config.toml")).unwrap(),
