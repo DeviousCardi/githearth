@@ -65,8 +65,10 @@ affordance defects fixed in PR #165, and the journey found the missing clone
 URLs and cross-repo source label, also fixed. The exploratory sweep's low
 findings (non-400 extractor rejections, empty 405s, unbounded patterns) were
 fixed in the same PR. A transient `storage operation failed` merge 500 was seen
-once by two testers and could not be reproduced in dedicated retries; it is
-recorded as an observation.
+once — in the regression tester's first pass — and corroborated in the shared
+server log by the exploratory tester; it did not reproduce in dedicated retries
+or two further full passes, no code change was made for it, and it is recorded as
+an observation ([05](round-4/05-regression.md), O1).
 
 ### Round 2 by domain
 
@@ -140,8 +142,10 @@ All ten issues filed from this campaign (#150–#159) are fixed and verified:
 Historical note: the primary test database still holds 27 orphan
 `push_credentials` rows created by the pre-fix SSH build (21:19–21:24Z); the fix
 stops new orphans but does not backfill. The lab instance is disposable. A
-single `storage operation failed` merge 500 was observed once by two testers
-during round 4 and was not reproducible in dedicated retries.
+single `storage operation failed` merge 500 was observed once during round 4 — one
+occurrence, seen in the response by the regression tester and in the shared
+server log by the exploratory tester — and was not reproducible in dedicated
+retries; no fix was made.
 
 ## Reproducing
 

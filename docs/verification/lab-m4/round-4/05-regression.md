@@ -13,9 +13,10 @@ requests, merges, branch/tag protection, the new branch-settings page, the revie
 the comment redirect. The merge-auth ordering change did not break any legitimate merge or
 auto-merge path, and the reviewer UI left the JSON API behaviour and response shapes intact.
 
-One **transient** `500 storage operation failed` was seen once on a merge in the first pass
+One **unreproducible** `500 storage operation failed` was seen once on a merge in the first pass
 (observation O1); it did not reproduce in a dedicated 8/8 reproduction run, an immediate
-manual retry, or either of the two further full passes.
+manual retry, or either of the two further full passes. Recorded outcome: unreproducible, no
+code change made, and no data inconsistency left behind.
 
 ## Counts
 
@@ -88,16 +89,33 @@ None reproducible.
 
 ## Observations (non-blocking, no action required for M4 sign-off)
 
-**O1 — one transient 500 on a merge (first pass only).** During the first pass, merging
-`regr4ad#3` immediately after a change-request → approval cycle returned
+**O1 — one unreproducible 500 on a merge (first pass only).** **Outcome: unreproducible;
+no fix made.** This was one occurrence, not a defect class: it is recorded as an
+observation, the code was not changed for it, and no data inconsistency was left behind.
+
+What was observed: on `main` `cd7946b` (the round-4 build), during the first pass, merging
+`regr4ad#3` immediately after a change-request → approval cycle, `POST
+/api/v1/organizations/lab05/repositories/regr4ad/pulls/3/merge` returned
 `500 {"error":"storage operation failed"}` in 111 ms; the server logged
 `ERROR repository read failed category=git repository_id=1896c046… (regr4ad)` from
 `browse::map_storage_error` (`crates/githearth-server/src/browse.rs:179`). The same request
 succeeded on immediate retry (201, merged), and the identical sequence passed 8/8 targeted
-retries plus every subsequent run; it was the only 5xx logged across all passes.
-The log records only `category=git`, not the `StorageError` variant, so the cause cannot be
-pinned down after the fact — logging the error kind (without paths) would make a recurrence
-diagnosable. No data inconsistency was left behind (no intent row, ref unchanged).
+retries plus every subsequent run; it was the only 5xx logged across all passes. The
+exploratory tester saw the same single event in the shared server log at 09:43:42 UTC
+(`08-exploratory.md:238–242`): same repository, same 111 ms, same message. So the event has
+two observers and one occurrence.
+
+What cannot be established: the log records only `category=git` and the repository, not the
+`StorageError` variant or which read failed. On this path the candidates are the branch-tip
+reads for head and base (`pulls::branch_tip`) and the mergeability candidate build
+(`mergeability::check_method` → `git::build_candidate`); all map their errors through
+`browse::map_storage_error`, so the record cannot say which one failed or why. Logging the
+error kind (without paths) would make a recurrence diagnosable.
+
+What is excluded: the exploratory report's hypothesis that the repository was being deleted
+while the merge ran. The immediate retry merged on the same repository, and the suite has no
+repository-deletion case, so nothing in the pass was deleting `regr4ad`; a repository mid-deletion
+would not have accepted the retry merge. No other 5xx appeared in the window.
 
 **O2 — NUL handling differs by surface, by design.** A NUL in a browser path renders the
 styled 404 (G16), while a NUL repository name on `/api/v1` is rejected as

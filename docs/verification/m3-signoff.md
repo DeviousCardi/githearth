@@ -78,11 +78,47 @@ the merge; it does not build the candidate and run required checks on it. A
 check that passes on the source and fails only after the merge with the target
 can therefore authorize the merge.
 
+### The candidate-binding gap
+
+The gap is in which revision a merge decision is bound to. An intent records the
+source head, the expected target tip and a digest over the approvals and required
+checks taken at that source head (`merge_intents.rs:617`). The worker re-reads
+both refs and refuses the intent unless they still equal the recorded values
+(`merge.rs:370–383` for the target, `merge.rs:408–416` for the source), builds
+the merge candidate from exactly those two commits under the repository lock
+(`merge.rs:560–593`), and moves the ref with a compare-and-swap on the expected
+target (`merge.rs:637`). The content that is merged is therefore the candidate
+for the recorded target and head, and a moved target or source goes stale instead
+of merging something else.
+
+What is not bound is the **decision** to that candidate. The mergeability check
+that lets the merge through builds a candidate of its own at intent creation and
+keeps only the conflict verdict (`mergeability.rs:123–166`, called at
+`merge_intents.rs:643`); the candidate object id was not recorded at all in the
+build this error was seen on, and on `main` it is written later, by the worker
+(`merge.rs:614`, added after the round-4 build), while the approvals/checks
+digest is computed at the source head, never over the merged tree. A merge
+decision names the source and target revisions; it does not name the candidate
+commit it will produce or the tree the required checks ran against.
+
+The lab round-4 record is the operational face of this gap. One merge request
+failed `500 storage operation failed` on a git read, with no intent row left
+behind (`lab-m4/round-4/05-regression.md`, O1), and the log kept only
+`category=git` and the repository id, so neither the failed read nor the
+`StorageError` variant could be recovered; the same merge then succeeded on
+retry. Because the decision is bound to revisions and not to a candidate, that
+failure left no record of which candidate was under consideration or of what
+failed to build it. It is evidence for this gap, not a second defect in the merge
+path: the retry re-derived the same revisions and merged, and the target binding
+above was never wrong.
+
 This is a real gap against the promise, not a documentation ambiguity. The
 delivered behavior is retained and M3 remains signed off over it; the missing
-candidate test is scheduled as M6's "tested merge candidates" build item, with
-the exit case in the [two-person roadmap](../plan/08-two-person-roadmap.md#m6--isolated-ci).
-Until it ships, no document may repeat "the queue tests the candidate it merges".
+candidate test is scheduled as M6's "tested merge candidates" build item (M6
+increment 9C, exit case U39 in the
+[two-person roadmap](../plan/08-two-person-roadmap.md#phase-9--m6-isolated-ci)),
+which also owns the merge-error investigation. Until it ships, no document may
+repeat "the queue tests the candidate it merges".
 
 ## Sign-off
 
