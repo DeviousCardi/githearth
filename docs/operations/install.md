@@ -163,6 +163,8 @@ This runs eight read-only checks:
 - **jobs** — warns about dead jobs; warns about late pending jobs; fails when running jobs have an expired lease, meaning the runner isn't running
 - **housekeeping** — warns when an active repository has never run housekeeping or is more than two `housekeeping_interval_seconds` overdue (the scheduler has stopped), or when a repository's last run failed or was deferred; reports ok when housekeeping is disabled by configuration
 
+A ninth **base backfill** check appears only when a pull request's base could not be reconstructed because its target branch was deleted before the upgrade; it is a warning naming the affected requests, so an installation with recorded skips reports `9 checks`.
+
 When the database cannot be reached the `schema`, `lifecycle`, `jobs` and
 `housekeeping` checks are skipped (`skip <name>: database unavailable`) rather than counted
 as failures, so one outage counts as one failure, not three.
