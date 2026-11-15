@@ -86,6 +86,7 @@ actions! {
     RepositoryUnarchive => "repository.unarchive", sensitive,
     RepositoryDelete => "repository.delete", sensitive,
     RepositoryRestore => "repository.restore", sensitive,
+    RepositoryTransfer => "repository.transfer", sensitive,
     RefPush => "ref.push", routine,
     RefForcePush => "ref.force_push", sensitive,
     RefDelete => "ref.delete", sensitive,
@@ -142,6 +143,7 @@ impl Action {
             | RepositoryUnarchive
             | RepositoryDelete
             | RepositoryRestore
+            | RepositoryTransfer
             | IssueCreate
             | PullRequestCreate => Kind::Repository,
             RefPush | RefForcePush | RefDelete => Kind::Ref,

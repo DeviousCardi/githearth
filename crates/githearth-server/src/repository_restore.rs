@@ -170,10 +170,9 @@ pub async fn restore_repository(
 
         let mut tx = state.pool.begin().await?;
         // A transfer tombstone holds this path for its moved repository; a
-        // restore must not take the name back under it. (Before the transfer
-        // slice's `transferred_at` exists, the tombstone is a redirect whose
-        // target lives in another organization.)
-        if repositories::transfer_tombstone_holds_name(&mut tx, org_id, &repo.name).await? {
+        // restore must not take the name back under it, and must never resolve
+        // the name to the row in its new organization.
+        if repositories::path_moved_away(&mut tx, org_id, &repo.name).await? {
             tx.rollback().await?;
             return Err(name_taken());
         }

@@ -55,6 +55,8 @@ mod tag_protection_ui;
 pub mod teams;
 mod teams_ui;
 mod tokens;
+pub mod transfer;
+mod transfer_ui;
 pub mod ui;
 
 use anyhow::Context;
@@ -346,6 +348,8 @@ pub fn router(state: AppState) -> Router {
         // not appended as empty nested routers: axum 0.8 routes by path shape
         // and method, so each route below is registered like every other one.
         .merge(teams::router())
+        .merge(transfer::router())
+        .merge(transfer_ui::router())
         .merge(invitations::router())
         .merge(teams_ui::router())
         .merge(invitations_ui::router())

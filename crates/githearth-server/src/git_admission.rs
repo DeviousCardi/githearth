@@ -312,6 +312,14 @@ async fn authorize_fetch(
         }
     };
 
+    // ADR 0003: a `owner/name` a repository moved away from is gone, whatever
+    // the name now belongs to. Git answers it like a missing repository.
+    if repositories::path_moved_away(&mut conn, organization.id, repo_name)
+        .await
+        .map_err(unavailable)?
+    {
+        return Ok(FetchAuth::Denied);
+    }
     let repo = match repositories::find_by_name(&mut conn, organization.id, repo_name)
         .await
         .map_err(unavailable)?

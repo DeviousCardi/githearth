@@ -280,8 +280,11 @@ pub(crate) async fn create_fork(
                     {
                         Ok(r) => r,
                         Err(e) => {
+                            // 23505 is the name already being taken; `RowNotFound`
+                            // is a name a transfer has claimed or retired.
                             if e.as_database_error()
                                 .is_some_and(|d| d.code().as_deref() == Some("23505"))
+                                || matches!(e, sqlx::Error::RowNotFound)
                             {
                                 return Err(name_taken());
                             }

@@ -7,7 +7,7 @@ use axum::{
 use githearth_authz::{Action, Resource};
 use githearth_core::RepositoryStatus;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -21,6 +21,10 @@ fn not_found() -> ApiError {
 }
 fn org_not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found")
+}
+/// The address belonged to a repository that moved to another organization.
+pub(crate) fn moved_away() -> ApiError {
+    ApiError(StatusCode::GONE, "this repository has moved")
 }
 fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
@@ -114,6 +118,12 @@ pub(crate) async fn load_repo(
         .await?
         .ok_or_else(org_not_found)?;
 
+    // ADR 0003: an address a repository moved away from is `410 Gone` for
+    // every signed-in caller, before any fact about the repository is loaded, so
+    // a later reuse of the name can never make it resolve again.
+    if repositories::path_moved_away(&mut conn, org_id, name).await? {
+        return Err(moved_away());
+    }
     let Some(facts) = facts::load(&mut conn, actor_id, org_id).await? else {
         return Err(org_not_found());
     };
@@ -380,8 +390,11 @@ pub(crate) async fn create(
                     {
                         Ok(r) => r,
                         Err(e) => {
+                            // 23505 is the name already being taken; `RowNotFound`
+                            // is a name a transfer has just claimed at `org_id`.
                             if e.as_database_error()
                                 .is_some_and(|d| d.code().as_deref() == Some("23505"))
+                                || matches!(e, sqlx::Error::RowNotFound)
                             {
                                 return Err(name_taken());
                             }
@@ -542,6 +555,68 @@ pub(crate) async fn read(
     Ok(Json(RepositoryJson::from(&loaded.repo)))
 }
 
+/// Where a transfer target stands, relative to the source organization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetAccess {
+    /// The caller may create repositories in the target organization.
+    MayCreate,
+    /// A member of the target who lacks `repository.create`.
+    Denied,
+    /// Not a member at all: the target is reported exactly as a missing one.
+    Unknown,
+}
+
+/// Whether the caller may create in `target_org`, asked of the engine the same
+/// way the create and fork handlers ask it, including the in-transaction
+/// re-authorization every mutation does after locking.
+pub(crate) async fn target_access(
+    conn: &mut PgConnection,
+    state: &AppState,
+    actor: Uuid,
+    auth_age: u64,
+    target_org: Uuid,
+    in_transaction: bool,
+) -> Result<TargetAccess, ApiError> {
+    let facts = if in_transaction {
+        facts::load_in_transaction(conn, actor, target_org).await?
+    } else {
+        facts::load(conn, actor, target_org).await?
+    };
+    let Some(facts) = facts else {
+        return Ok(TargetAccess::Unknown);
+    };
+    let permitted = state
+        .authz
+        .authorize(&facts.request(
+            Action::RepositoryCreate,
+            Resource::Organization,
+            Some(Duration::from_secs(auth_age)),
+        ))
+        .is_allowed();
+    if permitted {
+        return Ok(TargetAccess::MayCreate);
+    }
+    // A member who lacks the grant is a refusal; a stranger to the target only
+    // learns that it does not exist, like every other organization endpoint.
+    if facts.account.organizations.contains(&target_org) {
+        Ok(TargetAccess::Denied)
+    } else {
+        Ok(TargetAccess::Unknown)
+    }
+}
+
+/// The refusal a target the caller may not create in gives. Both the outer
+/// check and the in-transaction re-check answer the same way.
+pub(crate) fn target_refusal(access: TargetAccess) -> ApiError {
+    match access {
+        // The route names the source repository: a stranger to the target must
+        // not be able to tell it apart from a missing source.
+        TargetAccess::MayCreate => not_found(),
+        TargetAccess::Denied => ApiError(StatusCode::FORBIDDEN, "not permitted"),
+        TargetAccess::Unknown => not_found(),
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateRepository {
@@ -599,7 +674,8 @@ pub(crate) async fn update(
                 match repositories::rename(&mut tx, loaded.repo.id, new_name).await {
                     Err(e)
                         if e.as_database_error()
-                            .is_some_and(|d| d.code().as_deref() == Some("23505")) =>
+                            .is_some_and(|d| d.code().as_deref() == Some("23505"))
+                            || matches!(e, sqlx::Error::RowNotFound) =>
                     {
                         return Err(name_taken());
                     }

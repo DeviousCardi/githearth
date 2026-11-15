@@ -379,6 +379,50 @@ pub(crate) fn not_found_page(username: Option<&str>) -> UiError {
     ))
 }
 
+/// `410 Gone` for an address a repository has moved away from (ADR 0003). The
+/// body says only that the address is gone — never where the repository went,
+/// and the same for a public and a private repository — so following an old
+/// link reveals nothing about the new home.
+pub(crate) fn moved_away_page(username: Option<&str>) -> UiError {
+    UiError(Box::new(
+        (
+            StatusCode::GONE,
+            Html(render_page(
+                "Repository moved",
+                username,
+                None,
+                false,
+                "<h1>This repository has moved</h1><p>This address no longer points at a repository. Look up the repository by its organization.</p>",
+            )),
+        )
+            .into_response(),
+    ))
+}
+
+/// Whether `owner/name` used to be a repository that has since moved to another
+/// organization. The repository page and its sub-pages answer `410` instead of
+/// resolving the name, so a redirected or reused name never reaches them.
+pub(crate) async fn path_moved_away(state: &AppState, slug: &str, name: &str) -> bool {
+    if !crate::valid_path_param(slug) || !crate::valid_path_param(name) {
+        return false;
+    }
+    let Ok(mut conn) = state.pool.acquire().await else {
+        return false;
+    };
+    let org_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(slug)
+        .fetch_optional(&mut *conn)
+        .await
+        .ok()
+        .flatten();
+    let Some(org_id) = org_id else {
+        return false;
+    };
+    repositories::path_moved_away(&mut conn, org_id, name)
+        .await
+        .unwrap_or(false)
+}
+
 /// Styled 404 for paths no router matched. Without this fallback axum answers
 /// with a bare, header-less 404 for unknown browse URLs.
 async fn fallback_page(
@@ -1421,6 +1465,13 @@ async fn repository(
     headers: HeaderMap,
     Path((slug, name)): Path<(String, String)>,
 ) -> Result<Response, UiError> {
+    if path_moved_away(&state, &slug, &name).await {
+        let username = browser_auth(&state, &headers)
+            .await
+            .ok()
+            .map(|(account, _)| account.username);
+        return Err(moved_away_page(username.as_deref()));
+    }
     let (repo, username, csrf, account_id, auth_age, is_admin) =
         match browser_auth(&state, &headers).await {
             Ok((account, auth_age)) => {
