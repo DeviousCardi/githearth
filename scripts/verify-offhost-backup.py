@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -74,6 +75,72 @@ class B28Harness(_m2.Harness):
         self._extra_containers = []
         self._inspector = None
         super().__init__(report_path)
+        self._use_short_root()
+
+    # ---- temporary directory ---------------------------------------------
+
+    def _use_short_root(self):
+        """Give the drill a short working directory on macOS.
+
+        macOS puts $TMPDIR under /var/folders/.../T/ (70 bytes here), so the
+        restored storage root becomes 87 bytes. `restore` rewrites the
+        configuration it published and validates it, and the hook socket is
+        <storage_root>/run/hook-XXXXXXXX.sock: 110 bytes, over the product's
+        107-byte Unix-socket limit, so restore correctly refuses. A short
+        $TMPDIR, or /tmp, leaves plenty of room.
+
+        On every other platform the standard m2-* directory under the system
+        temp root is kept.
+        """
+        if platform.system() != "Darwin":
+            return
+        tag = hashlib.sha256(str(self.tmp).encode()).hexdigest()[:12]
+        # Keep the hook socket path inside the 107-byte Unix limit: the
+        # socket is <parent>/<work>/storage-restored/run/hook-XXXXXXXX.sock.
+        limit = 107 - (1 + 20 + len("/storage-restored") + 23)
+        temp = Path(tempfile.gettempdir()).resolve()
+        parents = [p for p in (temp, Path("/tmp")) if p.is_dir()]
+        parent = next((p for p in parents if len(str(p)) <= limit),
+                      min(parents, key=lambda p: len(str(p))))
+        holding = parent / f"gh-drill-{tag}"
+        shutil.move(str(self.tmp), str(holding))
+        self.tmp = holding
+        self.folder.cleanup()
+        self.folder = tempfile.TemporaryDirectory(prefix="", dir=str(parent))
+        # The drill runs directly in the new short directory; copy its contents
+        # across and drop the holding directory.
+        for child in sorted(holding.iterdir()):
+            shutil.move(str(child), str(Path(self.folder.name) / child.name))
+        holding.rmdir()
+        self._repoint(Path(self.folder.name))
+
+    def _repoint(self, tmp_root):
+        """Recompute every derived path for the drill's working directory."""
+        self.tmp = tmp_root
+        self.env_path = tmp_root / "db.env"
+        self.log_path = tmp_root / "app.log"
+        if getattr(self, "log_file", None) is not None:
+            self.log_file.close()
+        self.log_file = open(self.log_path, "wb")
+        self.dump_path = tmp_root / "m2.dump"
+        self.storage_tar = tmp_root / "storage.tar"
+        self.home = tmp_root / "home"
+        self.home.mkdir(exist_ok=True)
+        self.cred_helper = tmp_root / "git-credential-m2"
+        self.cred_helper.write_text(
+            "#!/bin/sh\n"
+            'printf "username=%s\\npassword=%s\\n\\n" "$GITHEARTH_HTTP_USER" "$GITHEARTH_HTTP_PASS"\n'
+        )
+        self.cred_helper.chmod(0o755)
+        self.storage_root = tmp_root / "storage"
+        self.main_work = tmp_root / "work"
+        self.clone = tmp_root / "clone"
+        self.env_path.write_text(
+            "POSTGRES_USER=githearth\n"
+            f"POSTGRES_DB={MAIN_DB}\n"
+            f"POSTGRES_PASSWORD={self.db_password}\n"
+        )
+        self.env_path.chmod(0o600)
 
     # ---- server configuration --------------------------------------------
 
@@ -168,6 +235,25 @@ class B28Harness(_m2.Harness):
                f"{BACKUP_USER}@127.0.0.1", command],
             check=check, capture_output=True, text=True, timeout=120)
 
+    def _backup_host_network(self):
+        """Docker arguments that put the backup host's sshd on 127.0.0.1.
+
+        On Linux, `--network host` shares the host loopback, so the client
+        reaches the container over the host's 127.0.0.1 and sshd can stay bound
+        to loopback there.
+
+        On macOS (Docker Desktop), the "host" network namespace is the Linux
+        VM's, not the host's: ssh-keyscan on the Mac finds nothing and the
+        drill stops before it starts `backup`. Publishing the port on the host
+        loopback (-p 127.0.0.1:<port>:<port>) forwards inside the VM to the
+        container, and sshd must then accept connections on any address in the
+        container. That is the only difference; every assertion is the same.
+        """
+        if platform.system() == "Darwin":
+            return (["--publish", f"127.0.0.1:{self.backup_port}:{self.backup_port}"],
+                    f"0.0.0.0:{self.backup_port}")
+        return ["--network", "host"], f"127.0.0.1:{self.backup_port}"
+
     def start_backup_host(self):
         bk = self.backup_key = self.tmp / "backup_ed25519"
         self.ssh_keygen(bk)
@@ -187,17 +273,19 @@ class B28Harness(_m2.Harness):
         authorized = self.tmp / "backup_authorized_keys"
         authorized.write_text(pubkey + "\n")
         authorized.chmod(0o644)
+        network_args, listen_address = self._backup_host_network()
+        print(f"backup host network: {network_args}, sshd ListenAddress={listen_address}")
         setup = (
             f"useradd -m -s /bin/bash {BACKUP_USER} && "
             f"install -d -o {BACKUP_USER} -m 700 /home/{BACKUP_USER}/.ssh {BACKUP_REMOTE_DIR} && "
             f"install -o {BACKUP_USER} -m 600 /keys/authorized_keys /home/{BACKUP_USER}/.ssh/ && "
             "ssh-keygen -A && "
-            f"exec /usr/sbin/sshd -D -e -o ListenAddress=127.0.0.1:{self.backup_port} "
+            f"exec /usr/sbin/sshd -D -e -o ListenAddress={listen_address} "
             "-o PasswordAuthentication=no -o PermitRootLogin=no"
         )
         # No --rm: if sshd dies, its logs explain why; cleanup removes the container.
         subprocess.run(
-            ["docker", "run", "--detach", "--network", "host",
+            ["docker", "run", "--detach", *network_args,
              "--name", container_name,
              "-v", f"{authorized}:/keys/authorized_keys:ro",
              BACKUP_HOST_IMAGE, "bash", "-c", setup],
@@ -607,6 +695,16 @@ class B28Harness(_m2.Harness):
 
     # ---- run ---------------------------------------------------------------
 
+    def disk_free_gib(self):
+        """Free space in the Docker VM, where images, volumes and builds live."""
+        try:
+            out = subprocess.run(
+                ["docker", "run", "--rm", _m2.IMAGE, "df", "-BG", "--output=avail", "/"],
+                capture_output=True, text=True, timeout=180)
+            return int(out.stdout.strip().splitlines()[-1].rstrip("G").strip())
+        except (subprocess.SubprocessError, ValueError, IndexError):
+            return None
+
     def scenario(self, name, fn):
         start = time.time()
         try:
@@ -623,6 +721,12 @@ class B28Harness(_m2.Harness):
             "name": name, "result": result,
             "wall_seconds": round(time.time() - start, 3)})
         print(f"{result}: {name}")
+        free = self.disk_free_gib()
+        self.scenarios[-1]["docker_vm_free_gib"] = free
+        print(f"    docker VM free disk: {free} GiB")
+        if free is not None and free < 15:
+            raise HarnessError(
+                "free disk in the Docker VM fell below the 15 GiB floor")
         if detail:
             print(f"    {detail}")
         if result == "FAIL":
@@ -657,6 +761,7 @@ class B28Harness(_m2.Harness):
             ["git", "rev-parse", "HEAD"], cwd=ROOT,
             capture_output=True, text=True).stdout.strip()
         info["os"] = platform.platform() + " " + platform.machine()
+        info["backup_host_network"] = self._backup_host_network()
         report = {
             "environment": info, "scenarios": self.scenarios,
             "git_operations": self.git_ops, "server_lifetimes": self.lifetimes,
