@@ -1613,6 +1613,306 @@ async fn a_closed_pull_requests_base_survives_a_prune_after_its_target_branch_is
     teardown(fx).await;
 }
 
+// ---------------------------------------------------------------------------
+// Tests: the start-up base backfill (cross-review 2, F2)
+// ---------------------------------------------------------------------------
+
+/// The base pin row of `pull_id`, if any: `(commit_oid, retain_until)`, where
+/// `retain_until` prints the interval from now in days (negative in the past).
+async fn base_pin_of(fx: &Fixture, pull_id: Uuid) -> Option<(String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT commit_oid, \
+                CASE WHEN retain_until IS NULL THEN NULL \
+                     ELSE round(extract(epoch FROM retain_until - now()) / 86400.0, 1)::text END \
+         FROM pinned_commits WHERE base_of_pull_request_id = $1",
+    )
+    .bind(pull_id)
+    .fetch_optional(&fx.pool)
+    .await
+    .unwrap()
+}
+
+/// Drops the base pin of `pull_id`, reproducing the state a pre-`0046`
+/// installation is in (0045 never wrote a base pin at all).
+async fn forget_base_pin(fx: &Fixture, pull_id: Uuid) {
+    sqlx::query("DELETE FROM pinned_commits WHERE base_of_pull_request_id = $1")
+        .bind(pull_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+}
+
+/// Opens a request `side` -> `main` and returns its id and number.
+async fn open_request(fx: &Fixture, title: &str) -> (Uuid, i64) {
+    let (status, created) = call(
+        fx,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/pulls",
+            fx.org_slug, fx.repo_name
+        ),
+        Some(serde_json::json!({
+            "title": title,
+            "source_branch": "side",
+            "target_branch": "main",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    (
+        created["id"].as_str().unwrap().parse().unwrap(),
+        created["number"].as_i64().unwrap(),
+    )
+}
+
+/// F2 (a): a request that was **merged** before `0046` gets a base pin, and
+/// that pin carries a real expiry — the window from the merge, not `NULL`,
+/// which is what the old selection (open XOR closed) and the old
+/// `state = "open"` argument produced: the merged request was invisible and a
+/// closed one never expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
+async fn a_merged_request_from_before_the_upgrade_gets_a_base_pin_with_a_real_expiry() {
+    let fx = setup("backfill-merged", |_| {}).await;
+    let (dir, _head) = side_branch(&fx).await;
+    let (pull_id, number) = open_request(&fx, "merged before pins").await;
+    let (status, merged) = call(
+        &fx,
+        "PATCH",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/pulls/{number}",
+            fx.org_slug, fx.repo_name
+        ),
+        Some(serde_json::json!({"state": "closed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    // The state the upgrade finds: merged, with `merged_at` set (the merge
+    // executor writes both), and no base pin — 0045 never backfilled bases.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'merged', merged_at = now() - interval '1 hour', \
+         closed_at = NULL WHERE id = $1",
+    )
+    .bind(pull_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    forget_base_pin(&fx, pull_id).await;
+    assert!(base_pin_of(&fx, pull_id).await.is_none());
+
+    let written = housekeeping::backfill_bases(&fx.state).await.unwrap();
+    assert_eq!(written, 1, "the merged request is backfilled");
+    let (oid, expiry) = base_pin_of(&fx, pull_id)
+        .await
+        .expect("a merged pre-0046 request gets a base pin");
+    assert_eq!(oid, fx.base_commit, "the target branch's tip is the base");
+    let days: f64 = expiry
+        .expect("a merged request's base pin expires; NULL would outlive the row")
+        .parse()
+        .unwrap();
+    assert!(
+        (88.0..=90.0).contains(&days),
+        "the expiry is the 90-day window from the merge, got {days} days"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    teardown(fx).await;
+}
+
+/// F2 (b): a **closed** request's backfilled base pin expires when its window
+/// ends, and really stops keeping the base. The old code passed
+/// `state = "open"` into `pin_base`, so the row got `retain_until = NULL` and
+/// no later event (no close ever happens after start, `extend_for_closed`
+/// never runs for it) moved it: the base was pinned until the row itself was
+/// deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
+async fn a_closed_requests_backfilled_base_pin_expires_when_its_window_ends() {
+    let fx = setup("backfill-closed", |config| {
+        config.housekeeping_grace_seconds = 0;
+    })
+    .await;
+    let (dir, _head) = side_branch(&fx).await;
+    // The base of this request is history nothing else reaches.
+    let trunk = chain_without_ref(&fx, "backfill-base.txt", "base\n");
+    git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "update-ref",
+            "refs/heads/trunk",
+            &trunk,
+        ],
+    );
+    let (status, created) = call(
+        &fx,
+        "POST",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/pulls",
+            fx.org_slug, fx.repo_name
+        ),
+        Some(serde_json::json!({
+            "title": "closed before pins",
+            "source_branch": "side",
+            "target_branch": "trunk",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let pull_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    // Closed an hour ago, as the upgrade finds it, and without its base pin.
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'closed', closed_at = now() - interval '1 hour' \
+         WHERE id = $1",
+    )
+    .bind(pull_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    forget_base_pin(&fx, pull_id).await;
+
+    assert_eq!(housekeeping::backfill_bases(&fx.state).await.unwrap(), 1);
+    let (oid, expiry) = base_pin_of(&fx, pull_id).await.expect("base pin written");
+    assert_eq!(oid, trunk);
+    let days: f64 = expiry
+        .expect("a closed request's base pin expires; NULL would never release it")
+        .parse()
+        .unwrap();
+    assert!(
+        (89.0..=90.0).contains(&days),
+        "the expiry is the window from the close, got {days} days"
+    );
+
+    // The pin really keeps the base while it is live: the target branch goes
+    // and a zero-grace prune leaves the commit for the pin.
+    git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "update-ref",
+            "-d",
+            "refs/heads/trunk",
+        ],
+    );
+    fx.age_objects();
+    assert!(matches!(fx.run().await, Outcome::Completed(_)));
+    assert!(
+        fx.has_object(&trunk),
+        "the backfilled base pin keeps the base"
+    );
+
+    // The window ends: the pin expires, and the next run no longer keeps it.
+    sqlx::query("UPDATE pinned_commits SET retain_until = now() - interval '1 day' WHERE base_of_pull_request_id = $1")
+        .bind(pull_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let live: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pinned_commits WHERE base_of_pull_request_id = $1 \
+                        AND (retain_until IS NULL OR retain_until > now()))",
+    )
+    .bind(pull_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(!live, "the closed request's base pin is expired, not live");
+    // And a second backfill does not re-pin it as an open one: the exhausted
+    // window stays exhausted.
+    assert_eq!(housekeeping::backfill_bases(&fx.state).await.unwrap(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    teardown(fx).await;
+}
+
+/// F2 (c): a request whose target branch was deleted before the upgrade cannot
+/// be reconstructed. It is recorded — with its state and the reason — in a row
+/// `doctor` names, instead of being skipped in silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
+async fn a_request_whose_target_branch_is_gone_is_reported_by_the_base_backfill() {
+    let fx = setup("backfill-skip", |_| {}).await;
+    let (dir, _head) = side_branch(&fx).await;
+    let (pull_id, number) = open_request(&fx, "target branch gone").await;
+    // The upgrade's state: the **target** branch was deleted after the request
+    // closed, and no base pin was ever written.
+    git_ok(
+        &["--git-dir", fx.repo_path.to_str().unwrap()],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "update-ref",
+            "-d",
+            "refs/heads/main",
+        ],
+    );
+    sqlx::query(
+        "UPDATE pull_requests SET state = 'closed', closed_at = now() - interval '1 hour' \
+         WHERE id = $1",
+    )
+    .bind(pull_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    forget_base_pin(&fx, pull_id).await;
+
+    assert_eq!(
+        housekeeping::backfill_bases(&fx.state).await.unwrap(),
+        0,
+        "nothing can be reconstructed"
+    );
+    let skipped: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT state, target_branch, reason FROM pull_request_base_backfill_skips \
+         WHERE pull_request_id = $1",
+    )
+    .bind(pull_id)
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        skipped,
+        vec![(
+            "closed".to_owned(),
+            "main".to_owned(),
+            "target_branch_missing".to_owned()
+        )],
+        "the request is recorded with its state and the reason, not dropped"
+    );
+    // Running again is idempotent: one row, not a growing log.
+    assert_eq!(housekeeping::backfill_bases(&fx.state).await.unwrap(), 0);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pull_request_base_backfill_skips WHERE pull_request_id = $1",
+    )
+    .bind(pull_id)
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+
+    // An operator can see it: `doctor` names the repository and the request.
+    let checks = githearth_server::doctor::report(&fx.config).await;
+    let backfill = checks
+        .iter()
+        .find(|check| check.name == "base backfill")
+        .expect("doctor reports the skipped requests");
+    assert!(matches!(
+        backfill.status,
+        githearth_server::doctor::Status::Warn
+    ));
+    assert!(
+        backfill.detail.contains(&fx.repo_id.to_string())
+            && backfill.detail.contains(&format!("#PR-{number}"))
+            && backfill.detail.contains("closed")
+            && backfill.detail.contains("target branch deleted"),
+        "doctor names which request cannot be reconstructed: {}",
+        backfill.detail
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    teardown(fx).await;
+}
+
 /// B2: a review comment's commit is pinned while the comment exists. The
 /// comment names a commit that a force push makes unreachable; with zero grace
 /// and no ref to it, the commit and its tree survive a prune, and deleting the

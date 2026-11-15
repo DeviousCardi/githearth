@@ -1,6 +1,7 @@
 use crate::config::Config;
 use sqlx::PgPool;
 use std::path::Path;
+use uuid::Uuid;
 
 pub enum Status {
     Ok,
@@ -84,6 +85,12 @@ pub async fn report(config: &Config) -> Vec<Check> {
             );
             checks.push(jobs_check(&pool, config.job_timeout_seconds).await);
             checks.push(housekeeping_check(&pool, config).await);
+            // Only reported when it has something to report: a clean install
+            // has no skipped request, and the check count stays the eight the
+            // operations notes document.
+            if let Some(check) = base_backfill_check(&pool).await {
+                checks.push(check);
+            }
             pool.close().await;
         }
         Err(e) => {
@@ -341,6 +348,51 @@ async fn housekeeping_check(pool: &PgPool, config: &Config) -> Check {
             format_args!("{troubled} repo(s) with a failed or deferred run"),
         ),
         Ok(_) => Check::ok("housekeeping", "repositories are up to date"),
+    }
+}
+
+/// Pull requests whose base pin the start-up backfill could not write because
+/// their target branch was deleted before it ran (migration `0047`). A warning
+/// naming the requests, not a count: the operator has to rescue each base
+/// before the next prune. Read-only, like every doctor check.
+async fn base_backfill_check(pool: &PgPool) -> Option<Check> {
+    let skips: Result<Vec<(Uuid, i32, String, String)>, _> = sqlx::query_as(
+        "SELECT s.repository_id, pr.number, s.state, s.target_branch \
+         FROM pull_request_base_backfill_skips s \
+         JOIN pull_requests pr ON pr.id = s.pull_request_id \
+         ORDER BY s.repository_id, pr.number",
+    )
+    .fetch_all(pool)
+    .await;
+    match skips {
+        Err(_) => Some(Check::fail(
+            "base backfill",
+            "cannot query the skipped pull requests",
+        )),
+        Ok(skips) if skips.is_empty() => None,
+        Ok(skips) => {
+            let listed: Vec<String> = skips
+                .iter()
+                .take(10)
+                .map(|(repository_id, number, state, branch)| {
+                    format!("repository {repository_id} #PR-{number} ({state}, target {branch})")
+                })
+                .collect();
+            let more = if skips.len() > listed.len() {
+                format!(" and {} more", skips.len() - listed.len())
+            } else {
+                String::new()
+            };
+            Some(Check::warn(
+                "base backfill",
+                format_args!(
+                    "{} request(s) have no base pin and cannot be reconstructed \
+                     (target branch deleted): {}{more}",
+                    skips.len(),
+                    listed.join("; ")
+                ),
+            ))
+        }
     }
 }
 

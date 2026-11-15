@@ -119,10 +119,29 @@ and deletes only loose objects outside it:
      closed request its `compare/base...head`. The read path resolves a
      missing target branch to it. Requests that predate `0046` cannot have
      their base recovered exactly (the row never stored it and there is no
-     branch table), so `serve` backfills each of them with the target
-     branch's current tip before the scheduler starts: for an unmoved branch
-     that *is* the base, and for a moved one it is a later commit that still
-     reaches the original base.
+     branch table), so `serve` backfills the base of every one of them that has
+     no base pin, before the scheduler starts, using the target branch's
+     current tip. What that does:
+     - **Backfilled:** every open request; every closed request whose
+       `closed_at` is inside `housekeeping_pin_retention_days`; every merged
+       request whose `merged_at` is inside it. A closed or merged request's
+       backfilled pin carries its real state, so it expires
+       `housekeeping_pin_retention_days` from the backfill (the close or merge
+       is at most that window in the past) rather than living while the row
+       does. A closed or merged request outside the window is not backfilled:
+       its retention has already elapsed.
+     - **Approximated:** the pinned commit is the target branch's *current tip*.
+       For a branch that has not moved since the request opened it *is* the
+       base; for one that has moved it is a later commit that still reaches the
+       original base, which is a safe reachable super-set.
+     - **Skipped:** a request whose target branch no longer exists has no tip
+       to pin, so it is left without a base pin — and that is exactly the
+       request nothing else protects. It is recorded in
+       `pull_request_base_backfill_skips` with its state and reason, and
+       `githearth-server doctor` reports it by repository, number and state so
+       an operator can rescue the base before the first prune. A repository
+       whose Git storage cannot be read is reported and retried on the next
+       start.
    - **Review comment** — the `commit_id` an anchored comment names, while the
      comment exists; it cascades with the comment. A reviewed commit is also
      pinned while any review names it (the pre-`0046` backfill already pinned
@@ -148,10 +167,17 @@ and deletes only loose objects outside it:
    `housekeeping_fork_fetch_limit_bytes` (64 MiB by default), measured before
    anything is copied (the missing objects' stored size), so an oversized fork
    head cannot fill the target; the request then renders from the fork's own
-   pin. If a target prune releases the copy, the next read re-copies the
-   objects from the fork under the same cap, so a target prune cannot turn a
-   readable fork request into `revision not found` while the fork still holds
-   the objects. The authoritative copy is always the fork's.
+   pin. The target-side copy is readable while the target's pin is live: the
+   request's lifetime, then `housekeeping_pin_retention_days` after it closes
+   or merges, the same window as every other pin. Once that pin expires a
+   target prune releases the copy, and the target no longer renders the fork
+   request's diff (`compare` on the target answers `revision not found`). No
+   object is lost: the authoritative objects remain in the fork, under the
+   fork's own pin, which is what the pull request and its diff in the fork's
+   repository read. Restoring the target copy on the next read is **not**
+   implemented: `pulls::resolve_cross_repo_head` runs only on the target's
+   mergeability and code-owner paths, and both skip a closed request whose
+   head comes from its pin. The authoritative copy is always the fork's.
 
 Objects that are in no quarantine, reachable from no ref and reachable from no
 keep point or pin are the only deletion candidates.

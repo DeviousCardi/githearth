@@ -227,11 +227,17 @@ whose objects would add more than that to the target is refused **before**
 anything is copied, logged, and the pull request still renders from the fork's
 own pin.
 
-If a target prune releases the copy (the pin expired, or the request was
-deleted), the next read copies the objects from the fork again — under the same
-cap — instead of answering `revision not found`. The fork's pin is what makes
-that possible; deleting the fork ends it, and the request then reports no head,
-exactly as before pins existed.
+The target-side copy is readable while the target's pin is live: for the
+request's lifetime, then `housekeeping_pin_retention_days` after it closes or
+merges. Once that pin expires — or the request is deleted — a target prune
+releases the copy and the target no longer renders the fork request's diff: its
+`compare` answers `revision not found`. **Nothing is lost.** The authoritative
+objects stay in the fork under the fork's pin, so the pull request and its diff
+in the fork's repository still render, and the target's copy comes back only if
+a read that needs it in the target runs again (mergeability and code-owner
+checks, which skip a closed request resolved from its pin). Deleting the fork
+ends all of it, and the request then reports no head, exactly as before pins
+existed.
 
 ## Disabling it
 

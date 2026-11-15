@@ -420,8 +420,9 @@ async fn keep_points(
     Ok(KeepPoints { commits })
 }
 
-/// Backfills a base pin for every open or recently closed pull request that
-/// has none, at server start and before the scheduler can enqueue a run.
+/// Backfills a base pin for every pull request that has none: every open one,
+/// and every closed or merged one inside the retention window, at server start
+/// and before the scheduler can enqueue a run.
 ///
 /// A pull request row does not record the commit its target branch pointed at
 /// when it was opened, and 0046 cannot read Git, so this is the one pin the
@@ -432,14 +433,29 @@ async fn keep_points(
 /// tip reaches all of its ancestors). Requests opened after this version pin
 /// their exact base in their own create transaction.
 ///
+/// The row's real state is passed to [`crate::pins::pin_base`], so a closed or
+/// merged request's base pin expires `housekeeping_pin_retention_days` from
+/// now (the close or merge is at most that window in the past) instead of
+/// living while the row does.
+///
+/// A request whose target branch no longer exists cannot be reconstructed: its
+/// base is recorded in `pull_request_base_backfill_skips` with the state and
+/// the reason, surfaced by `doctor`, instead of being skipped in silence.
+///
 /// Runs over every active repository once, best effort per repository: a
 /// repository whose storage is unreadable is reported and skipped, and the
 /// next start retries it. Returns how many pins it wrote.
 pub async fn backfill_bases(state: &AppState) -> Result<usize, sqlx::Error> {
-    let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT pr.id, pr.repository_id, pr.target_branch FROM pull_requests pr \
+    // `merged_at` and `closed_at` are when the retention window starts (the
+    // close and merge paths extend the pins from that moment), so a closed or
+    // merged request is backfilled only while its window is still open.
+    let rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+        "SELECT pr.id, pr.repository_id, pr.target_branch, pr.state FROM pull_requests pr \
          WHERE (pr.state = 'open' \
-                OR (pr.state = 'closed' AND pr.closed_at > now() - make_interval(days => $1))) \
+                OR (pr.state = 'closed' \
+                    AND COALESCE(pr.closed_at, now()) > now() - make_interval(days => $1)) \
+                OR (pr.state = 'merged' \
+                    AND COALESCE(pr.merged_at, now()) > now() - make_interval(days => $1))) \
            AND NOT EXISTS (SELECT 1 FROM pinned_commits p WHERE p.base_of_pull_request_id = pr.id)",
     )
     .bind(days(state.config.housekeeping_pin_retention_days))
@@ -455,7 +471,7 @@ pub async fn backfill_bases(state: &AppState) -> Result<usize, sqlx::Error> {
             .min(state.config.housekeeping_timeout_seconds),
     );
     let mut tips: HashMap<Uuid, HashMap<String, String>> = HashMap::new();
-    for (_, repository_id, _) in &rows {
+    for (_, repository_id, _, _) in &rows {
         if tips.contains_key(repository_id) {
             continue;
         }
@@ -480,12 +496,20 @@ pub async fn backfill_bases(state: &AppState) -> Result<usize, sqlx::Error> {
     }
     let mut conn = state.pool.acquire().await?;
     let mut written = 0;
-    for (pull_id, repository_id, branch) in rows {
-        let Some(oid) = tips
-            .get(&repository_id)
-            .and_then(|read| read.get(&branch))
-            .cloned()
-        else {
+    let mut skipped = 0;
+    for (pull_id, repository_id, branch, pull_state) in rows {
+        // A repository whose tips could not be read is reported by the warn
+        // above and retried on the next start; it is not a per-request skip.
+        let Some(read) = tips.get(&repository_id) else {
+            continue;
+        };
+        // A request whose target branch is gone has no tip to pin. That is the
+        // one case this backfill cannot reconstruct, so it is recorded rather
+        // than dropped: an operator has to rescue the base before the first
+        // prune, and `doctor` names it.
+        let Some(oid) = read.get(&branch).cloned() else {
+            record_backfill_skip(&mut conn, repository_id, pull_id, &pull_state, &branch).await?;
+            skipped += 1;
             continue;
         };
         crate::pins::pin_base(
@@ -493,16 +517,62 @@ pub async fn backfill_bases(state: &AppState) -> Result<usize, sqlx::Error> {
             repository_id,
             pull_id,
             &oid,
-            "open",
+            &pull_state,
             state.config.housekeeping_pin_retention_days,
         )
         .await?;
+        // A branch that came back makes the request reconstructable: the skip
+        // record no longer describes it.
+        sqlx::query("DELETE FROM pull_request_base_backfill_skips WHERE pull_request_id = $1")
+            .bind(pull_id)
+            .execute(&mut *conn)
+            .await?;
         written += 1;
     }
-    if written > 0 {
-        tracing::info!(written, "pull-request base pins backfilled");
+    if written > 0 || skipped > 0 {
+        tracing::info!(
+            written,
+            skipped,
+            "pull-request base pins backfilled; skipped requests are listed by `githearth-server doctor`"
+        );
     }
     Ok(written)
+}
+
+/// Records one request this backfill could not reconstruct, keyed by its row:
+/// re-running the backfill (the next start) refreshes the state and reason in
+/// place. The row goes away when the pull request does, and when a later
+/// backfill does write the pin.
+async fn record_backfill_skip(
+    conn: &mut PgConnection,
+    repository_id: Uuid,
+    pull_request_id: Uuid,
+    state: &str,
+    target_branch: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pull_request_base_backfill_skips \
+         (pull_request_id, repository_id, state, target_branch, reason) \
+         VALUES ($1, $2, $3, $4, 'target_branch_missing') \
+         ON CONFLICT (pull_request_id) DO UPDATE SET \
+           repository_id = EXCLUDED.repository_id, state = EXCLUDED.state, \
+           target_branch = EXCLUDED.target_branch, reason = EXCLUDED.reason, \
+           updated_at = now()",
+    )
+    .bind(pull_request_id)
+    .bind(repository_id)
+    .bind(state)
+    .bind(target_branch)
+    .execute(conn)
+    .await?;
+    tracing::warn!(
+        %repository_id,
+        %pull_request_id,
+        state,
+        target_branch,
+        "base pin backfill cannot reconstruct this request: its target branch is gone"
+    );
+    Ok(())
 }
 
 fn days(retention_days: u64) -> i32 {

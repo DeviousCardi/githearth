@@ -93,8 +93,11 @@ ALTER TABLE pinned_commits
 -- Backfill 1 (pull-request bases) is not here: a pull request row does not
 -- record its base commit and there is no branch table to join, so the base is
 -- read from Git and backfilled by `pins::backfill_bases` at server start,
--- before the scheduler can enqueue a run. Every request opened after this
--- migration is pinned by its own create transaction.
+-- before the scheduler can enqueue a run. It covers every open request and
+-- every closed or merged one inside the retention window, and records in
+-- `pull_request_base_backfill_skips` (0047) the ones whose target branch is
+-- gone. Every request opened after this migration is pinned by its own create
+-- transaction.
 
 -- Backfill 2: every anchored review comment. Pinned while the comment exists.
 -- A comment pin carries no `pull_request_id`: 0045's

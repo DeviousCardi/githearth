@@ -610,9 +610,16 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// a fork pull request's head is copied into the target and **pinned there**,
 /// so after the fork's source branch is deleted and the target prunes with zero
 /// grace, the target's `compare` still renders the diff (it answered 404
-/// before this fix), the pin is charged to the target organization, and a
-/// target prune that releases the copy re-copies it from the fork's own pin on
-/// the next read instead of 404ing again.
+/// before this fix) and the copy is charged to the target organization.
+///
+/// The copy is readable **while the target's pin is live** (ADR 0013 "What is
+/// live", 8); there is no re-copy (cross-review 2, F1). The second half of this
+/// test is the assertion that binds the documents to the code: release the
+/// target's pins, run a **real** maintenance pass on the target at zero grace,
+/// and the copy is gone — the target's `compare` answers 404, the pull request
+/// still names its head from the fork's pin, and the fork still renders the
+/// diff from its own copy. A test that never prunes cannot see the difference
+/// between "survives" and "was never deleted", so this one prunes.
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn a_closed_fork_requests_target_copy_survives_a_target_prune_and_is_charged_there() {
@@ -737,41 +744,231 @@ async fn a_closed_fork_requests_target_copy_survives_a_target_prune_and_is_charg
             .unwrap();
     assert_eq!(fork_side, 0, "nothing is charged to the fork's repository");
 
-    // Release the target pin (as retention would) and prune again: this time
-    // the copy is up for deletion. The authoritative objects stay in the fork,
-    // and the next read copies them back under the same cap and charge instead
-    // of answering 404.
-    sqlx::query("UPDATE pinned_commits SET retain_until = now() - interval '1 day' WHERE repository_id = $1 AND pull_request_id = $2")
-        .bind(f.parent_repo_id)
-        .bind(pull_id)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    let renamed = git_run(git_cmd(&[
-        "--git-dir",
-        f.parent_repo_path.to_str().unwrap(),
-        "pack-refs",
-        "--all",
-    ]))
-    .await;
-    assert!(renamed.status.success());
-    let reread = request(&f.app, "GET", &compare, Some(&f.owner_token), json!(null)).await;
-    assert_eq!(reread.0, StatusCode::OK, "{}", reread.1);
-
-    let (bytes_after, _): (i64, i64) = sqlx::query_as(
-        "SELECT bytes, fetches FROM repository_fork_fetches \
-         WHERE repository_id = $1 AND source_repository_id = $2",
+    // Release every pin the **target** holds for this request (as retention
+    // does when the window ends), then run a real maintenance pass on the
+    // target with zero grace: the copy is now unreachable and up for deletion.
+    sqlx::query(
+        "UPDATE pinned_commits SET retain_until = now() - interval '1 day' \
+         WHERE repository_id = $1 AND pull_request_id = $2",
     )
     .bind(f.parent_repo_id)
-    .bind(f.fork_id)
-    .fetch_one(&f.pool)
+    .bind(pull_id)
+    .execute(&f.pool)
     .await
     .unwrap();
+    // Pack the target first, so the pruned head is a packed object the run has
+    // to loosen, age and delete — not a loose file some previous step removed.
+    // A loose unreachable commit the run really deletes, so "the copy is gone"
+    // below cannot be a no-op run.
+    let doomed = commit_into(&f.parent_repo_path, "doomed.txt", "gone\n").await;
+    git_ok(git_cmd(&[
+        "--git-dir",
+        f.parent_repo_path.to_str().unwrap(),
+        "repack",
+        "-adq",
+    ]))
+    .await;
+    for entry in walk_files(&f.parent_repo_path.join("objects")) {
+        std::fs::File::open(&entry)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(7200),
+                ),
+            )
+            .unwrap();
+    }
+    let outcome = githearth_server::housekeeping::run_repository_now(&f.state, f.parent_repo_id)
+        .await
+        .unwrap();
     assert!(
-        bytes_after >= bytes || bytes_after == 0,
-        "the ledger stays consistent"
+        matches!(
+            outcome,
+            githearth_server::housekeeping::Outcome::Completed(_)
+        ),
+        "{outcome:?}"
     );
+    assert!(
+        !has_object(&f.parent_repo_path, &doomed).await,
+        "the second run really pruned"
+    );
+    if std::env::var("B2F5_PROBE").is_ok() {
+        let leaked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pinned_commits WHERE repository_id = $1 \
+               AND retain_until IS NULL)",
+        )
+        .bind(f.parent_repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        eprintln!(
+            "PROBE-B2F5 copy gone? {} doomed gone? {} live NULL target pins? {leaked}",
+            !has_object(&f.parent_repo_path, &f.fork_feature_head).await,
+            !has_object(&f.parent_repo_path, &doomed).await
+        );
+    }
+    assert!(
+        !has_object(&f.parent_repo_path, &f.fork_feature_head).await,
+        "an expired target pin releases the copied head on a real prune"
+    );
+
+    // The documented consequence, not a re-copy: the target's `compare` for a
+    // copy it no longer holds answers `revision not found`. If a re-copy is
+    // ever implemented, this is the assertion that has to change with the
+    // documents (ADR 0013 "What is live", 8).
+    let reread = request(&f.app, "GET", &compare, Some(&f.owner_token), json!(null)).await;
+    assert_eq!(
+        reread.0,
+        StatusCode::NOT_FOUND,
+        "the target no longer renders the diff once its pin has expired: {}",
+        reread.1
+    );
+
+    // Nothing is lost: the pull request still names its head from the fork's
+    // pin, and the fork's own copy still renders the diff.
+    let (status, body) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/pulls/{}",
+            f.parent_org_slug, f.parent_repo_name, f.number
+        ),
+        Some(&f.owner_token),
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["head_id"].as_str(),
+        Some(f.fork_feature_head.as_str()),
+        "the closed request still resolves its head from the fork's pin: {body}"
+    );
+    let fork_objects = f.fork_path.join("objects");
+    let in_fork = git_run(git_cmd(&[
+        "--git-dir",
+        f.fork_path.to_str().unwrap(),
+        "cat-file",
+        "-e",
+        &f.fork_feature_head,
+    ]))
+    .await;
+    assert!(
+        in_fork.status.success(),
+        "the authoritative objects remain in the fork ({})",
+        fork_objects.display()
+    );
+    let (status, fork_diff) = request(
+        &f.app,
+        "GET",
+        &format!(
+            "/api/v1/organizations/{}/repositories/{}/compare/main...{}",
+            f.contrib_org_slug, f.fork_name, f.fork_feature_head
+        ),
+        Some(&f.contributor_token),
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fork_diff}");
+    assert!(
+        fork_diff["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["new_path"] == "feat.txt"),
+        "the fork still renders the diff: {fork_diff}"
+    );
+    assert!(
+        !fork_diff["files"].as_array().unwrap().is_empty(),
+        "the fork's diff names the changed file: {fork_diff}"
+    );
+    assert!(
+        fork_diff["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["new_path"] == "contribution.txt"),
+        "the fork's diff is the fork's own copy of the head: {fork_diff}"
+    );
+
     finish(f).await;
+}
+
+/// A commit in `repo` that no ref reaches, written through a throwaway ref so
+/// a pack takes it and then deleted, so only the prune can remove it.
+async fn commit_into(repo: &std::path::Path, name: &str, content: &str) -> String {
+    // A throwaway ref needs the objects reachable to be packed, so the commit
+    // is written through the repo's own work tree only if it has one; a bare
+    // repository has none. Use a temporary clone and fetch the commit into a
+    // single-use ref, then delete the ref.
+    let work = std::env::temp_dir().join(format!("gforks-commit-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&work).unwrap();
+    let tw = work.to_str().unwrap();
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "clone",
+        "--quiet",
+        "--",
+        repo.to_str().unwrap(),
+        ".",
+    ]))
+    .await;
+    std::fs::write(work.join(name), content).unwrap();
+    git_ok(git_cmd(&["-C", tw, "add", name])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        tw,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "doomed",
+    ]))
+    .await;
+    let oid = git_output(git_cmd(&["-C", tw, "rev-parse", "HEAD"])).await;
+    let reference = format!("refs/heads/doomed-{}", Uuid::new_v4().simple());
+    git_ok(git_cmd(&[
+        "--git-dir",
+        repo.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "--",
+        tw,
+        &format!("HEAD:{reference}"),
+    ]))
+    .await;
+    git_ok(git_cmd(&[
+        "--git-dir",
+        repo.to_str().unwrap(),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "update-ref",
+        "-d",
+        &reference,
+    ]))
+    .await;
+    let _ = std::fs::remove_dir_all(&work);
+    oid
+}
+
+/// Every file under `dir`, recursively.
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// The plan's cap: a fork pull request's head may add at most
