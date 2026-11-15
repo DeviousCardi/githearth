@@ -12,7 +12,7 @@ A row closes when UI/API, permission boundaries, error/pagination behavior, data
 | Repository management | Namespaces, visibility, lifecycle, transfers, archive/delete/restore | M2, M4.1 | IDs survive rename/transfer; old paths never resolve to a new owner; resumable lifecycle |
 | Git protocols | HTTP/SSH clone/fetch/push, tags, branches, multi-ref updates | M2, M4.1 | Standard clients; permissions; durable acknowledgement |
 | Git browsing | Files/trees, commits, diffs, blame, history, compare, archives | M2, M9 | Giant/binary files, object formats, path bounds |
-| Git operations | Forks, mirrors, imports, protected refs, signing policy, housekeeping | M3–M5, M12 | Mirror credentials; GC; race/crash behavior |
+| Git operations | Forks, protected refs, signing policy, housekeeping; mirrors and imports in M12 | M3–M5, M12 | Mirror credentials; GC; race/crash behavior |
 | Review | Requests/drafts, threaded reviews, suggestions, approvals, reviewers/code owners | M3 | Exact revision binding; stale approval policy |
 | Merge | Methods, conflicts, checks, queue, auto-merge, candidate-tested queue | M3, M6 | Expected target, policy version, duplicate workers, the merged candidate |
 | Issues | CRUD, comments, templates/forms, labels, assignments, milestones, dependencies | M2, M8 | Atomic comments/events; privacy and pagination |
@@ -62,10 +62,10 @@ Checked against the code on `main` at `747c65c`. "Delivered" means implemented w
 | Runtime | Configuration, migrations, probes, logs, bounds, shutdown | — |
 | Local identity | Bootstrap, login/logout, expiry, tokens, SSH keys | Account provisioning, password change/reset, re-authentication, login throttling → M4.1; OIDC/MFA/sign-up → M11a |
 | Tenancy | Organizations, owner membership, roles in authorization, repository grants | Member administration, teams, invitations → M4.1 |
-| Repository management | Namespaces, visibility, create/rename/archive/delete | Transfer → M4.1 |
+| Repository management | Namespaces, visibility, create/rename/archive/delete | Transfer, restore from trash → M4.1 |
 | Git protocols | HTTP and SSH clone/fetch/push, tags, branches, multi-ref | — |
 | Git browsing | Files/trees, commits, diffs, compare | Blame, history, archives stay M9 |
-| Git operations | Forks, protected refs, signing policy | Housekeeping → M4.1; mirrors, imports stay M5/M12 |
+| Git operations | Forks, protected refs, signing policy | Housekeeping → M4.1; mirrors, imports → M12 |
 | Review | All listed capabilities | — |
 | Merge | Methods, conflicts, checks, queue, auto-merge | Candidate-tested queue → M6; cluster behavior stays M5 |
 | Issues | CRUD and comments | Remainder stays M8 |
@@ -73,7 +73,7 @@ Checked against the code on `main` at `747c65c`. "Delivered" means implemented w
 | Audit/compliance | Hash-chained audit, IP retention, per-repository storage quota | Usage accounting, export, legal hold stay M11; deletion → M11a |
 | Installation | Runbook install, `doctor` preflight, Compose | One `setup` command with generated secrets → M4.1 |
 | Recovery | Maintenance-window backup, off-host copy, fresh restore (runbook procedure) | `backup`/`restore` commands with a write fence → M4.1; encrypted archive and online backup → M4.2; cluster backup → M5 |
-| Upgrades | Forward-only migrate with schema checks | Git log version skew → M5; PostgreSQL expand/contract → M11/M13 |
+| Upgrades | Forward-only migrate with schema checks | Git log version skew and the N/N+1 schema window → M5; general PostgreSQL expand/contract → M11/M13 |
 | Operations | `doctor`, structured logs, measured hardware minimums | Metrics → M4.1; traces, alerts, support bundles stay M11 |
 | UX | Server-rendered accessible UI, WCAG 2.2 AA basics audit | Membership/administration flows → M4.1 |
 | Freedom/release | License, generated third-party notices | SBOM, signed artifacts stay M13 |
@@ -81,7 +81,7 @@ Checked against the code on `main` at `747c65c`. "Delivered" means implemented w
 
 Rows added on 2026-11-15 and allocated in the table above: secrets at rest and key rotation, scoped short-lived tokens, per-organization rate limits and fairness (M4.2); self-service sign-up, email verification and recovery, and account and organization deletion (M11a); rolling upgrade with adjacent-version skew (M5).
 
-Two required rows still have no build list and no acceptance case: repository restore and mirrors. They are allocated — repository restore to M2/M4.1 in the table above, mirrors to M3–M5/M12 — so what is missing is a build list and a case, not a milestone, and M13's "every required inventory row" cannot close until both exist. This is recorded in the [review record](09-milestone-decisions.md#review-record). The per-repository storage quota does not count merge-created objects or fork copies; M4.1's housekeeping work makes it count total repository bytes.
+Repository restore and mirrors were the two required rows without a build list or a case. Both are now scheduled: repository restore in M4.1 (case U23c) and mirrors in M12, each with a build item and exit criteria in the [roadmap](04-forge-roadmap.md). The per-repository storage quota does not count merge-created objects or fork copies; M4.1's housekeeping work makes it count total repository bytes.
 
 ## Cross-cutting completion contract
 

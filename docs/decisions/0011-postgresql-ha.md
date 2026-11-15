@@ -1,6 +1,7 @@
 # ADR 0011: PostgreSQL high availability
 
-Date: 2026-11-14; rewritten 2026-11-15 after the second plan review.
+Date: 2026-11-14; rewritten 2026-11-15 after the second plan review; the
+synchronous standby count corrected on 2026-11-15 after the fifth.
 
 Status: **design accepted for M5; settings named, not yet measured.** Nothing
 here is implemented. This narrows the provisional selection in
@@ -16,10 +17,20 @@ recovery. If safe promotion cannot be established, writes stop.
 
 The earlier text claimed that "one node can be lost without losing an
 acknowledged write" and, in the same paragraph, that "with fewer than two
-healthy nodes, writes are unavailable". With one synchronous standby those two
-claims are inconsistent: if the acking standby is the node that dies, the
-surviving standby may be behind and the acknowledged commit is lost. A plan
-that documents the doubt instead of choosing is not a decision.
+healthy nodes, writes are unavailable" without naming the settings that make
+either true. Plain `synchronous_mode` falls back to asynchronous commit when no
+standby is available, and that fallback is an acknowledged write that one more
+failure loses. A plan that documents the doubt instead of choosing is not a
+decision.
+
+The first rewrite chose two synchronous standbys, reasoning that with one "the
+acking node can die and take the only copy with it". That reasoning was wrong:
+the primary also holds every commit it acknowledged, so losing it needs the
+primary and the synchronous standby to fail together, which is two machines and
+outside the failure model. Two synchronous standbys bought tolerance of a
+second failure at the price of stopping every metadata write whenever any one
+of the three nodes was down — less available than a single node. The fifth
+review corrected it to the setting below.
 
 Options considered: Patroni with etcd; pg_auto_failover; CloudNativePG
 (Kubernetes only); a failover manager built into GitHearth on the Raft library
@@ -45,7 +56,7 @@ bootstrap:
     maximum_lag_on_failover: 1048576
     synchronous_mode: true
     synchronous_mode_strict: true
-    synchronous_node_count: 2
+    synchronous_node_count: 1
     postgresql:
       use_pg_rewind: true
       use_slots: true
@@ -61,10 +72,11 @@ watchdog:
 ```
 
 - `synchronous_mode: true` makes Patroni manage
-  `synchronous_standby_names` from the `/sync` key. `synchronous_node_count: 2`
-  with three nodes means **both standbys must acknowledge**. With one
-  synchronous standby the acking node can die and take the only copy with it;
-  that configuration is not supported.
+  `synchronous_standby_names` from the `/sync` key. `synchronous_node_count: 1`
+  with three nodes means **one standby must acknowledge**, so every
+  acknowledged commit is on two machines. Patroni promotes only a member of the
+  `/sync` set, and replaces a failed synchronous standby with the other one
+  only after that one has caught up.
 - `synchronous_mode_strict: true` stops writes rather than silently falling
   back to asynchronous commit when the sync set cannot be formed. Plain
   `synchronous_mode` falls back, and a fallback is exactly the acknowledged
@@ -80,15 +92,23 @@ watchdog:
 
 ### What the configuration guarantees, and what it costs
 
-- **Durability:** every acknowledged commit is on the primary and both
-  standbys. Losing any one node leaves at least one node with every
-  acknowledged commit, and Patroni promotes a member of the `/sync` set, so no
-  acknowledged commit is lost.
-- **Availability:** losing one node costs write availability until two
-  standbys are in sync again, because the primary cannot acknowledge without
-  both. Reads continue on the primary; a standby can serve read-only queries
-  when the deployment routes them there. This is a deliberate choice of
-  durability over availability, and the roadmap states it.
+- **Durability:** every acknowledged commit is on the primary and the
+  synchronous standby. Losing the primary promotes the synchronous standby,
+  which has every acknowledged commit. Losing the synchronous standby leaves
+  the commits on the primary. Losing the third node loses nothing. No single
+  machine loss loses an acknowledged commit; losing the primary and the
+  synchronous standby together can, and that is outside the failure model.
+- **Availability:** one node loss does not stop writes for longer than the
+  failover or the replacement of the synchronous standby. Losing the primary
+  pauses writes for the promotion; losing the synchronous standby pauses them
+  until Patroni names the other standby synchronous, which it does only once
+  that standby has caught up; losing the asynchronous standby pauses nothing.
+  Both pauses are measured in Gate C. With two nodes down, strict mode stops
+  writes rather than acknowledging on one machine.
+- **Degraded state:** while one node is down the cluster has no spare. The
+  remaining pair still commits on two machines, and a second loss stops writes.
+  `doctor` and the metrics report the degraded state so the operator replaces
+  the node.
 - **Fencing window:** Patroni's watchdog is reset while the member holds its
   lease. If it cannot renew within the TTL, the watchdog expires and the
   postmaster is terminated, so an isolated primary stops writing rather than
@@ -140,9 +160,9 @@ Deferred, in this order of likelihood:
 - A clustered installation gains Patroni and etcd to install, upgrade and
   monitor, and a watchdog device on every database host. The `setup` command
   grows to manage them in M5.
-- One node loss stops metadata writes until the node is replaced. This is
-  visible and must be published; it is not a defect to be tuned away without
-  changing the durability claim.
+- One node loss pauses metadata writes for the measured failover or
+  synchronous-standby replacement, then writes continue on two machines with
+  no spare. A second loss stops writes. Both facts are published.
 - Qualifying one topology keeps the M5 fault matrix bounded. Other topologies
   are unsupported until separately qualified.
 - Because the application sees only an endpoint, replacing the manager later
@@ -152,14 +172,16 @@ Deferred, in this order of likelihood:
 
 1. Kill the primary; every acknowledged commit is present on the promoted
    node; clients resolve unknown outcomes by operation ID.
-2. Kill the acking standby; no acknowledged commit is lost, and writes stop
-   until a second standby is in sync.
+2. Kill the synchronous standby; no acknowledged commit is lost, writes pause
+   until the other standby is caught up and named synchronous, and the pause
+   is measured. Kill the asynchronous standby; writes do not pause. With two
+   nodes down, writes stop and never fall back to asynchronous commit.
 3. Partition the primary from etcd but not from the standbys; the watchdog
    stops it before a new primary accepts a write, and the window is measured.
 4. Kill two etcd members; writes stop, and no split brain appears.
 5. Cancel a client during commit; the commit is either absent or present, and
    the reported outcome is unknown, never a false rollback.
-6. Measure commit latency and throughput for the strict two-standby setting on
+6. Measure commit latency and throughput for the strict one-standby setting on
    the reference hardware; publish the cost.
 7. Restore from an external backup and from a WAL archive; verify the promoted
    primary's position.
