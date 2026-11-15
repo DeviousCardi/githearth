@@ -888,6 +888,12 @@ async fn position(pool: &PgPool) -> Result<PostgresPosition> {
     })
 }
 
+/// Whether the named destination database exists. Shared with export import,
+/// which refuses a destination that `restore` would too.
+pub(crate) async fn destination_database_exists(url: &str, name: &str) -> Result<bool> {
+    database_exists(url, name).await
+}
+
 async fn database_exists(url: &str, name: &str) -> Result<bool> {
     let options = sqlx::postgres::PgConnectOptions::from_str(url)
         .map_err(|_| anyhow::anyhow!("invalid PostgreSQL connection URL"))?
@@ -910,7 +916,14 @@ async fn database_exists(url: &str, name: &str) -> Result<bool> {
     Ok(exists)
 }
 
-async fn create_database(url: &str, name: &str) -> Result<()> {
+/// Create the destination database for a fresh import. Shared with `restore`.
+/// Returns whether this call created it: a concurrent create is reported as
+/// `false`, and the caller must not drop a database it did not create.
+pub(crate) async fn destination_create_database(url: &str, name: &str) -> Result<bool> {
+    create_database(url, name).await
+}
+
+async fn create_database(url: &str, name: &str) -> Result<bool> {
     let options = sqlx::postgres::PgConnectOptions::from_str(url)
         .map_err(|_| anyhow::anyhow!("invalid PostgreSQL connection URL"))?
         .database("postgres")
@@ -923,12 +936,31 @@ async fn create_database(url: &str, name: &str) -> Result<()> {
         .map_err(|_| {
             anyhow::anyhow!("cannot connect to PostgreSQL; check database availability")
         })?;
-    sqlx::query(&format!("CREATE DATABASE {}", quote_ident(name)))
+    let result = sqlx::query(&format!("CREATE DATABASE {}", quote_ident(name)))
         .execute(&pool)
-        .await
-        .map_err(|_| anyhow::anyhow!("cannot create the destination database"))?;
+        .await;
+    let created = match result {
+        Ok(_) => true,
+        // 42P04 is duplicate_database: another process created the name while
+        // this one was starting. It is not ours, so it must never be dropped.
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref()
+                == Some("42P04") =>
+        {
+            false
+        }
+        Err(_) => return Err(anyhow::anyhow!("cannot create the destination database")),
+    };
     pool.close().await;
-    Ok(())
+    Ok(created)
+}
+
+/// Drop a destination database whose import failed. Shared with `restore`.
+pub(crate) async fn destination_drop_database(url: &str, name: &str) -> Result<()> {
+    drop_database(url, name).await
 }
 
 async fn drop_database(url: &str, name: &str) -> Result<()> {
@@ -1619,7 +1651,13 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
     let mut config_written = false;
     let mut host_key_written = false;
     let result = async {
-        create_database(&options.database_url, &database).await?;
+        let created = create_database(&options.database_url, &database).await?;
+        if !created {
+            bail!(
+                "the destination database `{database}` appeared while restore was starting; \
+                 this restore did not create it and will not restore into or drop it"
+            );
+        }
         database_created = true;
         restore_database(&options.database_url, &root.join("database.dump"))?;
 
