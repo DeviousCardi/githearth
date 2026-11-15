@@ -1135,6 +1135,10 @@ mod tests {
             hook_socket_path: std::path::PathBuf::from("/nonexistent/hook.sock"),
             trusted_proxies: Vec::new(),
             mailer: Arc::new(crate::mail::DisabledTransport),
+            outbound: Arc::new(
+                crate::outbound::OutboundClient::from_config(&crate::config::Config::default())
+                    .unwrap(),
+            ),
             recorder: None,
             job_kinds: None,
             maintenance: crate::maintenance::Maintenance::new(

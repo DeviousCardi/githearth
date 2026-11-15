@@ -37,6 +37,7 @@ pub mod metrics;
 pub mod notification_email;
 pub mod notifications;
 mod notifications_ui;
+pub mod outbound;
 pub mod outbox;
 pub mod pins;
 pub mod protection;
@@ -146,6 +147,10 @@ pub struct AppState {
     /// Outbound mail. `DisabledTransport` unless SMTP is configured; tests
     /// replace it with an in-memory transport so no socket is opened.
     pub(crate) mailer: Arc<dyn mail::MailTransport>,
+    /// The one client every server-initiated HTTP request uses (ADR 0014 §7,
+    /// case U30c). Every later feature takes it from here; no feature opens its
+    /// own outbound connection.
+    pub outbound: Arc<outbound::OutboundClient>,
     /// In-memory counters and gauges the `/metrics` endpoint reads. `None` only
     /// for `AppState`s a unit test builds by hand; the middleware then counts
     /// nothing, and the endpoint still answers (with static gauges only).
@@ -281,6 +286,7 @@ impl AppState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| anyhow::anyhow!("trusted_proxies: invalid entry"))?;
         let mailer = mail::transport_from_config(&config)?;
+        let outbound = Arc::new(outbound::OutboundClient::from_config(&config)?);
         // The control token is regenerated on every start; the state file is
         // only an observation, never the fence `backup` trusts. A command that
         // is not `serve` must not rewrite the token of a running server.
@@ -316,6 +322,7 @@ impl AppState {
             hook_socket_path: socket_path,
             trusted_proxies,
             mailer,
+            outbound,
             recorder: Some(Arc::new(metrics::Recorder::new())),
             job_kinds: None,
             maintenance,
@@ -336,6 +343,14 @@ impl AppState {
     /// implementation so no SMTP socket is ever opened.
     pub fn with_mailer(mut self, mailer: Arc<dyn mail::MailTransport>) -> Self {
         self.mailer = mailer;
+        self
+    }
+
+    /// Replaces the one outbound client. Used by a test that builds one from a
+    /// configuration, and by a future feature that needs a different policy; the
+    /// transport and resolver seam itself stays crate-private.
+    pub fn with_outbound(mut self, outbound: Arc<outbound::OutboundClient>) -> Self {
+        self.outbound = outbound;
         self
     }
 

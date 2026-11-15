@@ -51,6 +51,11 @@ use `starttls` or `implicit`. An unauthenticated cleartext relay is allowed
 because it carries no credential. The server certificate is verified against
 the public web PKI; there is no "accept any certificate" switch.
 
+SMTP resolves its host once and checks every answer with the outbound client's
+address policy: a cloud-metadata endpoint is always refused, and a loopback,
+link-local or private answer needs `outbound_allow_private = true`. A loopback
+development relay therefore needs that option as well as `smtp_host`.
+
 ## What is sent
 
 Notification mail is limited to the notification kinds below and is addressed

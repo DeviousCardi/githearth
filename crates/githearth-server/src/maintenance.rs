@@ -422,6 +422,7 @@ enum Listener {
 
 fn probe(address: SocketAddr) -> Listener {
     let address = reachable_address(address);
+    // outbound-exempt: on-host liveness probe of a configured bind address, rewritten to loopback
     match TcpStream::connect_timeout(&address, Duration::from_millis(750)) {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Listener::Refused,
         Err(error) => Listener::Unknown(error.to_string()),
@@ -565,6 +566,7 @@ fn request_blocking(
     method: &str,
     path: &str,
 ) -> anyhow::Result<Status> {
+    // outbound-exempt: on-host loopback control channel; the address is the local state file's, rewritten to loopback
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
         .map_err(|error| anyhow::anyhow!("cannot connect to {address}: {error}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;

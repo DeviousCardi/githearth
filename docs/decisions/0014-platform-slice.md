@@ -293,6 +293,66 @@ first users follow immediately — OIDC discovery (M11a), external action
 sources (M6), webhooks, mirrors and importers (M12). No later feature opens
 its own outbound connection.
 
+**How the pin is enforced.** A destination is a DNS name; an IP literal,
+including the legacy `127.1`, `2130706433`, `0x7f.1` and `0300.0250.1.1`
+spellings, and userinfo are refused when the URL is parsed. Each hop resolves
+the name exactly once, checks every answer against the range and metadata
+policy, and hands the transport a `SocketAddr` — never the name. The transport
+takes no resolver, opens a fresh TCP stream per hop, sends `Connection: close`,
+and has no retry. A redirect is a new hop and is resolved and checked again. A
+connection pool cannot re-resolve because there is no pool. HTTP/2 reuse is not
+offered: the TLS client sets no ALPN (a test fails if `h2` is added), so one
+request is one connection. Proxy variables are not read and a proxy is not
+supported, so an egress proxy cannot move the connection away from the checked
+address. The only resolver in the crate is the client's `SystemResolver`;
+`TcpTransport`, `Connection` and the injection traits are crate-private, and a
+guard test scans every crate's `src` and `benches` for a socket, a DNS call or
+an HTTP client, exempting only `outbound.rs` and individual lines marked
+`// outbound-exempt: <reason>`.
+
+**What the client cannot prevent.** It cannot stop the platform resolver from
+returning a different answer to a *later, separate* request — that is why every
+hop resolves and checks afresh rather than caching an address — and it cannot
+stop a host-level transparent redirect or a compromised local resolver from
+routing the *one* connection to an address the policy approved. It also cannot
+inspect a TLS session after the handshake: the pin decides which address is
+connected to, and certificate verification decides whether that peer is the
+named host. Those are properties of the host's network stack, not of this
+client.
+
+**Named exceptions.** Two server-initiated connections do not go through the
+client's HTTP transport. They are marked at the line that opens them and are the
+only whole-file exemptions the guard would otherwise need:
+
+- **SMTP (`mail.rs`).** SMTP is not HTTP, so it cannot use the client's
+  transport. Its connect uses the same resolution and address policy:
+  `outbound::resolve_operator_destination` resolves the operator-configured
+  `smtp_host` once, checks every answer with the client's `classify_address`,
+  refuses a metadata endpoint always (and loopback, link-local and private
+  ranges without `outbound_allow_private`), and returns the pinned
+  `SocketAddr`, which is connected to directly. There is no second resolution
+  and no request-driven destination.
+- **The on-host maintenance control request and liveness probe
+  (`maintenance.rs`).** Both are loopback-only by construction: the address
+  comes from the local state file and a wildcard bind is rewritten to loopback.
+  They must work when the database, the configuration and the egress policy are
+  unavailable — that is what maintenance mode is. The control request cannot be
+  expressed through the client because the client refuses IP-literal
+  destinations and refuses loopback by default; admitting a loopback IP literal
+  would add a bypass to the very rule that protects the rest. They carry a token
+  generated at start, read from the on-host state file, and never leave the
+  host.
+
+The client is bounded in size and time: 1 MiB request, 5 MiB response, 5
+same-host redirects and 30 s for the whole exchange by default. Every response
+line is read through a bounded reader that never grows past its line limit, so
+a peer cannot exhaust memory with an endless header. The deadline is absolute
+and is passed into the blocking transport, which resets the socket timeout
+before every read and write and returns `Timeout` at the deadline, so a
+dribbling peer cannot keep the reading thread alive after the caller has
+returned.
+
+
 ## Alternatives considered
 
 - **Separate secret stores and token models per milestone.** Rejected: three
