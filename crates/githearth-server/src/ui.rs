@@ -830,13 +830,39 @@ async fn organization(
     } else {
         String::new()
     };
+    // Teams and invitations are administered by the same owner-only actions
+    // their pages check again before rendering anything.
+    let allowed = |action| {
+        state
+            .authz
+            .authorize(&facts.request(
+                action,
+                Resource::Organization,
+                Some(Duration::from_secs(auth_age)),
+            ))
+            .is_allowed()
+    };
+    let admin_links = [
+        (Action::TeamCreate, "Teams", "teams"),
+        (Action::InvitationRead, "Invitations", "invitations"),
+    ]
+    .into_iter()
+    .filter(|(action, _, _)| allowed(*action))
+    .map(|(_, label, path)| {
+        format!(
+            "<p><a href=\"/organizations/{}/{path}\">{label}</a></p>",
+            url_encode(&slug)
+        )
+    })
+    .collect::<String>();
     let body = format!(
-        "<h1>{}</h1><p class=\"muted\">{}</p>{}<div class=\"card\"><ul>{}</ul></div>{}",
+        "<h1>{}</h1><p class=\"muted\">{}</p>{}<div class=\"card\"><ul>{}</ul></div>{}{}",
         esc(&org_name),
         esc(&slug),
         new_repo_link,
         items,
-        members_link
+        members_link,
+        admin_links
     );
     let hash = browser_token_hash(&headers).unwrap_or_default();
     let csrf = Some(csrf_expected(&hash));

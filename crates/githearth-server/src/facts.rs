@@ -40,6 +40,17 @@ impl Facts {
             read_only: self.read_only,
         }
     }
+
+    /// One action against the organization itself. Invitation acceptance uses
+    /// it so it asks the engine the same question the JSON handlers do
+    /// (ADR 0002), with the same principal, teams and grants.
+    pub fn on_organization<'s>(
+        &'s self,
+        action: Action,
+        auth_age: Option<Duration>,
+    ) -> Request<'s> {
+        self.request(action, Resource::Organization, auth_age)
+    }
 }
 
 /// The account's direct teams plus all of their ancestors.
