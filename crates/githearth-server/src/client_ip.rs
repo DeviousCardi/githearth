@@ -1,9 +1,56 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/// The resolved client IP, inserted as a request extension by the `ClientIpLayer`.
-/// Public so callers such as the audit system can read it (TASK #88).
+/// The resolved client IP, inserted as a request extension by the
+/// `client_ip_middleware`. Public so a handler can extract it as well as the
+/// audit system reading it from the extension (TASK #88).
 #[derive(Debug, Clone, Copy)]
-pub struct ClientIp(pub IpAddr);
+pub struct ClientIp(pub(crate) IpAddr);
+
+impl ClientIp {
+    /// The resolved client IP, for a caller that already has one. The router's
+    /// `client_ip_middleware` builds it from the peer and `trusted_proxies`;
+    /// the metrics integration test uses it to address a request made with
+    /// `Router::oneshot`, which has no peer, without duplicating that logic.
+    pub fn resolved(addr: IpAddr) -> Self {
+        Self(addr)
+    }
+
+    /// The address the server resolved for this request, after trusted-proxy
+    /// handling.
+    pub fn addr(self) -> IpAddr {
+        self.0
+    }
+}
+
+/// The resolved client address, if the server resolved one for this request.
+/// A handler extracts this instead of digging through the extensions.
+pub struct ResolvedIp(pub Option<ClientIp>);
+
+// `Rejection` is impossible: a request without a resolved address (only
+// `Router::oneshot` in a unit test) yields `None` rather than an error. Both
+// traits are implemented because axum requires the optional form before it
+// accepts `Option<ResolvedIp>` as an argument.
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ResolvedIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.extensions.get::<ClientIp>().copied()))
+    }
+}
+
+impl<S: Send + Sync> axum::extract::OptionalFromRequestParts<S> for ResolvedIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(Some(Self(parts.extensions.get::<ClientIp>().copied())))
+    }
+}
 
 /// A single trusted-proxy entry: an individual IP or a CIDR range.
 #[derive(Debug, Clone)]

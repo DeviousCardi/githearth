@@ -29,6 +29,7 @@ pub mod merge;
 pub mod merge_intents;
 pub mod merge_worker;
 mod mergeability;
+pub mod metrics;
 pub mod notifications;
 mod notifications_ui;
 pub mod pins;
@@ -106,6 +107,14 @@ pub struct AppState {
     pub hook_tokens: Arc<std::sync::Mutex<HashMap<String, git_admission::Admitted>>>,
     pub(crate) hook_socket_path: std::path::PathBuf,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
+    /// In-memory counters and gauges the `/metrics` endpoint reads. `None` only
+    /// for `AppState`s a unit test builds by hand; the middleware then counts
+    /// nothing, and the endpoint still answers (with static gauges only).
+    pub(crate) recorder: Option<Arc<metrics::Recorder>>,
+    /// The job kinds `serve` registered, so `githearth_jobs_by_kind` publishes
+    /// a series per registered kind instead of per kind in the database. `None`
+    /// when no runner was started; the metric then publishes `other` only.
+    pub(crate) job_kinds: Option<Arc<[&'static str]>>,
 }
 impl AppState {
     /// Records that `added` bytes of a fork head were copied into `target`,
@@ -204,9 +213,22 @@ impl AppState {
             hook_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hook_socket_path: socket_path,
             trusted_proxies,
+            recorder: Some(Arc::new(metrics::Recorder::new())),
+            job_kinds: None,
         };
         tokio::spawn(crate::git_http::hook_accept_loop(listener, state.clone()));
         Ok(state)
+    }
+
+    /// Records the job kinds the runner registered, for
+    /// `githearth_jobs_by_kind`. `serve` calls this after building the registry.
+    pub fn record_job_kinds(&mut self, kinds: &[&'static str]) {
+        self.job_kinds = Some(Arc::from(kinds));
+    }
+
+    /// The in-memory counters behind `/metrics`.
+    pub fn recorder(&self) -> Option<&Arc<metrics::Recorder>> {
+        self.recorder.as_ref()
     }
 
     /// The sudo-mode window the authorization engine applies to sensitive
@@ -372,9 +394,19 @@ pub fn router(state: AppState) -> Router {
         ));
 
     let git = git_http::router(&state.config);
+    // Its own router, not part of `json`: a scrape is a plain `GET` with no
+    // body, and the JSON API's read-only boundary, body limit and JSON
+    // rejection rewriting have nothing to say about it. The handler refuses a
+    // non-loopback client itself, per request, using the resolved address.
+    let operator = Router::new().route(metrics::PATH, get(metrics::metrics));
 
     // The last layer runs first: resolve the client IP before observe logs it.
+    // `operator` is merged last because `ui::router()` installs a `fallback`,
+    // and a fallback answers only a path no route claims — merging order cannot
+    // shadow `/metrics`. An explicit route added by any merged router would,
+    // so `/metrics` must stay claimed only here.
     json.merge(git)
+        .merge(operator)
         .layer(axum::middleware::from_fn(observe))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -434,6 +466,11 @@ async fn client_ip_middleware(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    // `observe` runs outside this layer and cannot extract `State`; hand it the
+    // recorder through the request.
+    request
+        .extensions_mut()
+        .insert(metrics::ObservedRecorder(state.recorder.clone()));
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -496,6 +533,21 @@ async fn json_rejections(
 async fn observe(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let start = std::time::Instant::now();
     let method = request.method().clone();
+    // The counters are in memory: one atomic increment and one duration sum per
+    // request, never a database write. The recorder lives on the request's
+    // state extensions so the middleware needs no extractor of its own.
+    let recorder = request
+        .extensions()
+        .get::<metrics::ObservedRecorder>()
+        .and_then(|r| r.0.clone());
+    let service = metrics::git_service(request.uri().path());
+    // Counted from the start, not the finish: the scrape reads the gauge while
+    // its own request is running, so a request must be in flight while it is
+    // answered, or `in_flight` would always be one short and a lone `curl`
+    // scrape would always read 0.
+    if let Some(recorder) = &recorder {
+        recorder.request_started();
+    }
     // Never log raw URIs, query strings, headers, bodies, database errors or configuration.
     let route = request
         .extensions()
@@ -508,6 +560,14 @@ async fn observe(request: axum::extract::Request, next: axum::middleware::Next) 
         .map(|c| c.0.to_string())
         .unwrap_or_else(|| "unknown".into());
     let mut response = next.run(request).await;
+    if let Some(recorder) = &recorder {
+        let status = response.status().as_u16();
+        recorder.request(method.as_str(), status, start.elapsed());
+        if let Some(service) = service {
+            recorder.git_request(service, status);
+        }
+        recorder.request_finished();
+    }
     let headers = response.headers_mut();
     headers.insert("cache-control", "no-store".parse().unwrap());
     // Every response: no MIME sniffing (raw file views serve user content), and

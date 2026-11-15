@@ -199,7 +199,7 @@ async fn run(args: Args) -> Result<()> {
             if let Err(message) = doctor::schema_check(&pool).await {
                 bail!("database schema does not match this binary: {message}");
             }
-            let state = AppState::new(pool, config.clone())
+            let mut state = AppState::new(pool, config.clone())
                 .await
                 .context("cannot initialize authentication")?;
             // The one pin 0046 cannot write (a base is not stored in
@@ -216,6 +216,10 @@ async fn run(args: Args) -> Result<()> {
             githearth_server::notifications::register(&mut registry);
             githearth_server::codeowners::register(&mut registry);
             githearth_server::housekeeping::register(&mut registry, &config);
+            // `/metrics` labels a job only by a kind this runner registered, so
+            // the endpoint never grows a series for a row left by an older
+            // binary.
+            state.record_job_kinds(&registry.kinds());
             let _housekeeping = githearth_server::housekeeping::spawn(state.clone());
             let jobs = jobs::spawn(state.clone(), registry, jobs_shutdown.clone());
             let _ssh = if config.ssh_enabled {
@@ -230,6 +234,12 @@ async fn run(args: Args) -> Result<()> {
                 .await
                 .context("cannot bind HTTP listener")?;
             tracing::info!(bind = %config.bind, "HTTP server listening; use loopback or a trusted TLS proxy");
+            if config.metrics_enabled {
+                tracing::info!(
+                    non_loopback = config.metrics_allow_non_loopback,
+                    "metrics endpoint enabled"
+                );
+            }
             axum::serve(
                 listener,
                 router(state).into_make_service_with_connect_info::<SocketAddr>(),

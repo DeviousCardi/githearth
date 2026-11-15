@@ -48,3 +48,12 @@ auth_concurrency = 2
 # login_throttle_max_per_username = 10
 # login_throttle_max_per_client = 50
 # login_throttle_window_seconds = 900
+# Metrics endpoint (docs/operations/metrics.md). Off by default; when on it
+# answers only a loopback client and publishes the documented metric and label
+# list, which carries no organization, repository or account identifier.
+# metrics_enabled = true
+# Answers a non-loopback client too. Only for a deliberate decision: the
+# listener must be on a private interface nothing else can reach, and the line
+# is accepted only together with `metrics_enabled = true` above (on its own it
+# is refused at load, because it would do nothing).
+# metrics_allow_non_loopback = true
