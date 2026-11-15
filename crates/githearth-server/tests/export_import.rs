@@ -3,24 +3,30 @@
 //!
 //! The harness exports a real installation, imports it into a fresh
 //! installation, exports that installation, and compares counts, checksums and
-//! sampled content. The seeded metadata is the ground truth: every count and
-//! every sampled field below is asserted against what `seed_installation`
-//! created, not merely against the second export. Assertions read the two
-//! exports and native Git; no acceptance assertion queries PostgreSQL. The
-//! database is used only to create the source installation and to reserve a
-//! fresh destination, as the backup suite does.
+//! content. The seeded metadata is the ground truth: every record and field in
+//! the export is parsed and compared against the source installation's database
+//! rows, not merely against the second export. The source database is the
+//! expected-value fixture; no acceptance assertion queries the imported
+//! destination. Assertions read the two exports, the source rows and native
+//! Git. The database is used to create the source installation, to read back
+//! the expected metadata, and to reserve a fresh destination, as the backup
+//! suite does.
 //!
 //! Deliberate failures damage one object's bytes, change a count in the
 //! manifest, drop an object from the manifest (restating its part checksum),
 //! alter one metadata field (restating the metadata part), and set an unknown
-//! format version; every import must refuse before writing anything. A fork's
-//! parent is checked in both UUID orders, because the export used to lose the
-//! parent whose id sorted after its child's.
+//! format version; every import must refuse before writing anything. Two more
+//! cases damage the exported team name and swap the two grant ids, restating
+//! the metadata part: a typed import cannot see either (the archive is
+//! internally consistent), so the source-anchored harness must. A fork's parent
+//! is checked in both UUID orders, because the export used to lose the parent
+//! whose id sorted after its child's.
 
 use githearth_git::object_store::{FsObjectStore, ObjectKey, ObjectStore, TenantId};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -731,8 +737,246 @@ fn object_payload(archive: &Path) -> (String, Vec<u8>) {
     (digest, fs::read(archive.join(relative)).unwrap())
 }
 
+/// Every metadata kind and the query that renders the source installation's
+/// rows as the export's JSON records. The timestamps use the exporter's exact
+/// format so equality is field-for-field, not a normalized comparison.
+const SOURCE_METADATA_QUERIES: [(&str, &str); 10] = [
+    (
+        "account",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'account'::text AS kind, id, username, email,
+                    CASE WHEN email_verified_at IS NULL THEN NULL
+                         ELSE to_char(email_verified_at AT TIME ZONE 'UTC',
+                                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                    END AS email_verified_at,
+                    is_admin, suspended,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+             FROM accounts
+           ) t"#,
+    ),
+    (
+        "organization",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'organization'::text AS kind, id, slug, name, suspended,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+             FROM organizations
+           ) t"#,
+    ),
+    (
+        "membership",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'membership'::text AS kind, organization_id, account_id, role
+             FROM memberships
+           ) t"#,
+    ),
+    (
+        "team",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'team'::text AS kind, id, organization_id, parent_id, slug, name,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+             FROM teams
+           ) t"#,
+    ),
+    (
+        "team_member",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'team_member'::text AS kind, team_id, account_id
+             FROM team_members
+           ) t"#,
+    ),
+    (
+        "repository",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'repository'::text AS kind, id, organization_id, name, description,
+                    visibility, archived, status, object_format, created_by,
+                    parent_repository_id,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+                    to_char(updated_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
+             FROM repositories
+           ) t"#,
+    ),
+    (
+        "grant",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'grant'::text AS kind, id, role, subject_kind, subject_id,
+                    scope_kind, scope_id, repository_id,
+                    CASE WHEN expires_at IS NULL THEN NULL
+                         ELSE to_char(expires_at AT TIME ZONE 'UTC',
+                                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                    END AS expires_at,
+                    granted_by,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+             FROM grants
+           ) t"#,
+    ),
+    (
+        "issue",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'issue'::text AS kind, id, repository_id, number, title, body,
+                    author_id, state,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+                    to_char(updated_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
+                    CASE WHEN closed_at IS NULL THEN NULL
+                         ELSE to_char(closed_at AT TIME ZONE 'UTC',
+                                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                    END AS closed_at
+             FROM issues
+           ) t"#,
+    ),
+    (
+        "pull_request",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'pull_request'::text AS kind, id, repository_id, number, title, body,
+                    author_id, source_branch, target_branch, source_repository_id,
+                    state, draft, closed_reason,
+                    CASE WHEN merged_at IS NULL THEN NULL
+                         ELSE to_char(merged_at AT TIME ZONE 'UTC',
+                                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                    END AS merged_at,
+                    merged_by,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+                    to_char(updated_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
+                    CASE WHEN closed_at IS NULL THEN NULL
+                         ELSE to_char(closed_at AT TIME ZONE 'UTC',
+                                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                    END AS closed_at
+             FROM pull_requests
+           ) t"#,
+    ),
+    (
+        "pull_request_review",
+        r#"SELECT to_jsonb(t)::text FROM (
+             SELECT 'pull_request_review'::text AS kind, id, pull_request_id,
+                    reviewer_id, verdict, commit_id, body,
+                    to_char(created_at AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+             FROM pull_request_reviews
+           ) t"#,
+    ),
+];
+
+/// The source installation's metadata, read from its database, as the records
+/// an export must carry. This is the harness's ground truth: comparing the two
+/// exports only to each other accepts an exporter that loses or corrupts a
+/// field in both.
+fn expected_metadata(database_url: &str) -> BTreeMap<String, Vec<Value>> {
+    let url = database_url.to_owned();
+    runtime().block_on(async move {
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let mut grouped = BTreeMap::new();
+        for (kind, sql) in SOURCE_METADATA_QUERIES {
+            let mut records: Vec<Value> = sqlx::query_scalar::<_, String>(sql)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|text| serde_json::from_str(&text).unwrap())
+                .collect();
+            records.sort_by_key(record_sort_key);
+            grouped.insert(kind.to_owned(), records);
+        }
+        pool.close().await;
+        grouped
+    })
+}
+
+/// The exporter's stable order within a kind: ids for entities, composite
+/// identities for the join records, repository and number for issues and pulls.
+fn record_sort_key(record: &Value) -> String {
+    let field = |name: &str| record[name].as_str().unwrap_or_default().to_owned();
+    match record["kind"].as_str().unwrap_or_default() {
+        "membership" => format!("{}/{}", field("organization_id"), field("account_id")),
+        "team_member" => format!("{}/{}", field("team_id"), field("account_id")),
+        "issue" | "pull_request" => format!(
+            "{}/{:010}",
+            field("repository_id"),
+            record["number"].as_i64().unwrap_or_default()
+        ),
+        _ => field("id"),
+    }
+}
+
+fn metadata_by_kind(lines: &[String]) -> BTreeMap<String, Vec<Value>> {
+    let mut grouped: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for line in lines {
+        let record: Value = serde_json::from_str(line).unwrap();
+        let kind = record["kind"].as_str().unwrap().to_owned();
+        grouped.entry(kind).or_default().push(record);
+    }
+    for records in grouped.values_mut() {
+        records.sort_by_key(record_sort_key);
+    }
+    grouped
+}
+
+/// Compare every record and field in `metadata.jsonl` against the source rows.
+/// Returns the differing kinds and values instead of panicking so the
+/// regression test can prove the harness fails for a wrong name or swapped id.
+fn anchor_metadata(archive: &Path, expected: &BTreeMap<String, Vec<Value>>) -> Result<(), String> {
+    let actual = metadata_by_kind(&lines_without_header(&archive.join("metadata.jsonl")));
+    if &actual == expected {
+        return Ok(());
+    }
+    let mut kinds: Vec<&str> = expected
+        .keys()
+        .chain(actual.keys())
+        .map(String::as_str)
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let mut differences = Vec::new();
+    for kind in kinds {
+        if expected.get(kind) != actual.get(kind) {
+            differences.push(format!(
+                "{kind}: source {:?}, export {:?}",
+                expected.get(kind),
+                actual.get(kind)
+            ));
+        }
+    }
+    Err(differences.join("\n"))
+}
+
+/// Rewrite `metadata.jsonl` through `mutate` and restate the metadata part's
+/// checksum, byte and line counts, so only a content check can see the change.
+fn rewrite_metadata(archive: &Path, mutate: impl FnOnce(&mut Vec<Value>)) {
+    let path = archive.join("metadata.jsonl");
+    let text = fs::read_to_string(&path).unwrap();
+    let mut lines = text.lines();
+    let header = lines.next().unwrap().to_owned();
+    let mut records: Vec<Value> = lines
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    mutate(&mut records);
+    let mut rewritten = header;
+    for record in records {
+        rewritten.push('\n');
+        rewritten.push_str(&serde_json::to_string(&record).unwrap());
+    }
+    rewritten.push('\n');
+    fs::write(&path, &rewritten).unwrap();
+    let mut changed = manifest(archive);
+    changed["metadata"]["bytes"] = Value::from(rewritten.len() as u64);
+    changed["metadata"]["sha256"] = Value::from(sha256_hex(rewritten.as_bytes()));
+    changed["metadata"]["lines"] =
+        Value::from(rewritten.lines().filter(|line| !line.is_empty()).count() as u64);
+    write_manifest(archive, &changed);
+}
+
 /// U30a: export, import into a fresh installation, export again, and compare
-/// counts, checksums and sampled content.
+/// counts, checksums, every metadata field against the source database, and
+/// sampled bytes and Git content.
 #[test]
 #[ignore = "requires PostgreSQL and git; run with --include-ignored"]
 fn export_import_round_trip_agrees_on_counts_checksums_and_content() {
@@ -783,13 +1027,13 @@ fn export_import_round_trip_agrees_on_counts_checksums_and_content() {
     let second_lines = lines_without_header(&second.join("metadata.jsonl"));
     assert_eq!(
         first_lines, second_lines,
-        "every metadata record, including sampled issue/PR/review/team/grant content, must \
-         agree"
+        "every metadata record must agree between the two exports"
     );
 
-    // Anchor the metadata to the seeded installation: comparing the two exports
-    // to each other alone would accept an exporter that dropped a kind or
-    // swapped two fields, because both exports would lose it identically.
+    // Anchor the metadata to the source installation: comparing the two exports
+    // to each other alone would accept an exporter that dropped a kind, changed
+    // a value or swapped two ids, because both exports would lose it
+    // identically. The expected records are read back from the source database.
     let counts = first_manifest["counts"]
         .as_object()
         .expect("the manifest has counts");
@@ -819,71 +1063,13 @@ fn export_import_round_trip_agrees_on_counts_checksums_and_content() {
         "the export carries exactly the ten covered kinds: {counts:?}"
     );
 
-    let issue_line = first_lines
-        .iter()
-        .find(|line| line.contains("\"kind\":\"issue\""))
-        .expect("the seeded issue is exported");
-    assert!(
-        issue_line.contains(r#""title":"Export issue""#),
-        "{issue_line}"
-    );
-    assert!(
-        issue_line.contains("Issue body travels in metadata.jsonl"),
-        "{issue_line}"
-    );
-    let pull_line = first_lines
-        .iter()
-        .find(|line| line.contains("\"kind\":\"pull_request\""))
-        .expect("the seeded pull request is exported");
-    assert!(
-        pull_line.contains(r#""title":"Export pull""#),
-        "{pull_line}"
-    );
-    assert!(pull_line.contains(r#""body":"Pull body""#), "{pull_line}");
-    assert!(
-        pull_line.contains(r#""source_branch":"feature""#)
-            && pull_line.contains(r#""target_branch":"main""#),
-        "{pull_line}"
-    );
-    let review_line = first_lines
-        .iter()
-        .find(|line| line.contains("\"kind\":\"pull_request_review\""))
-        .expect("the seeded review is exported");
-    assert!(review_line.contains("A sampled review"), "{review_line}");
-    assert!(
-        review_line.contains(r#""verdict":"commented""#),
-        "{review_line}"
-    );
-    let repository_line = first_lines
-        .iter()
-        .find(|line| line.contains("\"kind\":\"repository\""))
-        .expect("the seeded repository is exported");
-    assert!(
-        repository_line.contains(r#""name":"widget""#),
-        "{repository_line}"
-    );
-    assert!(
-        repository_line.contains(r#""parent_repository_id":null"#),
-        "a plain repository is not a fork: {repository_line}"
-    );
-    let account_line = first_lines
-        .iter()
-        .find(|line| line.contains("\"kind\":\"account\""))
-        .expect("the admin account is exported");
-    assert!(
-        account_line.contains(r#""username":"admin""#),
-        "{account_line}"
-    );
-    assert!(
-        !account_line.contains("password"),
-        "the account record carries no credential: {account_line}"
-    );
-    assert!(
-        first_lines
-            .iter()
-            .any(|line| line.contains("\"kind\":\"team_member\"")),
-        "the seeded team member is exported"
-    );
+    let expected = expected_metadata(&source.database.url);
+    anchor_metadata(&first, &expected).unwrap_or_else(|differences| {
+        panic!("the export does not match the source database:\n{differences}")
+    });
+    anchor_metadata(&second, &expected).unwrap_or_else(|differences| {
+        panic!("the re-export does not match the source database:\n{differences}")
+    });
 
     // The manifest's omitted set is part of the contract; assert the classes
     // the review found unrecorded are now named.
@@ -1045,6 +1231,60 @@ fn deliberate_failures_are_refused_before_writing() {
     write_manifest(&archive, &changed);
     let failure = refused(&archive, "case-field-dest", "names repository");
     println!("case field: {failure}");
+}
+
+/// The review's two injections: a wrong team name and two swapped grant ids,
+/// each with the metadata part restated so the checksum cannot see it. The
+/// typed import accepts both (the archive is internally consistent), so the
+/// source-anchored harness must fail; this test proves the assertions do.
+#[test]
+#[ignore = "requires PostgreSQL and git; run with --include-ignored"]
+fn the_harness_refuses_a_wrong_name_and_a_swapped_grant_id() {
+    let mut source = Installation::new("anchors");
+    seed_installation(&mut source);
+    let pristine = source.path.join("pristine-export");
+    source.export(&pristine);
+    let expected = expected_metadata(&source.database.url);
+    anchor_metadata(&pristine, &expected).expect("the pristine export matches the source");
+
+    let archive = source.path.join("case-team-name");
+    copy_tree(&pristine, &archive);
+    rewrite_metadata(&archive, |records| {
+        let team = records
+            .iter_mut()
+            .find(|record| record["kind"] == "team")
+            .expect("the seeded team is exported");
+        assert_eq!(team["name"], "Core");
+        team["name"] = Value::from("Kore");
+    });
+    let differences =
+        anchor_metadata(&archive, &expected).expect_err("a wrong team name must fail the harness");
+    assert!(differences.contains("team"), "{differences}");
+    assert!(differences.contains("Kore"), "{differences}");
+    println!("wrong team name: {differences}");
+
+    let archive = source.path.join("case-swapped-grant");
+    copy_tree(&pristine, &archive);
+    rewrite_metadata(&archive, |records| {
+        let ids: Vec<String> = records
+            .iter()
+            .filter(|record| record["kind"] == "grant")
+            .map(|record| record["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids.len(), 2, "the seed creates two grants");
+        for record in records
+            .iter_mut()
+            .filter(|record| record["kind"] == "grant")
+        {
+            let id = record["id"].as_str().unwrap().to_owned();
+            let other = if id == ids[0] { &ids[1] } else { &ids[0] };
+            record["id"] = Value::from(other.clone());
+        }
+    });
+    let differences = anchor_metadata(&archive, &expected)
+        .expect_err("swapping two grant ids must fail the harness");
+    assert!(differences.contains("grant"), "{differences}");
+    println!("swapped grant ids: {differences}");
 }
 
 /// B1: a fork's parent must survive export and import whichever UUID sorts

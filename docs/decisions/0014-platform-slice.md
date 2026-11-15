@@ -766,19 +766,25 @@ import won the name) is left untouched. Re-running a successful import is
 refused: the export is a snapshot, not a delta.
 
 **Tolerances and harness.** Counts must be equal, each object's checksum must
-be equal, Git refs digests must be equal, and sampled metadata, object bytes
-and Git content are compared exactly. `tests/export_import.rs` seeds
-organizations, accounts, a repository with two commits, an issue, a pull
-request and review, a team with a member and grant, and an object; it exports,
-imports into a fresh installation, exports again and compares. Every seeded
-count and every sampled field is anchored to the source, so an exporter that
-drops a kind or swaps two fields fails the harness rather than agreeing with
-itself. Its deliberate failures damage a sampled object's bytes, change a count
-in the manifest, drop an object from the manifest while restating its part
-checksum, alter one metadata field while restating the metadata part, and set
-an unknown version; each must make the import refuse before it writes. A fork
-seeded in both UUID orders must keep its parent through export and import. A
-round trip that cannot fail is not evidence.
+be equal, Git refs digests must be equal, and object bytes and sampled Git
+content are compared exactly. `tests/export_import.rs` seeds organizations,
+accounts, a repository with two commits, an issue, a pull request and review,
+a team with a member and grant, and an object; it exports, imports into a fresh
+installation, exports again and compares. The harness parses both
+`metadata.jsonl` streams and compares every record, field by field, against the
+rows read back from the source installation's database — every id, name, slug,
+role, subject, scope, visibility, state, author, reviewer, commit id and
+timestamp — so an exporter that drops a record or a kind, corrupts a value or
+swaps two ids fails the harness rather than agreeing with itself. Its
+deliberate failures damage a sampled object's bytes, change a count in the
+manifest, drop an object from the manifest while restating its part checksum,
+alter one metadata field while restating the metadata part, and set an unknown
+version; each must make the import refuse before it writes. Two further cases
+write the wrong team name and swap the two grant ids, each with the metadata
+part restated: a typed import cannot detect either because the archive is
+internally consistent, so the source-anchored comparison must, and a regression
+test proves it does. A fork seeded in both UUID orders must keep its parent
+through export and import. A round trip that cannot fail is not evidence.
 
 The format is unsigned and unanchored, so a deliberately rewritten archive that
 restates every count and checksum imports as a smaller installation; the harness
