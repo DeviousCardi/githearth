@@ -25,6 +25,17 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// This file shares one database, so every fixture must also share one
+/// installation key: a row created by one test is read by the next test's
+/// `AppState`, and two different installation keys would make it unreadable.
+fn shared_key_file() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("githearth-audit-ip-test.key");
+    if !path.exists() {
+        let _ = githearth_server::secrets::generate_raw_key_file(&path);
+    }
+    path
+}
+
 async fn setup() -> (axum::Router, PgPool, std::path::PathBuf, String, Uuid) {
     let storage_root = std::env::temp_dir().join(format!("githearth-audit-ip-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
@@ -34,10 +45,18 @@ async fn setup() -> (axum::Router, PgPool, std::path::PathBuf, String, Uuid) {
         database_max_connections: 32,
         database_timeout_seconds: 5,
         storage_root: storage_root.clone(),
+        installation_key_file: shared_key_file(),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
     MIGRATOR.run(&pool).await.unwrap();
+    // This file shares one database. Reset the key set so a key from an earlier
+    // test (or an earlier run under a different installation key) cannot decide
+    // whether this test's app-created key is encrypted.
+    sqlx::query("TRUNCATE audit_ip_keys, stored_secrets, secret_data_keys")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // A single account with a known password, so login can be exercised.
     let username = tag("user");
@@ -125,12 +144,19 @@ async fn http_action_records_client_ip_on_audit_row() {
     let digest = digest.expect("a ConnectInfo request records a digest");
     assert_eq!(digest.len(), 32);
 
-    let key: Vec<u8> = sqlx::query_scalar("SELECT key FROM audit_ip_keys WHERE id = $1")
-        .bind(key_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(digest, hmac(&key, b"203.0.113.7"));
+    // The key is now an envelope: the plaintext column is cleared and the
+    // material lives in `stored_secrets` under a wrapped data key. Only a
+    // legacy row inserted by a fixture would still have `key` set.
+    let plaintext: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT key FROM audit_ip_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        plaintext.is_none(),
+        "the audit IP key must be encrypted at rest"
+    );
 
     let _ = std::fs::remove_dir_all(&storage_root);
     pool.close().await;
@@ -451,10 +477,15 @@ async fn plain_pool() -> (PgPool, std::path::PathBuf) {
         database_max_connections: 32,
         database_timeout_seconds: 5,
         storage_root: storage_root.clone(),
+        installation_key_file: shared_key_file(),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
     MIGRATOR.run(&pool).await.unwrap();
+    sqlx::query("TRUNCATE audit_ip_keys, stored_secrets, secret_data_keys")
+        .execute(&pool)
+        .await
+        .unwrap();
     (pool, storage_root)
 }
 

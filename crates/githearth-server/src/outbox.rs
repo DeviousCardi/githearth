@@ -332,7 +332,10 @@ pub fn spawn(
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { run(&state, shutdown).await })
+    let keys = state.installation_keys.clone();
+    tokio::spawn(crate::secrets::scope(keys, async move {
+        run(&state, shutdown).await
+    }))
 }
 
 /// The delay before retry `retry` (1-based): `base × 2^(retry−1)`, capped.

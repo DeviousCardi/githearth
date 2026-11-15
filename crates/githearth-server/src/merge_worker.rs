@@ -299,7 +299,8 @@ pub async fn run_once(state: &AppState, repository: Option<Uuid>) -> Result<usiz
 /// run a pass at startup; the first pass runs after one interval. Never panics
 /// or exits the loop on errors.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    let keys = state.installation_keys.clone();
+    tokio::spawn(crate::secrets::scope(keys, async move {
         let interval = Duration::from_secs(state.config.merge_worker_interval_seconds);
         let mut tick = tokio::time::interval(interval);
         tick.tick().await;
@@ -317,7 +318,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 }
             }
         }
-    })
+    }))
 }
 
 #[cfg(test)]

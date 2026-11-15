@@ -648,8 +648,14 @@ fn audit_rotate_ip_key_creates_key() {
     let migrated = migrate(&schema);
     assert!(migrated.status.success(), "{}", stderr(&migrated));
 
+    let key_path = temp_file("rotate-installation.key");
+    githearth_server::secrets::generate_raw_key_file(&key_path).unwrap();
     let mut command = server();
     command.env("GITHEARTH_DATABASE_URL", schema.url());
+    command.env(
+        "GITHEARTH_INSTALLATION_KEY_FILE",
+        key_path.to_str().unwrap(),
+    );
     command.args(["audit", "rotate-ip-key"]);
     let output = run(command);
     assert!(output.status.success(), "{}", stderr(&output));

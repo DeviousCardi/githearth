@@ -112,6 +112,20 @@ fn doctor_with_fresh_database_reports_all_ok() {
     );
     std::fs::write(&config_path, config_content).unwrap();
 
+    // The shared test database may still hold secrets from an earlier test run.
+    // Clear them before migrate: a migration with no installation key refuses
+    // to run while encrypted secrets exist (which is what `serve` should do),
+    // and this test is about a clean doctor, not about another suite's key.
+    let _ = Command::new("psql")
+        .arg(&base)
+        .args(["-v", "ON_ERROR_STOP=1", "-c"])
+        .arg(
+            "DO $$ BEGIN                IF to_regclass('secret_data_keys') IS NOT NULL THEN                  TRUNCATE audit_ip_keys, stored_secrets, secret_data_keys CASCADE;                END IF;              END $$",
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
     // Migrate first: the shared test database's state depends on test order.
     let mut command = server();
     command.args(["--config", config_path.to_str().unwrap(), "migrate"]);

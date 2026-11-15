@@ -98,6 +98,11 @@ impl Fixture {
             ..Config::default()
         };
         adjust(&mut config, &storage_root);
+        if config.installation_key_file.as_os_str().is_empty() {
+            config.installation_key_file =
+                githearth_server::secrets::test_key_file(&std::env::temp_dir(), "account-admin")
+                    .unwrap();
+        }
         let pool = connect(&config).await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
         let state = AppState::new(pool.clone(), config.clone()).await.unwrap();

@@ -158,6 +158,25 @@ pub struct Config {
     /// file's contents are the key: the path is configuration, the key is not.
     #[serde(default)]
     pub backup_key_file: PathBuf,
+    /// The operator-owned key that wraps every stored secret (ADR 0014 §3).
+    /// The file, not its path, is the key: it must be mode 0600, outside the
+    /// storage root, and is never written to PostgreSQL or a backup. Empty
+    /// means no key is configured; an installation that already holds encrypted
+    /// secrets then refuses to start.
+    #[serde(default)]
+    pub installation_key_file: PathBuf,
+    /// Decrypt-only predecessor kept while a rotation re-wraps data keys.
+    #[serde(default)]
+    pub installation_key_previous_file: PathBuf,
+    /// `file` (a key or passphrase descriptor file) or `kms`. A KMS adapter is
+    /// an interface in ADR 0014 §3; this binary ships no vendor adapter and
+    /// refuses to start rather than silently falling back to a file.
+    #[serde(default = "default_installation_key_method")]
+    pub installation_key_method: String,
+    /// File holding the passphrase when the installation key descriptor uses
+    /// `method = "passphrase"`.
+    #[serde(default)]
+    pub installation_key_passphrase_file: Option<PathBuf>,
     /// How long `maintenance start` waits for in-flight writes to drain.
     #[serde(default = "default_maintenance_drain_timeout_seconds")]
     pub maintenance_drain_timeout_seconds: u64,
@@ -253,6 +272,10 @@ impl Default for Config {
             public_url: default_public_url(),
             backup_directory: default_backup_directory(),
             backup_key_file: PathBuf::new(),
+            installation_key_file: PathBuf::new(),
+            installation_key_previous_file: PathBuf::new(),
+            installation_key_method: default_installation_key_method(),
+            installation_key_passphrase_file: None,
             maintenance_drain_timeout_seconds: default_maintenance_drain_timeout_seconds(),
             legacy_token_deprecation_date: default_legacy_token_deprecation_date(),
         }
@@ -266,6 +289,9 @@ fn default_public_url() -> String {
 }
 fn default_backup_directory() -> PathBuf {
     PathBuf::from("backups")
+}
+fn default_installation_key_method() -> String {
+    "file".to_string()
 }
 fn default_maintenance_drain_timeout_seconds() -> u64 {
     300
@@ -546,6 +572,26 @@ impl Config {
         {
             env!(backup_key_file, "GITHEARTH_BACKUP_KEY_FILE");
         }
+        if let Ok(value) = std::env::var("GITHEARTH_INSTALLATION_KEY_FILE") {
+            c.installation_key_file = if value.is_empty() {
+                PathBuf::new()
+            } else {
+                PathBuf::from(value)
+            };
+        }
+        if let Ok(value) = std::env::var("GITHEARTH_INSTALLATION_KEY_PREVIOUS_FILE") {
+            c.installation_key_previous_file = if value.is_empty() {
+                PathBuf::new()
+            } else {
+                PathBuf::from(value)
+            };
+        }
+        if let Ok(value) = std::env::var("GITHEARTH_INSTALLATION_KEY_METHOD") {
+            c.installation_key_method = value;
+        }
+        if let Ok(value) = std::env::var("GITHEARTH_INSTALLATION_KEY_PASSPHRASE_FILE") {
+            c.installation_key_passphrase_file = (!value.is_empty()).then(|| PathBuf::from(value));
+        }
         env!(
             maintenance_drain_timeout_seconds,
             "GITHEARTH_MAINTENANCE_DRAIN_TIMEOUT_SECONDS"
@@ -680,6 +726,22 @@ impl Config {
         if self.storage_root.as_os_str().is_empty() {
             bail!("storage_root must not be empty");
         }
+        if !matches!(self.installation_key_method.as_str(), "file" | "kms") {
+            bail!("installation_key_method must be \"file\" or \"kms\"");
+        }
+        if !self.installation_key_previous_file.as_os_str().is_empty()
+            && self.installation_key_file.as_os_str().is_empty()
+        {
+            bail!("installation_key_previous_file requires installation_key_file");
+        }
+        if !self.installation_key_file.as_os_str().is_empty()
+            && self.installation_key_file == self.installation_key_previous_file
+        {
+            bail!(
+                "installation_key_previous_file must name a different file from \
+                 installation_key_file"
+            );
+        }
         // The hook admission socket is <storage_root>/run/hook-XXXXXXXX.sock, and a
         // Unix socket path must fit sun_path (108 bytes with its NUL on Linux).
         let socket_len = self.storage_root.as_os_str().len() + HOOK_SOCKET_SUFFIX_LEN;
@@ -692,6 +754,7 @@ impl Config {
         if self.ssh_enabled && self.ssh_host_key_path.as_os_str().is_empty() {
             bail!("ssh_host_key_path must be set when ssh_enabled is true");
         }
+        self.check_private_paths_outside_storage()?;
         for entry in &self.trusted_proxies {
             if crate::client_ip::parse_trusted_proxy(entry).is_err() {
                 bail!(
@@ -742,6 +805,62 @@ impl Config {
                     "smtp_tls = \"none\" cannot be combined with smtp_username: \
                      AUTH PLAIN would send the password in cleartext; use \
                      smtp_tls = \"starttls\" or \"implicit\""
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The storage tar carries `storage_root` verbatim, so an installation key
+    /// or another private operator file inside it would travel in every backup.
+    /// This is part of `validate` (not only `backup`) so `serve`, `migrate` and
+    /// `doctor` refuse at start rather than discovering it when a backup runs.
+    pub(crate) fn check_private_paths_outside_storage(&self) -> Result<()> {
+        // `canonicalize` fails for a path that does not exist yet (a key created
+        // after setup) and resolves `/tmp` to `/private/tmp` on macOS. Resolve
+        // the parent in that case so the comparison is still real.
+        fn resolve(path: &Path) -> PathBuf {
+            std::fs::canonicalize(path).unwrap_or_else(|_| {
+                match (path.parent(), path.file_name()) {
+                    (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                        .map(|parent| parent.join(name))
+                        .unwrap_or_else(|_| path.to_path_buf()),
+                    _ => path.to_path_buf(),
+                }
+            })
+        }
+        let storage = resolve(&self.storage_root);
+        let mut paths: Vec<(&str, &Path)> = Vec::new();
+        if !self.installation_key_file.as_os_str().is_empty() {
+            paths.push(("installation key", &self.installation_key_file));
+        }
+        if !self.installation_key_previous_file.as_os_str().is_empty() {
+            paths.push((
+                "previous installation key",
+                &self.installation_key_previous_file,
+            ));
+        }
+        if let Some(path) = &self.installation_key_passphrase_file {
+            paths.push(("installation key passphrase", path));
+        }
+        if let Some(path) = &self.smtp_password_file {
+            paths.push(("SMTP credential", path));
+        }
+        if !self.backup_key_file.as_os_str().is_empty() {
+            paths.push(("backup key", &self.backup_key_file));
+        }
+        for (label, path) in paths {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let resolved = resolve(path);
+            if resolved.starts_with(&storage) {
+                bail!(
+                    "the {label} {} is inside storage_root {}; move it outside the storage root \
+                     before starting the server or taking a backup, or the storage tar would \
+                     carry it",
+                    resolved.display(),
+                    storage.display()
                 );
             }
         }

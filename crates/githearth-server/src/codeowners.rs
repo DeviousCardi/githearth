@@ -1141,6 +1141,7 @@ mod tests {
                 std::env::temp_dir().join(format!("githearth-maint-{}.json", uuid::Uuid::new_v4())),
             ),
             maintenance_token: Arc::from("test-token"),
+            installation_keys: None,
         };
 
         let result = review(

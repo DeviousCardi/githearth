@@ -47,6 +47,7 @@ pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
 pub mod repository_restore;
+pub mod secrets;
 mod settings_ui;
 pub mod setup;
 pub mod ssh;
@@ -158,6 +159,9 @@ pub struct AppState {
     /// The on-host bearer token for the maintenance control endpoint. It is
     /// written to `<storage_root>/run/maintenance.token` with mode 0600.
     pub(crate) maintenance_token: Arc<str>,
+    /// The operator's installation key set, when one is configured. It unwraps
+    /// a secret at the point of use; no handler returns it.
+    pub installation_keys: Option<Arc<secrets::InstallationKeySet>>,
 }
 impl AppState {
     /// Records that `added` bytes of a fork head were copied into `target`,
@@ -297,6 +301,7 @@ impl AppState {
                 .join("run")
                 .join(maintenance::STATE_FILE),
         );
+        let installation_keys = secrets::InstallationKeySet::from_config(&config)?.map(Arc::new);
         let state = Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
@@ -315,6 +320,7 @@ impl AppState {
             job_kinds: None,
             maintenance,
             maintenance_token: Arc::from(maintenance_token),
+            installation_keys,
         };
         tokio::spawn(crate::git_http::hook_accept_loop(listener, state.clone()));
         Ok(state)
@@ -590,6 +596,7 @@ async fn client_ip_middleware(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let keys = state.installation_keys.clone();
     // `observe` runs outside this layer and cannot extract `State`; hand it the
     // recorder through the request.
     request
@@ -610,9 +617,9 @@ async fn client_ip_middleware(
             .collect();
         let ip = client_ip(addr, &fwd, &state.trusted_proxies);
         request.extensions_mut().insert(ClientIp(ip));
-        return CLIENT_IP.scope(ip, next.run(request)).await;
+        return secrets::scope(keys, CLIENT_IP.scope(ip, next.run(request))).await;
     }
-    next.run(request).await
+    secrets::scope(keys, next.run(request)).await
 }
 
 /// Extractor rejections (a malformed query string or path id) answer
@@ -726,6 +733,21 @@ impl ApiError {
 }
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
+        if let sqlx::Error::Protocol(message) = &error
+            && let Some(cause) = message.strip_prefix(INSTALLATION_KEY_ERROR)
+        {
+            // A configuration/key problem, not a database outage. The cause
+            // names key ids and paths only; never key material.
+            tracing::error!(
+                category = "installation key",
+                cause = %cause,
+                "installation key unavailable"
+            );
+            return Self(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "installation key unavailable",
+            );
+        }
         if error
             .as_database_error()
             .is_some_and(|e| e.is_unique_violation())
@@ -1769,32 +1791,144 @@ pub(crate) async fn event_with_actor(
 /// concurrent first writers may both see no rows and each insert a key. That is
 /// harmless because each event stores its own key_id and digest, so both keys
 /// remain equally valid.
+///
+/// The key material is stored as an envelope: a per-key data key wrapped by the
+/// installation key, and the HMAC key encrypted under that data key. Only rows
+/// written before 0056's backfill (or by a test that inserts the old column
+/// directly) still carry plaintext, and start-up refuses to run until those are
+/// encrypted.
+#[derive(sqlx::FromRow)]
+struct CurrentIpKey {
+    id: Uuid,
+    key: Option<Vec<u8>>,
+    secret_id: Option<Uuid>,
+    data_key_id: Option<Uuid>,
+    nonce: Option<Vec<u8>>,
+    ciphertext: Option<Vec<u8>>,
+    kek_id: Option<String>,
+    wrap_method: Option<String>,
+    wrapped_key: Option<Vec<u8>>,
+}
+
+const CURRENT_IP_KEY: &str = "SELECT k.id, k.key, k.secret_id, s.data_key_id, s.nonce, \
+     s.ciphertext, d.kek_id, d.wrap_method, d.wrapped_key \
+     FROM audit_ip_keys k \
+     LEFT JOIN stored_secrets s ON s.id = k.secret_id \
+     LEFT JOIN secret_data_keys d ON d.id = s.data_key_id \
+     ORDER BY k.created_at DESC, k.id DESC LIMIT 1";
+
+fn no_installation_key() -> sqlx::Error {
+    installation_key_error(
+        "no installation key is configured, so a client IP digest cannot be stored",
+    )
+}
+
+/// Marks an error as an installation-key problem rather than a database
+/// outage. `From<sqlx::Error>` turns this into `503 installation key
+/// unavailable` and logs the cause (which names key ids only, never key
+/// material), instead of the misleading `503 database unavailable`.
+const INSTALLATION_KEY_ERROR: &str = "installation-key: ";
+
+fn installation_key_error(message: impl std::fmt::Display) -> sqlx::Error {
+    sqlx::Error::Protocol(format!("{INSTALLATION_KEY_ERROR}{message}"))
+}
+
 async fn current_or_new_ip_key(
     conn: &mut sqlx::PgConnection,
 ) -> Result<(Uuid, Vec<u8>), sqlx::Error> {
-    if let Some(key) = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-        "SELECT id, key FROM audit_ip_keys ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .fetch_optional(&mut *conn)
-    .await?
+    if let Some(row) = sqlx::query_as::<_, CurrentIpKey>(CURRENT_IP_KEY)
+        .fetch_optional(&mut *conn)
+        .await?
     {
-        return Ok(key);
+        return open_current_ip_key(row);
     }
+    let keys = secrets::current_keys().ok_or_else(no_installation_key)?;
     let id = Uuid::new_v4();
     let key = audit_retention::new_ip_key_bytes();
-    sqlx::query(
-        "INSERT INTO audit_ip_keys (id, key) \
+    let secret_id = Uuid::new_v4();
+    let sealed = secrets::seal(&keys, secret_id, &key).map_err(|error| {
+        installation_key_error(format!("cannot encrypt the audit IP key: {error:#}"))
+    })?;
+    secrets::insert_sealed(&mut *conn, &format!("audit_ip_key/{id}"), &sealed)
+        .await
+        .map_err(|error| {
+            installation_key_error(format!("cannot store the audit IP key: {error:#}"))
+        })?;
+    let inserted = sqlx::query(
+        "INSERT INTO audit_ip_keys (id, secret_id) \
          SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM audit_ip_keys)",
     )
     .bind(id)
-    .bind(&key)
+    .bind(secret_id)
     .execute(&mut *conn)
-    .await?;
-    sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-        "SELECT id, key FROM audit_ip_keys ORDER BY created_at DESC, id DESC LIMIT 1",
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok((id, key));
+    }
+    // Another writer won the first-key race. Its row is equally valid; use it.
+    // Remove this call's two rows first, or they would inflate the secret and
+    // data-key counts forever without a referencing audit key.
+    sqlx::query("DELETE FROM stored_secrets WHERE id = $1")
+        .bind(secret_id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM secret_data_keys WHERE id = $1")
+        .bind(sealed.data_key_id)
+        .execute(&mut *conn)
+        .await?;
+    let row = sqlx::query_as::<_, CurrentIpKey>(CURRENT_IP_KEY)
+        .fetch_one(&mut *conn)
+        .await?;
+    open_current_ip_key(row)
+}
+
+fn open_current_ip_key(row: CurrentIpKey) -> Result<(Uuid, Vec<u8>), sqlx::Error> {
+    let (
+        Some(secret_id),
+        Some(data_key_id),
+        Some(nonce),
+        Some(ciphertext),
+        Some(kek_id),
+        Some(wrap_method),
+        Some(wrapped_key),
+    ) = (
+        row.secret_id,
+        row.data_key_id,
+        row.nonce,
+        row.ciphertext,
+        row.kek_id,
+        row.wrap_method,
+        row.wrapped_key,
     )
-    .fetch_one(&mut *conn)
-    .await
+    else {
+        // A row written before the envelope, or by another writer that has
+        // not run the 0056 backfill. Refuse it: silently using the plaintext
+        // would both serve and preserve exactly the secret this slice exists
+        // to remove. Backfill is an operator action, so the error names it.
+        let id = row.id;
+        return row.key.map_or_else(
+            || Err(installation_key_error("audit IP key has no key material")),
+            |_| {
+                Err(installation_key_error(format!(
+                    "audit IP key {id} is still plaintext; stop every other writer and run \
+                     `githearth-server migrate` with the installation key"
+                )))
+            },
+        );
+    };
+    let keys = secrets::current_keys().ok_or_else(no_installation_key)?;
+    let data_key = secrets::WrappedDataKey {
+        id: data_key_id,
+        kek_id,
+        wrap_method,
+        wrapped_key,
+    };
+    let plaintext =
+        secrets::open(&keys, secret_id, &data_key, &nonce, &ciphertext).map_err(|error| {
+            installation_key_error(format!("cannot decrypt the audit IP key: {error:#}"))
+        })?;
+    Ok((row.id, plaintext))
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {

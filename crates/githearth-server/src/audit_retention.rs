@@ -90,16 +90,25 @@ pub struct PruneResult {
     pub legacy_remaining: u64,
 }
 
-pub async fn rotate_ip_key(pool: &PgPool, dry_run: bool) -> anyhow::Result<Uuid> {
+pub async fn rotate_ip_key(
+    pool: &PgPool,
+    keys: &crate::secrets::InstallationKeySet,
+    dry_run: bool,
+) -> anyhow::Result<Uuid> {
     let id = Uuid::new_v4();
     let key = new_ip_key_bytes();
     if !dry_run {
-        sqlx::query("INSERT INTO audit_ip_keys (id, key) VALUES ($1, $2)")
+        let secret_id = Uuid::new_v4();
+        let sealed = crate::secrets::seal(keys, secret_id, &key)?;
+        let mut tx = pool.begin().await?;
+        crate::secrets::insert_sealed(&mut tx, &format!("audit_ip_key/{id}"), &sealed).await?;
+        sqlx::query("INSERT INTO audit_ip_keys (id, secret_id) VALUES ($1, $2)")
             .bind(id)
-            .bind(&key)
-            .execute(pool)
+            .bind(secret_id)
+            .execute(&mut *tx)
             .await
             .context("insert new ip key")?;
+        tx.commit().await?;
     }
     Ok(id)
 }
@@ -143,6 +152,13 @@ pub async fn drop_ip_keys(
     for key_id in candidates {
         if !dry_run {
             let mut tx = pool.begin().await?;
+            let secret_id: Option<Uuid> =
+                sqlx::query_scalar("SELECT secret_id FROM audit_ip_keys WHERE id = $1 FOR UPDATE")
+                    .bind(key_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .context("lock key")?
+                    .flatten();
             let deleted = sqlx::query_scalar::<_, bool>(
                 "WITH locked AS ( \
                  SELECT id FROM audit_ip_keys WHERE id = $1 FOR UPDATE) \
@@ -156,6 +172,30 @@ pub async fn drop_ip_keys(
             .fetch_optional(&mut *tx)
             .await
             .context("delete key")?;
+            if deleted.is_some()
+                && let Some(secret_id) = secret_id
+            {
+                // Crypto-shredding: the digest binding dies with the key, and
+                // the wrapped data key is removed rather than left orphaned.
+                let data_key_id: Option<Uuid> =
+                    sqlx::query_scalar("SELECT data_key_id FROM stored_secrets WHERE id = $1")
+                        .bind(secret_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .context("find stored secret")?;
+                sqlx::query("DELETE FROM stored_secrets WHERE id = $1")
+                    .bind(secret_id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("delete stored secret")?;
+                if let Some(data_key_id) = data_key_id {
+                    sqlx::query("DELETE FROM secret_data_keys WHERE id = $1")
+                        .bind(data_key_id)
+                        .execute(&mut *tx)
+                        .await
+                        .context("delete data key")?;
+                }
+            }
             tx.commit().await?;
 
             if deleted.is_some() {
@@ -229,6 +269,13 @@ mod tests {
             .await
             .unwrap();
         conn.close().await.unwrap();
+    }
+
+    fn test_keys(name: &str) -> crate::secrets::InstallationKeySet {
+        let path = crate::secrets::test_key_file(&std::env::temp_dir(), name).unwrap();
+        crate::secrets::InstallationKeySet::from_paths(&path, None, None)
+            .unwrap()
+            .unwrap()
     }
 
     async fn test_pool(name: &str) -> (PgPool, String) {
@@ -434,7 +481,8 @@ mod tests {
             ).bind(format!("{prefix}.%")).fetch_one(&pool).await.unwrap();
             assert_eq!(our_after, our_before, "dry-run prune must not modify any rows");
             let pre_key_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_ip_keys").fetch_one(&pool).await.unwrap();
-            let new_id = rotate_ip_key(&pool, true).await.unwrap();
+            let keys = test_keys("dryrun");
+            let new_id = rotate_ip_key(&pool, &keys, true).await.unwrap();
             let post_key_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_ip_keys").fetch_one(&pool).await.unwrap();
             assert_eq!(post_key_count, pre_key_count, "dry-run rotate must not create a key");
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_ip_keys WHERE id = $1").bind(new_id).fetch_one(&pool).await.unwrap();
@@ -461,7 +509,8 @@ mod tests {
         use std::time::Duration;
         tokio::time::timeout(Duration::from_secs(60), async {
             let (pool, db_name) = test_pool("rotate").await;
-            let new_key_id = rotate_ip_key(&pool, false).await.unwrap();
+            let keys = test_keys("rotate");
+            let new_key_id = rotate_ip_key(&pool, &keys, false).await.unwrap();
             let key_count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM audit_ip_keys WHERE id = $1")
                     .bind(new_key_id)
@@ -510,7 +559,8 @@ mod tests {
             let old_id = Uuid::new_v4();
             sqlx::query("INSERT INTO audit_ip_keys (id, key, created_at) VALUES ($1, $2, clock_timestamp() - '3 years'::interval)")
                 .bind(old_id).bind(vec![0x11u8; 32]).execute(&pool).await.unwrap();
-            let new_id = rotate_ip_key(&pool, false).await.unwrap();
+            let keys = test_keys("drprunold");
+            let new_id = rotate_ip_key(&pool, &keys, false).await.unwrap();
             let result = drop_ip_keys(&pool, 365, true).await.unwrap();
             assert!(result.dropped.contains(&old_id), "old key must be in dropped: {:?}", result.dropped);
             assert_eq!(result.skipped_in_use.len(), 0);
@@ -547,7 +597,8 @@ mod tests {
                 .bind(free_id).bind(vec![0x99u8; 32]).execute(&pool).await.unwrap();
             let free_event = insert_digest_event(&pool, Some(org_id), actor, &format!("{prefix}.free"), "10.0.0.11", free_id, 2).await;
             sqlx::query("UPDATE audit_events SET client_ip = NULL WHERE id = $1").bind(free_event).execute(&pool).await.unwrap();
-            rotate_ip_key(&pool, false).await.unwrap();
+            let keys = test_keys("dropskip");
+            rotate_ip_key(&pool, &keys, false).await.unwrap();
             let result = drop_ip_keys(&pool, 365, false).await.unwrap();
             assert!(result.skipped_in_use.contains(&in_use_id), "in-use skipped: {:?}", result.skipped_in_use);
             assert!(result.dropped.contains(&free_id), "free dropped: {:?}", result.dropped);
@@ -586,7 +637,8 @@ mod tests {
             let v = crate::audit::verify(&mut tx, Some(org_id)).await.unwrap();
             tx.commit().await.unwrap();
             assert!(v.ok, "chain must verify after prune");
-            let new_key_id = rotate_ip_key(&pool, false).await.unwrap();
+            let keys = test_keys("chain");
+            let new_key_id = rotate_ip_key(&pool, &keys, false).await.unwrap();
             drop_ip_keys(&pool, 365, false).await.unwrap();
             let mut conn2 = pool.acquire().await.unwrap();
             let mut tx2 = conn2.begin().await.unwrap();

@@ -611,7 +611,7 @@ fn clean_host_reaches_a_doctor_clean_running_installation() {
     );
     let out = stdout(&output);
     assert!(out.contains("created      "), "{out}");
-    assert!(out.contains("11 checks, 0 failed"), "{out}");
+    assert!(out.contains("12 checks, 0 failed"), "{out}");
     assert!(out.contains("setup complete"), "{out}");
     assert_no_secrets(&output, &database.url);
 
@@ -840,7 +840,7 @@ fn a_resumed_run_uses_the_recorded_url_and_reads_no_stdin() {
     );
     assert!(out.contains("existing settings used"), "{out}");
     assert!(out.contains("administrator exists"), "{out}");
-    assert!(out.contains("11 checks, 0 failed"), "{out}");
+    assert!(out.contains("12 checks, 0 failed"), "{out}");
     assert_eq!(
         before,
         snapshot(&installation.path),
@@ -936,7 +936,7 @@ fn second_run_changes_nothing_and_asks_for_nothing() {
     assert!(out.contains("administrator exists"), "{out}");
     assert!(out.contains("up to date"), "{out}");
     assert!(out.contains("existing key kept"), "{out}");
-    assert!(out.contains("11 checks, 0 failed"), "{out}");
+    assert!(out.contains("12 checks, 0 failed"), "{out}");
     assert_no_secrets(&second, &database.url);
 
     let after = snapshot(&installation.path);
@@ -964,7 +964,7 @@ fn interrupted_run_resumes_and_finishes_only_the_missing_steps() {
     let err = stderr(&failed);
     assert!(err.contains("stopped during the schema step"), "{err}");
     assert!(
-        err.contains("completed: configuration, storage directory, SSH host key"),
+        err.contains("completed: configuration, installation key, storage directory, SSH host key"),
         "{err}"
     );
     assert!(err.contains("run it again to resume"), "{err}");
@@ -973,6 +973,13 @@ fn interrupted_run_resumes_and_finishes_only_the_missing_steps() {
     assert!(!both(&failed).contains(&database.url), "{}", both(&failed));
     assert!(installation.config().exists());
     assert!(installation.host_key().exists());
+    assert!(
+        installation
+            .path
+            .join("githearth/installation.key")
+            .exists(),
+        "the interrupted run creates the installation key before the schema"
+    );
     assert_eq!(
         fs::read_to_string(installation.config())
             .unwrap()
@@ -991,7 +998,7 @@ fn interrupted_run_resumes_and_finishes_only_the_missing_steps() {
     let err = stderr(&failed_again);
     assert!(err.contains("stopped during the schema step"), "{err}");
     assert!(
-        err.contains("completed: configuration, storage directory, SSH host key"),
+        err.contains("completed: configuration, installation key, storage directory, SSH host key"),
         "{err}"
     );
     assert!(!err.contains("no step completed"), "{err}");
