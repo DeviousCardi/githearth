@@ -67,7 +67,7 @@ The server checks Git ≥ 2.40 at startup for these (2.47 ships in the image). `
 | Rebase (cherry-pick sequence) | For each commit `C` in `git rev-list --reverse target..source`, `git merge-tree --write-tree --merge-base=C^ <previous> C` (with `<previous>` starting at the target tip), then `git commit-tree <tree> -p <previous>`. A range containing a merge commit is refused (`Failed`, "cannot rebase merge commits"); a commit whose result tree equals its parent's is dropped, which also drops intentionally empty commits |
 | Fast-forward only | No new object; `source_oid` is the new target value, accepted only when `target_oid` is an ancestor of `source_oid` |
 
-Committer identity is the configured server identity. The merging actor authors merge commits; the squash author is set by A (see open items); each rebased commit keeps its original author, author date and message. `build_candidate` receives every identity and timestamp from the caller, so it never reads configuration or the clock. A conflict makes `build_candidate` return the conflicting paths; the intent goes `conflicted`, no ref changes, and the paths are reported. Candidate objects are unreferenced until the ref moves. They are protected by the M4.1 housekeeping keep-set, which pins every object referenced by a merge intent in `validating` or `executing` (candidate and result OIDs), so a candidate survives the execute window and a crash recovery without relying on a fixed time-based grace period.
+Committer identity is the configured server identity. The merging actor authors merge commits; the squash author is set by A (see open items); each rebased commit keeps its original author, author date and message. `build_candidate` receives every identity and timestamp from the caller, so it never reads configuration or the clock. A conflict makes `build_candidate` return the conflicting paths; the intent goes `conflicted`, no ref changes, and the paths are reported. Candidate objects are unreferenced until the ref moves. They are protected by the M4.1 housekeeping keep-set, which pins every object referenced by a merge intent in `validating` or `executing` (candidate and result OIDs), so a candidate survives the execute window and a crash recovery without relying on a fixed time-based grace period ([ADR 0013](0013-repository-housekeeping.md)).
 
 ## Execution
 
@@ -115,7 +115,7 @@ The merge's prepared record gains an optional `origin` field, `"merge"`, copied 
 | Crash point | Journal | Refs | Recovery |
 | --- | --- | --- | --- |
 | Before candidate | none | unchanged | A re-drives from `queued`/`executing` after lease expiry; intent eventually `merged`, `stale` or `failed` |
-| After candidate, before lock | none | unchanged | Candidate unreferenced and no longer pinned once the intent leaves `executing`; re-drive rebuilds it |
+| After candidate, before ref update | none | unchanged | `candidate_oid` is persisted under the repository lock; maintenance pins it, and a re-drive reuses the same commit |
 | Prepared only, ref at expected old | prepared, no marker | target at `expected_target_oid` | aborted (marker lost): reconciler appends the aborted marker; no metadata; worker may re-drive |
 | Committed, marker lost | prepared, no marker | target at candidate | committed-marker-lost: reconciler appends the committed marker and replays the merge record |
 | Committed before metadata | prepared + committed | target at candidate | reconciler replays the merge record into the intent + ref-update/outbox rows |
@@ -125,7 +125,7 @@ The merge's prepared record gains an optional `origin` field, `"merge"`, copied 
 
 - A merge is a compare-and-swap ref update journaled through the same `reference-transaction` path as pushes, satisfying ADR 0003's requirement that every non-receive-pack ref change be journaled and authorized identically.
 - The intent row is metadata; the journal record is the durable merge result. One idempotent function turns a merge record into a merged intent, on the normal path and on replay, so lost metadata self-heals.
-- Candidate objects are unreferenced until the ref moves; scheduled maintenance keeps every object a `validating` or `executing` intent references and applies no separate grace period.
+- Candidate objects are unreferenced until the ref moves; `execute_intent` persists `candidate_oid` under the lock before moving the ref, and scheduled maintenance pins it while the intent is not finished ([ADR 0013](0013-repository-housekeeping.md)).
 
 ## Open items
 

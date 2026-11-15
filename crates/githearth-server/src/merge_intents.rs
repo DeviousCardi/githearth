@@ -980,6 +980,7 @@ pub async fn record_merge_result(
     old_oid: &str,
     new_oid: &str,
     ref_name: &str,
+    pin_retention_days: u64,
 ) -> Result<(), sqlx::Error> {
     let sequence = journal_sequence as i64;
 
@@ -1034,6 +1035,14 @@ pub async fn record_merge_result(
         .bind(operation_id)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some(pull_id) = merged_pr {
+            // Merging is the point the retention window starts from: the
+            // head may be about to become unreachable behind a deleted branch.
+            crate::pins::extend_for_closed(&mut tx, pull_id, pin_retention_days).await?;
+        } else {
+            // A retry over an already-merged request: the first call extended
+            // every pin of it, so there is nothing to extend again.
+        }
 
         let organization_id: Option<Uuid> =
             sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id = $1")

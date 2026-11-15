@@ -363,7 +363,13 @@ pub async fn replay(
             githearth_git::journal::Outcome::Committed => {
                 match prepared.origin {
                     Some(Origin::Merge) => {
-                        crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                        crate::merge::apply_merge_record(
+                            &mut conn,
+                            repository,
+                            &prepared,
+                            state.config.housekeeping_pin_retention_days,
+                        )
+                        .await?;
                     }
                     Some(Origin::Suggestion) => {
                         crate::pulls::apply_suggestion_record(&mut conn, repository, &prepared)
@@ -398,7 +404,13 @@ pub async fn replay(
                 .await?;
                 match prepared.origin {
                     Some(Origin::Merge) => {
-                        crate::merge::apply_merge_record(&mut conn, repository, &prepared).await?;
+                        crate::merge::apply_merge_record(
+                            &mut conn,
+                            repository,
+                            &prepared,
+                            state.config.housekeeping_pin_retention_days,
+                        )
+                        .await?;
                     }
                     Some(Origin::Suggestion) => {
                         crate::pulls::apply_suggestion_record(&mut conn, repository, &prepared)

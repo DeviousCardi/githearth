@@ -619,6 +619,20 @@ macro_rules! archive_handler {
                         "repository.unarchived"
                     };
                     event(&mut tx, Some(loaded.org_id), loaded.actor_id, event_kind).await?;
+                    // Maintenance skips archived repositories (ADR 0013), so an
+                    // unarchive asks for a run rather than waiting a whole
+                    // interval. The dedupe key keeps it to one run either way.
+                    if !$archived {
+                        crate::jobs::enqueue(
+                            &mut tx,
+                            Some(loaded.org_id),
+                            crate::housekeeping::JOB_KIND,
+                            serde_json::json!({ "repository_id": loaded.repo.id }),
+                            &loaded.repo.id.to_string(),
+                            None,
+                        )
+                        .await?;
+                    }
                     let updated = repositories::get(&mut tx, loaded.repo.id).await?.unwrap();
                     let result_json = RepositoryJson::from(&updated);
                     let status = StatusCode::OK;

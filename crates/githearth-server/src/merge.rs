@@ -4,8 +4,10 @@
 use githearth_git::journal::Record;
 use githearth_git::merge::{Candidate, Identity, Method, Request};
 use sqlx::PgConnection;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -20,6 +22,7 @@ pub(crate) async fn apply_merge_record(
     conn: &mut PgConnection,
     repository: Uuid,
     prepared: &Record,
+    pin_retention_days: u64,
 ) -> Result<(), ReplayError> {
     let [update] = prepared.updates.as_slice() else {
         return Err(ReplayError::Invalid(
@@ -38,6 +41,7 @@ pub(crate) async fn apply_merge_record(
         &update.old,
         &update.new,
         &update.reference,
+        pin_retention_days,
     )
     .await?;
     Ok(())
@@ -77,6 +81,9 @@ pub enum MergeError {
     Storage(githearth_git::StorageError),
     Replay(ReplayError),
     Join(tokio::task::JoinError),
+    /// A run stopped at an injected test point; never returned in production
+    /// unless a test armed it with [`fail_after_candidate`].
+    Injected(&'static str),
 }
 
 impl fmt::Display for MergeError {
@@ -86,6 +93,7 @@ impl fmt::Display for MergeError {
             MergeError::Storage(e) => write!(f, "storage error: {e}"),
             MergeError::Replay(e) => write!(f, "journal replay error: {e}"),
             MergeError::Join(e) => write!(f, "blocking task failed: {e}"),
+            MergeError::Injected(point) => write!(f, "merge execution interrupted at {point}"),
         }
     }
 }
@@ -97,6 +105,7 @@ impl std::error::Error for MergeError {
             MergeError::Storage(e) => Some(e),
             MergeError::Replay(e) => Some(e),
             MergeError::Join(e) => Some(e),
+            MergeError::Injected(_) => None,
         }
     }
 }
@@ -123,6 +132,31 @@ impl From<tokio::task::JoinError> for MergeError {
     fn from(e: tokio::task::JoinError) -> Self {
         MergeError::Join(e)
     }
+}
+
+/// Intents armed to fail after the candidate is persisted. Test-only: it
+/// simulates a crash between writing `candidate_oid` and moving the ref, so a
+/// test can prove the keep point protects the orphaned candidate. Production
+/// never arms one.
+fn injected_crashes() -> &'static Mutex<HashSet<Uuid>> {
+    static CRASHES: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    CRASHES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Arm `operation_id` to return [`MergeError::Injected`] immediately after it
+/// persists `candidate_oid`.
+pub fn fail_after_candidate(operation_id: Uuid) {
+    injected_crashes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(operation_id);
+}
+
+fn take_injected_crash(operation_id: Uuid) -> bool {
+    injected_crashes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&operation_id)
 }
 
 #[derive(sqlx::FromRow)]
@@ -247,8 +281,9 @@ pub async fn execute_intent(
         });
     }
 
-    // 5. Revalidate every fact the intent recorded. The intent row is never
-    // written here except through `record_merge_result`.
+    // 5. Revalidate every fact the intent recorded. The row is written here
+    // only to persist the candidate (step 7); the outcome still comes from
+    // `record_merge_result`.
     let (pull, rules, approvals, checks_passed) = {
         let mut conn = state.pool.acquire().await?;
         let Some(pull) = pulls::fetch_pull(&mut conn, intent.pull_request_id).await? else {
@@ -579,6 +614,28 @@ pub async fn execute_intent(
             }
         }
     };
+
+    // 6b. Persist the candidate while the repository lock still excludes
+    // housekeeping. A crash before the ref moves then leaves a durable keep
+    // point, so the candidate's objects survive a prune and a retry reuses the
+    // same commit. The update is fenced on `executing`, so a cancelled intent
+    // is not resurrected.
+    let persisted = sqlx::query(
+        "UPDATE merge_intents SET candidate_oid = $1, updated_at = now() \
+         WHERE operation_id = $2 AND state = 'executing'",
+    )
+    .bind(&new_oid)
+    .bind(operation_id)
+    .execute(&state.pool)
+    .await?;
+    if persisted.rows_affected() == 0 {
+        return Ok(MergeOutcome::Stale {
+            reason: "intent is no longer executing".into(),
+        });
+    }
+    if take_injected_crash(operation_id) {
+        return Err(MergeError::Injected("after_candidate"));
+    }
 
     // 7. Compare-and-swap the target ref through the journaling hook.
     let repo = repo_path.clone();

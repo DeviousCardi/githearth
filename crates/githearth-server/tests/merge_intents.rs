@@ -707,6 +707,7 @@ async fn record_merge_result_is_idempotent() {
         &old_oid,
         &new_oid,
         ref_name,
+        30,
     )
     .await
     .unwrap();
@@ -755,6 +756,7 @@ async fn record_merge_result_is_idempotent() {
         &old_oid,
         &new_oid,
         ref_name,
+        30,
     )
     .await
     .unwrap();
@@ -809,6 +811,7 @@ async fn close_during_execution_still_ends_merged_and_merged_is_terminal() {
         &f.head,
         &"c".repeat(40),
         "refs/heads/main",
+        30,
     )
     .await
     .unwrap();

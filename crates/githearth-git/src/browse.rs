@@ -209,6 +209,32 @@ pub fn resolve(repo: &Path, rev: &str, timeout: Duration) -> Result<Option<Strin
     Ok(Some(id.trim().to_owned()))
 }
 
+/// Every branch's tip in one `for-each-ref` call, keyed by branch name. Used
+/// by the housekeeping pin refresh: one bounded Git call instead of one
+/// `rev-parse` per open pull request.
+pub fn branch_tips(
+    repo: &Path,
+    timeout: Duration,
+) -> Result<HashMap<String, String>, StorageError> {
+    let mut command = cmd(repo);
+    command.args([
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/heads",
+    ]);
+    let out = run(command, timeout, MAX_OUTPUT_BYTES)?;
+    let mut tips = HashMap::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        let Some((target, name)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            tips.insert(branch.to_owned(), target.to_owned());
+        }
+    }
+    Ok(tips)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefInfo {
     pub name: String,

@@ -511,6 +511,118 @@ impl Storage {
         Ok(())
     }
 
+    /// Whether `repository` stores object `oid`.
+    pub fn repository_has_object(&self, repository: Uuid, oid: &str) -> Result<bool, StorageError> {
+        if !is_lower_hex(oid.bytes().next().unwrap_or(0)) || !matches!(oid.len(), 40 | 64) {
+            return Ok(false);
+        }
+        let Ok(path) = self.verified_dir(&self.repository_path(repository)) else {
+            return Ok(false);
+        };
+        let output = git()
+            .arg("--git-dir")
+            .arg(path.join("."))
+            .args(["cat-file", "-e", oid])
+            .output()?;
+        Ok(output.status.success())
+    }
+
+    /// Copies the objects `commit` reaches from `source` into `target` and
+    /// returns the bytes the target's `objects/` grew by, refusing **before
+    /// any change** when that would exceed `max_bytes`.
+    ///
+    /// This is the plan's "cap on bytes fetched per fork pull request"
+    /// (`docs/plan/04-forge-roadmap.md`, housekeeping), with the copy charged
+    /// to the target organization because the bytes live in the target. The
+    /// bound is measured, not trusted: the missing objects are listed in
+    /// `target` (which is a full copy of its fork's history, so its own refs
+    /// are the right exclusion), sized from `source`, and summed before the
+    /// pack is built. The target's `objects/` growth is measured after as well,
+    /// so a fetch that passed the bound but grew the target more still reports
+    /// [`StorageError::FetchLimit`].
+    ///
+    /// The caller holds `target`'s lock. `None` copies without a cap (the
+    /// operator/CLI path that has no quota to charge).
+    pub fn mirror_objects(
+        &self,
+        target: Uuid,
+        source: Uuid,
+        commit: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<u64, StorageError> {
+        let target_path = self.verified_dir(&self.repository_path(target))?;
+        let source_path = self.verified_dir(&self.repository_path(source))?;
+        if !is_full_oid(commit) {
+            return Err(StorageError::Invalid(
+                "commit must be a full object id".into(),
+            ));
+        }
+        let missing = missing_objects(&target_path, &source_path, commit)?;
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        if let Some(max) = max_bytes {
+            let incoming = object_bytes(&source_path, &missing)?;
+            if incoming > max {
+                return Err(StorageError::FetchLimit { incoming, max });
+            }
+        }
+        let before = dir_size(&target_path.join("objects"), None)?;
+        let pack = checked(
+            git()
+                .arg("--git-dir")
+                .arg(&source_path)
+                .args(["pack-objects", "--stdout", "--revs", "--delta-base-offset"])
+                .arg("--quiet")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    let mut stdin = child.stdin.take().expect("piped stdin");
+                    for id in &missing {
+                        writeln!(stdin, "{id}")?;
+                    }
+                    drop(stdin);
+                    child.wait_with_output()
+                })?,
+        )?;
+        // `pack-objects` writes a progress-free pack to stdout; the target's
+        // indexer verifies every object and writes the pack. No ref is
+        // created, no hook runs, and a failed import leaves nothing behind.
+        let mut child = git()
+            .arg("--git-dir")
+            .arg(&target_path)
+            .args(["index-pack", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin.write_all(&pack)?;
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(StorageError::Git(format!(
+                "index-pack: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let after = dir_size(&target_path.join("objects"), None)?;
+        let added = after.saturating_sub(before);
+        if let Some(max) = max_bytes
+            && added > max
+        {
+            return Err(StorageError::FetchLimit {
+                incoming: added,
+                max,
+            });
+        }
+        Ok(added)
+    }
+
     pub fn trash(&self, repository: Uuid) -> Result<PathBuf, StorageError> {
         let source = self.repository_path(repository);
         self.verified_dir(&source)?;
@@ -789,6 +901,105 @@ pub struct TmpEntry {
 fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
 }
+
+fn is_full_oid(oid: &str) -> bool {
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(hex)
+}
+
+/// The objects `commit` reaches in `source` that `target` does not hold.
+///
+/// Both repositories are full copies (a fork holds its parent's history at
+/// fork time), so the target's object set is read once with
+/// `rev-list --objects --all` and the source's walk is filtered by it. The
+/// exclusion runs in the source because a target with an unreachable object
+/// that ties its refs together would otherwise make `--not --all` drop the
+/// object itself, and a target without the commit cannot resolve it at all.
+fn missing_objects(
+    target_path: &Path,
+    source_path: &Path,
+    commit: &str,
+) -> Result<Vec<String>, StorageError> {
+    let have = checked(
+        git()
+            .arg("--git-dir")
+            .arg(target_path)
+            .args(["rev-list", "--objects", "--all"])
+            .output()?,
+    )?;
+    let have: HashSet<String> = String::from_utf8_lossy(&have)
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .map(str::to_owned)
+        .collect();
+    let walked = checked(
+        git()
+            .arg("--git-dir")
+            .arg(source_path)
+            .args(["rev-list", "--objects", commit])
+            .output()?,
+    )?;
+    Ok(String::from_utf8_lossy(&walked)
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .filter(|id| !id.is_empty() && !have.contains(*id))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The stored size of `ids` as the target will keep them: each object's type
+/// and body length from `cat-file --batch-check` in `source`, plus
+/// [`OBJECT_OVERHEAD_BYTES`] of framing. A compressed object is smaller on
+/// disk than its body, so this is an upper bound: the cap can only refuse a
+/// fetch that might have fit, never let one through that does not.
+fn object_bytes(source_path: &Path, ids: &[String]) -> Result<u64, StorageError> {
+    let mut child = git()
+        .arg("--git-dir")
+        .arg(source_path)
+        .args(["cat-file", "--batch-check"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        for id in ids {
+            writeln!(stdin, "{id}")?;
+        }
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(StorageError::Git(format!(
+            "cat-file --batch-check: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut total: u64 = 0;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // "<oid> <type> <size>".
+        let mut fields = line.split(' ');
+        let (Some(_oid), Some(kind), Some(size)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(StorageError::Invalid(
+                "unexpected cat-file output for an incoming object".into(),
+            ));
+        };
+        let size: u64 = size
+            .parse()
+            .map_err(|_| StorageError::Invalid("unparseable object size".into()))?;
+        total = total
+            .saturating_add(size)
+            .saturating_add(kind.len() as u64 + 32)
+            .saturating_add(OBJECT_OVERHEAD_BYTES);
+    }
+    Ok(total)
+}
+
+/// Per-object framing a loose object costs beyond its body: the type and
+/// length header, the two-byte zlib header and checksum, and the fan-out
+/// directory entry. Measured at 68.6 bytes per object on the housekeeping
+/// repository, which is the number the operator note publishes.
+const OBJECT_OVERHEAD_BYTES: u64 = 24;
 
 /// Unlink one lock file, tolerating its absence.
 fn remove_lock_file(path: &Path) -> Result<(), StorageError> {

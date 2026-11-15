@@ -376,6 +376,17 @@ async fn create_read_and_list_with_shared_numbering() {
     assert_eq!(body["approvals"], 0);
     assert_eq!(body["changes_requested"], 0);
 
+    // The same transaction pinned the head (ADR 0013 "What is live", 7).
+    let pull_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let (pinned_oid, reason): (String, String) =
+        sqlx::query_as("SELECT commit_oid, reason FROM pinned_commits WHERE pull_request_id = $1")
+            .bind(pull_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(pinned_oid, f.feature_head);
+    assert_eq!(reason, "pull_request_head");
+
     let (status, body) = request(
         &f.app,
         "GET",

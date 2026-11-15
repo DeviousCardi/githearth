@@ -1124,6 +1124,7 @@ mod tests {
             },
             auth_slots: Arc::new(Semaphore::new(2)),
             git_slots: Arc::new(Semaphore::new(2)),
+            housekeeping_slots: Arc::new(Semaphore::new(2)),
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(Engine::new().unwrap()),
             storage: Arc::new(storage),

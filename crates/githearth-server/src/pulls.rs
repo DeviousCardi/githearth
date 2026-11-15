@@ -537,6 +537,22 @@ pub(crate) async fn branch_tip(
 /// into the target repository so mergeability and code-owner computations can
 /// resolve the head there (only objects are fetched; no target ref is written).
 /// Same-repository pulls already have the head and need no fetch.
+///
+/// The copy is **bounded and charged**: at most
+/// `housekeeping_fork_fetch_limit_bytes` may be added to the target's
+/// `objects/` per call (`Storage::mirror_objects`), and the bytes actually
+/// added are charged to the target organization in `repository_fork_fetches`
+/// (the target already counts them in its own `objects/`, which the push quota
+/// hook measures, so the ledger never lets a fork's copies be forgotten and is
+/// the audit trail for the cap). The cap comes from the plan:
+/// "a fork pull request is pinned in the repository that stores its head
+/// objects (the target, which already copies them), charged to the target
+/// organization, with a cap on bytes fetched per fork pull request".
+///
+/// A copy that would exceed the cap is refused before it runs with a `413`
+/// naming the cap; the pull request still renders from the fork's own pin. The
+/// copy takes the target's repository lock (a push on the target serializes
+/// with it) for the duration of the Git work only.
 pub(crate) async fn fetch_cross_repo_head(
     state: &AppState,
     repository_id: Uuid,
@@ -546,24 +562,163 @@ pub(crate) async fn fetch_cross_repo_head(
     if source_repository_id == repository_id {
         return Ok(());
     }
+    // Skip only when the target already holds the commit the request resolves
+    // to, and which *this call* is for. A fork is a full copy
+    // ([ADR 0008](../../decisions/0008-forks.md)), so the target also has a
+    // `refs/heads/<branch>` of its own at fork time; that ref says nothing
+    // about whether the fork's newer head was copied since.
+    let head = branch_tip(state, source_repository_id, source_branch).await?;
+    let Some(head) = head else {
+        return Ok(());
+    };
     let storage = state.storage.clone();
-    let reference = format!("refs/heads/{source_branch}");
-    tokio::task::spawn_blocking(move || {
-        storage.fetch_ref(repository_id, source_repository_id, &reference)
+    let probe = head.clone();
+    let present =
+        tokio::task::spawn_blocking(move || storage.repository_has_object(repository_id, &probe))
+            .await
+            .map_err(|_| storage_error())?
+            .map_err(|_| storage_error())?;
+    if present {
+        return Ok(());
+    }
+    let cap = state.config.housekeeping_fork_fetch_limit_bytes;
+    let guard = state
+        .storage
+        .repository_lock(repository_id)
+        .lock_owned()
+        .await;
+    let storage = state.storage.clone();
+    let source = source_repository_id;
+    let oid = head.clone();
+    let fetched = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        storage.mirror_objects(repository_id, source, &oid, Some(cap))
     })
     .await
-    .map_err(|_| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage operation failed",
-        )
-    })?
-    .map_err(|_| {
-        ApiError(
+    .map_err(|_| storage_error())?;
+    match fetched {
+        Ok(added) => {
+            state
+                .metrics_fork_fetched(repository_id, source_repository_id, added)
+                .await;
+            Ok(())
+        }
+        Err(githearth_git::StorageError::FetchLimit { incoming, max }) => {
+            tracing::warn!(
+                %repository_id, %source_repository_id, incoming, max,
+                "fork pull request head refused by the fetch cap"
+            );
+            Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, FETCH_CAP_MESSAGE))
+        }
+        Err(_) => Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "repository storage unavailable",
-        )
+        )),
+    }
+}
+
+/// Names the cap and where it is configured; `ApiError` carries a static
+/// message, so the numbers are logged next to it instead.
+const FETCH_CAP_MESSAGE: &str = "the fork's head would add more bytes than this repository's \
+     fork pull request fetch cap (housekeeping_fork_fetch_limit_bytes); the pull request \
+     still renders from the fork's own pin";
+
+fn storage_error() -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "storage operation failed",
+    )
+}
+
+/// Why a cross-repository head is not in `target`. [`resolve_cross_repo_head`]
+/// marks the result [`HeadInTarget::Missing`] only when that is provable; a
+/// lookup that cannot tell (no leftover object, no database answer) is left to
+/// the caller as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadInTarget {
+    /// The object is in the target: `compare` and mergeability can run.
+    Present,
+    /// The object is provably not in the target; `oid` is the commit the
+    /// caller wanted to resolve there.
+    Missing,
+}
+
+/// Resolves `oid` in the target repository, mirroring it from the source when
+/// it is provably absent, and reports which.
+///
+/// This is what makes a closed fork pull request's diff survive a prune of the
+/// **target**: its head objects are copied into the target when the request is
+/// read or merged (`fetch_cross_repo_head`) and the copy is pinned there, but a
+/// pin can be released (retention, a deleted request) and a maintenance run can
+/// then delete the copy. The authoritative objects stay in the fork, so the
+/// next read copies them again, under the same cap and charge, instead of
+/// answering `revision not found`.
+pub(crate) async fn resolve_cross_repo_head(
+    state: &AppState,
+    target: Uuid,
+    pull: &PullJson,
+    oid: &str,
+) -> Result<HeadInTarget, ApiError> {
+    if pull.source_repository_id == target {
+        // Same-repository: the object is in this repository already; a missing
+        // one is not this function's question.
+        return Ok(HeadInTarget::Present);
+    }
+    let storage = state.storage.clone();
+    let oid_owned = oid.to_owned();
+    let in_target =
+        tokio::task::spawn_blocking(move || storage.repository_has_object(target, &oid_owned))
+            .await
+            .map_err(|_| storage_error())?
+            .map_err(|_| storage_error())?;
+    if in_target {
+        return Ok(HeadInTarget::Present);
+    }
+    // Only mirror a commit the source still has: a head that no longer exists
+    // anywhere must stay a missing revision, not become a storage error.
+    let storage = state.storage.clone();
+    let source = pull.source_repository_id;
+    let oid_owned = oid.to_owned();
+    let in_source =
+        tokio::task::spawn_blocking(move || storage.repository_has_object(source, &oid_owned))
+            .await
+            .map_err(|_| storage_error())?
+            .map_err(|_| storage_error())?;
+    if !in_source {
+        return Ok(HeadInTarget::Missing);
+    }
+    let mut conn = state.pool.acquire().await?;
+    let pinned: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pinned_commits \
+         WHERE repository_id = $1 AND commit_oid = $2 AND reason = 'pull_request_head' \
+           AND (retain_until IS NULL OR retain_until > now()))",
+    )
+    .bind(source)
+    .bind(oid)
+    .fetch_one(&mut *conn)
+    .await?;
+    drop(conn);
+    if !pinned {
+        return Ok(HeadInTarget::Missing);
+    }
+    // Restore only, never the first copy: the first copy is charged and capped
+    // by `fetch_cross_repo_head` at create/merge time. A restore re-adds
+    // objects this target's maintenance deleted; it is bounded by the same
+    // object-set size the original copy had.
+    let storage = state.storage.clone();
+    let oid_owned = oid.to_owned();
+    let added = tokio::task::spawn_blocking(move || {
+        storage.mirror_objects(target, source, &oid_owned, None)
     })
+    .await
+    .map_err(|_| storage_error())?;
+    match added {
+        Ok(added) => {
+            state.metrics_fork_fetched(target, source, added).await;
+            Ok(HeadInTarget::Present)
+        }
+        Err(_) => Err(storage_error()),
+    }
 }
 
 async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, ApiError> {
@@ -572,7 +727,88 @@ async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, 
         branch_tip(state, repo_id, &pull.target_branch).await?,
     ))
 }
+
+/// Fills a missing **base** with the pull request's base pin (ADR 0013 "What
+/// is live", 7), the way [`tips_with_pin`] fills a missing head. Only a
+/// closed or merged request, and only a live pin: an open request whose target
+/// branch is gone keeps reading as it did before pins.
+async fn base_with_pin(
+    state: &AppState,
+    target: Uuid,
+    pull: &PullJson,
+    mut tips: Tips,
+) -> Result<Tips, ApiError> {
+    if tips.1.is_none() && matches!(pull.state.as_str(), "closed" | "merged") {
+        let mut conn = state.pool.acquire().await?;
+        let pinned: Option<String> = sqlx::query_scalar(
+            "SELECT p.commit_oid FROM pinned_commits p \
+             JOIN repositories r ON r.id = p.repository_id AND r.status = 'active' \
+             WHERE p.base_of_pull_request_id = $1 AND p.repository_id = $2 \
+               AND (p.retain_until IS NULL OR p.retain_until > now()) \
+             ORDER BY p.created_at DESC, p.id DESC LIMIT 1",
+        )
+        .bind(pull.id)
+        .bind(target)
+        .fetch_optional(&mut *conn)
+        .await?;
+        tips.1 = pinned;
+    }
+    Ok(tips)
+}
 type Tips = (Option<String>, Option<String>);
+
+/// The head a closed or merged pull request shows when its source branch no
+/// longer exists: the newest live pin in the repository that owns the head
+/// (ADR 0013 "What is live", 7). The pin is why the diff survives the branch
+/// delete; without this fallback the product would refuse to show it while the
+/// objects were still there.
+///
+/// An open pull request, or a source repository that is gone (a deleted fork's
+/// pins cascade with it), reads as `None` exactly as before.
+async fn pinned_head(state: &AppState, pull: &PullJson) -> Result<Option<String>, ApiError> {
+    let mut conn = state.pool.acquire().await?;
+    pinned_head_on(&mut conn, pull).await
+}
+
+/// The pin lookup on an existing connection or transaction, so a close can
+/// see the retention it just extended in the same transaction.
+async fn pinned_head_on(
+    conn: &mut PgConnection,
+    pull: &PullJson,
+) -> Result<Option<String>, ApiError> {
+    if !matches!(pull.state.as_str(), "closed" | "merged") {
+        return Ok(None);
+    }
+    let oid: Option<String> = sqlx::query_scalar(
+        "SELECT p.commit_oid FROM pinned_commits p \
+         JOIN repositories r ON r.id = p.repository_id AND r.status = 'active' \
+         WHERE p.pull_request_id = $1 AND p.repository_id = $2 AND p.retain_until > now() \
+         ORDER BY p.created_at DESC, p.id DESC LIMIT 1",
+    )
+    .bind(pull.id)
+    .bind(pull.source_repository_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(oid)
+}
+
+/// Replaces a missing head with the pull request's live pin when it is closed
+/// or merged. Returns whether the pin supplied the head, so the caller can
+/// skip paths that need objects in the target repository (a fork's pinned
+/// head lives in the fork).
+async fn tips_with_pin(
+    state: &AppState,
+    pull: &PullJson,
+    mut tips: Tips,
+) -> Result<(Tips, bool), ApiError> {
+    if tips.0.is_none()
+        && let Some(oid) = pinned_head(state, pull).await?
+    {
+        tips.0 = Some(oid);
+        return Ok((tips, true));
+    }
+    Ok((tips, false))
+}
 
 /// Attaches the live code-owner facts to a detail response so create/PATCH
 /// report the same fields as GET .../pulls/{n} (#157).
@@ -789,6 +1025,10 @@ pub(crate) async fn create_pull(
             // Read the code-owner facts from the same head and base the detail
             // endpoint uses, before opening the transaction that stores the
             // response.
+            let target_row = repositories::get(&mut *state.pool.acquire().await?, loaded.repo.id)
+                .await?
+                .ok_or_else(not_active)?;
+            let cross_repository = source_repository_id != target_row.id;
             fetch_cross_repo_head(
                 state,
                 loaded.repo.id,
@@ -827,6 +1067,47 @@ pub(crate) async fn create_pull(
             .await?;
             if inserted.rows_affected() == 0 {
                 return Err(already_open());
+            }
+            // Pin the head in the repository that owns it, in this same
+            // transaction: a closed pull request's diff must survive a prune
+            // after its branch is deleted (ADR 0013 "What is live", 7). The
+            // pin is a row, never a Git ref, and is never advertised.
+            crate::pins::pin_head(
+                &mut tx,
+                source_repository_id,
+                id,
+                &head,
+                state.config.housekeeping_pin_retention_days,
+            )
+            .await?;
+            // Pin the base in the target repository, where the base commit
+            // lives. A closed request whose target branch is later deleted
+            // then still shows `compare/base...head`.
+            crate::pins::pin_base(
+                &mut tx,
+                loaded.repo.id,
+                id,
+                &base,
+                "open",
+                state.config.housekeeping_pin_retention_days,
+            )
+            .await?;
+            // A fork pull request's head objects live in the fork; the target
+            // keeps a copy (`read_pull`, merge and code-owner checks resolve the
+            // head there), and that copy is pinned in the target, charged to
+            // the target organization. Without the pin a target prune deletes
+            // the copy and `compare` answers 404 once the fork's branch is
+            // gone. A target that has not yet kept the copy records it on its
+            // next refresh (`housekeeping::refresh_open_pins`).
+            if cross_repository {
+                crate::pins::pin_target_copy(
+                    &mut tx,
+                    loaded.repo.id,
+                    id,
+                    &head,
+                    state.config.housekeeping_pin_retention_days,
+                )
+                .await?;
             }
             event(
                 &mut tx,
@@ -1077,25 +1358,33 @@ pub(crate) async fn read_pull(
     let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
-    let tips = tips(state, loaded.repo.id, &pull).await?;
+    let (tips, pinned) =
+        tips_with_pin(state, &pull, tips(state, loaded.repo.id, &pull).await?).await?;
+    let tips = base_with_pin(state, loaded.repo.id, &pull, tips).await?;
     let mergeability = match &tips {
-        (Some(head), Some(base)) => {
-            fetch_cross_repo_head(
-                state,
-                loaded.repo.id,
-                pull.source_repository_id,
-                &pull.source_branch,
-            )
-            .await?;
-            crate::mergeability::for_pull(state, loaded.repo.id, head, base).await?
+        // A pinned head is unreachable by design and may live only in a fork;
+        // mergeability is not meaningful for a closed request anyway.
+        (Some(head), Some(base)) if !pinned => {
+            // The head must resolve in *this* repository for mergeability. When
+            // a target prune has removed the copy, restore it from the fork's
+            // pinned object; if that is impossible, say so instead of a 404.
+            match resolve_cross_repo_head(state, loaded.repo.id, &pull, head).await? {
+                HeadInTarget::Present => {
+                    crate::mergeability::for_pull(state, loaded.repo.id, head, base).await?
+                }
+                HeadInTarget::Missing => Vec::new(),
+            }
         }
         _ => Vec::new(),
     };
     let mut conn = state.pool.acquire().await?;
     let mut detail = detail(&mut conn, loaded.repo.id, pull, tips).await?;
     detail.mergeability = mergeability;
-    // Attach the live code-owner requirements for the pull request page.
-    if let (Some(head), Some(base)) = (detail.head_id.as_deref(), detail.base_id.as_deref()) {
+    // Attach the live code-owner requirements for the pull request page. A
+    // pinned head may live only in a fork, so that path is skipped.
+    if !pinned
+        && let (Some(head), Some(base)) = (detail.head_id.as_deref(), detail.base_id.as_deref())
+    {
         let review = crate::codeowners::review(
             state,
             loaded.repo.id,
@@ -1170,16 +1459,17 @@ async fn update(
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
             }
-            let tips = tips(state, loaded.repo.id, &pull).await?;
+            let (tips, pinned) =
+                tips_with_pin(state, &pull, tips(state, loaded.repo.id, &pull).await?).await?;
+            let tips = base_with_pin(state, loaded.repo.id, &pull, tips).await?;
             let codeowners = match (&tips.0, &tips.1) {
-                (Some(head), Some(base)) => {
-                    fetch_cross_repo_head(
-                        state,
-                        loaded.repo.id,
-                        pull.source_repository_id,
-                        &pull.source_branch,
-                    )
-                    .await?;
+                (Some(head), Some(base))
+                    if !pinned
+                        && matches!(
+                            resolve_cross_repo_head(state, loaded.repo.id, &pull, head).await?,
+                            HeadInTarget::Present
+                        ) =>
+                {
                     Some((
                         head.clone(),
                         crate::codeowners::load(state, loaded.repo.id, base, head).await?,
@@ -1265,11 +1555,28 @@ async fn update(
                     Some("pull request closed"),
                 )
                 .await?;
+                // The retention window starts at the close. A request that
+                // stayed open longer than the window keeps its diff for the
+                // configured period from now, not from its last refresh.
+                crate::pins::extend_for_closed(
+                    &mut tx,
+                    locked.id,
+                    state.config.housekeeping_pin_retention_days,
+                )
+                .await?;
             }
 
             let pull = fetch_pull(&mut tx, locked.id).await?.unwrap();
             let status = StatusCode::OK;
-            let mut detail = detail(&mut tx, loaded.repo.id, pull, tips).await?;
+            // Closing a request whose branch is already gone must return the
+            // same head a later GET will: the pin that was just extended.
+            let mut detail_tips = tips;
+            if detail_tips.0.is_none()
+                && let Some(oid) = pinned_head_on(&mut tx, &pull).await?
+            {
+                detail_tips.0 = Some(oid);
+            }
+            let mut detail = detail(&mut tx, loaded.repo.id, pull, detail_tips).await?;
             if let Some((head, codeowners)) = codeowners {
                 let review = crate::codeowners::review_loaded(
                     &mut tx,
@@ -1666,6 +1973,14 @@ pub(crate) async fn create_pull_comment(
             .bind(input.in_reply_to)
             .execute(&mut *tx)
             .await?;
+            // An anchored comment names the current head (checked above, before
+            // the transaction). Pin that commit while the comment exists, in this
+            // same transaction: a force push that makes it unreachable must not
+            // cost the comment its line (U11).
+            if let Some(commit) = input.commit_id.as_deref() {
+                crate::pins::pin_review_comment(&mut tx, pull.source_repository_id, id, commit)
+                    .await?;
+            }
             sqlx::query("UPDATE pull_requests SET updated_at = now() WHERE id = $1")
                 .bind(pull.id)
                 .execute(&mut *tx)
@@ -1944,6 +2259,12 @@ pub(crate) async fn create_pull_review(
             .bind(&input.body)
             .fetch_one(&mut *tx)
             .await?;
+            // The reviewed commit is the current head, checked above (outside
+            // the transaction). Pin it while the review exists, as the comment
+            // and status pins do (U11); the head pin alone would only cover it
+            // until the next force push.
+            crate::pins::pin_review_commit(&mut tx, pull.source_repository_id, &input.commit_id)
+                .await?;
             // Any verdict satisfies a pending review request for this reviewer.
             sqlx::query(
                 "DELETE FROM pull_request_review_requests \
