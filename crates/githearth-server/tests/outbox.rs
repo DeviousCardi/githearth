@@ -1603,3 +1603,52 @@ async fn a_consumer_without_a_handler_is_refused() {
     assert!(delivered_at.is_some(), "the event's fan-out committed");
     finish(&config, pool, db).await;
 }
+
+/// The guard also has to hold for an **update**: `register` upserts, and a
+/// consumer that is already registered with a handler must not be able to
+/// null its own kind through `ON CONFLICT … job_kind = EXCLUDED.job_kind`.
+/// Without the `job_kind.is_none()` refusal the row would keep its name and
+/// budget but lose the handler, and its events would stop being enqueued.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_registered_consumer_cannot_lose_its_handler() {
+    let db = Db::new(true).await;
+    let config = fast_config(&db.url);
+    let (_state, pool) = state_for(&config).await;
+
+    outbox::register(&pool, &consume_a()).await.unwrap();
+    let before: (Option<String>, i32, i32) = sqlx::query_as(
+        "SELECT job_kind, max_attempts, backoff_cap_seconds FROM outbox_consumers WHERE name = $1",
+    )
+    .bind(CONSUMER_A)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before.0.as_deref(), Some(JOB_A));
+
+    let mut bare = Consumer {
+        kinds: Some(vec!["test.some-kind".to_string()]),
+        max_attempts: 3,
+        backoff_cap: Duration::from_secs(7),
+        ..consume_a()
+    };
+    bare.job_kind = None;
+    let refused = outbox::register(&pool, &bare).await;
+    assert!(
+        refused.is_err(),
+        "a consumer already registered cannot drop its handler"
+    );
+
+    let after: (Option<String>, i32, i32) = sqlx::query_as(
+        "SELECT job_kind, max_attempts, backoff_cap_seconds FROM outbox_consumers WHERE name = $1",
+    )
+    .bind(CONSUMER_A)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "the refused update wrote nothing: the live consumer keeps its kind and budget"
+    );
+    finish(&config, pool, db).await;
+}

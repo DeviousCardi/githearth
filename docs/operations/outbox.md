@@ -48,6 +48,17 @@ well inside the budget. Attempts, `next_attempt_at` and the last error are on th
 delivery row; the job carries the same cap so a retry does not silently fall back
 to the generic five-attempt default.
 
+A delivery's cap (and its attempt budget) is **fixed at enqueue time**: the relay
+copies the consumer's `max_attempts` onto the delivery row and onto its job, and
+its `backoff_cap_seconds` onto the job. Raising or lowering a consumer's cap
+later changes the deliveries created afterwards only; a delivery already queued
+keeps the values it was created with. So a cap lowered to shorten a stuck
+backlog does not shorten the deliveries already in it.
+
+`jobs requeue` is the exception: it reenqueues with the row's `max_attempts` but
+with the consumer's **current** `backoff_cap_seconds`, so a requeued delivery
+picks up a cap that was changed after it was first created.
+
 One consumer's failures never delay another's: each `(event, consumer)` is its
 own job, so a failing handler retries on its own schedule while other consumers
 receive the same event normally.
@@ -98,6 +109,14 @@ running, the row is skipped rather than doubled.
 - Neither check writes.
 
 ## Upgrades and the cutover watermark
+
+The built-in consumer's notifications are keyed on the source rows their events
+name (the merge intent's `operation_id`, the `review_id`, the `request_id`), not
+on the audit event id. Rows a pre-`0050` release wrote keep the audit event id in
+`notifications.event_id`: there is no backfill, so the uniqueness of those rows
+is still per event. A replay of a journal entry that happened before the upgrade
+can therefore still notify twice; one after it cannot. See ADR 0006, "Revision
+for M4.1".
 
 Migration `0050_outbox_fanout.sql` writes one position per audit chain for the
 built-in consumer, at that chain's head at migration time. A consumer receives

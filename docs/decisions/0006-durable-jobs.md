@@ -220,7 +220,12 @@ What changes:
   notification keys are the source rows the events name (the merge intent's
   `operation_id`, the `review_id`, the `request_id`), not the event id, because
   one source row can produce more than one event (a replayed journal entry) and
-  the handler must write one notification for it.
+  the handler must write one notification for it. This holds for every row this
+  release writes, **not** for rows a pre-`0050` release wrote: those keep the
+  audit event id in `notifications.event_id`, are not backfilled, and their
+  uniqueness is still one notification per event, not per source row. Two
+  releases of a merge can therefore still notify twice for a replay that
+  happened before the upgrade. A backfill is a follow-up, not part of U12.
 
 A defect found while building M4.1 is recorded here as a requirement: the
 `Retry` outcome's reschedule used a PostgreSQL `make_interval(millis => …)`

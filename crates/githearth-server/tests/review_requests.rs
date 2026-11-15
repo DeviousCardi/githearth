@@ -356,12 +356,19 @@ async fn notification_jobs(f: &Fixture, kind: &str) -> i64 {
 /// `delivered` delivery row: a relay that never enqueued the pair leaves its
 /// delivery `pending`, and a quiet deadline `break` would swallow exactly that.
 /// Both fail the test (review F4).
-async fn run_jobs(state: &AppState) {
-    let before: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM outbox_events WHERE kind = ANY($1)")
-        .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap();
+async fn run_jobs(state: &AppState, pull_id: Uuid) {
+    // Scoped to the pull request the test created: this suite shares one
+    // database, and another test's undelivered event must not read as this
+    // test's loss.
+    let before: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM outbox_events \
+         WHERE kind = ANY($1) AND payload->>'pull_request_id' = $2",
+    )
+    .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
+    .bind(pull_id.to_string())
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
     githearth_server::outbox::fan_out_batch(state, 10_000)
         .await
         .expect("outbox fan-out");
@@ -414,6 +421,44 @@ async fn run_jobs(state: &AppState) {
     .await
     .unwrap();
     assert_eq!(open, 0, "a delivery never ran after the drain (review F4)");
+    assert_every_event_reached_a_finished_delivery(state, pull_id).await;
+}
+
+/// Every event the built-in consumer's filter selects for this test's pull
+/// request — not only those that existed before the drain — has a `delivered`
+/// or `dead` delivery for it.
+///
+/// `before` cannot see an event the test wrote after its last `run_jobs`, so a
+/// helper that only checks `before` passes a relay that silently drops that
+/// event (review F4 follow-up). The query is the fan-out's own pair condition
+/// (`outbox::PAIRS`), scoped to the pull request the test created: this suite
+/// shares one database, and tests that write an event without draining (a
+/// review, a request) must not read as this test's loss. A skipped pair leaves
+/// the delivery missing, a pair whose job was never enqueued leaves it
+/// `pending`, and both fail here.
+async fn assert_every_event_reached_a_finished_delivery(state: &AppState, pull_id: Uuid) {
+    let lost: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT e.kind, e.id FROM outbox_events e \
+         JOIN outbox_consumers c ON c.name = 'notification.outbox' \
+         LEFT JOIN outbox_consumer_positions p ON p.consumer_id = c.id AND p.chain = e.chain \
+         WHERE e.payload->>'pull_request_id' = $1 \
+           AND e.seq > COALESCE(p.from_seq, 0) \
+           AND (c.event_filter IS NULL OR c.event_filter = 'null'::jsonb \
+                OR c.event_filter ? e.kind) \
+           AND NOT EXISTS (SELECT 1 FROM outbox_deliveries d \
+                           WHERE d.event_id = e.id AND d.consumer_id = c.id \
+                             AND d.state IN ('delivered', 'dead')) \
+         ORDER BY e.chain, e.seq",
+    )
+    .bind(pull_id.to_string())
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert!(
+        lost.is_empty(),
+        "{} event(s) never reached a finished delivery: {lost:?} (review F4)",
+        lost.len()
+    );
 }
 
 #[tokio::test]
@@ -449,7 +494,7 @@ async fn author_requests_a_member_and_is_notified() {
     // The reviewer is notified once, and the one event produced one
     // notification job (ADR 0006, revised for M4.1: the request path writes the
     // event, the relay makes the job).
-    run_jobs(&f.state).await;
+    run_jobs(&f.state, f.pull_id).await;
 
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM notifications WHERE account_id = $1 \
@@ -693,7 +738,7 @@ async fn remove_then_re_request_notifies_once() {
 
     // One event per request, one notification job per event; only the job for
     // the live request notifies.
-    run_jobs(&f.state).await;
+    run_jobs(&f.state, f.pull_id).await;
     // The job for the first request was already delivered and left the dedupe
     // index, but the removal made the job a no-op; the live one notifies.
     let events: i64 = sqlx::query_scalar(

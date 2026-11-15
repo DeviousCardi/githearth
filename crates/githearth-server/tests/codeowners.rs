@@ -419,6 +419,33 @@ async fn run_jobs(state: &AppState) {
         .fetch_all(&state.pool)
         .await
         .unwrap();
+    // Two passes, as `serve` runs them. Every event that existed before this
+    // call must have a `delivered` delivery row: a relay that never enqueued
+    // the pair leaves its delivery `pending`, and a quiet deadline `break`
+    // would swallow exactly that. Both fail the test (review F4).
+    run_drain(state).await;
+    // This suite's code-owner job writes a `pull_request.review_requested`
+    // event when it runs, so the first drain creates an event it has not yet
+    // been asked to fan out. The second pass fans it out and the second drain
+    // runs its delivery; a relay that skips the pair leaves it missing, and a
+    // job that was never enqueued leaves it `pending`.
+    run_drain(state).await;
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_deliveries d \
+         WHERE d.event_id = ANY($1) AND d.state = 'pending'",
+    )
+    .bind(&before)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(open, 0, "a delivery never ran after the drain (review F4)");
+    assert_every_event_reached_a_finished_delivery(state).await;
+}
+
+/// One relay pass, then the runner drains until two consecutive looks see
+/// nothing `pending` or `running`. A quiet `break` at the deadline would hide a
+/// relay that never enqueued the job, so it panics (review F4).
+async fn run_drain(state: &AppState) {
     githearth_server::outbox::fan_out_batch(state, 10_000)
         .await
         .expect("outbox fan-out");
@@ -430,10 +457,6 @@ async fn run_jobs(state: &AppState) {
     // The runner has to be started before the first look, or it waits a full
     // poll interval with nothing pending.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    // Two consecutive empty looks before the drain ends: a job the runner
-    // has not claimed yet already shows as `pending`, and an enqueue can
-    // land between two looks under load. A quiet `break` at the deadline
-    // would hide a relay that never enqueued the job, so it panics.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut quiet = 0;
     loop {
@@ -460,18 +483,65 @@ async fn run_jobs(state: &AppState) {
     }
     shutdown.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner).await;
-    // No handler of this suite writes its own event, so every event in `before`
-    // is owed a delivery that ran. Counting the rows still `pending` fails when
-    // the relay skipped a pair: the delivery is created and never enqueued.
-    let open: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM outbox_deliveries d \
-         WHERE d.event_id = ANY($1) AND d.state = 'pending'",
+}
+
+/// Every event the built-in consumer's filter selects — not only those that
+/// existed before the drain — has a `delivered` or `dead` delivery for it.
+///
+/// `before` cannot see an event the test wrote after its last `run_jobs`, so a
+/// helper that only checks `before` passes a relay that silently drops that
+/// event (review F4 follow-up); this suite's code-owner tests write their
+/// review-request event after the fixture, outside `before`.
+///
+/// The query is the fan-out's own pair condition (`outbox::PAIRS`, without the
+/// `delivered_at` scan filter): this consumer's filter selects the kind and the
+/// chain's position admits it. A skipped pair leaves the delivery missing, a
+/// pair whose job was never enqueued leaves it `pending`, and both fail here.
+async fn assert_every_event_reached_a_finished_delivery(state: &AppState) {
+    let lost: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT e.kind, e.id \
+         FROM outbox_events e \
+         JOIN outbox_consumers c ON c.name = 'notification.outbox' \
+         LEFT JOIN outbox_consumer_positions p ON p.consumer_id = c.id AND p.chain = e.chain \
+         WHERE e.seq > COALESCE(p.from_seq, 0) \
+           AND (c.event_filter IS NULL OR c.event_filter = 'null'::jsonb \
+                OR c.event_filter ? e.kind) \
+           AND NOT EXISTS (SELECT 1 FROM outbox_deliveries d \
+                           WHERE d.event_id = e.id AND d.consumer_id = c.id \
+                             AND d.state IN ('delivered', 'dead')) \
+         ORDER BY e.chain, e.seq",
     )
-    .bind(&before)
-    .fetch_one(&state.pool)
+    .fetch_all(&state.pool)
     .await
     .unwrap();
-    assert_eq!(open, 0, "a delivery never ran after the drain (review F4)");
+    assert!(
+        lost.is_empty(),
+        "{} event(s) never reached a finished delivery: {lost:?} (review F4)",
+        lost.len()
+    );
+}
+
+/// The newest event of `kind` in `f.org_id` reached a finished delivery: the
+/// event the test just wrote is not lost behind an assertion on the request
+/// row the handler writes.
+async fn assert_event_delivered(f: &Fixture, kind: &str) {
+    let (id, state): (Uuid, String) = sqlx::query_as(
+        "SELECT e.id, COALESCE(d.state, 'none') FROM outbox_events e \
+         LEFT JOIN outbox_deliveries d \
+                ON d.event_id = e.id AND d.consumer_id = \
+                   (SELECT id FROM outbox_consumers WHERE name = 'notification.outbox') \
+         WHERE e.organization_id = $1 AND e.kind = $2 \
+         ORDER BY e.chain DESC, e.seq DESC LIMIT 1",
+    )
+    .bind(f.org_id)
+    .bind(kind)
+    .fetch_one(&f.pool)
+    .await
+    .expect("the test's event was written");
+    assert!(
+        state == "delivered" || state == "dead",
+        "the test's newest {kind} event ({id}) reached `{state}`, not a finished delivery (review F4)"
+    );
 }
 
 async fn pull_id(f: &Fixture) -> Uuid {
@@ -569,6 +639,10 @@ async fn opening_a_pr_requests_review_from_the_account_code_owner() {
     .await
     .unwrap();
     assert_eq!(requested, vec![writer_id]);
+    // The request the push created reached a finished delivery, not only a
+    // request row: a relay that dropped its event would leave the row empty
+    // and this names the cause (review F4).
+    assert_event_delivered(&f, "pull_request.review_requested").await;
 
     finish(f).await;
     db.drop_db().await;
@@ -658,6 +732,7 @@ async fn a_team_code_owner_requests_each_member() {
     let mut expected = vec![m1, m2];
     expected.sort();
     assert_eq!(requested, expected);
+    assert_event_delivered(&f, "pull_request.review_requested").await;
 
     finish(f).await;
     db.drop_db().await;

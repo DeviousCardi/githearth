@@ -384,12 +384,19 @@ async fn approve(f: &Fixture, verdict: &str, commit: &str, token: &str) {
 /// Both fail the test (review F4). Tests that write their own events also call
 /// [`await_deliveries`] for the ones they wrote, which the relay only fans out
 /// during this call.
-async fn run_jobs(state: &AppState) {
-    let before: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM outbox_events WHERE kind = ANY($1)")
-        .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap();
+async fn run_jobs(state: &AppState, org_id: Option<Uuid>) {
+    // Scoped to the fixture's organization when the test has one: this keeps
+    // the report about the test's own events. `None` is only for the raw
+    // fixtures, which run on their own per-test database.
+    let before: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM outbox_events \
+         WHERE kind = ANY($1) AND ($2::uuid IS NULL OR organization_id = $2)",
+    )
+    .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
     githearth_server::outbox::fan_out_batch(state, 10_000)
         .await
         .expect("outbox fan-out");
@@ -442,6 +449,41 @@ async fn run_jobs(state: &AppState) {
     .await
     .unwrap();
     assert_eq!(open, 0, "a delivery never ran after the drain (review F4)");
+    assert_every_event_reached_a_finished_delivery(state, org_id).await;
+}
+
+/// Every event the built-in consumer's filter selects for this test's
+/// organization — not only those that existed before the drain — has a
+/// `delivered` or `dead` delivery for it.
+///
+/// `before` cannot see an event the test wrote after its last `run_jobs`, so a
+/// helper that only checks `before` passes a relay that silently drops that
+/// event (review F4 follow-up). A skipped pair leaves the delivery missing; a
+/// pair whose job was never enqueued leaves it `pending`; both fail here. The
+/// query is scoped to the fixture's organization, so it reads only this test's
+/// rows, and the filter is part of it, so an event the consumer is not owed
+/// (`repository.created`) is not reported as lost.
+async fn assert_every_event_reached_a_finished_delivery(state: &AppState, org_id: Option<Uuid>) {
+    let lost: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT e.kind, e.id FROM outbox_events e \
+         JOIN outbox_consumers c ON c.name = 'notification.outbox' \
+         WHERE ($1::uuid IS NULL OR e.organization_id = $1) \
+           AND (c.event_filter IS NULL OR c.event_filter = 'null'::jsonb \
+                OR c.event_filter ? e.kind) \
+           AND NOT EXISTS (SELECT 1 FROM outbox_deliveries d \
+                           WHERE d.event_id = e.id AND d.consumer_id = c.id \
+                             AND d.state IN ('delivered', 'dead')) \
+         ORDER BY e.chain, e.seq",
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert!(
+        lost.is_empty(),
+        "{} event(s) never reached a finished delivery: {lost:?} (review F4)",
+        lost.len()
+    );
 }
 
 /// Asserts that every event of `kind` in `chain`'s backlog reached a
@@ -602,7 +644,7 @@ async fn merge_by_someone_else_notifies_author_once() {
             .await
             .unwrap();
     assert_eq!(direct, 0, "the merge path writes the event, not a job");
-    run_jobs(&f.state).await;
+    run_jobs(&f.state, Some(f.org_id)).await;
     let jobs: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM jobs WHERE kind LIKE 'notification.%' \
          AND payload->>'event_id' = $1",
@@ -641,8 +683,20 @@ async fn self_merge_notifies_nobody() {
         .unwrap();
     execute_intent(&f.state, op).await.unwrap();
 
-    run_jobs(&f.state).await;
+    run_jobs(&f.state, Some(f.org_id)).await;
 
+    // The merge event itself reached a finished delivery: "no notification" is
+    // then a decision of the handler, not a relay that never ran (review,
+    // condition 2). Keyed on the merge intent, so it is this test's event.
+    let event: Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox_events WHERE kind = 'pull_request.merged' \
+         AND payload->>'operation_id' = $1",
+    )
+    .bind(op.to_string())
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    await_deliveries(&f.state, &[event]).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
         .fetch_one(&f.pool)
         .await
@@ -680,7 +734,7 @@ async fn review_by_someone_else_notifies_author_once() {
             .await
             .unwrap();
     assert_eq!(direct, 0, "the review path writes the event, not a job");
-    run_jobs(&f.state).await;
+    run_jobs(&f.state, Some(f.org_id)).await;
     let jobs: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM jobs WHERE kind LIKE 'notification.%' \
          AND payload->>'event_id' = $1",
@@ -724,8 +778,19 @@ async fn self_review_notifies_nobody() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    run_jobs(&f.state).await;
+    run_jobs(&f.state, Some(f.org_id)).await;
 
+    // The self-review's event reached a finished delivery: an empty table is
+    // then the handler's decision, not a relay that never ran (review,
+    // condition 2).
+    let event: Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox_events WHERE kind = 'pull_request.reviewed' \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    await_deliveries(&f.state, &[event]).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
         .fetch_one(&f.pool)
         .await
@@ -905,7 +970,7 @@ async fn a_second_event_for_the_same_source_row_notifies_once() {
     let mut all = merged_events.clone();
     all.extend(&review_events);
     all.extend(&request_events);
-    run_jobs(&state).await;
+    run_jobs(&state, organization_id).await;
     await_deliveries(&state, &all).await;
     for (kind, events) in [
         ("pull_request.merged", &merged_events),
@@ -919,22 +984,27 @@ async fn a_second_event_for_the_same_source_row_notifies_once() {
         );
     }
 
-    let rows: Vec<(String, Uuid, Uuid)> =
-        sqlx::query_as("SELECT kind, account_id, event_id FROM notifications ORDER BY kind")
+    // Sorted on both sides: the database's collation decides whether
+    // `review_requested` sorts before `reviewed`, and the assertion is about
+    // the rows, not their order.
+    let mut rows: Vec<(String, Uuid, Uuid)> =
+        sqlx::query_as("SELECT kind, account_id, event_id FROM notifications")
             .fetch_all(&db.pool)
             .await
             .unwrap();
+    let mut expected = vec![
+        ("pull_request.merged".to_string(), author, operation_id),
+        ("pull_request.reviewed".to_string(), author, review_id),
+        (
+            "pull_request.review_requested".to_string(),
+            reviewer,
+            request_id,
+        ),
+    ];
+    rows.sort();
+    expected.sort();
     assert_eq!(
-        rows,
-        vec![
-            ("pull_request.merged".to_string(), author, operation_id),
-            ("pull_request.reviewed".to_string(), author, review_id),
-            (
-                "pull_request.review_requested".to_string(),
-                reviewer,
-                request_id
-            ),
-        ],
+        rows, expected,
         "one notification per source row, keyed on the row and not the event"
     );
 
@@ -1027,7 +1097,7 @@ async fn handler_is_idempotent_across_redelivery() {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        run_jobs(&state).await;
+        run_jobs(&state, None).await;
     }
 
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
@@ -1063,7 +1133,7 @@ async fn deleted_pull_request_yields_done_without_a_row() {
     .unwrap();
     tx.commit().await.unwrap();
 
-    run_jobs(&state).await;
+    run_jobs(&state, None).await;
 
     // The handler returned Done: the job is done and no notification was written.
     let job_state: String =
@@ -1125,7 +1195,7 @@ async fn malformed_payload_fails_the_job() {
     }
     tx.commit().await.unwrap();
 
-    run_jobs(&state).await;
+    run_jobs(&state, None).await;
 
     for (_, key, _) in &cases {
         let state_col: String = sqlx::query_scalar("SELECT state FROM jobs WHERE dedupe_key = $1")
