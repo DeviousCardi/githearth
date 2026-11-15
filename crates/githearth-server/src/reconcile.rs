@@ -703,6 +703,14 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 }
 
 async fn run_pass(state: &AppState, attempts: &mut HashMap<Uuid, u32>) {
+    // A pass creates, trashes, purges and orphans directories and replays
+    // journals. The fence must therefore quiesce it, and `in_flight` must
+    // count it while it runs. The whole pass holds one permit so no storage
+    // operation of this pass escapes the drain.
+    let Some(_write) = state.maintenance.admit_write() else {
+        tracing::debug!("reconciler pass skipped; maintenance fence is up");
+        return;
+    };
     match reconcile_once(state, attempts).await {
         Ok(summary) => {
             if summary.has_changes() {

@@ -261,6 +261,24 @@ impl russh::server::Handler for SshHandler {
             }
         };
 
+        // A push is a write. Taking the permit before admission makes the
+        // fence atomic with the decision; the permit stays in the task below
+        // until receive-pack has exited and the journal has been replayed.
+        let maintenance_permit = if want == Want::Push {
+            match state.maintenance.admit_write() {
+                Some(permit) => Some(permit),
+                None => {
+                    return refuse(
+                        session,
+                        channel,
+                        "githearth: maintenance mode; writes are refused\n".as_bytes(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
         let admitted = match git_admission::admit_account(
             &state,
             identity.account,
@@ -448,6 +466,7 @@ impl russh::server::Handler for SshHandler {
             tokio::spawn(async move {
                 // The hook token must outlive git, which runs the hooks.
                 let _token_guard = token_guard;
+                let _maintenance_permit = maintenance_permit;
                 let exit_code = stream_git_io(
                     channel,
                     &mut handle,

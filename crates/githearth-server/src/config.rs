@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
 
 // Deliberately no Debug: database_url contains credentials.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub database_url: String,
@@ -132,10 +132,20 @@ pub struct Config {
     /// Absolute base URL used in mail links. No trailing slash is required.
     #[serde(default = "default_public_url")]
     pub public_url: String,
+    /// Directory `backup` writes to when `--output` is not given.
+    #[serde(default = "default_backup_directory")]
+    pub backup_directory: PathBuf,
+    /// Key file `backup`/`restore` read when `--key-file` is not given. The
+    /// file's contents are the key: the path is configuration, the key is not.
+    #[serde(default)]
+    pub backup_key_file: PathBuf,
+    /// How long `maintenance start` waits for in-flight writes to drain.
+    #[serde(default = "default_maintenance_drain_timeout_seconds")]
+    pub maintenance_drain_timeout_seconds: u64,
 }
 
 /// How the SMTP connection is protected.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SmtpTls {
     /// Plain connection upgraded with STARTTLS (the default, usually port 587).
@@ -213,6 +223,9 @@ impl Default for Config {
             smtp_username: None,
             smtp_password_file: None,
             public_url: default_public_url(),
+            backup_directory: default_backup_directory(),
+            backup_key_file: PathBuf::new(),
+            maintenance_drain_timeout_seconds: default_maintenance_drain_timeout_seconds(),
         }
     }
 }
@@ -221,6 +234,12 @@ fn default_smtp_port() -> u16 {
 }
 fn default_public_url() -> String {
     "http://127.0.0.1:8080".to_string()
+}
+fn default_backup_directory() -> PathBuf {
+    PathBuf::from("backups")
+}
+fn default_maintenance_drain_timeout_seconds() -> u64 {
+    300
 }
 fn default_login_throttle_max_per_username() -> u64 {
     10
@@ -420,6 +439,24 @@ impl Config {
             c.smtp_password_file = (!value.is_empty()).then(|| PathBuf::from(value));
         }
         env!(public_url, "GITHEARTH_PUBLIC_URL");
+        if std::env::var("GITHEARTH_BACKUP_DIRECTORY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            env!(backup_directory, "GITHEARTH_BACKUP_DIRECTORY");
+        }
+        if std::env::var("GITHEARTH_BACKUP_KEY_FILE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            env!(backup_key_file, "GITHEARTH_BACKUP_KEY_FILE");
+        }
+        env!(
+            maintenance_drain_timeout_seconds,
+            "GITHEARTH_MAINTENANCE_DRAIN_TIMEOUT_SECONDS"
+        );
         env!(housekeeping_enabled, "GITHEARTH_HOUSEKEEPING_ENABLED");
         env!(
             housekeeping_interval_seconds,
@@ -511,6 +548,8 @@ impl Config {
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_username)
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_client)
             || !(1..=86_400).contains(&self.login_throttle_window_seconds)
+            || self.backup_directory.as_os_str().is_empty()
+            || !(1..=86_400).contains(&self.maintenance_drain_timeout_seconds)
             || !(60..=2_592_000).contains(&self.housekeeping_interval_seconds)
             || self.housekeeping_grace_seconds > 31_536_000
             || !(1..=16).contains(&self.housekeeping_concurrency)
@@ -525,7 +564,7 @@ impl Config {
             || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {

@@ -7,6 +7,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+aes-gcm = "0.11"
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 async-compression = { version = "0.4", features = ["gzip", "tokio"] }

@@ -358,6 +358,14 @@ async fn receive_pack(
 ) -> Result<Response, GitHttpError> {
     let repo_name = strip_dot_git(&repo).ok_or(GitHttpError::NotFound)?;
 
+    // The request middleware admits a write atomically with the fence check,
+    // but a push keeps committing after the response headers are written. This
+    // second permit is moved into the task that owns the journal replay, so
+    // `maintenance status` cannot say drained while receive-pack is still
+    // updating refs. It never checks the fence again: a push admitted before
+    // the fence must be drained, not refused mid-flight.
+    let maintenance_permit = state.maintenance.track_write();
+
     let admitted =
         git_admission::admit(&state, &headers, &org, repo_name, git_admission::Want::Push)
             .await
@@ -566,6 +574,10 @@ async fn receive_pack(
             // itself dropped, never before the hook has had a chance to run.
             let _guard = repo_guard;
             let _token_guard = token_guard;
+            let _maintenance_permit = maintenance_permit;
+            // Tests hold here to prove the permit outlives the client's
+            // response and the journal replay; a no-op unless set.
+            crate::testseam::hold("HTTP_PUSH_AFTER_EXIT").await;
             match pushes::replay(&state, repo_id).await {
                 Ok(_) => {
                     // A refused push leaves no `repository_pushes` row; remove
