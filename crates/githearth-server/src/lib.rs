@@ -10,6 +10,7 @@ pub mod client_ip;
 pub mod codeowners;
 pub mod config;
 pub mod doctor;
+pub mod email_verification;
 pub mod facts;
 pub mod forks;
 pub mod git_admission;
@@ -23,6 +24,7 @@ pub mod issues;
 mod issues_ui;
 pub mod jobs;
 mod login_throttle;
+pub mod mail;
 pub mod membership;
 mod membership_ui;
 pub mod merge;
@@ -30,6 +32,7 @@ pub mod merge_intents;
 pub mod merge_worker;
 mod mergeability;
 pub mod metrics;
+pub mod notification_email;
 pub mod notifications;
 mod notifications_ui;
 pub mod outbox;
@@ -108,6 +111,9 @@ pub struct AppState {
     pub hook_tokens: Arc<std::sync::Mutex<HashMap<String, git_admission::Admitted>>>,
     pub(crate) hook_socket_path: std::path::PathBuf,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
+    /// Outbound mail. `DisabledTransport` unless SMTP is configured; tests
+    /// replace it with an in-memory transport so no socket is opened.
+    pub(crate) mailer: Arc<dyn mail::MailTransport>,
     /// In-memory counters and gauges the `/metrics` endpoint reads. `None` only
     /// for `AppState`s a unit test builds by hand; the middleware then counts
     /// nothing, and the endpoint still answers (with static gauges only).
@@ -202,6 +208,7 @@ impl AppState {
             .map(|e| parse_trusted_proxy(e))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| anyhow::anyhow!("trusted_proxies: invalid entry"))?;
+        let mailer = mail::transport_from_config(&config)?;
         let state = Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
@@ -214,6 +221,7 @@ impl AppState {
             hook_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hook_socket_path: socket_path,
             trusted_proxies,
+            mailer,
             recorder: Some(Arc::new(metrics::Recorder::new())),
             job_kinds: None,
         };
@@ -225,6 +233,13 @@ impl AppState {
     /// `githearth_jobs_by_kind`. `serve` calls this after building the registry.
     pub fn record_job_kinds(&mut self, kinds: &[&'static str]) {
         self.job_kinds = Some(Arc::from(kinds));
+    }
+
+    /// Replaces the outbound transport. Tests use this with an in-memory
+    /// implementation so no SMTP socket is ever opened.
+    pub fn with_mailer(mut self, mailer: Arc<dyn mail::MailTransport>) -> Self {
+        self.mailer = mailer;
+        self
     }
 
     /// The in-memory counters behind `/metrics`.
@@ -356,6 +371,8 @@ pub fn router(state: AppState) -> Router {
         .merge(browse::router())
         .merge(tokens::router())
         .merge(account_admin::router())
+        .merge(email_verification::router())
+        .merge(notification_email::router())
         .merge(ssh_keys::router())
         .merge(notifications::router())
         .route(

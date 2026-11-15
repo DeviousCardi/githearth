@@ -23,6 +23,9 @@ hmac = "0.12"
 rand = "0.8"
 # No "rsa": RUSTSEC-2023-0071 (Marvin) has no fix; Ed25519/ECDSA client keys only. "ring" is already in the tree.
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
+# SMTP STARTTLS/implicit TLS, verifying the server against the public roots.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -108,6 +108,58 @@ pub struct Config {
     /// loopback address.
     #[serde(default)]
     pub metrics_allow_non_loopback: bool,
+    /// Outbound SMTP host. Empty (the default) disables email delivery; the
+    /// verification link and notifications then queue and retry, but no socket
+    /// is opened. See docs/operations/email.md.
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub smtp_tls: SmtpTls,
+    /// The envelope sender and `From:` address. Required when `smtp_host` is set.
+    #[serde(default)]
+    pub smtp_from: String,
+    /// SMTP AUTH username. Authentication is skipped when both this and the
+    /// credential file are absent (an unauthenticated relay).
+    #[serde(default)]
+    pub smtp_username: Option<String>,
+    /// File holding the SMTP credential. Read once at start-up and never
+    /// logged, never returned, never placed in an error message. `-` reads one
+    /// line from stdin. The credential is never a TOML value.
+    #[serde(default)]
+    pub smtp_password_file: Option<PathBuf>,
+    /// Absolute base URL used in mail links. No trailing slash is required.
+    #[serde(default = "default_public_url")]
+    pub public_url: String,
+}
+
+/// How the SMTP connection is protected.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpTls {
+    /// Plain connection upgraded with STARTTLS (the default, usually port 587).
+    #[default]
+    Starttls,
+    /// TLS from the first byte (usually port 465).
+    Implicit,
+    /// Cleartext. Only for a loopback relay in development, and refused when
+    /// an SMTP username is configured: AUTH over it would send the password
+    /// in the clear.
+    None,
+}
+
+impl std::str::FromStr for SmtpTls {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "starttls" => Ok(Self::Starttls),
+            "implicit" => Ok(Self::Implicit),
+            "none" => Ok(Self::None),
+            _ => Err("smtp_tls must be starttls, implicit or none"),
+        }
+    }
 }
 impl Default for Config {
     fn default() -> Self {
@@ -154,8 +206,21 @@ impl Default for Config {
             login_throttle_window_seconds: default_login_throttle_window_seconds(),
             metrics_enabled: false,
             metrics_allow_non_loopback: false,
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            smtp_tls: SmtpTls::Starttls,
+            smtp_from: String::new(),
+            smtp_username: None,
+            smtp_password_file: None,
+            public_url: default_public_url(),
         }
     }
+}
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_public_url() -> String {
+    "http://127.0.0.1:8080".to_string()
 }
 fn default_login_throttle_max_per_username() -> u64 {
     10
@@ -344,6 +409,17 @@ impl Config {
             metrics_allow_non_loopback,
             "GITHEARTH_METRICS_ALLOW_NON_LOOPBACK"
         );
+        env!(smtp_host, "GITHEARTH_SMTP_HOST");
+        env!(smtp_port, "GITHEARTH_SMTP_PORT");
+        env!(smtp_tls, "GITHEARTH_SMTP_TLS");
+        env!(smtp_from, "GITHEARTH_SMTP_FROM");
+        if let Ok(value) = std::env::var("GITHEARTH_SMTP_USERNAME") {
+            c.smtp_username = (!value.is_empty()).then_some(value);
+        }
+        if let Ok(value) = std::env::var("GITHEARTH_SMTP_PASSWORD_FILE") {
+            c.smtp_password_file = (!value.is_empty()).then(|| PathBuf::from(value));
+        }
+        env!(public_url, "GITHEARTH_PUBLIC_URL");
         env!(housekeeping_enabled, "GITHEARTH_HOUSEKEEPING_ENABLED");
         env!(
             housekeeping_interval_seconds,
@@ -482,6 +558,43 @@ impl Config {
                 "metrics_allow_non_loopback requires metrics_enabled = true; \
                  the metrics endpoint is off"
             );
+        }
+        if self.public_url.len() > 2048
+            || !(self.public_url.starts_with("http://") || self.public_url.starts_with("https://"))
+            || self
+                .public_url
+                .bytes()
+                .any(|b| b.is_ascii_control() || b == b' ')
+        {
+            bail!("public_url must be an http:// or https:// URL without spaces or control bytes");
+        }
+        if !self.smtp_host.is_empty() {
+            if self.smtp_port == 0 {
+                bail!("smtp_port must be between 1 and 65535");
+            }
+            if !crate::invitations::valid_email(&self.smtp_from) {
+                bail!("smtp_from must be a valid email address when smtp_host is set");
+            }
+            if self
+                .smtp_username
+                .as_deref()
+                .is_some_and(|username| username.is_empty())
+            {
+                bail!("smtp_username must not be empty when set");
+            }
+            if self.smtp_username.is_some() && self.smtp_password_file.is_none() {
+                bail!("smtp_username requires smtp_password_file");
+            }
+            // A cleartext connection with AUTH would put the password on the
+            // wire in base64. `none` stays usable for an unauthenticated
+            // loopback relay; an authenticated one must use TLS.
+            if self.smtp_tls == SmtpTls::None && self.smtp_username.is_some() {
+                bail!(
+                    "smtp_tls = \"none\" cannot be combined with smtp_username: \
+                     AUTH PLAIN would send the password in cleartext; use \
+                     smtp_tls = \"starttls\" or \"implicit\""
+                );
+            }
         }
         Ok(())
     }
@@ -684,6 +797,62 @@ mod tests {
             config.metrics_enabled && config.metrics_allow_non_loopback,
             "the example's block was not the override with the endpoint on: {toml}"
         );
+    }
+
+    /// B1: `smtp_tls = "none"` must never carry a credential. A cleartext
+    /// session with a username reaches `AUTH PLAIN` and puts the password on
+    /// the wire, so `validate` refuses the combination. `none` remains usable
+    /// for an unauthenticated loopback relay. The test also pins the SMTP
+    /// keys' other validation rules, which had no test.
+    #[test]
+    fn smtp_cleartext_cannot_carry_credentials() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            smtp_host: "127.0.0.1".into(),
+            smtp_port: 25,
+            smtp_tls: SmtpTls::None,
+            smtp_from: "githearth@example.com".into(),
+            ..Config::default()
+        };
+        // Revert: delete the `SmtpTls::None && smtp_username` bail above; this
+        // configuration validates and the client sends AUTH PLAIN in cleartext.
+        assert!(
+            c.validate().is_ok(),
+            "an unauthenticated cleartext loopback relay stays usable"
+        );
+        c.smtp_username = Some("githearth".into());
+        c.smtp_password_file = Some(PathBuf::from("/etc/githearth/smtp-password"));
+        let error = c.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("smtp_tls = \"none\" cannot be combined with smtp_username"),
+            "{error}"
+        );
+        // The same credentials over TLS are accepted.
+        c.smtp_tls = SmtpTls::Starttls;
+        assert!(c.validate().is_ok());
+
+        // The other SMTP rules: a zero port, a missing sender, a username with
+        // no credential file.
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            smtp_host: "smtp.example.com".into(),
+            ..Config::default()
+        };
+        c.smtp_port = 0;
+        assert!(c.validate().is_err());
+        c.smtp_port = 587;
+        assert!(c.validate().is_err(), "smtp_from is required");
+        c.smtp_from = "not an address".into();
+        assert!(c.validate().is_err());
+        c.smtp_from = "githearth@example.com".into();
+        c.smtp_username = Some("githearth".into());
+        let error = c.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("smtp_username requires smtp_password_file"),
+            "{error}"
+        );
+        c.smtp_password_file = Some(PathBuf::from("/etc/githearth/smtp-password"));
+        assert!(c.validate().is_ok());
     }
 
     #[test]

@@ -1407,6 +1407,7 @@ dependencies = [
  "rand 0.8.8",
  "russh",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1420,6 +1421,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
