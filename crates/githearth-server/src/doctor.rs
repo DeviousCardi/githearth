@@ -56,6 +56,51 @@ impl Check {
     }
 }
 
+/// Counts the legacy two-scope tokens still accepted before the enforced
+/// cutoff (U27). Nothing is changed; the operator revokes or replaces them.
+/// This is where an operator reads the date and the remaining count, so it
+/// prints the instant the server actually enforces rather than recomputing one.
+async fn legacy_tokens_check(pool: &PgPool, config: &Config) -> Check {
+    let row: Result<(i64, Option<String>), _> = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE legacy_deadline > clock_timestamp()), \
+                to_char(max(legacy_deadline) FILTER (WHERE revoked_at IS NULL) \
+                        AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+         FROM access_tokens WHERE legacy AND revoked_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await;
+    match row {
+        Ok((0, Some(end))) => Check::ok(
+            "tokens",
+            format_args!("no legacy tokens remain; the last enforced cutoff was {end}"),
+        ),
+        Ok((0, None)) => Check::ok(
+            "tokens",
+            format_args!(
+                "no legacy tokens; legacy repo:read/repo:write tokens are refused from \
+                 the UTC midnight after {}",
+                config.legacy_token_deprecation_date
+            ),
+        ),
+        Ok((n, Some(end))) => Check::warn(
+            "tokens",
+            format_args!(
+                "{n} legacy repo:read/repo:write token(s) remain; no legacy token is \
+                 accepted at or after {end}"
+            ),
+        ),
+        Ok((n, None)) => Check::warn(
+            "tokens",
+            format_args!(
+                "{n} legacy repo:read/repo:write token(s) remain; refused from the UTC \
+                 midnight after {}",
+                config.legacy_token_deprecation_date
+            ),
+        ),
+        Err(e) => Check::fail("tokens", e),
+    }
+}
+
 pub async fn report(config: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
 
@@ -75,6 +120,7 @@ pub async fn report(config: &Config) -> Vec<Check> {
                 Ok(d) => Check::ok("schema", d),
                 Err(d) => Check::fail("schema", d),
             });
+            checks.push(legacy_tokens_check(&pool, config).await);
             checks.push(
                 match lifecycle_check(&pool, config.reconcile_grace_seconds).await {
                     Ok(0) => Check::ok("lifecycle", "no stuck repositories"),
@@ -93,8 +139,8 @@ pub async fn report(config: &Config) -> Vec<Check> {
             checks.push(outbox_check(&pool).await);
             checks.push(housekeeping_check(&pool, config).await);
             // Only reported when it has something to report: a clean install
-            // has no skipped request. So `doctor` runs ten checks there and
-            // eleven on an install whose base backfill warned, which is what
+            // has no skipped request. So `doctor` runs eleven checks there and
+            // twelve on an install whose base backfill warned, which is what
             // `docs/operations/install.md` documents.
             if let Some(check) = base_backfill_check(&pool).await {
                 checks.push(check);
@@ -104,6 +150,7 @@ pub async fn report(config: &Config) -> Vec<Check> {
         Err(e) => {
             checks.push(Check::fail("database", e));
             checks.push(Check::skip("schema"));
+            checks.push(Check::skip("tokens"));
             checks.push(Check::skip("lifecycle"));
             checks.push(Check::skip("jobs"));
             checks.push(Check::skip("outbox"));

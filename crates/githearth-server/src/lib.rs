@@ -204,6 +204,23 @@ impl AppState {
 
     async fn build(pool: PgPool, config: Config, write_token: bool) -> anyhow::Result<Self> {
         config.validate()?;
+        // Pin the operator's legacy deprecation date onto every legacy token.
+        // The stored instant is the first instant of the UTC day after that
+        // date, so the date the operator reads (config, `doctor`, the docs) is
+        // the date enforced and both lookups refuse at exactly the next UTC
+        // midnight. `LEAST` makes the pass monotone: shortening the configured
+        // date shortens existing rows, while raising it back can never
+        // re-extend a token that was already narrowed. A database that is not
+        // migrated yet (a one-off unit test with a lazy pool) simply skips
+        // this; `ready` reports the real schema state.
+        let _ = sqlx::query(
+            "UPDATE access_tokens SET legacy_deadline = LEAST(legacy_deadline, \
+             ($1::date + 1)::timestamp AT TIME ZONE 'UTC') \
+             WHERE legacy AND subject_kind = 'account'",
+        )
+        .bind(&config.legacy_token_deprecation_date)
+        .execute(&pool)
+        .await;
         let dummy_hash =
             tokio::task::spawn_blocking(|| hash_password("dummy-password-not-an-account"))
                 .await??;
@@ -1147,22 +1164,69 @@ pub(crate) async fn authenticate_token_hash(
             username: row.1,
             is_admin: row.2,
             read_only: false,
+            confinement: None,
         },
         row.3.max(0) as u64,
     ))
 }
-#[derive(Clone, Serialize, sqlx::FromRow)]
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
 pub struct Account {
     pub id: Uuid,
     pub username: String,
     pub is_admin: bool,
     #[serde(skip)]
     pub read_only: bool,
+    /// The token's resource-set/scope/audience narrowing, when this account
+    /// authenticated with a scoped token rather than a session or legacy token.
+    #[serde(skip)]
+    pub confinement: Option<githearth_authz::Confinement>,
 }
 impl Account {
     /// `repo:read`-only access tokens may never perform writes.
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only
+    }
+}
+
+/// Who an authenticated access token acts for. Sessions and legacy tokens
+/// resolve to `Account`; service-account and run tokens keep their own
+/// principal so the audit actor and the engine see the non-human identity.
+#[derive(Clone, Debug)]
+pub enum Actor {
+    Account {
+        account: Account,
+        confinement: Option<githearth_authz::Confinement>,
+    },
+    ServiceAccount {
+        id: Uuid,
+        organization: Uuid,
+        confinement: Option<githearth_authz::Confinement>,
+    },
+    Run {
+        id: Uuid,
+        account: Uuid,
+        organization: Uuid,
+        confinement: Option<githearth_authz::Confinement>,
+    },
+}
+
+impl Actor {
+    /// The account a decision acts for: the account itself, or a run's
+    /// triggering account. A service account has none.
+    pub fn account_id(&self) -> Option<Uuid> {
+        match self {
+            Actor::Account { account, .. } => Some(account.id),
+            Actor::ServiceAccount { .. } => None,
+            Actor::Run { account, .. } => Some(*account),
+        }
+    }
+
+    pub fn audit_actor(&self) -> AuditActor {
+        match self {
+            Actor::Account { account, .. } => AuditActor::account(account.id),
+            Actor::ServiceAccount { id, .. } => AuditActor::service_account(*id),
+            Actor::Run { id, account, .. } => AuditActor::run(*id, *account),
+        }
     }
 }
 
@@ -1194,20 +1258,40 @@ pub(crate) async fn authenticate_credential(
     }
 }
 
-/// Resolves a personal access token: reject revoked, expired and
-/// suspended-account tokens, return the account with `read_only` set whenever
-/// the token lacks `repo:write`, and `auth_age` large enough that sensitive
-/// actions keep requiring a fresh session. `last_used_at` is refreshed, at a
-/// throttled rate so a burst of Git requests does not write per-request.
+/// The transport a credential is presented on. A token's audience must contain
+/// it; legacy tokens carry both `api` and `git`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    Api,
+    Git,
+    Registry,
+}
+
+impl Transport {
+    pub fn name(self) -> &'static str {
+        match self {
+            Transport::Api => "api",
+            Transport::Git => "git",
+            Transport::Registry => "registry",
+        }
+    }
+}
+
+/// Resolves a legacy personal access token: reject revoked, expired and
+/// suspended-account tokens, and refuse the token after its deprecation
+/// deadline (U27). Only legacy account tokens authenticate here; scoped and
+/// non-account tokens go through [`authenticate_access_token_actor`].
 pub async fn authenticate_access_token(
     pool: &PgPool,
     token_hash: Vec<u8>,
 ) -> ApiResult<((Account, u64), Uuid)> {
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, bool, Vec<String>, Option<bool>)>(
-        "SELECT a.id, t.id, a.username, a.is_admin, t.scopes, (t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp()) AS expired \
+        "SELECT a.id, t.id, a.username, a.is_admin, t.scopes, \
+         ((t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp()) \
+           OR (t.legacy_deadline IS NOT NULL AND t.legacy_deadline <= clock_timestamp())) AS expired \
          FROM accounts a JOIN access_tokens t ON t.account_id = a.id \
          WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND NOT a.suspended \
-         AND NOT a.must_change_password",
+         AND NOT a.must_change_password AND t.subject_kind = 'account' AND t.legacy",
     )
     .bind(&token_hash)
     .fetch_optional(pool)
@@ -1221,14 +1305,7 @@ pub async fn authenticate_access_token(
     // (which implies repo:read) is the only capability beyond reading, so a
     // token without it is treated as read-only for every scope check.
     let read_only = !scopes.iter().any(|s| s == "repo:write");
-    // Throttle the last_used_at refresh: touch only when stale by >60s.
-    let _ = sqlx::query(
-        "UPDATE access_tokens SET last_used_at = clock_timestamp() \
-         WHERE token_hash = $1 AND (last_used_at IS NULL OR last_used_at < clock_timestamp() - interval '60 seconds')",
-    )
-    .bind(&token_hash)
-    .execute(pool)
-    .await?;
+    touch_token(pool, &token_hash).await;
     Ok((
         (
             Account {
@@ -1236,24 +1313,210 @@ pub async fn authenticate_access_token(
                 username,
                 is_admin,
                 read_only,
+                confinement: None,
             },
             u64::MAX,
         ),
         token_id,
     ))
 }
+
+/// Resolves any access-token subject on one transport. The token's audience,
+/// expiry, revocation, legacy deadline and (for a run) the run's live status
+/// are checked here; the resource set and scopes are enforced by the policy
+/// engine from the returned [`Actor`].
+pub async fn authenticate_access_token_actor(
+    pool: &PgPool,
+    token_hash: Vec<u8>,
+    transport: Transport,
+) -> ApiResult<(Actor, Uuid)> {
+    let row = sqlx::query(
+        "SELECT t.id, t.subject_kind, t.account_id, t.service_account_id, t.run_id, \
+                t.scopes, t.resource_set, t.audience, t.legacy, \
+                ((t.expires_at IS NOT NULL AND t.expires_at <= clock_timestamp()) \
+                  OR (t.legacy_deadline IS NOT NULL AND t.legacy_deadline <= clock_timestamp())) AS expired, \
+                a.id AS a_id, a.username, a.is_admin, a.suspended AS a_suspended, \
+                a.must_change_password AS a_mcp, \
+                sa.organization_id AS sa_org, (sa.disabled_at IS NOT NULL) AS sa_disabled, \
+                r.organization_id AS run_org, r.triggered_by, r.status AS run_status, \
+                (r.ended_at IS NOT NULL) AS run_ended, \
+                ar.suspended AS ar_suspended, ar.must_change_password AS ar_mcp \
+         FROM access_tokens t \
+         LEFT JOIN accounts a ON a.id = t.account_id \
+         LEFT JOIN service_accounts sa ON sa.id = t.service_account_id \
+         LEFT JOIN ci_runs r ON r.id = t.run_id \
+         LEFT JOIN accounts ar ON ar.id = r.triggered_by \
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL",
+    )
+    .bind(&token_hash)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(unauthorized)?;
+    if row.get::<Option<bool>, _>("expired").unwrap_or(false) {
+        return Err(unauthorized());
+    }
+    let audience: Vec<String> = row.get("audience");
+    if !audience.iter().any(|a| a == transport.name()) {
+        return Err(unauthorized());
+    }
+    let scopes: Vec<String> = row.get("scopes");
+    let read_only = !scopes.iter().any(|s| s == "repo:write");
+    let legacy: bool = row.get("legacy");
+    let confinement = if legacy {
+        None
+    } else {
+        Some(confinement(&row)?)
+    };
+    let token_id: Uuid = row.get("id");
+    let actor = match row.get::<String, _>("subject_kind").as_str() {
+        "account" => {
+            if row.get::<Option<bool>, _>("a_suspended").unwrap_or(true)
+                || row.get::<Option<bool>, _>("a_mcp").unwrap_or(true)
+            {
+                return Err(unauthorized());
+            }
+            Actor::Account {
+                account: Account {
+                    id: row.get("a_id"),
+                    username: row.get("username"),
+                    is_admin: row.get("is_admin"),
+                    read_only,
+                    confinement: confinement.clone(),
+                },
+                confinement,
+            }
+        }
+        "service_account" => {
+            if row.get::<Option<bool>, _>("sa_disabled").unwrap_or(true) {
+                return Err(unauthorized());
+            }
+            Actor::ServiceAccount {
+                id: row.get("service_account_id"),
+                organization: row.get("sa_org"),
+                confinement,
+            }
+        }
+        "run" => {
+            if row.get::<Option<bool>, _>("run_ended").unwrap_or(true)
+                || row.get::<Option<String>, _>("run_status").as_deref() != Some("running")
+                || row.get::<Option<bool>, _>("ar_suspended").unwrap_or(true)
+                || row.get::<Option<bool>, _>("ar_mcp").unwrap_or(true)
+            {
+                return Err(unauthorized());
+            }
+            Actor::Run {
+                id: row.get("run_id"),
+                account: row.get("triggered_by"),
+                organization: row.get("run_org"),
+                confinement,
+            }
+        }
+        _ => return Err(unauthorized()),
+    };
+    touch_token(pool, &token_hash).await;
+    Ok((actor, token_id))
+}
+
+/// Builds the engine's confinement from a token row. A malformed stored set is
+/// a 500-class refusal, not a token with no limit.
+fn confinement(row: &sqlx::postgres::PgRow) -> ApiResult<githearth_authz::Confinement> {
+    let scopes: Vec<String> = row.get("scopes");
+    let audience: Vec<String> = row.get("audience");
+    let value: serde_json::Value = row.get("resource_set");
+    let resources = parse_resource_set(&value).ok_or(ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "token resource set is invalid",
+    ))?;
+    Ok(githearth_authz::Confinement {
+        resources,
+        scopes,
+        audience,
+    })
+}
+
+/// Parses the canonical resource-set grammar (ADR 0014 section 2):
+/// `[{"type":"repository","id":...}, {"type":"organization","id":...},
+///   {"type":"package","organization":...,"name":...}]`.
+pub(crate) fn parse_resource_set(
+    value: &serde_json::Value,
+) -> Option<Vec<githearth_authz::ResourceSelector>> {
+    use githearth_authz::ResourceSelector;
+    let items = value.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    let mut selectors = Vec::with_capacity(items.len());
+    for item in items {
+        let kind = item.get("type")?.as_str()?;
+        match kind {
+            "repository" => selectors.push(ResourceSelector::Repository(
+                item.get("id")?.as_str()?.parse().ok()?,
+            )),
+            "organization" => selectors.push(ResourceSelector::Organization(
+                item.get("id")?.as_str()?.parse().ok()?,
+            )),
+            "package" => selectors.push(ResourceSelector::Package {
+                organization: item.get("organization")?.as_str()?.parse().ok()?,
+                name: item.get("name")?.as_str()?.to_owned(),
+            }),
+            _ => return None,
+        }
+    }
+    Some(selectors)
+}
+
+async fn touch_token(pool: &PgPool, token_hash: &[u8]) {
+    // Throttle the last_used_at refresh: touch only when stale by >60s.
+    let _ = sqlx::query(
+        "UPDATE access_tokens SET last_used_at = clock_timestamp() \
+         WHERE token_hash = $1 AND (last_used_at IS NULL OR last_used_at < clock_timestamp() - interval '60 seconds')",
+    )
+    .bind(token_hash)
+    .execute(pool)
+    .await;
+}
+
 /// Resolves an access token from its plaintext `gth_` string, for transports
 /// that receive the token directly (e.g. the Git Basic-auth path).
 pub(crate) async fn authenticate_access_token_plaintext(
     pool: &PgPool,
     token: &str,
-) -> ApiResult<((Account, u64), Uuid)> {
+    transport: Transport,
+) -> ApiResult<(Actor, Uuid)> {
     let rest = token.strip_prefix("gth_").ok_or_else(unauthorized)?;
     if rest.len() != 64 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(unauthorized());
     }
-    authenticate_access_token(pool, Sha256::digest(token.as_bytes()).to_vec()).await
+    authenticate_access_token_actor(pool, Sha256::digest(token.as_bytes()).to_vec(), transport)
+        .await
 }
+
+/// Authenticates any subject for an API request. The historical [`authenticate`]
+/// keeps its account/session/legacy-token contract; handlers that accept the
+/// non-account subjects call this one.
+pub(crate) async fn authenticate_actor(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    transport: Transport,
+) -> ApiResult<(Actor, u64)> {
+    match bearer_credential(headers)? {
+        Credential::Session { token_hash } => {
+            let (account, age) = authenticate_token_hash(pool, token_hash).await?;
+            Ok((
+                Actor::Account {
+                    account,
+                    confinement: None,
+                },
+                age,
+            ))
+        }
+        Credential::AccessToken { token_hash } => {
+            let (actor, _) = authenticate_access_token_actor(pool, token_hash, transport).await?;
+            Ok((actor, u64::MAX))
+        }
+    }
+}
+
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Account>> {
     Ok(Json(authenticate(&state.pool, &headers).await?.0))
 }
@@ -1396,12 +1659,58 @@ pub(crate) async fn event(
     event_with(tx, organization, actor, kind, serde_json::json!({})).await
 }
 
+/// The audit actor for a row. An account acts as itself; a service account by
+/// its row id with no account; a run by its run id plus its triggering account.
+#[derive(Clone, Copy, Debug)]
+pub struct AuditActor {
+    pub kind: &'static str,
+    pub id: Uuid,
+    pub account: Option<Uuid>,
+}
+
+impl AuditActor {
+    pub fn account(id: Uuid) -> Self {
+        Self {
+            kind: "account",
+            id,
+            account: Some(id),
+        }
+    }
+
+    pub fn service_account(id: Uuid) -> Self {
+        Self {
+            kind: "service_account",
+            id,
+            account: None,
+        }
+    }
+
+    pub fn run(id: Uuid, account: Uuid) -> Self {
+        Self {
+            kind: "run",
+            id,
+            account: Some(account),
+        }
+    }
+}
+
 /// `event` with `extra` fields merged into the outbox payload (IDs only, never
 /// secrets); the audit row keeps its fixed columns and shares the event id.
 pub(crate) async fn event_with(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     organization: Option<Uuid>,
     actor: Uuid,
+    kind: &str,
+    extra: serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    event_with_actor(tx, organization, AuditActor::account(actor), kind, extra).await
+}
+
+/// The same event under a non-account principal's audit actor.
+pub(crate) async fn event_with_actor(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    organization: Option<Uuid>,
+    actor: AuditActor,
     kind: &str,
     extra: serde_json::Value,
 ) -> Result<(), sqlx::Error> {
@@ -1424,11 +1733,14 @@ pub(crate) async fn event_with(
         None => (None, None, None),
     };
     sqlx::query(
-        "INSERT INTO audit_events (id,organization_id,actor_id,kind,client_ip,client_ip_key_id,client_ip_digest) VALUES ($1,$2,$3,$4,$5::inet,$6,$7)",
+        "INSERT INTO audit_events (id,organization_id,actor_id,actor_kind,actor_account_id,kind,client_ip,client_ip_key_id,client_ip_digest) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7::inet,$8,$9)",
     )
     .bind(id)
     .bind(organization)
-    .bind(actor)
+    .bind(actor.id)
+    .bind(actor.kind)
+    .bind(actor.account)
     .bind(kind)
     .bind(client_ip)
     .bind(client_ip_key_id)
@@ -1441,7 +1753,9 @@ pub(crate) async fn event_with(
         .bind(kind)
         .bind({
             let mut payload = extra;
-            payload["actor_id"] = serde_json::json!(actor);
+            payload["actor_id"] = serde_json::json!(actor.id);
+            payload["actor_kind"] = serde_json::json!(actor.kind);
+            payload["actor_account_id"] = serde_json::json!(actor.account);
             payload["organization_id"] = serde_json::json!(organization);
             payload
         })

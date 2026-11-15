@@ -4,15 +4,29 @@
 use std::time::Duration;
 
 use githearth_authz::{
-    Account, Action, BuiltinRole, Grant, Organization, Principal, Request, Resource, Role, Scope,
-    Subject, Team,
+    Account, Action, BuiltinRole, Confinement, Grant, Organization, Principal, Request, Resource,
+    Role, Run, Scope, ServiceAccount, Subject, Team,
 };
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
+/// The principal a snapshot authorizes for. `Account` is the historical path;
+/// `ServiceAccount` and `Run` are the non-account subjects from ADR 0014.
+#[derive(Clone)]
+pub enum PrincipalFacts {
+    Account(Account),
+    ServiceAccount(ServiceAccount),
+    Run(Run),
+}
+
 #[derive(Clone)]
 pub struct Facts {
+    /// The account a decision acts for: the signed-in account, or (for a run)
+    /// the account that triggered it. A service-account snapshot carries a
+    /// placeholder so the historical field stays present; `principal` is what
+    /// the engine uses.
     pub account: Account,
+    pub principal: Option<PrincipalFacts>,
     pub teams: Vec<Team>,
     pub grants: Vec<Grant>,
     pub organization: Organization,
@@ -22,6 +36,15 @@ pub struct Facts {
 }
 
 impl Facts {
+    pub fn principal<'a>(&'a self) -> Principal<'a> {
+        match &self.principal {
+            Some(PrincipalFacts::Account(account)) => Principal::Account(account),
+            Some(PrincipalFacts::ServiceAccount(account)) => Principal::ServiceAccount(account),
+            Some(PrincipalFacts::Run(run)) => Principal::Run(run),
+            None => Principal::Account(&self.account),
+        }
+    }
+
     pub fn request<'a>(
         &'a self,
         action: Action,
@@ -29,7 +52,7 @@ impl Facts {
         auth_age: Option<Duration>,
     ) -> Request<'a> {
         Request {
-            principal: Principal::Account(&self.account),
+            principal: self.principal(),
             teams: &self.teams,
             grants: &self.grants,
             action,
@@ -84,13 +107,57 @@ pub async fn load_scoped(
     organization_id: Uuid,
     read_only: bool,
 ) -> Result<Option<Facts>, sqlx::Error> {
+    load_scoped_confined(conn, account_id, organization_id, read_only, None).await
+}
+
+/// The same snapshot with the token's resource-set/scope/audience confinement
+/// attached to the account principal.
+pub async fn load_scoped_confined(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+    read_only: bool,
+    confinement: Option<Confinement>,
+) -> Result<Option<Facts>, sqlx::Error> {
     let mut tx = conn.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await?;
-    let facts = snapshot(&mut tx, account_id, organization_id, read_only).await?;
+    let facts = snapshot(&mut tx, account_id, organization_id, read_only, confinement).await?;
     tx.commit().await?;
     Ok(facts)
+}
+
+/// Load facts for any token subject. The caller has already authenticated the
+/// credential and checked its audience; this snapshot enforces the token's
+/// resource set and scopes inside the engine.
+pub async fn load_actor(
+    conn: &mut PgConnection,
+    actor: &crate::Actor,
+    organization_id: Uuid,
+) -> Result<Option<Facts>, sqlx::Error> {
+    match actor {
+        crate::Actor::Account {
+            account,
+            confinement,
+            ..
+        } => {
+            load_scoped_confined(
+                conn,
+                account.id,
+                organization_id,
+                account.is_read_only(),
+                confinement.clone(),
+            )
+            .await
+        }
+        crate::Actor::ServiceAccount {
+            id, confinement, ..
+        } => load_service_account(conn, *id, organization_id, confinement.clone()).await,
+        crate::Actor::Run {
+            id, confinement, ..
+        } => load_run(conn, *id, organization_id, confinement.clone()).await,
+    }
 }
 
 /// Load the same snapshot on a connection that is already inside a transaction.
@@ -105,31 +172,61 @@ pub async fn load_in_transaction(
     account_id: Uuid,
     organization_id: Uuid,
 ) -> Result<Option<Facts>, sqlx::Error> {
-    snapshot(conn, account_id, organization_id, false).await
+    snapshot(conn, account_id, organization_id, false, None).await
 }
 
-async fn snapshot(
+async fn organization(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+) -> Result<Option<Organization>, sqlx::Error> {
+    Ok(
+        sqlx::query("SELECT suspended FROM organizations WHERE id = $1")
+            .bind(organization_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .map(|row| Organization {
+                id: organization_id,
+                suspended: row.get("suspended"),
+            }),
+    )
+}
+
+async fn account_row(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+) -> Result<Option<(Account, bool)>, sqlx::Error> {
+    let Some(row) =
+        sqlx::query("SELECT suspended, is_admin, must_change_password FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(&mut *conn)
+            .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        Account {
+            id: account_id,
+            suspended: row.get("suspended"),
+            site_admin: row.get("is_admin"),
+            organizations: Vec::new(),
+            teams: Vec::new(),
+            confinement: None,
+        },
+        row.get("must_change_password"),
+    )))
+}
+
+async fn account_snapshot(
     conn: &mut PgConnection,
     account_id: Uuid,
     organization_id: Uuid,
     read_only: bool,
+    confinement: Option<Confinement>,
 ) -> Result<Option<Facts>, sqlx::Error> {
-    let organization = match sqlx::query("SELECT suspended FROM organizations WHERE id = $1")
-        .bind(organization_id)
-        .fetch_optional(&mut *conn)
-        .await?
-    {
-        Some(row) => Organization {
-            id: organization_id,
-            suspended: row.get("suspended"),
-        },
-        None => return Ok(None),
+    let Some(organization) = organization(conn, organization_id).await? else {
+        return Ok(None);
     };
-    let Some(account) = sqlx::query("SELECT suspended, is_admin FROM accounts WHERE id = $1")
-        .bind(account_id)
-        .fetch_optional(&mut *conn)
-        .await?
-    else {
+    let Some((mut account, _must_change)) = account_row(conn, account_id).await? else {
         return Ok(None);
     };
     let member: bool = sqlx::query_scalar(
@@ -152,18 +249,146 @@ async fn snapshot(
     .into_iter()
     .map(|row| row.get("id"))
     .collect();
-    let account = Account {
-        id: account_id,
-        suspended: account.get("suspended"),
-        site_admin: account.get("is_admin"),
-        organizations: if member {
-            vec![organization_id]
-        } else {
-            vec![]
-        },
-        teams: direct,
+    account.organizations = if member {
+        vec![organization_id]
+    } else {
+        vec![]
     };
-    let teams: Vec<Team> = sqlx::query(&format!(
+    account.teams = direct;
+    account.confinement = confinement;
+    let teams = teams(conn, account_id, organization_id).await?;
+    let grants = account_grants(conn, account_id, organization_id).await?;
+    Ok(Some(Facts {
+        account,
+        principal: None,
+        teams,
+        grants,
+        organization,
+        read_only,
+    }))
+}
+
+async fn snapshot(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+    read_only: bool,
+    confinement: Option<Confinement>,
+) -> Result<Option<Facts>, sqlx::Error> {
+    account_snapshot(conn, account_id, organization_id, read_only, confinement).await
+}
+
+async fn load_service_account(
+    conn: &mut PgConnection,
+    service_account_id: Uuid,
+    organization_id: Uuid,
+    confinement: Option<Confinement>,
+) -> Result<Option<Facts>, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let Some(organization) = organization(&mut tx, organization_id).await? else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let Some(row) = sqlx::query(
+        "SELECT id, organization_id, disabled_at IS NOT NULL AS disabled \
+         FROM service_accounts WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(service_account_id)
+    .bind(organization_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let principal = ServiceAccount {
+        id: service_account_id,
+        organization: organization_id,
+        suspended: row.get("disabled"),
+        confinement,
+    };
+    let grants = service_account_grants(&mut tx, service_account_id, organization_id).await?;
+    // The historical field is unused for a service account; a placeholder keeps
+    // the struct shape without inventing an owning account.
+    let account = Account {
+        id: Uuid::nil(),
+        suspended: principal.suspended,
+        site_admin: false,
+        organizations: vec![organization_id],
+        teams: Vec::new(),
+        confinement: None,
+    };
+    tx.commit().await?;
+    Ok(Some(Facts {
+        account,
+        principal: Some(PrincipalFacts::ServiceAccount(principal)),
+        teams: Vec::new(),
+        grants,
+        organization,
+        read_only: false,
+    }))
+}
+
+async fn load_run(
+    conn: &mut PgConnection,
+    run_id: Uuid,
+    organization_id: Uuid,
+    confinement: Option<Confinement>,
+) -> Result<Option<Facts>, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let Some(_organization) = organization(&mut tx, organization_id).await? else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let Some(row) = sqlx::query(
+        "SELECT triggered_by, status, (ended_at IS NOT NULL) AS ended FROM ci_runs \
+         WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(run_id)
+    .bind(organization_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let account_id: Uuid = row.get("triggered_by");
+    let ended = row.get::<bool, _>("ended") || row.get::<String, _>("status") != "running";
+    // Reuse the account snapshot's facts for the triggering account.
+    let mut facts = account_snapshot(
+        &mut tx,
+        account_id,
+        organization_id,
+        false,
+        // The run, not the account, carries the token's confinement.
+        None,
+    )
+    .await?
+    .expect("run organization and account were just checked");
+    let run = Run {
+        id: run_id,
+        organization: organization_id,
+        account: facts.account.clone(),
+        ended,
+        confinement,
+    };
+    facts.principal = Some(PrincipalFacts::Run(run));
+    tx.commit().await?;
+    Ok(Some(facts))
+}
+
+async fn teams(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+) -> Result<Vec<Team>, sqlx::Error> {
+    Ok(sqlx::query(&format!(
         "{TEAMS_CTE} SELECT id, organization_id, parent_id FROM tree ORDER BY id"
     ))
     .bind(account_id)
@@ -176,9 +401,15 @@ async fn snapshot(
         organization: row.get("organization_id"),
         parent: row.get("parent_id"),
     })
-    .collect();
-    let mut grants = Vec::new();
-    for row in sqlx::query(&format!(
+    .collect())
+}
+
+async fn account_grants(
+    conn: &mut PgConnection,
+    account_id: Uuid,
+    organization_id: Uuid,
+) -> Result<Vec<Grant>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
         "{TEAMS_CTE} SELECT role, subject_kind, subject_id, repository_id FROM grants \
  WHERE scope_id = $2 AND revoked_at IS NULL \
  AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
@@ -189,8 +420,31 @@ async fn snapshot(
     .bind(account_id)
     .bind(organization_id)
     .fetch_all(&mut *conn)
-    .await?
-    {
+    .await?;
+    Ok(grants_from_rows(rows, organization_id))
+}
+
+async fn service_account_grants(
+    conn: &mut PgConnection,
+    service_account_id: Uuid,
+    organization_id: Uuid,
+) -> Result<Vec<Grant>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT role, subject_kind, subject_id, repository_id FROM grants \
+ WHERE scope_id = $2 AND subject_kind = 'service_account' AND subject_id = $1 \
+ AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
+ ORDER BY id",
+    )
+    .bind(service_account_id)
+    .bind(organization_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(grants_from_rows(rows, organization_id))
+}
+
+fn grants_from_rows(rows: Vec<sqlx::postgres::PgRow>, organization_id: Uuid) -> Vec<Grant> {
+    let mut grants = Vec::new();
+    for row in rows {
         let role = match row.get::<String, _>("role").as_str() {
             "member" => Some(BuiltinRole::Member),
             "read" => Some(BuiltinRole::Read),
@@ -208,6 +462,7 @@ async fn snapshot(
         let subject = match row.get::<String, _>("subject_kind").as_str() {
             "account" => Subject::Account(row.get("subject_id")),
             "team" => Subject::Team(row.get("subject_id")),
+            "service_account" => Subject::ServiceAccount(row.get("subject_id")),
             kind => {
                 tracing::warn!(kind, %organization_id, "unknown grant subject ignored");
                 continue;
@@ -224,11 +479,5 @@ async fn snapshot(
             scope,
         });
     }
-    Ok(Some(Facts {
-        account,
-        teams,
-        grants,
-        organization,
-        read_only,
-    }))
+    grants
 }

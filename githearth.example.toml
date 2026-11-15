@@ -5,6 +5,12 @@ database_max_connections = 10
 database_timeout_seconds = 3
 request_timeout_seconds = 15
 token_ttl_seconds = 3600
+# Last day a legacy repo:read/repo:write token is accepted; it is refused from
+# the following midnight UTC. It must be in 2026-11-16..=2027-06-30, so it can
+# shorten the window but never extend it. `doctor` reports the enforced cutoff
+# and the remaining count.
+# See docs/operations/tokens.md and ADR 0014 section 2a.
+# legacy_token_deprecation_date = "2027-06-30"
 body_limit_bytes = 524288
 # secure_cookies = true  # set false only for local HTTP development
 auth_concurrency = 2

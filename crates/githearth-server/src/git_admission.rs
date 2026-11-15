@@ -34,6 +34,9 @@ pub struct Admitted {
     /// True when the credential was a read-only scoped access token.
     pub read_only: bool,
     pub credential: CredentialRef,
+    /// The authenticated subject, kept so a pre-receive reload re-reads the
+    /// same principal (a service account or run is not an account row).
+    pub actor: crate::Actor,
 }
 
 impl std::fmt::Debug for Admitted {
@@ -118,67 +121,112 @@ pub async fn admit(
 ) -> Result<Admitted, AuthError> {
     reject_nul_path(org_slug, repo_name)?;
     let (username, password) = parse_basic(headers)?;
-    // A personal access token may be supplied as the Basic password (or the
-    // username when only the token is embedded in the URL). Detect `gth_` and
-    // short-circuit to the access-token path before password verification.
-    let (account_id, read_only, credential) =
-        if password.starts_with("gth_") || username.starts_with("gth_") {
-            let token = if password.starts_with("gth_") {
-                &password
-            } else {
-                &username
-            };
-            match crate::authenticate_access_token_plaintext(&state.pool, token).await {
-                Ok(((account, _), token_id)) => (
-                    account.id,
-                    account.is_read_only(),
-                    CredentialRef::Token(token_id),
-                ),
-                Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
-                    return Err(AuthError(
-                        StatusCode::UNAUTHORIZED,
-                        "invalid or expired credentials",
-                    ));
-                }
-                Err(_) => {
-                    return Err(AuthError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "authentication unavailable",
-                    ));
-                }
-            }
+    // A token may be supplied as the Basic password (or the username when only
+    // the token is embedded in the URL). Detect `gth_` and short-circuit to the
+    // access-token path before password verification.
+    if password.starts_with("gth_") || username.starts_with("gth_") {
+        let token = if password.starts_with("gth_") {
+            &password
         } else {
-            // The same throttled sign-in as the API and the browser form (M4.1
-            // U03); the resolved client address comes from the client-IP
-            // middleware, which wraps this route too.
-            let Some(account_id) = crate::sign_in(
-                state,
-                &username,
-                &password,
-                crate::login_throttle::Request::from_current(),
-            )
-            .await
-            // Busy or unavailable is not a bad password: the client must not re-prompt.
-            .map_err(|e| match e.0 {
-                StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, e.message()),
-                _ => AuthError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "authentication unavailable",
-                ),
-            })?
-            else {
-                return Err(AuthError(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid or expired credentials",
-                ));
-            };
-            (account_id, false, CredentialRef::Password)
+            &username
         };
-
-    admit_account(
-        state, account_id, read_only, credential, org_slug, repo_name, want,
+        return match crate::authenticate_access_token_plaintext(
+            &state.pool,
+            token,
+            crate::Transport::Git,
+        )
+        .await
+        {
+            Ok((actor, token_id)) => {
+                admit_actor(
+                    state,
+                    actor,
+                    CredentialRef::Token(token_id),
+                    org_slug,
+                    repo_name,
+                    want,
+                )
+                .await
+            }
+            Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => Err(AuthError(
+                StatusCode::UNAUTHORIZED,
+                "invalid or expired credentials",
+            )),
+            Err(_) => Err(AuthError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication unavailable",
+            )),
+        };
+    }
+    // The same throttled sign-in as the API and the browser form (M4.1
+    // U03); the resolved client address comes from the client-IP
+    // middleware, which wraps this route too.
+    let Some(account_id) = crate::sign_in(
+        state,
+        &username,
+        &password,
+        crate::login_throttle::Request::from_current(),
     )
     .await
+    // Busy or unavailable is not a bad password: the client must not re-prompt.
+    .map_err(|e| match e.0 {
+        StatusCode::TOO_MANY_REQUESTS => AuthError(e.0, e.message()),
+        _ => AuthError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication unavailable",
+        ),
+    })?
+    else {
+        return Err(AuthError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired credentials",
+        ));
+    };
+
+    admit_account(
+        state,
+        account_id,
+        false,
+        CredentialRef::Password,
+        org_slug,
+        repo_name,
+        want,
+    )
+    .await
+}
+
+/// Admit any token subject. The credential has already been authenticated on
+/// the Git transport; this loads the right principal's facts and runs the same
+/// fetch/push decision an account gets.
+async fn admit_actor(
+    state: &AppState,
+    actor: crate::Actor,
+    credential: CredentialRef,
+    org_slug: &str,
+    repo_name: &str,
+    want: Want,
+) -> Result<Admitted, AuthError> {
+    match &actor {
+        crate::Actor::Account {
+            account,
+            confinement,
+        } => {
+            admit_account_scoped(
+                state,
+                account.id,
+                account.is_read_only(),
+                confinement.clone(),
+                credential,
+                org_slug,
+                repo_name,
+                want,
+            )
+            .await
+        }
+        crate::Actor::ServiceAccount { .. } | crate::Actor::Run { .. } => {
+            admit_subject(state, actor, credential, org_slug, repo_name, want).await
+        }
+    }
 }
 
 /// Admit a fetch. A request without an Authorization header may read a public
@@ -448,6 +496,77 @@ pub async fn admit_account(
     repo_name: &str,
     want: Want,
 ) -> Result<Admitted, AuthError> {
+    admit_account_scoped(
+        state, account_id, read_only, None, credential, org_slug, repo_name, want,
+    )
+    .await
+}
+
+/// Admit an SSH identity: an account key keeps the historical path, a service
+/// account's own key is a principal with its grants and no token confinement.
+pub async fn admit_identity(
+    state: &AppState,
+    identity: &crate::ssh::SshIdentity,
+    credential: CredentialRef,
+    org_slug: &str,
+    repo_name: &str,
+    want: Want,
+) -> Result<Admitted, AuthError> {
+    let Some(service_account) = identity.service_account else {
+        return admit_account(
+            state,
+            identity.account,
+            identity.read_only,
+            credential,
+            org_slug,
+            repo_name,
+            want,
+        )
+        .await;
+    };
+    let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    let mut conn = state.pool.acquire().await.map_err(unavailable)?;
+    let organization: Option<Uuid> = sqlx::query_scalar(
+        "SELECT organization_id FROM service_accounts WHERE id = $1 AND disabled_at IS NULL",
+    )
+    .bind(service_account)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(unavailable)?;
+    drop(conn);
+    let Some(organization) = organization else {
+        return Err(AuthError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired credentials",
+        ));
+    };
+    admit_subject(
+        state,
+        crate::Actor::ServiceAccount {
+            id: service_account,
+            organization,
+            confinement: None,
+        },
+        credential,
+        org_slug,
+        repo_name,
+        want,
+    )
+    .await
+}
+
+/// The account path with a scoped token's resource set and scopes attached.
+#[allow(clippy::too_many_arguments)]
+pub async fn admit_account_scoped(
+    state: &AppState,
+    account_id: Uuid,
+    read_only: bool,
+    confinement: Option<githearth_authz::Confinement>,
+    credential: CredentialRef,
+    org_slug: &str,
+    repo_name: &str,
+    want: Want,
+) -> Result<Admitted, AuthError> {
     reject_nul_path(org_slug, repo_name)?;
     let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
     let mut conn = state.pool.acquire().await.map_err(unavailable)?;
@@ -474,13 +593,86 @@ pub async fn admit_account(
         .map_err(unavailable)?
         .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
 
-    let Some(facts) = crate::facts::load_scoped(&mut conn, account_id, org_id, read_only)
+    let Some(facts) =
+        crate::facts::load_scoped_confined(&mut conn, account_id, org_id, read_only, confinement)
+            .await
+            .map_err(unavailable)?
+    else {
+        return Err(AuthError(StatusCode::NOT_FOUND, "not found"));
+    };
+    drop(conn);
+    let actor = crate::Actor::Account {
+        account: crate::Account {
+            id: account_id,
+            username: String::new(),
+            is_admin: false,
+            read_only,
+            confinement: facts.account.confinement.clone(),
+        },
+        confinement: facts.account.confinement.clone(),
+    };
+    admit_facts(
+        state, facts, actor, account_id, read_only, credential, org_slug, repo_name, want,
+    )
+    .await
+}
+
+/// A service account's token or SSH key, or a run token. The principal's
+/// organization must match the requested path; its grants determine what it may
+/// do, and a token's confinement narrows it further inside the engine.
+async fn admit_subject(
+    state: &AppState,
+    actor: crate::Actor,
+    credential: CredentialRef,
+    org_slug: &str,
+    repo_name: &str,
+    want: Want,
+) -> Result<Admitted, AuthError> {
+    reject_nul_path(org_slug, repo_name)?;
+    let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    let subject_org = match &actor {
+        crate::Actor::ServiceAccount { organization, .. } => *organization,
+        crate::Actor::Run { organization, .. } => *organization,
+        crate::Actor::Account { .. } => unreachable!("account goes through admit_account"),
+    };
+    let mut conn = state.pool.acquire().await.map_err(unavailable)?;
+    let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(org_slug)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(unavailable)?
+        .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    if org_id != subject_org {
+        return Err(AuthError(StatusCode::NOT_FOUND, "not found"));
+    }
+    let Some(facts) = crate::facts::load_actor(&mut conn, &actor, org_id)
         .await
         .map_err(unavailable)?
     else {
         return Err(AuthError(StatusCode::NOT_FOUND, "not found"));
     };
     drop(conn);
+    let account = actor.account_id().unwrap_or(Uuid::nil());
+    admit_facts(
+        state, facts, actor, account, false, credential, org_slug, repo_name, want,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_facts(
+    state: &AppState,
+    facts: crate::facts::Facts,
+    actor: crate::Actor,
+    account: Uuid,
+    read_only: bool,
+    credential: CredentialRef,
+    org_slug: &str,
+    repo_name: &str,
+    want: Want,
+) -> Result<Admitted, AuthError> {
+    let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    let org_id = facts.organization.id;
 
     // Archived repositories stay readable; the engine refuses their ref updates.
     let repo = match authorize_fetch(
@@ -529,7 +721,7 @@ pub async fn admit_account(
     }
 
     Ok(Admitted {
-        account: account_id,
+        account,
         organization: org_id,
         repository: repo,
         facts,
@@ -537,6 +729,7 @@ pub async fn admit_account(
         tag_rules,
         read_only,
         credential,
+        actor,
     })
 }
 
@@ -545,15 +738,10 @@ pub async fn admit_account(
 pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, AuthError> {
     let unavailable = |_| AuthError(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
     let mut conn = state.pool.acquire().await.map_err(unavailable)?;
-    let facts = crate::facts::load_scoped(
-        &mut conn,
-        admitted.account,
-        admitted.organization,
-        admitted.read_only,
-    )
-    .await
-    .map_err(unavailable)?
-    .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    let facts = crate::facts::load_actor(&mut conn, &admitted.actor, admitted.organization)
+        .await
+        .map_err(unavailable)?
+        .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
     let repository = match repositories::get(&mut conn, admitted.repository.id)
         .await
         .map_err(unavailable)?
@@ -585,6 +773,7 @@ pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, A
         tag_rules,
         read_only: admitted.read_only,
         credential: admitted.credential.clone(),
+        actor: admitted.actor.clone(),
     })
 }
 
@@ -731,6 +920,7 @@ mod tests {
             site_admin: owner,
             organizations: vec![org_id],
             teams: vec![],
+            confinement: None,
         };
         let grants = if owner {
             vec![Grant {
@@ -759,6 +949,7 @@ mod tests {
             },
             facts: crate::facts::Facts {
                 account,
+                principal: None,
                 teams: vec![],
                 grants,
                 organization,
@@ -768,6 +959,16 @@ mod tests {
             tag_rules: vec![],
             read_only: false,
             credential: CredentialRef::Password,
+            actor: crate::Actor::Account {
+                account: crate::Account {
+                    id: account_id,
+                    username: String::new(),
+                    is_admin: owner,
+                    read_only: false,
+                    confinement: None,
+                },
+                confinement: None,
+            },
         }
     }
 

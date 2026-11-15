@@ -500,6 +500,7 @@ async fn ssh_client(f: &Fixture, account: Uuid) -> SshClient {
     let authenticate: ssh::Authenticate = Arc::new(move |fp: String| {
         let identity = (fp == fingerprint).then_some(ssh::SshIdentity {
             account,
+            service_account: None,
             key_id: Uuid::new_v4(),
             read_only: false,
         });
@@ -1374,6 +1375,7 @@ async fn removed_member_is_denied_over_ssh() {
     let authenticate: ssh::Authenticate = Arc::new(move |fp: String| {
         let identity = (fp == fingerprint).then_some(ssh::SshIdentity {
             account: member_id,
+            service_account: None,
             key_id: Uuid::new_v4(),
             read_only: false,
         });

@@ -735,6 +735,7 @@ async fn fixture(label: &str) -> Fixture {
     let authenticate: ssh::Authenticate = Arc::new(move |f: String| {
         let found = (f == fp).then(|| ssh::SshIdentity {
             account: owner_id,
+            service_account: None,
             key_id: Uuid::new_v4(),
             read_only: false,
         });

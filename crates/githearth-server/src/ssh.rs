@@ -24,6 +24,8 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct SshIdentity {
     pub account: Uuid,
+    /// Set when the key belongs to a service account; `account` is then nil.
+    pub service_account: Option<Uuid>,
     pub key_id: Uuid,
     pub read_only: bool,
 }
@@ -174,7 +176,12 @@ impl russh::server::Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         let identity = self.conn.identity.lock().unwrap().clone();
         if let Some(id) = &identity {
-            tracing::info!(account_id = %id.account, key_id = %id.key_id, "ssh authentication succeeded");
+            tracing::info!(
+                account_id = %id.account,
+                service_account_id = ?id.service_account,
+                key_id = %id.key_id,
+                "ssh authentication succeeded"
+            );
         }
         drop(self.conn.unauthenticated_permit.lock().unwrap().take());
         Ok(())
@@ -279,10 +286,9 @@ impl russh::server::Handler for SshHandler {
             None
         };
 
-        let admitted = match git_admission::admit_account(
+        let admitted = match git_admission::admit_identity(
             &state,
-            identity.account,
-            identity.read_only,
+            &identity,
             git_admission::CredentialRef::SshKey(identity.key_id),
             &org,
             &repo,

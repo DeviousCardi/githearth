@@ -289,6 +289,64 @@ pub(crate) fn require(state: &AppState, loaded: &Loaded, action: Action) -> Resu
     }
 }
 
+/// The same load as [`load_repo`], for an authenticated token subject. The API
+/// read path accepts a service-account or run token as well as an account.
+pub(crate) async fn load_repo_actor(
+    state: &AppState,
+    actor: &crate::Actor,
+    auth_age: u64,
+    org_slug: &str,
+    name: &str,
+) -> Result<Loaded, ApiError> {
+    if !valid_path_param(org_slug) || !valid_path_param(name) {
+        return Err(invalid());
+    }
+    let mut conn = state.pool.acquire().await?;
+    let org_id = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = $1")
+        .bind(org_slug)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(org_not_found)?;
+
+    if repositories::path_moved_away(&mut conn, org_id, name).await? {
+        return Err(moved_away());
+    }
+    let Some(facts) = facts::load_actor(&mut conn, actor, org_id).await? else {
+        return Err(org_not_found());
+    };
+
+    let repo = match repositories::find_by_name(&mut conn, org_id, name).await? {
+        Some(repo) => repo,
+        None => match repositories::find_by_name_any_status(&mut conn, org_id, name).await? {
+            Some(row) if is_gone(row.status) => row,
+            _ => return Err(not_found()),
+        },
+    };
+
+    if is_gone(repo.status) {
+        let loaded = Loaded {
+            actor_id: actor.account_id().unwrap_or(Uuid::nil()),
+            auth_age,
+            org_id,
+            facts,
+            repo,
+        };
+        return if may_see_gone(state, &loaded) {
+            Err(gone())
+        } else {
+            Err(not_found())
+        };
+    }
+
+    Ok(Loaded {
+        actor_id: actor.account_id().unwrap_or(Uuid::nil()),
+        auth_age,
+        org_id,
+        facts,
+        repo,
+    })
+}
+
 pub(crate) async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -559,8 +617,9 @@ pub(crate) async fn read(
     headers: HeaderMap,
     Path((org_slug, name)): Path<(String, String)>,
 ) -> Result<Json<RepositoryJson>, ApiError> {
-    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
-    let loaded = load_repo(&state, actor.id, auth_age, &org_slug, &name).await?;
+    let (actor, auth_age) =
+        crate::authenticate_actor(&state.pool, &headers, crate::Transport::Api).await?;
+    let loaded = load_repo_actor(&state, &actor, auth_age, &org_slug, &name).await?;
     require(&state, &loaded, Action::RepositoryRead)?;
     Ok(Json(RepositoryJson::from(&loaded.repo)))
 }

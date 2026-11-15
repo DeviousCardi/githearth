@@ -125,6 +125,17 @@ impl Action {
         )
     }
 
+    /// The scope namespace an action belongs to: organisation actions are
+    /// `org:*`, and repository, ref, issue and pull-request actions are
+    /// `repo:*`. A package scope matches neither, so it never permits a
+    /// repository or organisation action (ADR 0014 section 2a).
+    fn scope_namespace(self) -> &'static str {
+        match self.resource_kind() {
+            Kind::Organization => "org",
+            Kind::Repository | Kind::Ref | Kind::Issue | Kind::PullRequest => "repo",
+        }
+    }
+
     fn resource_kind(self) -> Kind {
         use Action::*;
         match self {
@@ -237,6 +248,7 @@ impl Role {
 pub enum Subject {
     Account(Uuid),
     Team(Uuid),
+    ServiceAccount(Uuid),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -253,6 +265,69 @@ pub struct Grant {
     pub scope: Scope,
 }
 
+/// One entry in a token's resource set. The API resolves names to these
+/// canonical forms before storing the set (ADR 0014 section 2, open item 2).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceSelector {
+    Organization(Uuid),
+    Repository(Uuid),
+    Package { organization: Uuid, name: String },
+}
+
+/// What a scoped token narrows its principal to: a list of resources, the
+/// action scopes over them, and the transports it may be presented on.
+/// `None` on a principal means an unconfined credential (a session, an SSH key,
+/// or a legacy account token).
+#[derive(Clone, Debug, Default)]
+pub struct Confinement {
+    pub resources: Vec<ResourceSelector>,
+    pub scopes: Vec<String>,
+    pub audience: Vec<String>,
+}
+
+impl Confinement {
+    /// Whether the resource set contains this request resource.
+    pub fn permits_resource(&self, organization: &Organization, resource: &Resource<'_>) -> bool {
+        match resource {
+            Resource::Organization => self
+                .resources
+                .iter()
+                .any(|r| matches!(r, ResourceSelector::Organization(id) if *id == organization.id)),
+            _ => self.resources.iter().any(|r| match r {
+                ResourceSelector::Repository(id) => {
+                    resource.repository().is_some_and(|repo| repo.id == *id)
+                }
+                ResourceSelector::Organization(id) => resource
+                    .repository()
+                    .is_some_and(|repo| repo.organization == *id),
+                ResourceSelector::Package { .. } => false,
+            }),
+        }
+    }
+
+    /// Whether a scope permits the action. Scopes are namespaced: a `repo:*`
+    /// scope covers repository, ref, issue and pull-request actions, and only
+    /// an `org:*` scope could cover organisation administration (the token
+    /// grammar has no such scope yet, so an organisation action is never
+    /// permitted by a token). `repo:write` implies read; `package:*` names
+    /// another resource type and never permits either.
+    pub fn permits_action(&self, action: Action) -> bool {
+        let namespace = action.scope_namespace();
+        let write = !action.read_only_permitted();
+        self.scopes.iter().any(|scope| {
+            let Some((scope_namespace, level)) = scope.split_once(':') else {
+                return false;
+            };
+            scope_namespace == namespace
+                && match level {
+                    "write" => true,
+                    "read" => !write,
+                    _ => false,
+                }
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Account {
     pub id: Uuid,
@@ -262,6 +337,31 @@ pub struct Account {
     pub organizations: Vec<Uuid>,
     /// Teams the account belongs to directly.
     pub teams: Vec<Uuid>,
+    /// The token's narrowing, when the credential is a scoped token.
+    pub confinement: Option<Confinement>,
+}
+
+/// An organization-owned non-human identity (ADR 0014 section 2). It carries
+/// its grants through `Subject::ServiceAccount` and, for a token, the token's
+/// confinement. It has no teams and cannot administer the instance.
+#[derive(Clone, Debug)]
+pub struct ServiceAccount {
+    pub id: Uuid,
+    pub organization: Uuid,
+    pub suspended: bool,
+    pub confinement: Option<Confinement>,
+}
+
+/// One CI run, resolving to its run record and the account that triggered it.
+/// It inherits the triggering account's grants and teams, narrowed by the
+/// token's confinement, and refuses everything once the run has ended.
+#[derive(Clone, Debug)]
+pub struct Run {
+    pub id: Uuid,
+    pub organization: Uuid,
+    pub account: Account,
+    pub ended: bool,
+    pub confinement: Option<Confinement>,
 }
 
 #[derive(Clone, Debug)]
@@ -363,6 +463,16 @@ impl Resource<'_> {
             Resource::PullRequest(..) => Kind::PullRequest,
         }
     }
+
+    fn repository(&self) -> Option<&Repository> {
+        match self {
+            Resource::Organization => None,
+            Resource::Repository(repo)
+            | Resource::Ref(repo, _)
+            | Resource::Issue(repo, _)
+            | Resource::PullRequest(repo, _) => Some(repo),
+        }
+    }
 }
 
 /// Merge facts computed by the service for the exact head and target
@@ -374,11 +484,13 @@ pub struct Merge {
     pub code_owner_review_ok: bool,
 }
 
-/// The requesting principal: a signed-in account, or an unauthenticated
-/// visitor, who carries no grants, no teams and no account attributes.
+/// The requesting principal: a signed-in account, an organization-owned
+/// service account, one CI run, or an unauthenticated visitor.
 #[derive(Clone, Copy, Debug)]
 pub enum Principal<'a> {
     Account(&'a Account),
+    ServiceAccount(&'a ServiceAccount),
+    Run(&'a Run),
     Anonymous,
 }
 
@@ -570,6 +682,7 @@ impl Engine {
             let subject = match grant.subject {
                 Subject::Account(id) => uid("Account", id.to_string()),
                 Subject::Team(id) => uid("Team", id.to_string()),
+                Subject::ServiceAccount(id) => uid("ServiceAccount", id.to_string()),
             };
             let scope = match grant.scope {
                 Scope::Organization(id) => uid("Organization", id.to_string()),
@@ -615,6 +728,8 @@ impl Engine {
         let action = uid("Action", request.action.name().to_owned());
         let principal = match request.principal {
             Principal::Account(account) => uid("Account", account.id.to_string()),
+            Principal::ServiceAccount(account) => uid("ServiceAccount", account.id.to_string()),
+            Principal::Run(run) => uid("Run", run.id.to_string()),
             Principal::Anonymous => uid("Anonymous", String::new()),
         };
         let cedar_request =
@@ -706,15 +821,42 @@ fn check_facts(request: &Request<'_>) -> Result<(), &'static str> {
     if repository.is_some_and(|r| r.organization != org) {
         return Err("repository is not in the organization");
     }
+    let organization = request.organization;
     let teams: HashMap<Uuid, &Team> = request.teams.iter().map(|t| (t.id, t)).collect();
     if teams.len() != request.teams.len() {
         return Err("duplicate team");
     }
-    let (principal_teams, organizations): (&[Uuid], &[Uuid]) = match request.principal {
-        Principal::Account(account) => (&account.teams, &account.organizations),
-        Principal::Anonymous if request.grants.is_empty() && request.teams.is_empty() => (&[], &[]),
-        Principal::Anonymous => return Err("anonymous principal carries no grants or teams"),
-    };
+    let (principal_teams, organizations, confinement): (&[Uuid], &[Uuid], Option<&Confinement>) =
+        match request.principal {
+            Principal::Account(account) => (
+                &account.teams,
+                &account.organizations,
+                account.confinement.as_ref(),
+            ),
+            Principal::ServiceAccount(account) => {
+                if account.organization != organization.id {
+                    return Err("service account is not in the organization");
+                }
+                (&[], &[], account.confinement.as_ref())
+            }
+            Principal::Run(run) => {
+                if run.organization != organization.id {
+                    return Err("run is not in the organization");
+                }
+                if run.ended {
+                    return Err("run has ended");
+                }
+                (
+                    &run.account.teams,
+                    &run.account.organizations,
+                    run.confinement.as_ref(),
+                )
+            }
+            Principal::Anonymous if request.grants.is_empty() && request.teams.is_empty() => {
+                (&[], &[], None)
+            }
+            Principal::Anonymous => return Err("anonymous principal carries no grants or teams"),
+        };
     for id in principal_teams {
         let team = teams.get(id).ok_or("principal team missing")?;
         if !organizations.contains(&team.organization) {
@@ -727,6 +869,14 @@ fn check_facts(request: &Request<'_>) -> Result<(), &'static str> {
             if parent.organization != team.organization {
                 return Err("parent team in another organization");
             }
+        }
+    }
+    if let Some(confinement) = confinement {
+        if !confinement.permits_resource(organization, &request.resource) {
+            return Err("resource is outside the token's resource set");
+        }
+        if !confinement.permits_action(request.action) {
+            return Err("action is outside the token's scope");
         }
     }
     Ok(())
@@ -772,8 +922,8 @@ fn build_entities(request: &Request<'_>) -> (EntityUid, Vec<Entity>) {
         [("suspended", bool_(org.suspended))],
         [],
     )];
-    match request.principal {
-        Principal::Account(account) => entities.push(entity(
+    let account_entity = |account: &Account| {
+        entity(
             uid("Account", account.id.to_string()),
             [
                 ("suspended", bool_(account.suspended)),
@@ -784,7 +934,30 @@ fn build_entities(request: &Request<'_>) -> (EntityUid, Vec<Entity>) {
                 .iter()
                 .map(|id| uid("Organization", id.to_string()))
                 .chain(account.teams.iter().map(|id| uid("Team", id.to_string()))),
+        )
+    };
+    match request.principal {
+        Principal::Account(account) => entities.push(account_entity(account)),
+        Principal::ServiceAccount(account) => entities.push(entity(
+            uid("ServiceAccount", account.id.to_string()),
+            [
+                ("organization", ref_(org_uid.clone())),
+                ("suspended", bool_(account.suspended)),
+            ],
+            [org_uid.clone()],
         )),
+        Principal::Run(run) => {
+            entities.push(account_entity(&run.account));
+            entities.push(entity(
+                uid("Run", run.id.to_string()),
+                [
+                    ("organization", ref_(org_uid.clone())),
+                    ("account", ref_(uid("Account", run.account.id.to_string()))),
+                    ("ended", bool_(run.ended)),
+                ],
+                [uid("Account", run.account.id.to_string()), org_uid.clone()],
+            ));
+        }
         Principal::Anonymous => {
             entities.push(entity(uid("Anonymous", String::new()), [], []));
         }

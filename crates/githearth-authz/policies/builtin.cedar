@@ -14,7 +14,9 @@ when {
 @id("internal-read")
 permit (principal, action in GitHearth::Action::"public_read", resource)
 when {
-  principal is GitHearth::Account &&
+  (principal is GitHearth::Account ||
+   principal is GitHearth::ServiceAccount ||
+   principal is GitHearth::Run) &&
   ((resource is GitHearth::Repository &&
      resource.visibility == "internal" &&
      principal in resource.organization) ||
@@ -47,6 +49,15 @@ unless { principal is GitHearth::Account && principal.site_admin };
 @id("suspended-account")
 forbid (principal, action, resource)
 when { principal is GitHearth::Account && principal.suspended };
+
+@id("suspended-service-account")
+forbid (principal, action, resource)
+when { principal is GitHearth::ServiceAccount && principal.suspended };
+
+// A run is invalid the moment it ends, including on cancellation.
+@id("ended-run")
+forbid (principal, action, resource)
+when { principal is GitHearth::Run && principal.ended };
 
 // Unauthenticated visitors get public reading and nothing else, whatever
 // any role or misconfiguration permits.

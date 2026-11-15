@@ -122,7 +122,7 @@ pub async fn verify(
         "organization_id = $1"
     };
     let sql = format!(
-        "SELECT seq, id, organization_id, actor_id, kind, \
+        "SELECT seq, id, organization_id, actor_id, actor_kind, actor_account_id, kind, \
          (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS micros, prev_hash, hash, \
          host(client_ip) AS client_ip, client_ip_key_id, client_ip_digest \
          FROM audit_events WHERE {chain_filter} AND seq IS NOT NULL AND seq <= $2 ORDER BY seq"
@@ -180,10 +180,11 @@ pub async fn verify(
     })
 }
 
-/// The canonical encoding from the migration, mirrored byte-for-byte:
-/// id || organization_id (nil when NULL) || actor_id || len(kind) || kind
-/// || seq || created_at microseconds, all big-endian, followed by exactly one
-/// trailing form:
+/// The canonical encoding from migration 0055, mirrored byte-for-byte:
+/// id || organization_id (nil when NULL) || actor_id
+/// || len(actor_kind) || actor_kind || actor_account_id (nil when NULL)
+/// || len(kind) || kind || seq || created_at microseconds, all big-endian,
+/// followed by exactly one trailing form:
 ///   V3 — key_id (16 bytes) || digest (32 bytes) when a digest is present
 ///   (the raw IP is NOT part of the hash, so it can be pruned later);
 ///   V2 — len(host(client_ip)) || host(client_ip) when the IP is present;
@@ -192,6 +193,8 @@ fn hash_row(row: &sqlx::postgres::PgRow, seq: i64, prev: &[u8; 32]) -> Vec<u8> {
     let id: Uuid = row.get("id");
     let org: Option<Uuid> = row.get("organization_id");
     let actor: Uuid = row.get("actor_id");
+    let actor_kind: String = row.get("actor_kind");
+    let actor_account: Option<Uuid> = row.get("actor_account_id");
     let kind: String = row.get("kind");
     let micros: i64 = row.get("micros");
     let client_ip: Option<String> = row.get("client_ip");
@@ -202,6 +205,9 @@ fn hash_row(row: &sqlx::postgres::PgRow, seq: i64, prev: &[u8; 32]) -> Vec<u8> {
     hasher.update(id.as_bytes());
     hasher.update(org.unwrap_or(SITE_CHAIN).as_bytes());
     hasher.update(actor.as_bytes());
+    hasher.update((actor_kind.len() as i64).to_be_bytes());
+    hasher.update(actor_kind.as_bytes());
+    hasher.update(actor_account.unwrap_or(SITE_CHAIN).as_bytes());
     hasher.update((kind.len() as i64).to_be_bytes());
     hasher.update(kind.as_bytes());
     hasher.update(seq.to_be_bytes());

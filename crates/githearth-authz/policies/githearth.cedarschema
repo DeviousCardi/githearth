@@ -32,6 +32,20 @@ namespace GitHearth {
     suspended: Bool,
     site_admin: Bool,
   };
+  // An organization-owned non-human identity. It has no password, no teams
+  // and no site-administrator flag; its token narrows it with scopes and a
+  // resource set (enforced from loaded facts, not from these attributes).
+  entity ServiceAccount in [Organization] = {
+    organization: Organization,
+    suspended: Bool,
+  };
+  // One CI run. It resolves to the run record and the account that triggered
+  // it, inherits that account's grants/teams, and is invalid once ended.
+  entity Run in [Account, Organization] = {
+    organization: Organization,
+    account: Account,
+    ended: Bool,
+  };
   // visibility: "public", "internal" (members of the owning organization) or "private".
   entity Repository in [Organization] = {
     organization: Organization,
@@ -84,79 +98,79 @@ namespace GitHearth {
   // Organization
   action "organization.read" in ["member", "read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "repository.create" in ["member"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "organization.update" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "organization.manage_members" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "organization.delete" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "team.create" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "team.update" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "team.delete" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "invitation.read" in ["owner"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "invitation.create" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "invitation.revoke" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "organization.suspend" in ["site_admin", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
   action "organization.unsuspend" in ["site_admin", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Organization,
       context: Auth,
     };
@@ -164,55 +178,55 @@ namespace GitHearth {
   // Repository
   action "repository.read" in ["public_read", "read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "repository.clone" in ["public_read", "read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "issue.create" in ["read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "pull_request.create" in ["read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "repository.update" in ["maintain"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "repository.manage_access" in ["admin", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "repository.archive" in ["admin", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "repository.unarchive" in ["admin", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "repository.delete" in ["admin", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
@@ -223,7 +237,7 @@ namespace GitHearth {
   // administrators.
   action "repository.restore" in ["owner", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
@@ -232,13 +246,13 @@ namespace GitHearth {
   // the separate `repository.create` decision on the target Organization.
   action "repository.transfer" in ["admin", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
   action "status.create" in ["write"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Repository,
       context: Auth,
     };
@@ -246,19 +260,19 @@ namespace GitHearth {
   // Refs
   action "ref.push" in ["write"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Ref,
       context: Auth,
     };
   action "ref.force_push" in ["write", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Ref,
       context: Auth,
     };
   action "ref.delete" in ["write", "sensitive"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Ref,
       context: Auth,
     };
@@ -266,31 +280,31 @@ namespace GitHearth {
   // Issues
   action "issue.read" in ["public_read", "read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Issue,
       context: Auth,
     };
   action "issue.comment" in ["read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Issue,
       context: Auth,
     };
   action "issue.label" in ["triage"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Issue,
       context: Auth,
     };
   action "issue.assign" in ["triage"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Issue,
       context: Auth,
     };
   action "issue.close" in ["triage"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: Issue,
       context: Auth,
     };
@@ -298,25 +312,25 @@ namespace GitHearth {
   // Pull requests
   action "pull_request.read" in ["public_read", "read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: PullRequest,
       context: Auth,
     };
   action "pull_request.comment" in ["read"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: PullRequest,
       context: Auth,
     };
   action "pull_request.close" in ["triage"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: PullRequest,
       context: Auth,
     };
   action "pull_request.approve" in ["write"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: PullRequest,
       context: Auth,
     };
@@ -324,7 +338,7 @@ namespace GitHearth {
   // head and target revisions being merged, never taken from the caller.
   action "pull_request.merge" in ["write"]
     appliesTo {
-      principal: [Account, Anonymous],
+      principal: [Account, ServiceAccount, Run, Anonymous],
       resource: PullRequest,
       context: MergeAuth,
     };

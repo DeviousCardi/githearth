@@ -510,6 +510,7 @@ async fn ssh_client(f: &Fixture, account: Uuid) -> SshClient {
     let authenticate: ssh::Authenticate = Arc::new(move |fp: String| {
         let identity = (fp == fingerprint).then_some(ssh::SshIdentity {
             account,
+            service_account: None,
             key_id: Uuid::new_v4(),
             read_only: false,
         });
@@ -1655,6 +1656,7 @@ fn engine_may(policy: &str, action: githearth_authz::Action) -> bool {
         site_admin: false,
         organizations: vec![org.id],
         teams: vec![],
+        confinement: None,
     };
     let grants = [githearth_authz::Grant {
         role: githearth_authz::Role::Custom("editor".to_owned()),
