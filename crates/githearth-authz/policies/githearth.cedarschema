@@ -227,6 +227,15 @@ namespace GitHearth {
       resource: Repository,
       context: Auth,
     };
+  // Moving a repository to another organization (ADR 0003). It is the
+  // repository's own administration, so it sits in "admin"; the target side is
+  // the separate `repository.create` decision on the target Organization.
+  action "repository.transfer" in ["admin", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
   action "status.create" in ["write"]
     appliesTo {
       principal: [Account, Anonymous],

@@ -412,6 +412,20 @@ impl Storage {
         self.timestamped_path("orphans", repository, now)
     }
 
+    /// Read-only check that the repository's Git directory is a real directory
+    /// inside the storage root and can be listed. A transfer changes no bytes on
+    /// disk, so this is all it needs from storage: it proves the history it is
+    /// moving is there and readable before anything in the database changes.
+    /// Errors are the caller's to map; no layout detail is returned.
+    pub fn repository_paths_ok(&self, repository: Uuid) -> Result<(), StorageError> {
+        let path = self.read_path(repository)?;
+        // A directory that cannot be listed is not a repository a move could
+        // leave usable; this reads one entry and fails on EACCES.
+        let mut entries = fs::read_dir(&path)?;
+        let _ = entries.next();
+        Ok(())
+    }
+
     fn verified_dir(&self, path: &Path) -> Result<PathBuf, StorageError> {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.file_type().is_dir() {

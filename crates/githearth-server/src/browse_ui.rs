@@ -61,10 +61,10 @@ fn encode_segments(path: &str) -> String {
 }
 
 fn load_error(error: crate::ApiError, username: Option<&str>) -> ui::UiError {
-    if error.status_code() == StatusCode::NOT_FOUND {
-        ui::not_found_page(username)
-    } else {
-        ui::unavailable_page(username)
+    match error.status_code() {
+        StatusCode::NOT_FOUND => ui::not_found_page(username),
+        StatusCode::GONE => ui::gone_page(username),
+        _ => ui::unavailable_page(username),
     }
 }
 
@@ -104,6 +104,12 @@ async fn load_repo_ui(
             Ok((Some(account.username), account.is_admin, loaded.repo.id))
         }
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
+            // An anonymous visitor sees the same `410` a signed-in one does for
+            // a repository that moved away, before the public-only fallback
+            // turns the address into a sign-in prompt.
+            if ui::path_moved_away(state, slug, name).await {
+                return Err(ui::moved_away_page(None));
+            }
             match repository_api::load_public_anonymous(state, slug, name).await {
                 Some(repo) => Ok((None, false, repo.id)),
                 None => {

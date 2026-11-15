@@ -283,6 +283,7 @@ impl Site<'_> {
             | RepositoryUnarchive
             | RepositoryDelete
             | RepositoryRestore
+            | RepositoryTransfer
             | IssueCreate
             | PullRequestCreate => Resource::Repository(repository),
             RefPush | RefForcePush | RefDelete => Resource::Ref(repository, &self.reference),
@@ -422,6 +423,13 @@ fn decision_table() {
         // Accounts and site administration
         ("suspended account denied", (Principal::Account(&w.suspended), OrganizationRead, &w.acme, Resource::Organization, None), false),
         ("site admin suspends org", (Principal::Account(&w.site_admin), OrganizationSuspend, &w.acme, Resource::Organization, None), true),
+        // Transfer: the source-side decision is the repository's administration
+        // group. The target side is `repository.create` on the target
+        // organization (see `repository_create_availability_matches_the_role_ladder`).
+        ("collaborator cannot transfer", (Principal::Account(&w.collaborator), RepositoryTransfer, &w.acme, Resource::Repository(&w.private), None), false),
+        ("owner of other org cannot transfer this org's repo", (Principal::Account(&w.outsider), RepositoryTransfer, &w.acme, Resource::Repository(&w.private), None), false),
+        ("owner transfers own org's repo", (Principal::Account(&w.owner), RepositoryTransfer, &w.acme, Resource::Repository(&w.private), None), true),
+        ("writing team member cannot transfer", (Principal::Account(&w.developer), RepositoryTransfer, &w.acme, Resource::Repository(&w.private), None), false),
         ("site admin cannot read private repo", (Principal::Account(&w.site_admin), RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
         ("owner cannot suspend org", (Principal::Account(&w.owner), OrganizationSuspend, &w.acme, Resource::Organization, None), false),
     ];
