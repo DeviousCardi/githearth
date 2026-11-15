@@ -161,6 +161,11 @@ pub struct Config {
     /// How long `maintenance start` waits for in-flight writes to drain.
     #[serde(default = "default_maintenance_drain_timeout_seconds")]
     pub maintenance_drain_timeout_seconds: u64,
+    /// The last day a legacy two-scope `repo:read`/`repo:write` token is
+    /// accepted, as `YYYY-MM-DD`. It is refused from the following midnight
+    /// UTC (U27). `doctor` reports the date and how many legacy tokens remain.
+    #[serde(default = "default_legacy_token_deprecation_date")]
+    pub legacy_token_deprecation_date: String,
 }
 
 /// How the SMTP connection is protected.
@@ -249,6 +254,7 @@ impl Default for Config {
             backup_directory: default_backup_directory(),
             backup_key_file: PathBuf::new(),
             maintenance_drain_timeout_seconds: default_maintenance_drain_timeout_seconds(),
+            legacy_token_deprecation_date: default_legacy_token_deprecation_date(),
         }
     }
 }
@@ -266,6 +272,45 @@ fn default_maintenance_drain_timeout_seconds() -> u64 {
 }
 fn default_object_upload_deadline_seconds() -> u64 {
     86_400
+}
+fn default_legacy_token_deprecation_date() -> String {
+    "2027-06-30".to_owned()
+}
+
+/// The announced legacy window (ADR 0014 section 2a). The configured date can
+/// move the end earlier but never later, so a token cannot be kept alive by
+/// editing configuration.
+const LEGACY_DEPRECATION_START: &str = "2026-11-16";
+const LEGACY_DEPRECATION_END: &str = "2027-06-30";
+
+/// `YYYY-MM-DD`, a real calendar date inside the announced legacy window.
+fn valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let digits = |range: std::ops::Range<usize>| bytes[range].iter().all(u8::is_ascii_digit);
+    if !digits(0..4) || !digits(5..7) || !digits(8..10) {
+        return false;
+    }
+    let year: u32 = value[0..4].parse().unwrap_or(0);
+    let month: u32 = value[5..7].parse().unwrap_or(0);
+    let day: u32 = value[8..10].parse().unwrap_or(0);
+    (1..=12).contains(&month)
+        && (1..=days_in_month(year, month)).contains(&day)
+        && (LEGACY_DEPRECATION_START..=LEGACY_DEPRECATION_END).contains(&value)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => 0,
+    }
 }
 fn default_login_throttle_max_per_username() -> u64 {
     5
@@ -505,6 +550,10 @@ impl Config {
             maintenance_drain_timeout_seconds,
             "GITHEARTH_MAINTENANCE_DRAIN_TIMEOUT_SECONDS"
         );
+        env!(
+            legacy_token_deprecation_date,
+            "GITHEARTH_LEGACY_TOKEN_DEPRECATION_DATE"
+        );
         env!(housekeeping_enabled, "GITHEARTH_HOUSEKEEPING_ENABLED");
         env!(
             housekeeping_interval_seconds,
@@ -571,6 +620,13 @@ impl Config {
             || self.database_url.starts_with("postgresql://"))
         {
             bail!("database_url must be a PostgreSQL URL");
+        }
+        if !valid_date(&self.legacy_token_deprecation_date) {
+            bail!(
+                "legacy_token_deprecation_date must be a calendar date in YYYY-MM-DD \
+                 between 2026-11-16 (the deprecation start) and 2027-06-30 (the \
+                 announced end); it can shorten the legacy window, never extend it"
+            );
         }
         if !(1..=100).contains(&self.database_max_connections)
             || !(1..=30).contains(&self.database_timeout_seconds)

@@ -51,6 +51,7 @@ fn account(organizations: &[Uuid], teams: &[Uuid]) -> Account {
         site_admin: false,
         organizations: organizations.to_vec(),
         teams: teams.to_vec(),
+        confinement: None,
     }
 }
 
@@ -438,6 +439,9 @@ fn decision_table() {
         let decision = match who {
             Principal::Account(who) => w.decide(&engine, who, action, org, resource, merge),
             Principal::Anonymous => w.anonymous(&engine, action, org, resource, merge),
+            Principal::ServiceAccount(_) | Principal::Run(_) => {
+                unreachable!("this table only names accounts and anonymous visitors")
+            }
         };
         if decision.is_allowed() != expected || matches!(decision, Decision::Invalid(_)) {
             failures.push(format!(
@@ -628,6 +632,9 @@ fn hostile_custom_role_cannot_override_built_in_forbids() {
         let d = match who {
             Principal::Account(who) => w.decide(&engine, who, action, org, resource, merge),
             Principal::Anonymous => w.anonymous(&engine, action, org, resource, merge),
+            Principal::ServiceAccount(_) | Principal::Run(_) => {
+                unreachable!("this table only names accounts and anonymous visitors")
+            }
         };
         match d {
             Decision::Deny(ids) if forbid.is_empty() || ids.iter().any(|id| id == forbid) => {}
@@ -1240,4 +1247,216 @@ fn repository_create_availability_matches_the_role_ladder() {
         read_only: false,
     });
     assert!(!d.is_allowed(), "{d:?}");
+}
+
+/// A scoped token's scope namespaces the action: `repo:*` covers repository,
+/// ref, issue and pull-request actions, and organisation administration needs a
+/// scope the grammar does not yet define. This pins the fix for the widening
+/// where an organisation-selector `repo:write` token was allowed
+/// `organization.delete` and friends (ADR 0014 section 2a).
+#[test]
+fn confinement_scopes_are_namespaced_and_never_cover_org_administration() {
+    use githearth_authz::{Confinement, ResourceSelector, Run, ServiceAccount};
+
+    let engine = Engine::new().unwrap();
+    let w = World::new();
+    let confinement = |resources: Vec<ResourceSelector>, scopes: &[&str]| Confinement {
+        resources,
+        scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+        audience: vec!["api".to_owned()],
+    };
+    fn req<'a>(
+        organization: &'a Organization,
+        principal: Principal<'a>,
+        teams: &'a [Team],
+        grants: &'a [Grant],
+        action: Action,
+        resource: Resource<'a>,
+    ) -> Request<'a> {
+        Request {
+            principal,
+            teams,
+            grants,
+            action,
+            organization,
+            resource,
+            merge: None,
+            auth_age: Some(Duration::ZERO),
+            read_only: false,
+        }
+    }
+
+    // Account subject with an organisation selector and repo:write.
+    let account = Account {
+        confinement: Some(confinement(
+            vec![ResourceSelector::Organization(w.acme.id)],
+            &["repo:write"],
+        )),
+        ..w.owner.clone()
+    };
+    let teams = w.accountable_teams(&account);
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::Account(&account),
+        &teams,
+        &w.grants,
+        Action::RepositoryRead,
+        Resource::Repository(&w.private),
+    ));
+    assert!(d.is_allowed(), "repository read in the org: {d:?}");
+    for action in [
+        Action::OrganizationDelete,
+        Action::OrganizationManageMembers,
+        Action::TeamCreate,
+        Action::InvitationCreate,
+        Action::RepositoryCreate,
+    ] {
+        let d = engine.authorize(&req(
+            &w.acme,
+            Principal::Account(&account),
+            &teams,
+            &w.grants,
+            action,
+            Resource::Organization,
+        ));
+        assert!(
+            matches!(d, Decision::Invalid("action is outside the token's scope")),
+            "{action:?} must be outside a repo:write scope: {d:?}"
+        );
+    }
+
+    // A read scope covers reads and refuses writes.
+    let read = Account {
+        confinement: Some(confinement(
+            vec![ResourceSelector::Organization(w.acme.id)],
+            &["repo:read"],
+        )),
+        ..w.owner.clone()
+    };
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::Account(&read),
+        &teams,
+        &w.grants,
+        Action::RefPush,
+        Resource::Ref(&w.private, &w.feature),
+    ));
+    assert!(
+        matches!(d, Decision::Invalid(_)),
+        "repo:read must not push: {d:?}"
+    );
+
+    // A package scope permits no repository action, and a repository selector
+    // does not reach another repository.
+    let package = Account {
+        confinement: Some(confinement(
+            vec![ResourceSelector::Repository(w.private.id)],
+            &["package:write"],
+        )),
+        ..w.owner.clone()
+    };
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::Account(&package),
+        &teams,
+        &w.grants,
+        Action::RepositoryRead,
+        Resource::Repository(&w.private),
+    ));
+    assert!(
+        matches!(d, Decision::Invalid("action is outside the token's scope")),
+        "package:write must not read a repository: {d:?}"
+    );
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::Account(&package),
+        &teams,
+        &w.grants,
+        Action::RepositoryRead,
+        Resource::Repository(&w.public),
+    ));
+    assert!(
+        matches!(
+            d,
+            Decision::Invalid("resource is outside the token's resource set")
+        ),
+        "a selector must not reach another repository: {d:?}"
+    );
+
+    // Service account: its own grant inside the selector is allowed; org
+    // administration and anything outside the selector are refused.
+    let service = ServiceAccount {
+        id: Uuid::new_v4(),
+        organization: w.acme.id,
+        suspended: false,
+        confinement: Some(confinement(
+            vec![ResourceSelector::Repository(w.private.id)],
+            &["repo:read"],
+        )),
+    };
+    let grants = vec![grant(
+        BuiltinRole::Read,
+        Subject::ServiceAccount(service.id),
+        Scope::Repository(w.private.id),
+    )];
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::ServiceAccount(&service),
+        &[],
+        &grants,
+        Action::RepositoryRead,
+        Resource::Repository(&w.private),
+    ));
+    assert!(d.is_allowed(), "service account inside its set: {d:?}");
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::ServiceAccount(&service),
+        &[],
+        &grants,
+        Action::RepositoryRead,
+        Resource::Repository(&w.public),
+    ));
+    assert!(
+        matches!(
+            d,
+            Decision::Invalid("resource is outside the token's resource set")
+        ),
+        "service account outside its set: {d:?}"
+    );
+
+    // Run: inherits the triggering account's write, but only inside the set;
+    // an ended run is refused outright.
+    let run = Run {
+        id: Uuid::new_v4(),
+        organization: w.acme.id,
+        account: w.developer.clone(),
+        ended: false,
+        confinement: Some(confinement(
+            vec![ResourceSelector::Repository(w.private.id)],
+            &["repo:write"],
+        )),
+    };
+    let run_teams = w.accountable_teams(&run.account);
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::Run(&run),
+        &run_teams,
+        &w.grants,
+        Action::RefPush,
+        Resource::Ref(&w.private, &w.feature),
+    ));
+    assert!(d.is_allowed(), "run inside its set: {d:?}");
+    let ended = Run {
+        ended: true,
+        ..run.clone()
+    };
+    let d = engine.authorize(&req(
+        &w.acme,
+        Principal::Run(&ended),
+        &run_teams,
+        &w.grants,
+        Action::RefPush,
+        Resource::Ref(&w.private, &w.feature),
+    ));
+    assert!(matches!(d, Decision::Invalid("run has ended")), "{d:?}");
 }

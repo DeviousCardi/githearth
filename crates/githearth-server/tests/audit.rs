@@ -360,19 +360,12 @@ async fn backfilled_rows_verify() {
         .execute(&pool)
         .await
         .unwrap();
-    // Apply migration 0007 (adds columns, trigger, backfill).
-    let m7 = migrations.iter().find(|m| m.version == 7).unwrap();
-    sqlx::raw_sql(&m7.sql).execute(&pool).await.unwrap();
-    // Apply 0019 (adds client_ip and the v2 trigger) so the schema matches what
-    // verify() expects; v2 hashes byte-identically to 0007 when client_ip is
-    // NULL, so these backfilled rows keep their 0007-computed hashes.
-    let m19 = migrations.iter().find(|m| m.version == 19).unwrap();
-    sqlx::raw_sql(&m19.sql).execute(&pool).await.unwrap();
-    // Apply 0022 (adds the IP key/digest columns and the v3 trigger) so the
-    // schema matches what verify() selects; the backfilled rows have no digest,
-    // so they keep their 0019-computed hashes.
-    let m22 = migrations.iter().find(|m| m.version == 22).unwrap();
-    sqlx::raw_sql(&m22.sql).execute(&pool).await.unwrap();
+    // Apply the remaining migrations in order: 0007 backfills the chain, and
+    // later migrations extend the encoding; 0055 adds actor kind/account and
+    // rehashes every chain under the V4 encoding the verifier mirrors.
+    for m in migrations.iter().filter(|m| m.version >= 7) {
+        sqlx::raw_sql(&m.sql).execute(&pool).await.unwrap();
+    }
     let (org_rows, org_ok, bad1) = verify_chain(&pool, Some(org_id)).await;
     assert_eq!(
         (org_rows, org_ok, bad1),

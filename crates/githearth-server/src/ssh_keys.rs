@@ -299,16 +299,22 @@ pub async fn authenticate(
     conn: &mut PgConnection,
     fingerprint: &str,
 ) -> Result<Option<ssh::SshIdentity>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Uuid, Uuid, bool)>(
-        "SELECT k.id, k.account_id, (k.expires_at IS NOT NULL AND k.expires_at <= clock_timestamp()) AS expired \
-         FROM ssh_keys k JOIN accounts a ON a.id = k.account_id \
-         WHERE k.fingerprint = $1 AND k.revoked_at IS NULL AND NOT a.suspended \
-         AND NOT a.must_change_password",
+    let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<Uuid>, bool)>(
+        "SELECT k.id, k.subject_kind, k.account_id, k.service_account_id, \
+                (k.expires_at IS NOT NULL AND k.expires_at <= clock_timestamp()) AS expired \
+         FROM ssh_keys k \
+         LEFT JOIN accounts a ON a.id = k.account_id \
+         LEFT JOIN service_accounts sa ON sa.id = k.service_account_id \
+         WHERE k.fingerprint = $1 AND k.revoked_at IS NULL \
+         AND ((k.subject_kind = 'account' AND a.id IS NOT NULL \
+               AND NOT a.suspended AND NOT a.must_change_password) \
+           OR (k.subject_kind = 'service_account' AND sa.id IS NOT NULL \
+               AND sa.disabled_at IS NULL))",
     )
     .bind(fingerprint)
     .fetch_optional(&mut *conn)
     .await?;
-    let Some((key_id, account_id, expired)) = row else {
+    let Some((key_id, subject_kind, account_id, service_account_id, expired)) = row else {
         return Ok(None);
     };
     if expired {
@@ -322,8 +328,17 @@ pub async fn authenticate(
     .bind(key_id)
     .execute(&mut *conn)
     .await?;
+    let (account, service_account) = if subject_kind == "service_account" {
+        (Uuid::nil(), service_account_id)
+    } else {
+        let Some(account) = account_id else {
+            return Ok(None);
+        };
+        (account, None)
+    };
     Ok(Some(ssh::SshIdentity {
-        account: account_id,
+        account,
+        service_account,
         key_id,
         read_only: false,
     }))

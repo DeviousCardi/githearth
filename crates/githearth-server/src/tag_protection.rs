@@ -648,7 +648,9 @@ mod tests {
                 site_admin: false,
                 organizations: vec![org],
                 teams: vec![],
+                confinement: None,
             },
+            principal: None,
             teams: vec![],
             grants: vec![Grant {
                 role: Role::Builtin(role),
@@ -729,7 +731,9 @@ mod tests {
                 site_admin: false,
                 organizations: vec![org],
                 teams: vec![],
+                confinement: None,
             },
+            principal: None,
             teams: vec![],
             grants: vec![Grant {
                 role: Role::Custom("release-bot".to_owned()),

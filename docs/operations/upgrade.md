@@ -35,6 +35,11 @@ Upgrades are forward-only; an older binary refuses a newer schema.
    githearth-server migrate --config /path/to/config.toml
    ```
    Rerun `doctor`; all checks must read `ok` or `warn` (0 failed).
+   The release that adds token subjects (migration 0055) must not be applied
+   while any old `serve` process is still running: that process has no
+   `subject_kind` predicate and would accept a new scoped account token as an
+   unconfined account credential. Step 1's stop or drain is the barrier; do not
+   run a mixed fleet across this migration.
 
 6. **Start and verify**
    ```

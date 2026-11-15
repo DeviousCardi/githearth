@@ -309,6 +309,7 @@ async fn ssh_clone_works() {
             let result = if f == fp {
                 Ok(Some(ssh::SshIdentity {
                     account: account_id,
+                    service_account: None,
                     key_id: Uuid::new_v4(),
                     read_only: false,
                 }))
@@ -419,6 +420,7 @@ async fn ssh_push_works() {
             let result = if f == fp {
                 Ok(Some(ssh::SshIdentity {
                     account: account_id,
+                    service_account: None,
                     key_id: Uuid::new_v4(),
                     read_only: false,
                 }))
@@ -636,12 +638,14 @@ async fn ssh_protected_tag_create_move_delete_refused() {
             let identity = if f == owner_fp {
                 Some(ssh::SshIdentity {
                     account: owner,
+                    service_account: None,
                     key_id: Uuid::new_v4(),
                     read_only: false,
                 })
             } else if f == writer_fp {
                 Some(ssh::SshIdentity {
                     account: writer,
+                    service_account: None,
                     key_id: Uuid::new_v4(),
                     read_only: false,
                 })
@@ -785,6 +789,7 @@ async fn ssh_non_member_receives_not_found() {
             let result = if f == fp {
                 Ok(Some(ssh::SshIdentity {
                     account: outsider_id,
+                    service_account: None,
                     key_id: Uuid::new_v4(),
                     read_only: false,
                 }))
@@ -925,6 +930,7 @@ async fn serve_with_repo_deadline(label: &str, auth_deadline: std::time::Duratio
     let authenticate: ssh::Authenticate = Arc::new(move |f: String| {
         let found = (f == fp).then(|| ssh::SshIdentity {
             account: account_id,
+            service_account: None,
             key_id: Uuid::new_v4(),
             read_only: false,
         });
@@ -1461,6 +1467,7 @@ async fn ssh_push_credentials_insert_failure_refused() {
             let result = if f == fid {
                 Ok(Some(ssh::SshIdentity {
                     account: account_id,
+                    service_account: None,
                     key_id: kid,
                     read_only: false,
                 }))

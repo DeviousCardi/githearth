@@ -85,6 +85,92 @@ secrets and tokens, three incompatible limit schemes), or to defer them to M11
   every subject. SSH is not a token transport; a service account authenticates
   over SSH with its own key, tested the same way.
 
+#### 2a. Open item 2, decided 2026-11-16: resource sets, issuance and the legacy window
+
+**Resource-set grammar.** A token carries a JSON array of selectors. Issuance
+accepts names and stores the canonical resolved form:
+
+```
+resource_set := [ selector, ... ]                       (at least one)
+selector := {"type":"repository","id":"<uuid>"}
+          | {"type":"repository","organization":"<org-slug>","name":"<repo-name>"}
+          | {"type":"organization","id":"<uuid>"}
+          | {"type":"organization","slug":"<org-slug>"}
+          | {"type":"package","organization":"<org-slug or uuid>","name":"<package>"}
+```
+
+There are no wildcards and no implicit parent: a `repository` selector reaches
+that repository (and its refs, issues and pull requests); an `organization`
+selector reaches the organization itself and every repository in it. A
+`package` selector is stored now for M7's registry credential and matches no
+repository action. Reaching a resource is not a grant: the scope still decides
+the action, so an `organization` selector with `repo:*` reaches that
+organization's repositories but permits no organisation action — the grammar
+has no `org:*` scope yet, and adding one is a decision, not an inference. The
+API resolves names to the canonical `id` form before storing; an unknown or
+deleted name is a `422`, never an empty set.
+
+**Scopes and audience.** Scopes are `repo:read`, `repo:write`, `package:read`
+and `package:write`; `repo:write` implies `repo:read`, and a scope over one
+resource type never permits another. Audience is a non-empty subset of `api`,
+`git` and `registry`; a token presented on a transport outside its audience is
+refused before authorization. A new token's expiry is 60 seconds to 24 hours
+(default one hour), and a non-legacy token must have one.
+
+**Issuance API.** `POST /api/v1/user/tokens` is session-authenticated and keeps
+its old body for a legacy token. The scoped body is:
+
+```json
+{
+  "name": "ci-build",
+  "subject": {"kind": "account"}
+          | {"kind": "service_account", "id": "<uuid>"}
+          | {"kind": "run", "id": "<uuid>"},
+  "resource_set": [{"type": "repository", "id": "<uuid>"}],
+  "scopes": ["repo:read"],
+  "audience": ["api", "git"],
+  "expires_in_seconds": 3600
+}
+```
+
+The response is the only place the plaintext appears (`token`, shown once); the
+row stores its SHA-256. A service-account token is issued only by an owner of
+that account's organization; a run token only by the account that triggered the
+run, while the run is live. `GET /api/v1/user/tokens` lists the caller's own
+tokens, its organizations' service-account tokens and its runs' tokens;
+`DELETE /api/v1/user/tokens/{id}` revokes any of those immediately (the next
+admission checks `revoked_at`). Delivery to a job is a mode-`0600` file whose
+path is in `GITHEARTH_TOKEN_FILE`, plus `GITHEARTH_TOKEN` for tools that need it
+inline; the job runner (M6) masks the inline value in its logs.
+
+**Principal model.** Cedar gains `ServiceAccount in Organization` and
+`Run in [Account, Organization]`. A service account's grants have
+`subject_kind = 'service_account'` and are read from the grant table; a run
+inherits the triggering account's grants and teams, resolves to its run row and
+that account, and is refused once the run's status is not `running` or
+`ended_at` is set. Each has an audit actor: `actor_kind = 'service_account'`
+with its row id and no account, or `actor_kind = 'run'` with the run id and the
+triggering account in `actor_account_id`. A scoped token of any subject also
+carries its resource set, scopes and audience into the engine, which refuses a
+resource or action outside them.
+
+**Legacy window.** The two-scope `repo:read`/`repo:write` token is deprecated
+from **2026-11-16**. It keeps working through **2027-06-30** and is refused
+from **2027-07-01T00:00:00Z**. The date is the configuration value
+`legacy_token_deprecation_date` (environment
+`GITHEARTH_LEGACY_TOKEN_DEPRECATION_DATE`, default `2027-06-30`); it is
+validated as a real calendar date no later than 2027-06-30, so it can shorten
+the window but never extend it. The server stores the first instant of the UTC
+day after that date (the default is exactly `2027-07-01T00:00:00Z`) and applies
+it monotonically at start-up (`LEAST(legacy_deadline, cutoff)`), so raising the
+value later cannot re-extend a token. Both authentication lookups refuse a
+legacy token at and after the stored instant, a legacy row cannot exist without
+one, and a legacy token is no longer issued once it has passed. `doctor` prints
+the enforced cutoff and the number of legacy tokens still accepted
+(`docs/operations/tokens.md`). The migration marks every existing token legacy
+and gives it the default cutoff; until then its scopes, expiry and account-wide
+reach are unchanged.
+
 ### 3. Secrets at rest
 
 - Envelope encryption: each stored secret has a data key; the data key is
@@ -240,8 +326,10 @@ its own outbound connection.
 1. **Resolved in M4.2 increment 7A** — object backend layout, the multipart
    format, the append format, quota accounting, crash consistency, torn tails
    and the size bounds, below.
-2. Token resource-set grammar, the issuance API shape and the exact legacy
-   deprecation date.
+2. **Resolved in M4.2 increment 7B** — the token resource-set grammar, the
+   issuance API shape and the exact legacy deprecation date are decided
+   2026-11-16 in section 2a (bounded, monotone, non-null cutoff enforced at
+   `2027-07-01T00:00:00Z`).
 3. KMS adapter interface and the passphrase-derived key parameters.
 4. Re-wrap batch size and the operator signal that rotation is complete.
 5. **Resolved in M4.2 increment 7A** — object-verification depth for backup

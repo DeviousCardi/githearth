@@ -2128,6 +2128,7 @@ async fn ssh_old_path_is_gone_then_resolves_after_restore() {
         let result = if supplied == fingerprint {
             Ok(Some(ssh::SshIdentity {
                 account,
+                service_account: None,
                 key_id: Uuid::new_v4(),
                 read_only: false,
             }))

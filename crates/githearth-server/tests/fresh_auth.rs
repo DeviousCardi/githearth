@@ -771,12 +771,14 @@ async fn git_transports_agree_on_force_push_and_delete() {
         let result = if fp == writer_fp {
             Ok(Some(ssh::SshIdentity {
                 account: writer_id,
+                service_account: None,
                 key_id: Uuid::new_v4(),
                 read_only: false,
             }))
         } else if fp == outsider_fp {
             Ok(Some(ssh::SshIdentity {
                 account: outsider_id,
+                service_account: None,
                 key_id: Uuid::new_v4(),
                 read_only: false,
             }))
