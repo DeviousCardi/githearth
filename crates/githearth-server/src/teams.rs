@@ -40,7 +40,6 @@ use axum::{
 use githearth_authz::Action;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{
@@ -150,28 +149,11 @@ pub(crate) struct Loaded {
 
 impl Loaded {
     /// Ask the engine one organization action with the caller's loaded facts:
-    /// the same principal, teams and grants every other handler uses.
-    pub(crate) fn may(&self, state: &AppState, action: Action) -> bool {
-        state
-            .authz
-            .authorize(
-                &self
-                    .org
-                    .facts
-                    .on_organization(action, Some(Duration::from_secs(self.org.auth_age))),
-            )
-            .is_allowed()
+    /// the same principal, teams and grants every other handler uses. A
+    /// freshness denial keeps its re-authentication envelope.
+    pub(crate) fn require(&self, state: &AppState, action: Action) -> Result<(), ApiError> {
+        self.org.require(state, action)
     }
-}
-
-fn may_on(org: &membership::Loaded, state: &AppState, action: Action) -> bool {
-    state
-        .authz
-        .authorize(
-            &org.facts
-                .on_organization(action, Some(Duration::from_secs(org.auth_age))),
-        )
-        .is_allowed()
 }
 
 /// Load organization and team, then require `action` on the organization.
@@ -186,14 +168,12 @@ async fn load_with(
     let org = membership::load(state, account, auth_age, org_slug).await?;
     // Authorization before the team lookup: a caller without the action learns
     // only what the organization decision says, never whether the team exists.
-    if !may_on(&org, state, action) {
-        return Err(org.refuse(state));
-    }
+    org.require(state, action)?;
     load_team(state, org, team_slug).await
 }
 
 /// Resolve the team inside an already-authorized organization. There is no
-/// separate team-level gate: every handler asks `may_on` for the exact action
+/// separate team-level gate: every handler asks `require` for the exact action
 /// its operation needs, so page and API share one rule.
 pub(crate) async fn load_team(
     state: &AppState,
@@ -225,9 +205,7 @@ async fn load_org(
 ) -> Result<membership::Loaded, ApiError> {
     let (account, auth_age) = authenticate(&state.pool, headers).await?;
     let loaded = membership::load(state, account, auth_age, org_slug).await?;
-    if !may_on(&loaded, state, action) {
-        return Err(loaded.refuse(state));
-    }
+    loaded.require(state, action)?;
     Ok(loaded)
 }
 
@@ -425,9 +403,7 @@ pub(crate) async fn create(
     body: &[u8],
     key: Option<&str>,
 ) -> Result<TeamJson, ApiError> {
-    if !may_on(org, state, Action::TeamCreate) {
-        return Err(org.refuse(state));
-    }
+    org.require(state, Action::TeamCreate)?;
     let input: NewTeam = serde_json::from_slice(body).map_err(|_| invalid())?;
     // Validate only after authorization, so an unauthorized caller cannot turn
     // a bad request into a 400 that reveals the organization exists.
@@ -447,9 +423,7 @@ pub(crate) async fn create(
             let mut tx = state.pool.begin().await?;
             membership::lock_organization(&mut tx, org.org_id).await?;
             let org = membership::reauthorize(&mut tx, org).await?;
-            if !may_on(&org, state, Action::TeamCreate) {
-                return Err(org.refuse(state));
-            }
+            org.require(state, Action::TeamCreate)?;
             let id = Uuid::new_v4();
             sqlx::query(
                 "INSERT INTO teams (id, organization_id, slug, name) VALUES ($1, $2, $3, $4)",
@@ -510,9 +484,7 @@ pub(crate) async fn delete_team_inner(
     loaded: &Loaded,
     key: Option<&str>,
 ) -> Result<(), ApiError> {
-    if !loaded.may(state, Action::TeamDelete) {
-        return Err(loaded.org.refuse(state));
-    }
+    loaded.require(state, Action::TeamDelete)?;
     let org = &loaded.org;
     let path = format!(
         "/api/v1/organizations/{}/teams/{}",
@@ -529,9 +501,7 @@ pub(crate) async fn delete_team_inner(
             let mut tx = state.pool.begin().await?;
             membership::lock_organization(&mut tx, org.org_id).await?;
             let org = membership::reauthorize(&mut tx, org).await?;
-            if !may_on(&org, state, Action::TeamDelete) {
-                return Err(org.refuse(state));
-            }
+            org.require(state, Action::TeamDelete)?;
             lock_team(&mut tx, loaded.team_id).await?;
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM teams WHERE id = $1)")
@@ -654,9 +624,7 @@ pub(crate) async fn add_member(
     body: &[u8],
     key: Option<&str>,
 ) -> Result<membership::MemberJson, ApiError> {
-    if !loaded.may(state, Action::TeamUpdate) {
-        return Err(loaded.org.refuse(state));
-    }
+    loaded.require(state, Action::TeamUpdate)?;
     if !valid_username(username) {
         return Err(invalid());
     }
@@ -676,9 +644,7 @@ pub(crate) async fn add_member(
             let mut tx = state.pool.begin().await?;
             membership::lock_organization(&mut tx, org.org_id).await?;
             let org = membership::reauthorize(&mut tx, org).await?;
-            if !may_on(&org, state, Action::TeamUpdate) {
-                return Err(org.refuse(state));
-            }
+            org.require(state, Action::TeamUpdate)?;
             lock_team(&mut tx, loaded.team_id).await?;
             let account_id: Option<Uuid> =
                 sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
@@ -772,9 +738,7 @@ pub(crate) async fn remove_member(
     username: &str,
     key: Option<&str>,
 ) -> Result<(), ApiError> {
-    if !loaded.may(state, Action::TeamUpdate) {
-        return Err(loaded.org.refuse(state));
-    }
+    loaded.require(state, Action::TeamUpdate)?;
     if !valid_username(username) {
         return Err(invalid());
     }
@@ -794,9 +758,7 @@ pub(crate) async fn remove_member(
             let mut tx = state.pool.begin().await?;
             membership::lock_organization(&mut tx, org.org_id).await?;
             let org = membership::reauthorize(&mut tx, org).await?;
-            if !may_on(&org, state, Action::TeamUpdate) {
-                return Err(org.refuse(state));
-            }
+            org.require(state, Action::TeamUpdate)?;
             lock_team(&mut tx, loaded.team_id).await?;
             let account_id: Option<Uuid> =
                 sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
@@ -887,9 +849,7 @@ pub(crate) async fn add_grant(
     body: &[u8],
     key: Option<&str>,
 ) -> Result<GrantJson, ApiError> {
-    if !loaded.may(state, Action::TeamUpdate) {
-        return Err(loaded.org.refuse(state));
-    }
+    loaded.require(state, Action::TeamUpdate)?;
     let input: NewGrant = serde_json::from_slice(body).map_err(|_| invalid())?;
     let valid_role = if input.on_organization {
         input.repository.is_none() && membership::ROLES.contains(&input.role.as_str())
@@ -915,9 +875,7 @@ pub(crate) async fn add_grant(
             let mut tx = state.pool.begin().await?;
             membership::lock_organization(&mut tx, org.org_id).await?;
             let org = membership::reauthorize(&mut tx, org).await?;
-            if !may_on(&org, state, Action::TeamUpdate) {
-                return Err(org.refuse(state));
-            }
+            org.require(state, Action::TeamUpdate)?;
             lock_team(&mut tx, loaded.team_id).await?;
             let repository_id: Option<Uuid> = match input.repository.as_deref() {
                 None => None,
@@ -1024,9 +982,7 @@ pub(crate) async fn revoke_grant(
     grant_id: Uuid,
     key: Option<&str>,
 ) -> Result<(), ApiError> {
-    if !loaded.may(state, Action::TeamDelete) {
-        return Err(loaded.org.refuse(state));
-    }
+    loaded.require(state, Action::TeamDelete)?;
     let org = &loaded.org;
     let path = format!(
         "/api/v1/organizations/{}/teams/{}/grants/{grant_id}",
@@ -1043,9 +999,7 @@ pub(crate) async fn revoke_grant(
             let mut tx = state.pool.begin().await?;
             membership::lock_organization(&mut tx, org.org_id).await?;
             let org = membership::reauthorize(&mut tx, org).await?;
-            if !may_on(&org, state, Action::TeamDelete) {
-                return Err(org.refuse(state));
-            }
+            org.require(state, Action::TeamDelete)?;
             lock_team(&mut tx, loaded.team_id).await?;
             let active: Option<(String, Option<Uuid>)> = sqlx::query_as(
                 "SELECT role, repository_id FROM grants WHERE id = $1 AND subject_kind = 'team' \

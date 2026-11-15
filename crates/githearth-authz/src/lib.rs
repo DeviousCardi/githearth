@@ -36,6 +36,12 @@ pub const MAX_ROLE_BYTES: usize = 16 * 1024;
 /// actions (sudo mode).
 pub const DEFAULT_FRESH_AUTH: Duration = Duration::from_secs(15 * 60);
 
+/// The built-in forbid that refuses a `sensitive` action whose authentication
+/// is older than the engine's window. A decision reports the policies that
+/// contributed to it, so this id is how a caller tells a freshness refusal
+/// apart from a missing grant without evaluating the window again.
+pub const FRESH_AUTH_FORBID: &str = "sensitive-requires-fresh-auth";
+
 macro_rules! sensitivity {
     (sensitive) => {
         true
@@ -412,6 +418,15 @@ impl Decision {
     pub fn is_allowed(&self) -> bool {
         matches!(self, Decision::Allow(_))
     }
+
+    /// Whether [`FRESH_AUTH_FORBID`] contributed to a denial. This is the
+    /// engine's own statement that the authentication was stale — but the
+    /// forbid fires for every stale caller, including one that also lacks the
+    /// grant, so it does not by itself say a password would help. Pair it with
+    /// [`Engine::allows_if_fresh`] before prompting.
+    pub fn denied_for_fresh_auth(&self) -> bool {
+        matches!(self, Decision::Deny(reasons) if reasons.iter().any(|reason| reason == FRESH_AUTH_FORBID))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,6 +540,23 @@ impl Engine {
             Ok(decision) => decision,
             Err(reason) => Decision::Invalid(reason),
         }
+    }
+
+    /// The same decision with sudo mode satisfied (a recency of zero).
+    ///
+    /// A surface answers a stale `sensitive` refusal with a re-authentication
+    /// prompt only when a password entry would actually allow the action. The
+    /// freshness forbid fires for every stale caller — including one that also
+    /// lacks the grant — so [`Decision::denied_for_fresh_auth`] alone cannot
+    /// tell those apart. This asks the engine the counterfactual instead of a
+    /// handler re-deriving the window: a caller without the grant is still
+    /// denied here, and a non-freshness forbid still applies.
+    pub fn allows_if_fresh(&self, request: &Request<'_>) -> bool {
+        self.authorize(&Request {
+            auth_age: Some(Duration::ZERO),
+            ..*request
+        })
+        .is_allowed()
     }
 
     fn evaluate(&self, request: &Request<'_>) -> Result<Decision, &'static str> {

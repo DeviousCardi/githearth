@@ -205,16 +205,6 @@ fn may_read(state: &AppState, loaded: &membership::Loaded) -> bool {
         .is_allowed()
 }
 
-fn may_create(state: &AppState, loaded: &membership::Loaded) -> bool {
-    state
-        .authz
-        .authorize(&loaded.facts.on_organization(
-            githearth_authz::Action::InvitationCreate,
-            Some(Duration::from_secs(loaded.auth_age)),
-        ))
-        .is_allowed()
-}
-
 /// Create an invitation with `invitation.create` (owner, sensitive). The
 /// response carries the token once; the row carries only its hash and the
 /// audit event names the invitation, never the token.
@@ -231,9 +221,7 @@ pub(crate) async fn create(
     loaded: &membership::Loaded,
     body: &[u8],
 ) -> Result<CreatedInvitation, ApiError> {
-    if !may_create(state, loaded) {
-        return Err(loaded.refuse(state));
-    }
+    loaded.require(state, githearth_authz::Action::InvitationCreate)?;
     let input: NewInvitation = serde_json::from_slice(body).map_err(|_| invalid())?;
     let email = input.email.trim().to_ascii_lowercase();
     let days = input.expires_in_days.unwrap_or(DEFAULT_EXPIRY_DAYS);
@@ -247,9 +235,7 @@ pub(crate) async fn create(
     let mut tx = state.pool.begin().await?;
     membership::lock_organization(&mut tx, loaded.org_id).await?;
     let loaded = membership::reauthorize(&mut tx, loaded).await?;
-    if !may_create(state, &loaded) {
-        return Err(loaded.refuse(state));
-    }
+    loaded.require(state, githearth_authz::Action::InvitationCreate)?;
     let team_id: Option<Uuid> = match input.team.as_deref() {
         None => None,
         Some(slug) => {
@@ -334,9 +320,7 @@ async fn create_invitation(
 ) -> Result<(StatusCode, Json<CreatedInvitation>), ApiError> {
     let (account, auth_age) = authenticate(&state.pool, &headers).await?;
     let loaded = membership::load(&state, account, auth_age, &org_slug).await?;
-    if !may_create(&state, &loaded) {
-        return Err(loaded.refuse(&state));
-    }
+    loaded.require(&state, githearth_authz::Action::InvitationCreate)?;
     // An `Idempotency-Key` is still validated when present, so a malformed one
     // is a 400 as on every other mutation, but creation is not replayed: see
     // `create`.
@@ -354,9 +338,7 @@ pub(crate) async fn revoke(
     id: Uuid,
     key: Option<&str>,
 ) -> Result<(), ApiError> {
-    if !may_revoke(state, loaded) {
-        return Err(loaded.refuse(state));
-    }
+    loaded.require(state, githearth_authz::Action::InvitationRevoke)?;
     let path = format!("/api/v1/organizations/{}/invitations/{id}", loaded.slug);
     let (_, _) = idempotency::run(
         &state.pool,
@@ -369,9 +351,7 @@ pub(crate) async fn revoke(
             let mut tx = state.pool.begin().await?;
             membership::lock_organization(&mut tx, loaded.org_id).await?;
             let loaded = membership::reauthorize(&mut tx, loaded).await?;
-            if !may_revoke(state, &loaded) {
-                return Err(loaded.refuse(state));
-            }
+            loaded.require(state, githearth_authz::Action::InvitationRevoke)?;
             let row: Option<(bool, bool)> = sqlx::query_as(
                 "SELECT revoked_at IS NOT NULL, used_at IS NOT NULL FROM invitations \
                  WHERE id = $1 AND organization_id = $2 FOR UPDATE",
@@ -414,16 +394,6 @@ pub(crate) async fn revoke(
     )
     .await?;
     Ok(())
-}
-
-fn may_revoke(state: &AppState, loaded: &membership::Loaded) -> bool {
-    state
-        .authz
-        .authorize(&loaded.facts.on_organization(
-            githearth_authz::Action::InvitationRevoke,
-            Some(Duration::from_secs(loaded.auth_age)),
-        ))
-        .is_allowed()
 }
 
 async fn revoke_invitation(

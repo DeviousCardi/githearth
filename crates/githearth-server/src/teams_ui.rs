@@ -114,7 +114,16 @@ fn form_fields(s: &Session, key: &str) -> String {
     )
 }
 
-fn api_error(s: &Session, error: &ApiError) -> ui::UiError {
+fn api_error(state: &AppState, s: &Session, slug: &str, error: &ApiError) -> ui::UiError {
+    if error.message() == "reauthentication required" {
+        return ui::reauthentication_page(
+            Some(&s.account.username),
+            s.account.is_admin,
+            &s.csrf,
+            state.fresh_auth(),
+            &format!("/organizations/{}/teams", ui::url_encode(slug)),
+        );
+    }
     match error.status_code() {
         StatusCode::UNAUTHORIZED => ui::auth_required(),
         StatusCode::NOT_FOUND => ui::not_found_page(Some(&s.account.username)),
@@ -135,12 +144,14 @@ fn not_permitted_page(s: &Session) -> ui::UiError {
 }
 
 /// The page refusal for an action the caller does not hold: a reader of the
-/// organization gets "not permitted", anyone else the masked 404.
-fn refuse(state: &AppState, s: &Session, org: &membership::Loaded) -> ui::UiError {
-    if org.refuse(state).status_code() == StatusCode::FORBIDDEN {
-        not_permitted_page(s)
-    } else {
-        ui::not_found_page(Some(&s.account.username))
+/// organization gets "not permitted", anyone else the masked 404, and a stale
+/// session whose grant is intact gets the password prompt.
+fn refuse(state: &AppState, s: &Session, org: &membership::Loaded, action: Action) -> ui::UiError {
+    match org.require(state, action) {
+        Err(error) => api_error(state, s, &org.slug, &error),
+        // `may` already answered no, so this arm is unreachable; keeping it
+        // total avoids a second, different refusal.
+        Ok(()) => not_permitted_page(s),
     }
 }
 
@@ -185,7 +196,15 @@ fn render_error(s: &Session, slug: &str, notice: &str) -> Response {
 
 /// A rejected submission stays on the page with its reason; anything else is
 /// the page its status deserves.
-fn submission(error: ApiError, s: &Session, slug: &str) -> Result<Response, ui::UiError> {
+fn submission(
+    state: &AppState,
+    error: ApiError,
+    s: &Session,
+    slug: &str,
+) -> Result<Response, ui::UiError> {
+    if error.message() == "reauthentication required" {
+        return Err(api_error(state, s, slug, &error));
+    }
     match error.status_code() {
         StatusCode::BAD_REQUEST | StatusCode::CONFLICT => {
             Ok(render_error(s, slug, error.message()))
@@ -208,9 +227,9 @@ async fn teams_page(
     let s = session(&state, &headers).await?;
     let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     if !may(&state, &s, &loaded, Action::TeamCreate) {
-        return Err(refuse(&state, &s, &loaded));
+        return Err(refuse(&state, &s, &loaded, Action::TeamCreate));
     }
     let list = teams::all_teams(&state, loaded.org_id)
         .await
@@ -273,9 +292,9 @@ async fn create_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     if !may(&state, &s, &loaded, Action::TeamCreate) {
-        return Err(refuse(&state, &s, &loaded));
+        return Err(refuse(&state, &s, &loaded, Action::TeamCreate));
     }
     let key = key_or_page(&s, &form.idempotency_key)?;
     let body = serde_json::json!({"slug": form.slug, "name": form.name}).to_string();
@@ -285,7 +304,7 @@ async fn create_submit(
             ui::url_encode(&loaded.slug)
         ))
         .into_response()),
-        Err(e) => submission(e, &s, &loaded.slug),
+        Err(e) => submission(&state, e, &s, &loaded.slug),
     }
 }
 
@@ -306,13 +325,13 @@ async fn delete_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let org = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     if !may(&state, &s, &org, Action::TeamDelete) {
-        return Err(refuse(&state, &s, &org));
+        return Err(refuse(&state, &s, &org, Action::TeamDelete));
     }
     let loaded = teams::load_team(&state, org, &team)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     let key = key_or_page(&s, &form.idempotency_key)?;
     match teams::delete_team_inner(&state, &loaded, Some(&key)).await {
         Ok(()) => Ok(Redirect::to(&format!(
@@ -320,7 +339,7 @@ async fn delete_submit(
             ui::url_encode(&loaded.org.slug)
         ))
         .into_response()),
-        Err(e) => submission(e, &s, &slug),
+        Err(e) => submission(&state, e, &s, &slug),
     }
 }
 
@@ -336,15 +355,15 @@ async fn team_page(
     let s = session(&state, &headers).await?;
     let org = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     // The page and every member and grant control on it are `team.update` or
     // `team.delete`; a caller with neither gets the refusal page, not the team.
     if !may(&state, &s, &org, Action::TeamUpdate) {
-        return Err(refuse(&state, &s, &org));
+        return Err(refuse(&state, &s, &org, Action::TeamUpdate));
     }
     let loaded = teams::load_team(&state, org, &team)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     render_team(&state, &s, &loaded).await
 }
 
@@ -529,20 +548,20 @@ async fn add_member_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let org = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     // Adding a member is `team.update`, the same action `add_member` asks for,
     // whether the form names the caller themselves or someone else.
     if !may(&state, &s, &org, Action::TeamUpdate) {
-        return Err(refuse(&state, &s, &org));
+        return Err(refuse(&state, &s, &org, Action::TeamUpdate));
     }
     let loaded = teams::load_team(&state, org, &team)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     let key = key_or_page(&s, &form.idempotency_key)?;
     let body = serde_json::json!({"username": form.username}).to_string();
     match teams::add_member(&state, &loaded, &form.username, body.as_bytes(), Some(&key)).await {
         Ok(_) => Ok(redirect_to_team(&loaded)),
-        Err(e) => submission(e, &s, &loaded.org.slug),
+        Err(e) => submission(&state, e, &s, &loaded.org.slug),
     }
 }
 
@@ -555,17 +574,17 @@ async fn remove_member_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let org = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     if !may(&state, &s, &org, Action::TeamUpdate) {
-        return Err(refuse(&state, &s, &org));
+        return Err(refuse(&state, &s, &org, Action::TeamUpdate));
     }
     let loaded = teams::load_team(&state, org, &team)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     let key = key_or_page(&s, &form.idempotency_key)?;
     match teams::remove_member(&state, &loaded, &username, Some(&key)).await {
         Ok(()) => Ok(redirect_to_team(&loaded)),
-        Err(e) => submission(e, &s, &loaded.org.slug),
+        Err(e) => submission(&state, e, &s, &loaded.org.slug),
     }
 }
 
@@ -590,19 +609,19 @@ async fn grant_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let org = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     // Adding a grant is `team.update`, the same action `add_grant` asks for.
     if !may(&state, &s, &org, Action::TeamUpdate) {
-        return Err(refuse(&state, &s, &org));
+        return Err(refuse(&state, &s, &org, Action::TeamUpdate));
     }
     let loaded = teams::load_team(&state, org, &team)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     let key = key_or_page(&s, &form.idempotency_key)?;
     let body = serde_json::json!({"repository": form.repository, "role": form.role}).to_string();
     match teams::add_grant(&state, &loaded, body.as_bytes(), Some(&key)).await {
         Ok(_) => Ok(redirect_to_team(&loaded)),
-        Err(e) => submission(e, &s, &loaded.org.slug),
+        Err(e) => submission(&state, e, &s, &loaded.org.slug),
     }
 }
 
@@ -615,19 +634,19 @@ async fn revoke_grant_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let org = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     // Revoking a grant is `team.delete`, not `team.update`.
     if !may(&state, &s, &org, Action::TeamDelete) {
-        return Err(refuse(&state, &s, &org));
+        return Err(refuse(&state, &s, &org, Action::TeamDelete));
     }
     let loaded = teams::load_team(&state, org, &team)
         .await
-        .map_err(|e| api_error(&s, &e))?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
     let key = key_or_page(&s, &form.idempotency_key)?;
     let grant_id = Uuid::parse_str(&grant).map_err(|_| invalid_page(&s))?;
     match teams::revoke_grant(&state, &loaded, grant_id, Some(&key)).await {
         Ok(()) => Ok(redirect_to_team(&loaded)),
-        Err(e) => submission(e, &s, &loaded.org.slug),
+        Err(e) => submission(&state, e, &s, &loaded.org.slug),
     }
 }
 

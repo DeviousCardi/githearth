@@ -108,11 +108,26 @@ fn may(state: &AppState, s: &Session, loaded: &membership::Loaded, action: Actio
         .is_allowed()
 }
 
-fn refuse(state: &AppState, s: &Session, loaded: &membership::Loaded) -> ui::UiError {
-    if loaded.refuse(state).status_code() == StatusCode::FORBIDDEN {
-        not_permitted_page(s)
-    } else {
-        ui::not_found_page(Some(&s.account.username))
+fn refuse(
+    state: &AppState,
+    s: &Session,
+    loaded: &membership::Loaded,
+    action: Action,
+) -> ui::UiError {
+    match loaded.require(state, action) {
+        Err(error) if error.message() == "reauthentication required" => ui::reauthentication_page(
+            Some(&s.account.username),
+            s.account.is_admin,
+            &s.csrf,
+            state.fresh_auth(),
+            &format!(
+                "/organizations/{}/invitations",
+                ui::url_encode(&loaded.slug)
+            ),
+        ),
+        Err(error) if error.status_code() == StatusCode::FORBIDDEN => not_permitted_page(s),
+        Err(_) => ui::not_found_page(Some(&s.account.username)),
+        Ok(()) => not_permitted_page(s),
     }
 }
 
@@ -165,7 +180,7 @@ async fn render(
     token: Option<(&str, &str)>,
 ) -> Result<Response, ui::UiError> {
     if !may(state, s, loaded, Action::InvitationRead) {
-        return Err(refuse(state, s, loaded));
+        return Err(refuse(state, s, loaded, Action::InvitationRead));
     }
     let list = invitations::list_in(state, loaded.org_id)
         .await
@@ -316,7 +331,7 @@ async fn create_submit(
         .await
         .map_err(|e| api_page_error(&s, &e))?;
     if !may(&state, &s, &loaded, Action::InvitationCreate) {
-        return Err(refuse(&state, &s, &loaded));
+        return Err(refuse(&state, &s, &loaded, Action::InvitationCreate));
     }
     // The form still carries a per-form key and it is validated, but creation
     // is not replayed: a second submit creates a second invitation.
@@ -334,6 +349,9 @@ async fn create_submit(
             // invitations never carries it again.
             let href = format!("/invitations/{}", ui::url_encode(&created.token));
             render(&state, &s, &loaded, None, Some((&created.token, &href))).await
+        }
+        Err(e) if e.message() == "reauthentication required" => {
+            Err(refuse(&state, &s, &loaded, Action::InvitationCreate))
         }
         Err(e) => match e.status_code() {
             StatusCode::BAD_REQUEST | StatusCode::CONFLICT => {
@@ -365,7 +383,7 @@ async fn revoke_submit(
         .await
         .map_err(|e| api_page_error(&s, &e))?;
     if !may(&state, &s, &loaded, Action::InvitationRevoke) {
-        return Err(refuse(&state, &s, &loaded));
+        return Err(refuse(&state, &s, &loaded, Action::InvitationRevoke));
     }
     let key = key_or_page(&s, &form.idempotency_key)?;
     let id = Uuid::parse_str(&id).map_err(|_| {
@@ -381,6 +399,9 @@ async fn revoke_submit(
             ui::url_encode(&loaded.slug)
         ))
         .into_response()),
+        Err(e) if e.message() == "reauthentication required" => {
+            Err(refuse(&state, &s, &loaded, Action::InvitationRevoke))
+        }
         Err(e) => match e.status_code() {
             StatusCode::NOT_FOUND => Err(ui::not_found_page(Some(&s.account.username))),
             StatusCode::FORBIDDEN => Err(not_permitted_page(&s)),

@@ -116,8 +116,19 @@ fn role_options(selected: &str) -> String {
         .collect()
 }
 
-/// Maps an API failure to the page a browser should see.
-fn api_error(s: &Session, error: &ApiError) -> ui::UiError {
+/// Maps an API failure to the page a browser should see. A freshness denial
+/// keeps the prompt the ADR names; every other 403 keeps the not-permitted
+/// page.
+fn api_error(state: &AppState, s: &Session, slug: &str, error: &ApiError) -> ui::UiError {
+    if error.message() == "reauthentication required" {
+        return ui::reauthentication_page(
+            Some(&s.account.username),
+            s.account.is_admin,
+            &s.csrf,
+            state.fresh_auth(),
+            &members_href(slug),
+        );
+    }
     match error.status_code() {
         StatusCode::UNAUTHORIZED => ui::auth_required(),
         StatusCode::NOT_FOUND => ui::not_found_page(Some(&s.account.username)),
@@ -149,17 +160,11 @@ fn require_manage(
     state: &AppState,
     s: &Session,
     loaded: &membership::Loaded,
+    slug: &str,
 ) -> Result<(), ui::UiError> {
-    if loaded.may_manage(state) {
-        return Ok(());
-    }
-    Err(
-        if loaded.refuse(state).status_code() == StatusCode::FORBIDDEN {
-            not_permitted_page(s)
-        } else {
-            ui::not_found_page(Some(&s.account.username))
-        },
-    )
+    loaded
+        .require(state, githearth_authz::Action::OrganizationManageMembers)
+        .map_err(|e| api_error(state, s, slug, &e))
 }
 
 /// The page equivalent of `require_target`: an administrator, or the caller
@@ -170,19 +175,18 @@ fn require_target_page(
     state: &AppState,
     s: &Session,
     loaded: &membership::Loaded,
+    slug: &str,
     username: &str,
     allow_self: bool,
 ) -> Result<(), ui::UiError> {
-    if loaded.may_change(state, username, allow_self) {
+    // Leaving is not the sensitive `manage_members` action; every other change
+    // asks the engine, keeping a freshness denial as the password prompt.
+    if allow_self && username == loaded.account.username {
         return Ok(());
     }
-    Err(
-        if loaded.refuse(state).status_code() == StatusCode::FORBIDDEN {
-            not_permitted_page(s)
-        } else {
-            ui::not_found_page(Some(&s.account.username))
-        },
-    )
+    loaded
+        .require(state, githearth_authz::Action::OrganizationManageMembers)
+        .map_err(|e| api_error(state, s, slug, &e))
 }
 
 struct Draft<'a> {
@@ -209,8 +213,8 @@ async fn members_page(
     let s = session(&state, &headers).await?;
     let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
-    require_manage(&state, &s, &loaded)?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
+    require_manage(&state, &s, &loaded, &slug)?;
     render(&state, &s, &slug, StatusCode::OK, None, &Draft::default()).await
 }
 
@@ -227,8 +231,8 @@ async fn render(
 ) -> Result<Response, ui::UiError> {
     let loaded = membership::load(state, s.account.clone(), s.auth_age, slug)
         .await
-        .map_err(|e| api_error(s, &e))?;
-    require_manage(state, s, &loaded)?;
+        .map_err(|e| api_error(state, s, slug, &e))?;
+    require_manage(state, s, &loaded, slug)?;
     let members = membership::all_members(state, loaded.org_id)
         .await
         .map_err(|_| ui::unavailable_page(Some(&s.account.username)))?;
@@ -345,8 +349,8 @@ async fn add_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
-    require_manage(&state, &s, &loaded)?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
+    require_manage(&state, &s, &loaded, &slug)?;
     // Authorization is decided before the per-form key is validated.
     let key = if idempotency::valid_key(&form.idempotency_key) {
         form.idempotency_key.as_str()
@@ -374,7 +378,7 @@ async fn add_submit(
                 StatusCode::BAD_REQUEST
                 | StatusCode::CONFLICT
                 | StatusCode::UNPROCESSABLE_ENTITY => e.status_code(),
-                _ => return Err(api_error(&s, &e)),
+                _ => return Err(api_error(&state, &s, &slug, &e)),
             };
             let notice = ui::idempotency_notice(&e).unwrap_or(e.message());
             render(&state, &s, &slug, status, Some(notice), &draft).await
@@ -401,8 +405,8 @@ async fn role_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
-    require_manage(&state, &s, &loaded)?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
+    require_manage(&state, &s, &loaded, &slug)?;
     // Authorization is decided before the per-form key is validated.
     let key = if idempotency::valid_key(&form.idempotency_key) {
         form.idempotency_key.as_str()
@@ -421,7 +425,7 @@ async fn role_submit(
                 StatusCode::BAD_REQUEST
                 | StatusCode::CONFLICT
                 | StatusCode::UNPROCESSABLE_ENTITY => e.status_code(),
-                _ => return Err(api_error(&s, &e)),
+                _ => return Err(api_error(&state, &s, &slug, &e)),
             };
             let notice = ui::idempotency_notice(&e).unwrap_or(e.message());
             render(&state, &s, &slug, status, Some(notice), &Draft::default()).await
@@ -446,8 +450,8 @@ async fn remove_submit(
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let loaded = membership::load(&state, s.account.clone(), s.auth_age, &slug)
         .await
-        .map_err(|e| api_error(&s, &e))?;
-    require_target_page(&state, &s, &loaded, &username, true)?;
+        .map_err(|e| api_error(&state, &s, &slug, &e))?;
+    require_target_page(&state, &s, &loaded, &slug, &username, true)?;
     // Authorization is decided before the per-form key is validated.
     let key = if idempotency::valid_key(&form.idempotency_key) {
         form.idempotency_key.as_str()
@@ -467,7 +471,7 @@ async fn remove_submit(
                 StatusCode::BAD_REQUEST
                 | StatusCode::CONFLICT
                 | StatusCode::UNPROCESSABLE_ENTITY => e.status_code(),
-                _ => return Err(api_error(&s, &e)),
+                _ => return Err(api_error(&state, &s, &slug, &e)),
             };
             let notice = ui::idempotency_notice(&e).unwrap_or(e.message());
             render(&state, &s, &slug, status, Some(notice), &Draft::default()).await

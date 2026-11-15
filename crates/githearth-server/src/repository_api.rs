@@ -256,13 +256,23 @@ pub(crate) async fn load_public_anonymous(
 
 pub(crate) fn require(state: &AppState, loaded: &Loaded, action: Action) -> Result<(), ApiError> {
     let authz_repo = repositories::authz_repository(&loaded.repo);
-    let decision = state.authz.authorize(&loaded.facts.request(
+    let request = loaded.facts.request(
         action,
         Resource::Repository(&authz_repo),
         Some(Duration::from_secs(loaded.auth_age)),
-    ));
+    );
+    let decision = state.authz.authorize(&request);
     if decision.is_allowed() {
         return Ok(());
+    }
+    // Keep the engine's reason: a `sensitive` action refused only because the
+    // session is stale becomes the re-authentication envelope, so the API and
+    // the pages can prompt for a password instead of reporting a plain denial.
+    // The forbid fires for every stale caller, so the engine is also asked
+    // whether a fresh password would actually allow it; a caller without the
+    // grant is still denied and falls through to the ordinary refusal below.
+    if decision.denied_for_fresh_auth() && state.authz.allows_if_fresh(&request) {
+        return Err(crate::reauthentication_required());
     }
     let read_ok = state
         .authz
