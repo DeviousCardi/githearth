@@ -1652,3 +1652,46 @@ async fn a_registered_consumer_cannot_lose_its_handler() {
     );
     finish(&config, pool, db).await;
 }
+
+/// `doctor` must count a `pending` delivery. The count query used to carry
+/// `WHERE state <> 'pending'`, so the `FILTER (WHERE state = 'pending')` count
+/// was always zero: a stalled relay printed `0 pending` and the check passed
+/// over the fault it exists to detect. Revert the filter and this test fails
+/// with `0 pending`.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn doctor_counts_a_pending_delivery() {
+    let db = Db::new(true).await;
+    let config = fast_config(&db.url);
+    let (state, pool) = state_for(&config).await;
+    let (actor, _) = account(&pool, "pending_actor").await;
+    let org = organization(&pool, actor, "pending").await;
+    outbox::register(&pool, &consume_a()).await.unwrap();
+    commit_event(&pool, Some(org), actor, "test.pending", json!({})).await;
+    relay_once(&state).await;
+
+    assert_eq!(
+        delivery_states(&pool, CONSUMER_A).await,
+        vec![("pending".to_string(), 0)],
+        "the fan-out left the delivery pending"
+    );
+
+    // Read-only: no runner is started, so the row never leaves `pending`.
+    let report = githearth_server::doctor::report(&config).await;
+    let check = report
+        .iter()
+        .find(|c| c.name == "outbox")
+        .expect("the outbox check exists");
+    assert!(
+        matches!(check.status, githearth_server::doctor::Status::Ok),
+        "doctor passes and reports the backlog: {}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("1 pending"),
+        "doctor counts the pending delivery: {}",
+        check.detail
+    );
+
+    finish(&config, pool, db).await;
+}

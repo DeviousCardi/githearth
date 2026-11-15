@@ -501,14 +501,18 @@ async fn housekeeping_check(pool: &PgPool, config: &Config) -> Check {
 /// with no handler (`job_kind` NULL) holds deliveries that nothing will ever
 /// enqueue; `outbox::register` refuses to create one, so this covers only a
 /// database an older release or a hand edit left behind, and it warns by name.
-/// Otherwise the check reports its counts and passes.
+/// Otherwise the check reports its counts and passes. `pending` is counted:
+/// a backlog that does not move is a stalled relay, and filtering it out made
+/// the check print `0 pending` over exactly that fault. Pending does not warn
+/// by itself: a new consumer's first delivery and a retry waiting out its
+/// backoff are pending by design.
 async fn outbox_check(pool: &PgPool) -> Check {
     let counts: Result<(i64, i64, i64, i64), _> = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE state = 'dead'), \
                 count(*) FILTER (WHERE state = 'pending'), \
                 count(*) FILTER (WHERE state = 'delivering'), \
                 count(*) FILTER (WHERE state = 'delivered') \
-         FROM outbox_deliveries WHERE state <> 'pending'",
+         FROM outbox_deliveries",
     )
     .fetch_one(pool)
     .await;

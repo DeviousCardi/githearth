@@ -175,7 +175,7 @@ it is a warning naming the affected requests. A clean install therefore prints
 
 When the database cannot be reached the `schema`, `lifecycle`, `jobs`, `outbox`
 and `housekeeping` checks are skipped (`skip <name>: database unavailable`) rather than counted
-as failures, so one outage counts as one failure, not four.
+as failures, so one outage counts as one failure, not five.
 
 Exit code is 0 when all checks pass (warnings and skips are allowed), 1 otherwise.
 The last line prints a summary: `N checks, F failed, W warnings, S skipped`.
@@ -188,7 +188,7 @@ ok   storage: /data/githearth/repositories writable
 ok   disk: 47.82 GiB free
 ok   email: not configured (smtp_host is empty); no mail is sent
 ok   database: connected
-ok   schema: latest v51
+ok   schema: latest v54
 ok   lifecycle: no stuck repositories
 ok   jobs: no dead, late or stuck jobs
 ok   outbox: 0 pending, 0 delivering, 0 delivered delivery(ies)

@@ -80,7 +80,9 @@ revoked.
 
 Invitations are audited as `organization.invitation_created`,
 `organization.invitation_accepted` and `organization.invitation_revoked`. The
-audit payload names the invitation and the address, never the token.
+created payload names the invitation and the invited address; the accepted
+payload names the invitation, role and team; the revoked payload names only the
+invitation. None of them carries the token.
 
 ## Related
 

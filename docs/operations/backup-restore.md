@@ -37,8 +37,8 @@ The fence covers every path that can acknowledge a write:
   interrupted and the worker pauses while the fence is up.
 
 `maintenance start` waits up to `maintenance_drain_timeout_seconds` (default
-300) and exits non-zero listing the writes still in flight if they do not
-finish. `maintenance status` shows the phase and count. The control endpoint is
+300) and exits non-zero with the number of writes still in flight if they do
+not finish. `maintenance status` shows the phase and count. The control endpoint is
 cryptographically authenticated and answers only a loopback client; with an
 explicit non-loopback `bind`, stop the server and use the `not-running` fence
 instead.
@@ -211,6 +211,13 @@ old audit keys still exist inside older encrypted archives — see
 - **Rotated/archived journals** (`journal.<first>`): the storage check reads the
   live `journal` file. Search indexes are rebuilt after restore.
 - **The advisory PostgreSQL LSN.** It is recorded, not compared.
+- **The drill harnesses on this machine.** `scripts/verify-m4.py` and
+  `scripts/verify-offhost-backup.py` drive these commands, but they require a
+  Linux host with Docker: their backup host and `sshd` live in containers and
+  must share the host's loopback, which Docker Desktop does not. They have not
+  run to completion on this machine, so their `backup`/`restore` assertions are
+  not proven here; run both on a Linux Docker host before treating them as
+  evidence.
 
 The manual `pg_dump` / `tar` / `SHA256SUMS` / `rsync` procedure in older
 releases did not fence writers. Do not combine it with these commands; use
