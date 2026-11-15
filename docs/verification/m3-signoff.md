@@ -88,8 +88,10 @@ both refs and refuses the intent unless they still equal the recorded values
 the merge candidate from exactly those two commits under the repository lock
 (`merge.rs:560–593`), and moves the ref with a compare-and-swap on the expected
 target (`merge.rs:637`). The content that is merged is therefore the candidate
-for the recorded target and head, and a moved target or source goes stale instead
-of merging something else.
+for the recorded target and head. A moved ref never merges something else, but
+the two cases differ: a direct merge whose target moved goes stale, while a
+queued entry is re-targeted to the current tip and revalidated before it merges
+(`merge.rs:370–383`); a moved source goes stale in both cases (`merge.rs:408–416`).
 
 What is not bound is the **decision** to that candidate. The mergeability check
 that lets the merge through builds a candidate of its own at intent creation and
@@ -101,24 +103,26 @@ digest is computed at the source head, never over the merged tree. A merge
 decision names the source and target revisions; it does not name the candidate
 commit it will produce or the tree the required checks ran against.
 
-The lab round-4 record is the operational face of this gap. One merge request
-failed `500 storage operation failed` on a git read, with no intent row left
-behind (`lab-m4/round-4/05-regression.md`, O1), and the log kept only
-`category=git` and the repository id, so neither the failed read nor the
-`StorageError` variant could be recovered; the same merge then succeeded on
-retry. Because the decision is bound to revisions and not to a candidate, that
-failure left no record of which candidate was under consideration or of what
-failed to build it. It is evidence for this gap, not a second defect in the merge
-path: the retry re-derived the same revisions and merged, and the target binding
-above was never wrong.
+The lab round-4 record touches this gap operationally, though it cannot pin the
+link. One merge request failed `500 storage operation failed` on a git read, with
+no intent row left behind (`lab-m4/round-4/05-regression.md`, O1), and the log
+kept only `category=git` and the repository id, so neither the failed read nor
+the `StorageError` variant could be recovered; the same merge then succeeded on
+retry. Because the decision is bound to revisions and not to a candidate, a
+failure at that point leaves no record of which candidate was under
+consideration; but the record cannot establish that the read which failed was the
+candidate build, so the event is consistent with the gap rather than proof of it.
+It is not a second defect in the merge path either: the retry re-derived the same
+revisions and merged, and the target binding above was never wrong.
 
 This is a real gap against the promise, not a documentation ambiguity. The
 delivered behavior is retained and M3 remains signed off over it; the missing
 candidate test is scheduled as M6's "tested merge candidates" build item (M6
 increment 9C, exit case U39 in the
-[two-person roadmap](../plan/08-two-person-roadmap.md#phase-9--m6-isolated-ci)),
-which also owns the merge-error investigation. Until it ships, no document may
-repeat "the queue tests the candidate it merges".
+[two-person roadmap](../plan/08-two-person-roadmap.md#phase-9--m6-isolated-ci)).
+The merge-error investigation is not part of that item: the roadmap carries it
+in M4.1's 6.4 operations-acceptance row. Until the candidate test ships, no
+document may repeat "the queue tests the candidate it merges".
 
 ## Sign-off
 

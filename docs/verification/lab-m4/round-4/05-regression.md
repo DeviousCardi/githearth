@@ -106,11 +106,15 @@ exploratory tester saw the same single event in the shared server log at 09:43:4
 two observers and one occurrence.
 
 What cannot be established: the log records only `category=git` and the repository, not the
-`StorageError` variant or which read failed. On this path the candidates are the branch-tip
-reads for head and base (`pulls::branch_tip`) and the mergeability candidate build
-(`mergeability::check_method` → `git::build_candidate`); all map their errors through
-`browse::map_storage_error`, so the record cannot say which one failed or why. Logging the
-error kind (without paths) would make a recurrence diagnosable.
+`StorageError` variant or which read failed. The reads on this path that map their errors
+through `browse::map_storage_error` include the branch-tip reads for head and base
+(`pulls::branch_tip`), the mergeability candidate build (`mergeability::check_method` →
+`git::build_candidate`), the CODEOWNERS and changed-file read (`codeowners::review` →
+`codeowners::load`), and the fast-forward candidate build the `ff_only` method needs
+(`mergeability::is_fast_forwardable`); because they all log the same line, the record cannot
+say which one failed or why. Logging the `StorageError` variant (without paths) would make a
+recurrence diagnosable as to the variant; naming the read that failed would also need an
+operation label on that log line.
 
 What is excluded: the exploratory report's hypothesis that the repository was being deleted
 while the merge ran. The immediate retry merged on the same repository, and the suite has no
