@@ -60,12 +60,20 @@ fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found")
 }
 
+/// A malformed path parameter (a NUL byte from `%00`, which PostgreSQL text
+/// cannot hold). Shared so the team and invitation routes refuse it exactly as
+/// the membership routes do.
+pub(crate) fn invalid_param() -> ApiError {
+    invalid()
+}
+
 fn not_permitted() -> ApiError {
     ApiError(StatusCode::FORBIDDEN, "not permitted")
 }
 
-/// The last owner cannot be removed, leave or be demoted.
-fn last_owner() -> ApiError {
+/// The last owner cannot be removed, leave or be demoted. Teams share the
+/// rule, so the refusal is one function.
+pub(crate) fn last_owner() -> ApiError {
     ApiError(
         StatusCode::CONFLICT,
         "the organization must keep at least one owner",
@@ -189,8 +197,12 @@ async fn load_manage(
 
 /// Lock the organization for the rest of the transaction. Every membership
 /// mutation takes this lock first, which serializes role changes, removals and
-/// leaves within one organization so the last-owner check cannot race.
-async fn lock_organization(conn: &mut PgConnection, org_id: Uuid) -> Result<(), sqlx::Error> {
+/// leaves within one organization so the last-owner check cannot race. Team
+/// mutations that can remove an owner team's grant take the same lock.
+pub(crate) async fn lock_organization(
+    conn: &mut PgConnection,
+    org_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT 1 FROM organizations WHERE id = $1 FOR NO KEY UPDATE")
         .bind(org_id)
         .execute(conn)
@@ -202,7 +214,11 @@ async fn lock_organization(conn: &mut PgConnection, org_id: Uuid) -> Result<(), 
 /// after the organization lock. The facts `load` captured before the lock may
 /// be stale: an owner demoted or removed while this request waited must lose
 /// the ability to finish the mutation it already passed the outer check for.
-async fn reauthorize(conn: &mut PgConnection, loaded: &Loaded) -> Result<Loaded, ApiError> {
+/// The team and invitation mutations re-authorize the same way.
+pub(crate) async fn reauthorize(
+    conn: &mut PgConnection,
+    loaded: &Loaded,
+) -> Result<Loaded, ApiError> {
     let Some(facts) = facts::load_in_transaction(conn, loaded.account.id, loaded.org_id).await?
     else {
         return Err(not_found());
@@ -287,6 +303,41 @@ async fn owner_count(conn: &mut PgConnection, org_id: Uuid) -> Result<i64, sqlx:
          AND (expires_at IS NULL OR expires_at > clock_timestamp())",
     )
     .bind(org_id)
+    .fetch_one(conn)
+    .await
+}
+
+/// Owner grants a live member can actually exercise, excluding `excluded`:
+/// an account grant whose subject is still a member, or a team grant with at
+/// least one team member who is still a member of the organization. A team
+/// grant with no members is not a reachable owner, so removing the last path
+/// to it would leave the organization ownerless even though the grant row is
+/// still active.
+pub(crate) async fn reachable_owner_count(
+    conn: &mut PgConnection,
+    org_id: Uuid,
+    excluded: Uuid,
+) -> Result<i64, sqlx::Error> {
+    // A quick total keeps the common case (no owners at all) cheap; the
+    // reachable count below is the rule.
+    if owner_count(&mut *conn, org_id).await? == 0 {
+        return Ok(0);
+    }
+    sqlx::query_scalar(
+        "SELECT count(*) FROM grants g \
+         WHERE g.scope_kind = 'organization' AND g.scope_id = $1 AND g.role = 'owner' \
+         AND g.repository_id IS NULL AND g.revoked_at IS NULL \
+         AND (g.expires_at IS NULL OR g.expires_at > clock_timestamp()) \
+         AND ((g.subject_kind = 'account' AND g.subject_id <> $2 \
+               AND EXISTS (SELECT 1 FROM memberships m \
+                           WHERE m.organization_id = $1 AND m.account_id = g.subject_id)) \
+           OR (g.subject_kind = 'team' AND EXISTS ( \
+                 SELECT 1 FROM team_members tm JOIN memberships m \
+                   ON m.organization_id = $1 AND m.account_id = tm.account_id \
+                 WHERE tm.team_id = g.subject_id AND tm.account_id <> $2)))",
+    )
+    .bind(org_id)
+    .bind(excluded)
     .fetch_one(conn)
     .await
 }
@@ -629,7 +680,10 @@ pub(crate) async fn set_role(
                 return Ok((status, body));
             }
             let event_kind = if current == "owner" {
-                if owner_count(&mut tx, loaded.org_id).await? <= 1 {
+                // A demotion must leave at least one owner a live member can
+                // actually exercise, not merely one grant row: a team grant
+                // with no members is not an owner.
+                if reachable_owner_count(&mut tx, loaded.org_id, account_id).await? == 0 {
                     return Err(last_owner());
                 }
                 "organization.member_demoted"
@@ -722,7 +776,11 @@ pub(crate) async fn remove(
             let current = locked_role(&mut tx, loaded.org_id, account_id)
                 .await?
                 .ok_or_else(no_such_member)?;
-            if current == "owner" && owner_count(&mut tx, loaded.org_id).await? <= 1 {
+            // Removing the membership also removes every team membership the
+            // account holds, so even a plain member can be the last reachable
+            // route to a team's owner grant. Refuse whenever the removal would
+            // leave no owner a live member can exercise.
+            if reachable_owner_count(&mut tx, loaded.org_id, account_id).await? == 0 {
                 return Err(last_owner());
             }
             // Every path that admits the account reads the membership or a

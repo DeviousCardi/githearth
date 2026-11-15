@@ -72,6 +72,11 @@ actions! {
     OrganizationSuspend => "organization.suspend", sensitive,
     OrganizationUnsuspend => "organization.unsuspend", sensitive,
     TeamCreate => "team.create", sensitive,
+    TeamUpdate => "team.update", sensitive,
+    TeamDelete => "team.delete", sensitive,
+    InvitationRead => "invitation.read", routine,
+    InvitationCreate => "invitation.create", sensitive,
+    InvitationRevoke => "invitation.revoke", sensitive,
     RepositoryCreate => "repository.create", routine,
     RepositoryRead => "repository.read", routine,
     RepositoryClone => "repository.clone", routine,
@@ -122,6 +127,11 @@ impl Action {
             | OrganizationSuspend
             | OrganizationUnsuspend
             | TeamCreate
+            | TeamUpdate
+            | TeamDelete
+            | InvitationRead
+            | InvitationCreate
+            | InvitationRevoke
             | RepositoryCreate => Kind::Organization,
             RepositoryRead
             | RepositoryClone

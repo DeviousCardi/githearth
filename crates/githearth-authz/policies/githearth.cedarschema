@@ -118,6 +118,36 @@ namespace GitHearth {
       resource: Organization,
       context: Auth,
     };
+  action "team.update" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "team.delete" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "invitation.read" in ["owner"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "invitation.create" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
+  action "invitation.revoke" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Organization,
+      context: Auth,
+    };
   action "organization.suspend" in ["site_admin", "sensitive"]
     appliesTo {
       principal: [Account, Anonymous],

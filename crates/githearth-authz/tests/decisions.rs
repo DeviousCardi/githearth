@@ -269,6 +269,11 @@ impl Site<'_> {
             | OrganizationSuspend
             | OrganizationUnsuspend
             | TeamCreate
+            | TeamUpdate
+            | TeamDelete
+            | InvitationRead
+            | InvitationCreate
+            | InvitationRevoke
             | RepositoryCreate => Resource::Organization,
             RepositoryRead
             | RepositoryClone
@@ -357,6 +362,14 @@ fn decision_table() {
         ("member reads org", (Principal::Account(&w.member), OrganizationRead, &w.acme, Resource::Organization, None), true),
         ("member creates repo", (Principal::Account(&w.member), RepositoryCreate, &w.acme, Resource::Organization, None), true),
         ("member cannot manage members", (Principal::Account(&w.member), OrganizationManageMembers, &w.acme, Resource::Organization, None), false),
+        ("owner updates a team", (Principal::Account(&w.owner), TeamUpdate, &w.acme, Resource::Organization, None), true),
+        ("owner deletes a team", (Principal::Account(&w.owner), TeamDelete, &w.acme, Resource::Organization, None), true),
+        ("member cannot update a team", (Principal::Account(&w.member), TeamUpdate, &w.acme, Resource::Organization, None), false),
+        // The grant path asks for `team.update`, so a caller who may edit a team
+        // may grant; deleting the team and revoking its grants are `team.delete`.
+        // No built-in separates them; the custom-role test below does.
+        ("member cannot grant a team access", (Principal::Account(&w.member), TeamUpdate, &w.acme, Resource::Organization, None), false),
+        ("member cannot delete a team", (Principal::Account(&w.member), TeamDelete, &w.acme, Resource::Organization, None), false),
         ("outsider cannot read org", (Principal::Account(&w.outsider), OrganizationRead, &w.acme, Resource::Organization, None), false),
         ("collaborator cannot read org", (Principal::Account(&w.collaborator), OrganizationRead, &w.acme, Resource::Organization, None), false),
         ("owner role does not cross orgs", (Principal::Account(&w.outsider), RepositoryRead, &w.acme, Resource::Repository(&w.private), None), false),
@@ -595,6 +608,49 @@ fn hostile_custom_role_cannot_override_built_in_forbids() {
         None,
     );
     assert!(d.is_allowed(), "{d:?}");
+}
+
+/// The grant add path asks for `team.update`, not `team.delete`: a custom role
+/// that may edit a team may grant, but must not be able to delete the team or
+/// revoke its grants. This pins the action split the API and page rely on.
+/// `teams.rs::a_team_update_only_role_may_grant_but_not_delete_or_revoke` pins
+/// the handler side (that `add_grant` asks for `team.update`); this pins the
+/// engine side, that `team.delete` does not follow from `team.update`.
+#[test]
+fn team_update_may_grant_but_not_delete() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .add_custom_role(
+            "team_editor",
+            r#"permit (principal in ?principal, action == GitHearth::Action::"team.update", resource in ?resource);"#,
+        )
+        .unwrap();
+    let w = World::new();
+    let who = account(&[w.acme.id], &[]);
+    let grants = [Grant {
+        role: Role::Custom("team_editor".into()),
+        subject: Subject::Account(who.id),
+        scope: Scope::Organization(w.acme.id),
+    }];
+    let decide = |action: Action| {
+        engine.authorize(&Request {
+            principal: Principal::Account(&who),
+            teams: &[],
+            grants: &grants,
+            action,
+            organization: &w.acme,
+            resource: Resource::Organization,
+            merge: None,
+            auth_age: Some(Duration::ZERO),
+            read_only: false,
+        })
+    };
+    let update = decide(Action::TeamUpdate);
+    assert!(update.is_allowed(), "{update:?}");
+    for action in [Action::TeamDelete, Action::TeamCreate] {
+        let denied = decide(action);
+        assert!(!denied.is_allowed(), "{action:?}: {denied:?}");
+    }
 }
 
 #[test]

@@ -17,6 +17,8 @@ pub mod git_hooks;
 pub mod git_http;
 pub mod housekeeping;
 pub mod idempotency;
+pub mod invitations;
+mod invitations_ui;
 pub mod issues;
 mod issues_ui;
 pub mod jobs;
@@ -44,6 +46,8 @@ pub mod ssh_keys;
 pub mod statuses;
 pub mod tag_protection;
 mod tag_protection_ui;
+pub mod teams;
+mod teams_ui;
 mod tokens;
 pub mod ui;
 
@@ -299,6 +303,14 @@ pub fn router(state: AppState) -> Router {
     let json = Router::new()
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(ready))
+        // The team and invitation API and pages. They are merged deliberately,
+        // not appended as empty nested routers: axum 0.8 routes by path shape
+        // and method, so each route below is registered like every other one.
+        .merge(teams::router())
+        .merge(invitations::router())
+        .merge(teams_ui::router())
+        .merge(invitations_ui::router())
+        .merge(invitations_ui::accept_router())
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/me", get(me))
