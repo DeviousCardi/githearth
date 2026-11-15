@@ -60,15 +60,19 @@ async fn authorize(
     let Some(facts) = facts::load(&mut conn, account_id, org_id).await? else {
         return Err(does_not_exist());
     };
-    if !state
-        .authz
-        .authorize(&facts.request(
-            Action::OrganizationUpdate,
-            Resource::Organization,
-            Some(Duration::from_secs(auth_age)),
-        ))
-        .is_allowed()
-    {
+    let request = facts.request(
+        Action::OrganizationUpdate,
+        Resource::Organization,
+        Some(Duration::from_secs(auth_age)),
+    );
+    let decision = state.authz.authorize(&request);
+    if !decision.is_allowed() {
+        // Reading audit is gated on a sensitive action, so a stale owner is
+        // told to re-authenticate rather than that the log does not exist. A
+        // caller the action would refuse even when fresh keeps its 403/404.
+        if decision.denied_for_fresh_auth() && state.authz.allows_if_fresh(&request) {
+            return Err(crate::reauthentication_required());
+        }
         if state
             .authz
             .authorize(&facts.request(

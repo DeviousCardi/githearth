@@ -719,6 +719,18 @@ struct ReauthenticateForm {
     return_to: String,
 }
 
+/// Where the prompt may send the browser after a successful re-authentication:
+/// a same-origin page this installation serves, and nothing else, so the prompt
+/// cannot become an open redirect.
+fn safe_return(path: &str) -> Option<&str> {
+    let known = path == "/admin/accounts" || path == "/settings";
+    let organization_page = path.starts_with("/organizations/")
+        && !path.contains("//")
+        && !path.contains('\\')
+        && !path.chars().any(|c| c.is_whitespace() || c.is_control());
+    (known || organization_page).then_some(path)
+}
+
 async fn reauthenticate_submit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -726,11 +738,7 @@ async fn reauthenticate_submit(
 ) -> Result<Response, ui::UiError> {
     let s = form_session(&state, &headers, &form.csrf_token).await?;
     let token_hash = ui::browser_token_hash(&headers).ok_or_else(ui::auth_required)?;
-    let destination = if form.return_to == "/admin/accounts" {
-        "/admin/accounts"
-    } else {
-        "/settings"
-    };
+    let destination = safe_return(&form.return_to).unwrap_or("/settings");
     match crate::account_admin::reauthenticate_session(
         &state,
         &s.account,

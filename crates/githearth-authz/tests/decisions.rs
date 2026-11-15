@@ -5,9 +5,9 @@
 use std::time::Duration;
 
 use githearth_authz::{
-    Account, Action, BuiltinRole, Decision, Engine, Grant, Issue, Merge, Organization, Principal,
-    Protection, PullRequest, Ref, Repository, Request, Resource, Role, Scope, Subject, Team,
-    Visibility,
+    Account, Action, BuiltinRole, Decision, Engine, FRESH_AUTH_FORBID, Grant, Issue, Merge,
+    Organization, Principal, Protection, PullRequest, Ref, Repository, Request, Resource, Role,
+    Scope, Subject, Team, Visibility,
 };
 use uuid::Uuid;
 
@@ -1017,56 +1017,88 @@ fn rust_sensitivity_matches_the_schema_sensitive_group() {
 fn sensitive_actions_require_fresh_authentication() {
     let engine = Engine::new().unwrap();
     let w = World::new();
-    let fresh = |engine: &Engine, age: Option<Duration>| -> Decision {
-        engine.authorize(&Request {
-            principal: Principal::Account(&w.owner),
-            teams: &[],
-            grants: &[grant(
-                BuiltinRole::Owner,
-                Subject::Account(w.owner.id),
-                Scope::Organization(w.acme.id),
-            )],
-            action: Action::OrganizationUpdate,
-            organization: &w.acme,
-            resource: Resource::Organization,
-            merge: None,
-            auth_age: age,
-            read_only: false,
-        })
+    let grants = [grant(
+        BuiltinRole::Owner,
+        Subject::Account(w.owner.id),
+        Scope::Organization(w.acme.id),
+    )];
+    let owner = |action: Action, age: Option<Duration>| Request {
+        principal: Principal::Account(&w.owner),
+        teams: &[],
+        grants: &grants,
+        action,
+        organization: &w.acme,
+        resource: Resource::Organization,
+        merge: None,
+        auth_age: age,
+        read_only: false,
     };
-    assert!(fresh(&engine, Some(Duration::from_secs(60))).is_allowed());
-    assert_eq!(
-        fresh(&engine, Some(Duration::from_secs(16 * 60))),
-        Decision::Deny(vec!["sensitive-requires-fresh-auth".into()])
+
+    let current = owner(Action::OrganizationUpdate, Some(Duration::from_secs(60)));
+    assert!(engine.authorize(&current).is_allowed());
+    assert!(!engine.authorize(&current).denied_for_fresh_auth());
+
+    let stale = owner(
+        Action::OrganizationUpdate,
+        Some(Duration::from_secs(16 * 60)),
     );
+    assert_eq!(
+        engine.authorize(&stale),
+        Decision::Deny(vec![FRESH_AUTH_FORBID.into()])
+    );
+    // The decision names the freshness policy, and a fresh password would
+    // allow the action, so a surface may prompt for re-authentication.
+    assert!(engine.authorize(&stale).denied_for_fresh_auth());
+    assert!(engine.allows_if_fresh(&stale));
+
     // Unknown recency counts as stale.
+    let unknown = owner(Action::OrganizationUpdate, None);
     assert_eq!(
-        fresh(&engine, None),
-        Decision::Deny(vec!["sensitive-requires-fresh-auth".into()])
+        engine.authorize(&unknown),
+        Decision::Deny(vec![FRESH_AUTH_FORBID.into()])
     );
+    assert!(engine.allows_if_fresh(&unknown));
+
     let longer = Engine::new()
         .unwrap()
         .with_fresh_auth(Duration::from_secs(60 * 60));
-    assert!(fresh(&longer, Some(Duration::from_secs(30 * 60))).is_allowed());
-    // Saturating beyond `Long` denies without panicking.
-    assert!(!fresh(&engine, Some(Duration::MAX)).is_allowed());
+    assert!(
+        longer
+            .authorize(&owner(
+                Action::OrganizationUpdate,
+                Some(Duration::from_secs(30 * 60)),
+            ))
+            .is_allowed()
+    );
+    // Saturating beyond `Long` denies without panicking; a password would fix it.
+    let saturated = owner(Action::OrganizationUpdate, Some(Duration::MAX));
+    assert!(!engine.authorize(&saturated).is_allowed());
+    assert!(engine.allows_if_fresh(&saturated));
+
     // Non-sensitive actions stay available without any recency.
-    let d = engine.authorize(&Request {
-        principal: Principal::Account(&w.owner),
+    let d = engine.authorize(&owner(Action::OrganizationRead, None));
+    assert!(d.is_allowed(), "{d:?}");
+
+    // A caller without the grant is denied for *two* reasons at once: the
+    // freshness forbid fires for anyone stale, and no permit applies. The
+    // engine's fresh counterfactual is false, so a surface must keep the
+    // ordinary refusal instead of prompting for a password that cannot help.
+    let no_grants: [Grant; 0] = [];
+    let no_grant = Request {
+        principal: Principal::Account(&w.member),
         teams: &[],
-        grants: &[grant(
-            BuiltinRole::Owner,
-            Subject::Account(w.owner.id),
-            Scope::Organization(w.acme.id),
-        )],
-        action: Action::OrganizationRead,
+        grants: &no_grants,
+        action: Action::OrganizationUpdate,
         organization: &w.acme,
         resource: Resource::Organization,
         merge: None,
         auth_age: None,
         read_only: false,
-    });
-    assert!(d.is_allowed(), "{d:?}");
+    };
+    let d = engine.authorize(&no_grant);
+    assert!(!d.is_allowed(), "{d:?}");
+    assert!(d.denied_for_fresh_auth(), "{d:?}");
+    assert!(!engine.allows_if_fresh(&no_grant), "{d:?}");
 }
 
 /// Role templates are cumulative: every higher role permits every action a

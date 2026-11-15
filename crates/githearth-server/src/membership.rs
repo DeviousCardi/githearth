@@ -110,29 +110,54 @@ pub(crate) struct Loaded {
 }
 
 impl Loaded {
+    /// The engine request for an organization action with the caller's loaded
+    /// facts and request-time authentication age.
+    fn request(&self, action: Action) -> githearth_authz::Request<'_> {
+        self.facts.request(
+            action,
+            Resource::Organization,
+            Some(Duration::from_secs(self.auth_age)),
+        )
+    }
+
+    /// The engine's decision for an organization action.
+    fn decision(&self, state: &AppState, action: Action) -> githearth_authz::Decision {
+        state.authz.authorize(&self.request(action))
+    }
+
+    /// Whether a fresh password would allow `action` for this caller.
+    fn allows_if_fresh(&self, state: &AppState, action: Action) -> bool {
+        state.authz.allows_if_fresh(&self.request(action))
+    }
+
+    /// Require an organization action. A denial the engine attributes to the
+    /// freshness forbid keeps the re-authentication envelope so a stale caller
+    /// can be prompted; every other denial is the masked refusal this module
+    /// already used (403 for a reader, 404 for a stranger). The engine is also
+    /// asked whether a fresh password would allow the action, because the
+    /// forbid fires for a caller without the grant too.
+    pub(crate) fn require(&self, state: &AppState, action: Action) -> Result<(), ApiError> {
+        let request = self.request(action);
+        let decision = state.authz.authorize(&request);
+        if decision.is_allowed() {
+            Ok(())
+        } else if decision.denied_for_fresh_auth() && state.authz.allows_if_fresh(&request) {
+            Err(crate::reauthentication_required())
+        } else {
+            Err(self.refuse(state))
+        }
+    }
+
     /// Whether the caller may administer membership: the owner-only, sensitive
     /// `organization.manage_members` action.
     pub(crate) fn may_manage(&self, state: &AppState) -> bool {
-        state
-            .authz
-            .authorize(&self.facts.request(
-                Action::OrganizationManageMembers,
-                Resource::Organization,
-                Some(Duration::from_secs(self.auth_age)),
-            ))
+        self.decision(state, Action::OrganizationManageMembers)
             .is_allowed()
     }
 
     /// Whether the caller may read the organization at all.
     fn may_read(&self, state: &AppState) -> bool {
-        state
-            .authz
-            .authorize(&self.facts.request(
-                Action::OrganizationRead,
-                Resource::Organization,
-                Some(Duration::from_secs(self.auth_age)),
-            ))
-            .is_allowed()
+        self.decision(state, Action::OrganizationRead).is_allowed()
     }
 
     /// Whether the caller may act on `username`: a membership administrator,
@@ -189,9 +214,7 @@ async fn load_manage(
 ) -> Result<Loaded, ApiError> {
     let (account, auth_age) = authenticate(&state.pool, headers).await?;
     let loaded = load(state, account, auth_age, org_slug).await?;
-    if !loaded.may_manage(state) {
-        return Err(loaded.refuse(state));
-    }
+    loaded.require(state, Action::OrganizationManageMembers)?;
     Ok(loaded)
 }
 
@@ -500,9 +523,7 @@ pub(crate) async fn add(
     body: &[u8],
     key: Option<&str>,
 ) -> Result<MemberJson, ApiError> {
-    if !loaded.may_manage(state) {
-        return Err(loaded.refuse(state));
-    }
+    loaded.require(state, Action::OrganizationManageMembers)?;
     let input: AddMember = serde_json::from_slice(body).map_err(|_| invalid())?;
     if !valid_username(&input.username) || !ROLES.contains(&input.role.as_str()) {
         return Err(invalid());
@@ -523,9 +544,7 @@ pub(crate) async fn add(
             // do: an owner demoted or removed while this add waited must not
             // finish it with the authority it held before the lock.
             let loaded = reauthorize(&mut tx, loaded).await?;
-            if !loaded.may_manage(state) {
-                return Err(loaded.refuse(state));
-            }
+            loaded.require(state, Action::OrganizationManageMembers)?;
             let account_id: Option<Uuid> =
                 sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
                     .bind(&input.username)
@@ -614,6 +633,14 @@ async fn require_target(
     allow_self: bool,
 ) -> Result<Uuid, ApiError> {
     if !loaded.may_change(state, username, allow_self) {
+        // Leaving is not the sensitive `manage_members` action, so only the
+        // administration branch can be a freshness denial. Preserve it, and
+        // only for a caller acting on someone else.
+        if !(allow_self && username == loaded.account.username)
+            && loaded.allows_if_fresh(state, Action::OrganizationManageMembers)
+        {
+            return Err(crate::reauthentication_required());
+        }
         return Err(loaded.refuse(state));
     }
     // A NUL byte cannot be bound as PostgreSQL text and is not a valid path

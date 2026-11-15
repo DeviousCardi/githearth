@@ -521,6 +521,45 @@ pub(crate) fn forbidden_page() -> UiError {
     ))
 }
 
+/// The prompt a browser shows when the engine refused a sensitive action
+/// because the session is older than the fresh-authentication window. The
+/// submitted password refreshes `sessions.authenticated_at` and the settings
+/// handler returns to `return_to`, so the operator can repeat the action.
+pub(crate) fn reauthentication_page(
+    username: Option<&str>,
+    is_admin: bool,
+    csrf: &str,
+    fresh_auth: Duration,
+    return_to: &str,
+) -> UiError {
+    let minutes = fresh_auth_minutes(fresh_auth);
+    let body = format!(
+        "<h1>Confirm your password</h1>\
+<p role=\"alert\">Reauthentication required. This action needs a password entry in the last {minutes} minutes.</p>\
+<form class=\"card\" method=\"post\" action=\"/settings/reauthenticate\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+<input type=\"hidden\" name=\"return_to\" value=\"{back}\">\
+<label for=\"reauth_password\">Password</label>\
+<input id=\"reauth_password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required>\
+<p><button type=\"submit\">Confirm password</button></p></form>",
+        csrf = esc(csrf),
+        back = esc(return_to),
+    );
+    UiError(Box::new(
+        (
+            StatusCode::FORBIDDEN,
+            Html(render_page(
+                "Confirm your password",
+                username,
+                Some(csrf),
+                is_admin,
+                &body,
+            )),
+        )
+            .into_response(),
+    ))
+}
+
 /// The friendly message a browser form should show when its submit ran into
 /// the idempotency layer: 409 (the same key is still running) or 422 (the same
 /// key was already used with a different body). Any other error is `None`, and
@@ -1444,6 +1483,17 @@ async fn restore_submit(
             &name,
         )
         .await),
+        Err(e) if e.message() == "reauthentication required" => Err(reauthentication_page(
+            Some(&account.username),
+            account.is_admin,
+            &csrf_expected(&token_hash),
+            state.fresh_auth(),
+            &format!(
+                "/organizations/{}/repositories/{}",
+                url_encode(&slug),
+                url_encode(&name)
+            ),
+        )),
         Err(e) => {
             let back = format!(
                 "<p><a href=\"/organizations/{}/repositories/{}\">Back to repository</a></p>",

@@ -1,6 +1,6 @@
 //! M4.1 U22: the fresh-authentication agreement test.
 //!
-//! Three tests pin the decision recorded on 2026-11-15 in ADRs 0002 and 0003:
+//! Five tests pin the decision recorded on 2026-11-15 in ADRs 0002 and 0003:
 //!
 //! 1. `git_transports_agree_on_force_push_and_delete` drives the same force
 //!    push and the same branch deletion over Git HTTP (a personal access
@@ -14,9 +14,15 @@
 //!    the browser UI: the sensitive action is refused with the re-authentication
 //!    prompt and succeeds after the password is presented.
 //! 3. `fresh_auth_exception_is_scoped_to_git` keeps the same stale session and
-//!    shows the account's API call is still refused while its Git token may
-//!    force push and delete, so the exception belongs to the transport, not to
-//!    the account.
+//!    shows the account's API call is still refused with the re-authentication
+//!    envelope while its Git token may force push and delete, so the exception
+//!    belongs to the transport, not to the account.
+//! 4. `every_sensitive_surface_returns_the_reauthentication_envelope` asks
+//!    every API and page surface that refuses a `sensitive` action, so the fix
+//!    is not shaped around `repository.archive`.
+//! 5. `a_grantless_or_routine_caller_does_not_get_a_reauthentication_prompt`
+//!    keeps the ordinary 403/404 for a caller without the grant and leaves a
+//!    non-sensitive action available to a stale session.
 //!
 //! Staleness is deterministic: the fixture builds the authorization engine with
 //! `Engine::with_fresh_auth` and ages `sessions.authenticated_at` in SQL. No
@@ -227,6 +233,22 @@ async fn member(pool: &PgPool, org_id: Uuid, repo_id: Uuid, role: Option<&str>) 
             .unwrap();
     }
     (account, username)
+}
+
+/// An organization-scope grant, enough to read the organization without
+/// holding any repository or administration grant.
+async fn org_grant(pool: &PgPool, org_id: Uuid, account: Uuid, role: &str) {
+    sqlx::query(
+        "INSERT INTO grants (id,role,subject_kind,subject_id,scope_kind,scope_id,granted_by) \
+         VALUES ($1,$2,'account',$3,'organization',$4,$3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(role)
+    .bind(account)
+    .bind(org_id)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn add_protection_rule(pool: &PgPool, repo_id: Uuid, created_by: Uuid) {
@@ -1010,16 +1032,40 @@ async fn fresh_auth_exception_is_scoped_to_git() {
         send(&f.app, json_request("POST", &archive, Some(&session), None)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     let denial: serde_json::Value = serde_json::from_str(&body).unwrap();
-    // `repository.archive` returns the generic refusal rather than the
-    // `reauthentication required` envelope (only account administration maps a
-    // freshness denial to the prompt); either way the stale session is refused.
-    assert!(
-        matches!(
-            denial["error"].as_str(),
-            Some("reauthentication required" | "not permitted")
+    // The owner holds `repository.archive`; only freshness is missing, so the
+    // denial names re-authentication instead of the generic refusal.
+    assert_eq!(denial["error"], "reauthentication required", "{body}");
+    assert_eq!(denial["reason"], "sensitive", "{body}");
+
+    // A second sensitive action on a different surface (membership, not the
+    // repository API) carries the same envelope, so the refusal is not shaped
+    // around one route.
+    let (target_id, target_name) = insert_account(&f.pool, false).await;
+    let add_member = format!("/api/v1/organizations/{org_slug}/members");
+    let (status, _, body) = send(
+        &f.app,
+        json_request(
+            "POST",
+            &add_member,
+            Some(&session),
+            Some(serde_json::json!({"username": target_name, "role": "member"})),
         ),
-        "{body}"
-    );
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let denial: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(denial["error"], "reauthentication required", "{body}");
+    assert_eq!(denial["reason"], "sensitive", "{body}");
+    // The refused add did not create the membership.
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM memberships WHERE organization_id = $1 AND account_id = $2)",
+    )
+    .bind(org_id)
+    .bind(target_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(!is_member);
 
     // The same account's Git token may still force push and delete, proving the
     // exception belongs to the Git transports rather than to the account.
@@ -1055,6 +1101,345 @@ async fn fresh_auth_exception_is_scoped_to_git() {
             .0,
         StatusCode::OK
     );
+    assert_eq!(
+        send(
+            &f.app,
+            json_request(
+                "POST",
+                &add_member,
+                Some(&session),
+                Some(serde_json::json!({"username": target_name, "role": "member"})),
+            )
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+
+    f.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: every sensitive surface keeps the freshness denial
+// ---------------------------------------------------------------------------
+
+/// One stale owner, one envelope, every surface that refuses a `sensitive`
+/// action: the repository API (archive, delete, transfer, restore),
+/// membership, teams, invitations and the audit read (gated on
+/// `organization.update`). Each refusal must name re-authentication, the
+/// browser membership page must show the same prompt, and none may change a
+/// row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn every_sensitive_surface_returns_the_reauthentication_envelope() {
+    let f = Fixture::new(WINDOW).await;
+    let (owner_id, owner_name) = insert_account(&f.pool, false).await;
+    let (org_id, org_slug) = fixture_organization(&f.pool, owner_id).await;
+    let (repo_id, repo_name) = create_active_repo(&f.pool, org_id, owner_id).await;
+    let (_target_id, target_name) = insert_account(&f.pool, false).await;
+    let (_target_org_id, target_org_slug) = fixture_organization(&f.pool, owner_id).await;
+    let deleted_id = Uuid::new_v4();
+    let deleted_name = tag("fa-deleted");
+    sqlx::query(
+        "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+         VALUES ($1,$2,$3,$4,$5,'deleted','private')",
+    )
+    .bind(deleted_id)
+    .bind(org_id)
+    .bind(&deleted_name)
+    .bind(owner_id)
+    .bind(Uuid::new_v4())
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let session = login(&f, &owner_name).await;
+    let age = age_sessions(&f.pool, owner_id, AGE_SECONDS).await;
+    assert!(age > WINDOW.as_secs() as i64, "session age {age}s");
+
+    let archive = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/archive");
+    let delete = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}");
+    let transfer = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/transfer");
+    let restore = format!("/api/v1/organizations/{org_slug}/repositories/{deleted_name}/restore");
+    let members = format!("/api/v1/organizations/{org_slug}/members");
+    let teams = format!("/api/v1/organizations/{org_slug}/teams");
+    let invitations = format!("/api/v1/organizations/{org_slug}/invitations");
+    let audit = format!("/api/v1/organizations/{org_slug}/audit");
+    let cases = [
+        ("POST", archive.as_str(), None),
+        (
+            "POST",
+            members.as_str(),
+            Some(serde_json::json!({"username": target_name, "role": "member"})),
+        ),
+        (
+            "POST",
+            teams.as_str(),
+            Some(serde_json::json!({"slug": tag("fa-team"), "name": "Fresh Auth Team"})),
+        ),
+        (
+            "POST",
+            invitations.as_str(),
+            Some(serde_json::json!({"email": "invite@example.com", "role": "member"})),
+        ),
+        ("GET", audit.as_str(), None),
+        (
+            "POST",
+            transfer.as_str(),
+            Some(
+                serde_json::json!({"organization": target_org_slug, "fork_pull_requests": "refuse"}),
+            ),
+        ),
+        ("POST", restore.as_str(), None),
+        ("DELETE", delete.as_str(), None),
+    ];
+    for (method, path, body) in cases {
+        let (status, _, body) =
+            send(&f.app, json_request(method, path, Some(&session), body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        let denial: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            denial["error"], "reauthentication required",
+            "{method} {path}: {body}"
+        );
+        assert_eq!(denial["reason"], "sensitive", "{method} {path}: {body}");
+    }
+
+    // The browser keeps the same reason: the members, teams and transfer pages
+    // show the password prompt instead of a bare 403.
+    let cookie = format!("githearth_session={session}");
+    let members_page = format!("/organizations/{org_slug}/members");
+    let teams_page = format!("/organizations/{org_slug}/teams");
+    let transfer_page = format!("/organizations/{org_slug}/repositories/{repo_name}/transfer");
+    for page_path in [&members_page, &teams_page, &transfer_page] {
+        let (status, _, page) = send(&f.app, get_page(page_path, &cookie)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{page_path}: {page}");
+        assert!(
+            page.contains("Confirm your password"),
+            "{page_path}: {page}"
+        );
+        assert!(
+            page.contains("Reauthentication required"),
+            "{page_path}: {page}"
+        );
+        assert!(
+            page.contains(&format!("name=\"return_to\" value=\"{page_path}\"")),
+            "{page_path}: {page}"
+        );
+    }
+
+    // The restore form's submit is the same refusal: the prompt comes from the
+    // API envelope, not from a page-local freshness test.
+    let (_, _, members_html) = send(&f.app, get_page(&members_page, &cookie)).await;
+    let csrf = csrf_from(&members_html);
+    let restore_key = Uuid::new_v4().simple().to_string();
+    let (status, _, page) = send(
+        &f.app,
+        post_form(
+            &format!("/organizations/{org_slug}/repositories/{deleted_name}/restore"),
+            &cookie,
+            &[("csrf_token", &csrf), ("idempotency_key", &restore_key)],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
+    assert!(page.contains("Confirm your password"), "{page}");
+    assert!(page.contains("Reauthentication required"), "{page}");
+
+    // Nothing was created, deleted or archived by a refused call.
+    let archived: bool = sqlx::query_scalar("SELECT archived FROM repositories WHERE id = $1")
+        .bind(repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert!(!archived);
+    let team_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM teams WHERE organization_id = $1")
+            .bind(org_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(team_count, 0);
+    let invitation_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM invitations WHERE organization_id = $1")
+            .bind(org_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(invitation_count, 0);
+    let member_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memberships WHERE organization_id = $1")
+            .bind(org_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(member_count, 1);
+    let source_org: Uuid =
+        sqlx::query_scalar("SELECT organization_id FROM repositories WHERE id=$1")
+            .bind(repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(source_org, org_id);
+    let deleted_status: String = sqlx::query_scalar("SELECT status FROM repositories WHERE id=$1")
+        .bind(deleted_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(deleted_status, "deleted");
+
+    // Presenting the password restores the same actions, so each refusal was
+    // freshness and nothing else.
+    assert_eq!(
+        send(
+            &f.app,
+            json_request(
+                "POST",
+                "/api/v1/me/reauthenticate",
+                Some(&session),
+                Some(serde_json::json!({"password": PASSWORD})),
+            )
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&f.app, json_request("POST", &archive, Some(&session), None))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &f.app,
+            json_request(
+                "POST",
+                &members,
+                Some(&session),
+                Some(serde_json::json!({"username": target_name, "role": "member"})),
+            )
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        send(
+            &f.app,
+            json_request(
+                "POST",
+                &teams,
+                Some(&session),
+                Some(serde_json::json!({"slug": tag("fa-team"), "name": "Fresh Auth Team"})),
+            )
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let (status, _, page) = send(&f.app, get_page(&members_page, &cookie)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+
+    f.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: the envelope does not spread to ordinary refusals or routine actions
+// ---------------------------------------------------------------------------
+
+/// A stale session keeps every other answer: a caller without the sensitive
+/// grant still gets the ordinary 403 (or the masked 404), and a routine action
+/// still succeeds without a password prompt.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_grantless_or_routine_caller_does_not_get_a_reauthentication_prompt() {
+    let f = Fixture::new(WINDOW).await;
+    let (owner_id, owner_name) = insert_account(&f.pool, false).await;
+    let (org_id, org_slug) = fixture_organization(&f.pool, owner_id).await;
+    let (repo_id, repo_name) = create_active_repo(&f.pool, org_id, owner_id).await;
+    // A reader: it may read the organization and the repository, but holds
+    // neither `repository.archive` nor `organization.manage_members`.
+    let (reader_id, reader_name) = member(&f.pool, org_id, repo_id, Some("read")).await;
+    org_grant(&f.pool, org_id, reader_id, "member").await;
+    // A member with no grant at all: neither the organization nor the private
+    // repository is readable, so the refusal is the masked 404.
+    let (outsider_id, outsider_name) = member(&f.pool, org_id, repo_id, None).await;
+    let (target_id, target_name) = insert_account(&f.pool, false).await;
+
+    let owner_session = login(&f, &owner_name).await;
+    let reader_session = login(&f, &reader_name).await;
+    let outsider_session = login(&f, &outsider_name).await;
+    for id in [owner_id, reader_id, outsider_id] {
+        age_sessions(&f.pool, id, AGE_SECONDS).await;
+    }
+
+    // A routine action by the stale owner still succeeds: only `sensitive`
+    // actions ask for a fresh password.
+    let repo_path = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}");
+    let (status, _, body) = send(
+        &f.app,
+        json_request(
+            "PATCH",
+            &repo_path,
+            Some(&owner_session),
+            Some(serde_json::json!({"description": "routine, still allowed"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A reader without the sensitive grant gets the ordinary refusal, not a
+    // prompt that would reveal the action is otherwise available to it.
+    let archive = format!("/api/v1/organizations/{org_slug}/repositories/{repo_name}/archive");
+    let (status, _, body) = send(
+        &f.app,
+        json_request("POST", &archive, Some(&reader_session), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, r#"{"error":"not permitted"}"#, "{body}");
+
+    // The same reader may not administer members: also the ordinary 403.
+    let members = format!("/api/v1/organizations/{org_slug}/members");
+    let (status, _, body) = send(
+        &f.app,
+        json_request(
+            "POST",
+            &members,
+            Some(&reader_session),
+            Some(serde_json::json!({"username": target_name, "role": "member"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, r#"{"error":"not permitted"}"#, "{body}");
+
+    // A member with no readable organization gets the masked 404, never the
+    // prompt.
+    let (status, _, body) = send(
+        &f.app,
+        json_request("POST", &archive, Some(&outsider_session), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body, r#"{"error":"not found"}"#, "{body}");
+
+    // Nothing was archived or added by the refused calls.
+    let archived: bool = sqlx::query_scalar("SELECT archived FROM repositories WHERE id = $1")
+        .bind(repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert!(!archived);
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM memberships WHERE organization_id = $1 AND account_id = $2)",
+    )
+    .bind(org_id)
+    .bind(target_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(!is_member);
 
     f.finish().await;
 }

@@ -248,15 +248,16 @@ pub(crate) async fn run(
                 return Err(not_found());
             };
             let authz_repo = repositories::authz_repository(&loaded.repo);
-            if !state
-                .authz
-                .authorize(&facts.request(
-                    Action::RepositoryTransfer,
-                    Resource::Repository(&authz_repo),
-                    Some(Duration::from_secs(auth_age)),
-                ))
-                .is_allowed()
-            {
+            let request = facts.request(
+                Action::RepositoryTransfer,
+                Resource::Repository(&authz_repo),
+                Some(Duration::from_secs(auth_age)),
+            );
+            let decision = state.authz.authorize(&request);
+            if !decision.is_allowed() {
+                if decision.denied_for_fresh_auth() && state.authz.allows_if_fresh(&request) {
+                    return Err(crate::reauthentication_required());
+                }
                 return Err(ApiError(StatusCode::FORBIDDEN, "not permitted"));
             }
             // And the target: a membership or create grant revoked meanwhile is

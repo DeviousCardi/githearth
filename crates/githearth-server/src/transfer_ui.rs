@@ -100,13 +100,13 @@ async fn render(
 ) -> Result<Response, ui::UiError> {
     let loaded = repository_api::load_current(state, s.account.id, s.auth_age, slug, name)
         .await
-        .map_err(|e| map_error(s, e))?;
+        .map_err(|e| map_error(state, s, &transfer_href(slug, name), e))?;
     // Only a caller who may transfer sees the form at all.
     repository_api::require(state, &loaded, githearth_authz::Action::RepositoryTransfer)
-        .map_err(|e| map_error(s, e))?;
+        .map_err(|e| map_error(state, s, &transfer_href(slug, name), e))?;
     let model = transfer::page_model(state, &loaded)
         .await
-        .map_err(|e| map_error(s, e))?;
+        .map_err(|e| map_error(state, s, &transfer_href(slug, name), e))?;
 
     let mut options = String::new();
     for (target_slug, target_name) in &model.targets {
@@ -177,7 +177,21 @@ the transfer is refused, and you rename first and transfer afterwards.</p>\
 /// Map an operation's refusal to the page a browser should see: a masked 404
 /// for what does not exist or is not readable, the panel with the reason for
 /// what the operator can change, and the 403 page for a real denial.
-fn map_error(s: &Session, error: crate::ApiError) -> ui::UiError {
+fn map_error(
+    state: &AppState,
+    s: &Session,
+    return_to: &str,
+    error: crate::ApiError,
+) -> ui::UiError {
+    if error.message() == "reauthentication required" {
+        return ui::reauthentication_page(
+            Some(&s.account.username),
+            s.account.is_admin,
+            &s.csrf,
+            state.fresh_auth(),
+            return_to,
+        );
+    }
     match error.status_code() {
         StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => {
             ui::not_found_page(Some(&s.account.username))
@@ -273,7 +287,7 @@ async fn transfer_submit(
         Err(e) => {
             let status = match e.status_code() {
                 StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY => e.status_code(),
-                _ => return Err(map_error(&s, e)),
+                _ => return Err(map_error(&state, &s, &transfer_href(&slug, &name), e)),
             };
             let notice = ui::idempotency_notice(&e).unwrap_or(e.message());
             let draft = Draft {
