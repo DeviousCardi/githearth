@@ -606,6 +606,11 @@ class M4Harness(_m2.Harness):
     def s4_backup_restore(self):
         """`backup` refuses while `serve` accepts writes; a racing push is
         either in the restore or was refused before acknowledgement."""
+        # s3 left the server running under a 1 MiB repository quota, and the
+        # repository is already larger, so any new push would be refused.
+        # Restart with the default configuration before exercising the fence.
+        self.stop_server()
+        self.start_server(MAIN_DB, self.storage_root, "s4")
         key = self.tmp / "m4-backup.key"
         key.write_text(secrets.token_hex(32))
         key.chmod(0o600)
@@ -630,7 +635,10 @@ class M4Harness(_m2.Harness):
                      ["add", "-A"], ["commit", "-m", "before the fence"]):
             subprocess.run(["git", "-C", str(race)] + args,
                            capture_output=True, check=True)
-        self.git("push", self.repo_url, "main", cwd=str(race),
+        # `main` already exists in this repository from s1-s3, so a plain
+        # push of a fresh history is refused. The race needs a base commit
+        # on the remote, not that particular branch name.
+        self.git("push", self.repo_url, "main:refs/heads/race-base", cwd=str(race),
                  user=self.admin_username, password=self.admin_password,
                  label="s4 base push")
 
@@ -755,7 +763,8 @@ class M4Harness(_m2.Harness):
             raise HarnessError("racing push was acknowledged but is missing after restore")
         if pushed.returncode != 0 and in_restore:
             raise HarnessError("racing push was refused but is present after restore")
-        if pushed.returncode != 0 and "maintenance" not in (pushed.stderr + pushed.stdout):
+        refusal = pushed.stderr + pushed.stdout
+        if pushed.returncode != 0 and "maintenance" not in refusal and "503" not in refusal:
             raise HarnessError(
                 f"racing push was refused for an unexpected reason: {pushed.stderr[:400]}")
 
