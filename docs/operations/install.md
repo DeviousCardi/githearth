@@ -152,7 +152,7 @@ before any check runs. One such error: `storage_root` must be short enough (at m
 107-byte Unix socket path limit. The checks below are only reached when the configuration
 is valid.
 
-This runs eight read-only checks:
+This runs nine read-only checks:
 
 - **git** — verifies Git ≥ 2.40 is available
 - **storage** — checks the storage root exists, is a writable directory, is not a symlink, is not world-writable, and every subdirectory (`repositories/`, `tmp/`, `trash/`, `orphans/`) that already exists is a real writable directory
@@ -161,13 +161,17 @@ This runs eight read-only checks:
 - **schema** — compares applied migrations against the binary; detects pending, failed, or tampered migrations
 - **lifecycle** — warns about repositories stuck in `creating` or `deleting` past the reconcile grace period (the reconciler retries them)
 - **jobs** — warns about dead jobs; warns about late pending jobs; fails when running jobs have an expired lease, meaning the runner isn't running
+- **outbox** — warns when an outbox delivery is `dead` (names `jobs requeue`, see [outbox.md](outbox.md)); warns when a registered consumer has no handler; otherwise reports the pending, delivering and delivered counts
 - **housekeeping** — warns when an active repository has never run housekeeping or is more than two `housekeeping_interval_seconds` overdue (the scheduler has stopped), or when a repository's last run failed or was deferred; reports ok when housekeeping is disabled by configuration
 
-A ninth **base backfill** check appears only when a pull request's base could not be reconstructed because its target branch was deleted before the upgrade; it is a warning naming the affected requests, so an installation with recorded skips reports `9 checks`.
+A tenth **base backfill** check appears only when a pull request's base could not
+be reconstructed because its target branch was deleted before the upgrade; it is
+a warning naming the affected requests. A clean install therefore prints
+`9 checks`, and an installation with recorded skips prints `10 checks`.
 
-When the database cannot be reached the `schema`, `lifecycle`, `jobs` and
-`housekeeping` checks are skipped (`skip <name>: database unavailable`) rather than counted
-as failures, so one outage counts as one failure, not three.
+When the database cannot be reached the `schema`, `lifecycle`, `jobs`, `outbox`
+and `housekeeping` checks are skipped (`skip <name>: database unavailable`) rather than counted
+as failures, so one outage counts as one failure, not four.
 
 Exit code is 0 when all checks pass (warnings and skips are allowed), 1 otherwise.
 The last line prints a summary: `N checks, F failed, W warnings, S skipped`.
@@ -175,13 +179,14 @@ The last line prints a summary: `N checks, F failed, W warnings, S skipped`.
 ### Example output
 
 ```
-ok   git: 2.45
+ok   git: 2.50
 ok   storage: /data/githearth/repositories writable
 ok   disk: 47.82 GiB free
 ok   database: connected
-ok   schema: latest v12
+ok   schema: latest v51
 ok   lifecycle: no stuck repositories
-ok   jobs: ok
+ok   jobs: no dead, late or stuck jobs
+ok   outbox: 0 pending, 0 delivering, 0 delivered delivery(ies)
 ok   housekeeping: repositories are up to date
-8 checks, 0 failed, 0 warnings, 0 skipped
+9 checks, 0 failed, 0 warnings, 0 skipped
 ```

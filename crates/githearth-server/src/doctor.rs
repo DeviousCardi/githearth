@@ -83,11 +83,17 @@ pub async fn report(config: &Config) -> Vec<Check> {
                     Err(d) => Check::fail("lifecycle", d),
                 },
             );
-            checks.push(jobs_check(&pool, config.job_timeout_seconds).await);
+            // Kinds the outbox relay owns. `jobs` and `outbox` are separate
+            // checks because a dead delivery is an outbox problem with its own
+            // command (`jobs requeue`), not a stuck runner.
+            let outbox_kinds = vec![crate::notifications::OUTBOX_JOB_KIND.to_string()];
+            checks.push(jobs_check(&pool, config.job_timeout_seconds, &outbox_kinds).await);
+            checks.push(outbox_check(&pool).await);
             checks.push(housekeeping_check(&pool, config).await);
             // Only reported when it has something to report: a clean install
-            // has no skipped request, and the check count stays the eight the
-            // operations notes document.
+            // has no skipped request. So `doctor` runs nine checks there and
+            // ten on an install whose base backfill warned, which is what
+            // `docs/operations/install.md` documents.
             if let Some(check) = base_backfill_check(&pool).await {
                 checks.push(check);
             }
@@ -98,6 +104,7 @@ pub async fn report(config: &Config) -> Vec<Check> {
             checks.push(Check::skip("schema"));
             checks.push(Check::skip("lifecycle"));
             checks.push(Check::skip("jobs"));
+            checks.push(Check::skip("outbox"));
             checks.push(Check::skip("housekeeping"));
         }
     }
@@ -293,14 +300,20 @@ async fn lifecycle_check(pool: &PgPool, grace_seconds: u64) -> Result<i64, Strin
 
 /// Read-only: dead jobs and late pending jobs warn; a running job whose lease
 /// expired long ago fails, because recovery would have reset it (ADR 0006).
-async fn jobs_check(pool: &PgPool, timeout_seconds: u64) -> Check {
+async fn jobs_check(pool: &PgPool, timeout_seconds: u64, outbox_kinds: &[String]) -> Check {
+    // Outbox delivery jobs are queued by the relay behind each consumer's
+    // registration position and retry budget: a new consumer's backlog and a
+    // delivery waiting out a backoff are both late on purpose, so they are not
+    // "late" here. Their dead state is reported by `outbox_check` instead.
     let counts: Result<(i64, i64, i64), _> = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE state = 'dead'), \
-         count(*) FILTER (WHERE state = 'pending' AND not_before < now() - interval '60 seconds'), \
+        "SELECT count(*) FILTER (WHERE state = 'dead' AND NOT (kind = ANY($2))), \
+         count(*) FILTER (WHERE state = 'pending' AND not_before < now() - interval '60 seconds' \
+                            AND NOT (kind = ANY($2))), \
          count(*) FILTER (WHERE state = 'running' AND lease_expires_at < now() - make_interval(secs => $1)) \
          FROM jobs",
     )
     .bind((2 * timeout_seconds) as f64)
+    .bind(outbox_kinds)
     .fetch_one(pool)
     .await;
     match counts {
@@ -348,6 +361,48 @@ async fn housekeeping_check(pool: &PgPool, config: &Config) -> Check {
             format_args!("{troubled} repo(s) with a failed or deferred run"),
         ),
         Ok(_) => Check::ok("housekeeping", "repositories are up to date"),
+    }
+}
+
+/// Outbox fan-out (ADR 0006, revised for M4.1). A `dead` delivery exhausted its
+/// consumer's budget and `jobs requeue` recovers it, so it warns. A consumer
+/// with no handler (`job_kind` NULL) holds deliveries that nothing will ever
+/// enqueue; `outbox::register` refuses to create one, so this covers only a
+/// database an older release or a hand edit left behind, and it warns by name.
+/// Otherwise the check reports its counts and passes.
+async fn outbox_check(pool: &PgPool) -> Check {
+    let counts: Result<(i64, i64, i64, i64), _> = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE state = 'dead'), \
+                count(*) FILTER (WHERE state = 'pending'), \
+                count(*) FILTER (WHERE state = 'delivering'), \
+                count(*) FILTER (WHERE state = 'delivered') \
+         FROM outbox_deliveries WHERE state <> 'pending'",
+    )
+    .fetch_one(pool)
+    .await;
+    let consumers: Result<i64, _> = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_consumers c WHERE c.job_kind IS NULL \
+           AND EXISTS (SELECT 1 FROM outbox_deliveries d WHERE d.consumer_id = c.id \
+                        AND d.state <> 'delivered')",
+    )
+    .fetch_one(pool)
+    .await;
+    match (counts, consumers) {
+        (Err(_), _) | (_, Err(_)) => Check::fail("outbox", "cannot query outbox deliveries"),
+        (Ok((dead, _, _, _)), _) if dead > 0 => Check::warn(
+            "outbox",
+            format_args!("{dead} dead delivery(ies); run `githearth-server jobs requeue`"),
+        ),
+        (Ok(_), Ok(consumers)) if consumers > 0 => Check::warn(
+            "outbox",
+            format_args!("{consumers} consumer(s) without a handler; deliveries stay pending"),
+        ),
+        (Ok((_, pending, delivering, delivered)), Ok(_)) => Check::ok(
+            "outbox",
+            format_args!(
+                "{pending} pending, {delivering} delivering, {delivered} delivered delivery(ies)"
+            ),
+        ),
     }
 }
 
@@ -839,7 +894,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-    async fn schema_pending_migrations() {
+    async fn schemapending_migrations() {
         let (pool, _schema) = db_pool().await;
         sqlx::query("DELETE FROM _sqlx_migrations WHERE version = (SELECT max(version) FROM _sqlx_migrations)")
             .execute(&pool)

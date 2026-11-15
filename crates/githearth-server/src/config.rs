@@ -81,6 +81,10 @@ pub struct Config {
     /// Completed jobs retention in days (ADR 0006).
     #[serde(default = "default_job_retention_days")]
     pub job_retention_days: u64,
+    /// Outbox fan-out poll interval in ms when no undelivered event is found
+    /// (ADR 0006, M4.1).
+    #[serde(default = "default_outbox_poll_interval_ms")]
+    pub outbox_poll_interval_ms: u64,
     /// IPs or CIDRs that are trusted to set `X-Forwarded-For` (TASK #88).
     /// Empty by default; every entry is validated at load.
     #[serde(default)]
@@ -135,6 +139,7 @@ impl Default for Config {
             job_timeout_seconds: default_job_timeout_seconds(),
             job_poll_interval_ms: default_job_poll_interval_ms(),
             job_retention_days: default_job_retention_days(),
+            outbox_poll_interval_ms: default_outbox_poll_interval_ms(),
             housekeeping_enabled: default_housekeeping_enabled(),
             housekeeping_interval_seconds: default_housekeeping_interval_seconds(),
             housekeeping_grace_seconds: default_housekeeping_grace_seconds(),
@@ -176,6 +181,10 @@ fn default_job_timeout_seconds() -> u64 {
 fn default_job_poll_interval_ms() -> u64 {
     500
 }
+fn default_outbox_poll_interval_ms() -> u64 {
+    500
+}
+
 fn default_job_retention_days() -> u64 {
     7
 }
@@ -317,6 +326,7 @@ impl Config {
         env!(job_timeout_seconds, "GITHEARTH_JOB_TIMEOUT_SECONDS");
         env!(job_poll_interval_ms, "GITHEARTH_JOB_POLL_INTERVAL_MS");
         env!(job_retention_days, "GITHEARTH_JOB_RETENTION_DAYS");
+        env!(outbox_poll_interval_ms, "GITHEARTH_OUTBOX_POLL_INTERVAL_MS");
         env!(
             login_throttle_max_per_username,
             "GITHEARTH_LOGIN_THROTTLE_MAX_PER_USERNAME"
@@ -421,6 +431,7 @@ impl Config {
             || !(1..=3600).contains(&self.job_timeout_seconds)
             || !(50..=60000).contains(&self.job_poll_interval_ms)
             || !(1..=365).contains(&self.job_retention_days)
+            || !(50..=60000).contains(&self.outbox_poll_interval_ms)
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_username)
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_client)
             || !(1..=86_400).contains(&self.login_throttle_window_seconds)
@@ -438,7 +449,7 @@ impl Config {
             || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {

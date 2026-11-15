@@ -31,6 +31,11 @@ pub enum JobOutcome {
 
 struct Registered {
     handler: Handler,
+    /// Outbox delivery kinds are not counted by the late-pending doctor check:
+    /// a delivery waiting out a retry backoff, a consumer with no handler yet,
+    /// or a backlog above the registration watermark is due by design, not a
+    /// stuck runner (ADR 0006, revised for M4.1).
+    outbox_delivery: bool,
     /// How long this kind may run. A kind whose work is several bounded steps
     /// (housekeeping) is longer than the generic `job_timeout_seconds`; without
     /// its own budget the runner would time it out mid-step and retry forever.
@@ -39,12 +44,16 @@ struct Registered {
 
 pub struct Registry {
     handlers: HashMap<&'static str, Registered>,
+    /// Test hook: cap every retry delay, so a test can reach the attempt cap
+    /// without waiting for real backoffs. Never set by `main`.
+    pub backoff_override: Option<Duration>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
+            backoff_override: None,
         }
     }
 
@@ -57,6 +66,7 @@ impl Registry {
             kind,
             Registered {
                 handler,
+                outbox_delivery: false,
                 budget: None,
             },
         );
@@ -69,6 +79,7 @@ impl Registry {
             kind,
             Registered {
                 handler,
+                outbox_delivery: false,
                 budget: Some(budget),
             },
         );
@@ -81,6 +92,22 @@ impl Registry {
         let mut kinds: Vec<&'static str> = self.handlers.keys().copied().collect();
         kinds.sort_unstable();
         kinds
+    }
+
+    /// Marks a kind as an outbox delivery: its jobs are queued by the relay
+    /// behind each consumer's registration position and retry budget.
+    pub fn mark_outbox_delivery(&mut self, kind: &str) {
+        if let Some(registered) = self.handlers.get_mut(kind) {
+            registered.outbox_delivery = true;
+        }
+    }
+
+    fn outbox_delivery_kinds(&self) -> Vec<String> {
+        self.handlers
+            .iter()
+            .filter(|(_, registered)| registered.outbox_delivery)
+            .map(|(kind, _)| (*kind).to_string())
+            .collect()
     }
 
     fn get(&self, kind: &str) -> Option<&Handler> {
@@ -130,7 +157,54 @@ struct RunnerClaim {
     payload: serde_json::Value,
     attempt: i32,
     max_attempts: i32,
+    backoff_cap_seconds: i32,
+    backoff_override: Duration,
     lease_holder: Uuid,
+}
+
+/// The base of the exponential backoff (ADR 0006: base 1 s, doubling).
+pub const BACKOFF_BASE_SECONDS: u32 = 1;
+
+/// How a job is enqueued when its kind needs more than the generic defaults.
+#[derive(Clone, Copy)]
+pub struct EnqueueOptions {
+    /// The job's attempt budget. `None` keeps the table default (5).
+    pub max_attempts: Option<i32>,
+    /// Hard ceiling on the exponential backoff.
+    pub backoff_cap: Duration,
+}
+
+impl Default for EnqueueOptions {
+    fn default() -> Self {
+        Self {
+            max_attempts: None,
+            backoff_cap: Duration::from_secs(DEFAULT_BACKOFF_CAP_SECONDS),
+        }
+    }
+}
+
+pub const DEFAULT_BACKOFF_CAP_SECONDS: u64 = 600;
+
+/// Makes every queued job of `kinds` due now: the operator's "the dependency
+/// is back" without waiting for each consumer's backoff. Tests walk an outage
+/// with it instead of sleeping for a 10-minute cap.
+pub async fn mark_due_outbox_jobs(pool: &sqlx::PgPool, kinds: &[String]) {
+    let _ = sqlx::query(
+        "UPDATE jobs SET not_before = now() \
+         WHERE state = 'pending' AND kind = ANY($1) AND not_before > now()",
+    )
+    .bind(kinds)
+    .execute(pool)
+    .await;
+}
+
+impl Registry {
+    /// Makes every queued job of this registry's outbox delivery kinds due
+    /// now. Tests that walk an outage hour by hour call it instead of waiting
+    /// for a 10-minute backoff.
+    pub async fn make_outbox_due(&self, pool: &sqlx::PgPool) {
+        mark_due_outbox_jobs(pool, &self.outbox_delivery_kinds()).await;
+    }
 }
 
 pub async fn enqueue(
@@ -141,9 +215,39 @@ pub async fn enqueue(
     dedupe_key: &str,
     delay: Option<Duration>,
 ) -> Result<(), sqlx::Error> {
+    enqueue_with(
+        conn,
+        organization_id,
+        kind,
+        payload,
+        dedupe_key,
+        delay,
+        EnqueueOptions::default(),
+    )
+    .await
+}
+
+/// `enqueue` with an explicit attempt budget and backoff cap. The outbox relay
+/// enqueues its per-consumer jobs this way: a budget that spans hours must be
+/// what the job retries with, and the cap is the consumer's, not a global one.
+///
+/// The budget is clamped to `>= 1` rather than refused: a job that can never be
+/// attempted has no useful outcome, and the delivery row's own budget is the
+/// one the operator can requeue with.
+pub async fn enqueue_with(
+    conn: &mut PgConnection,
+    organization_id: Option<Uuid>,
+    kind: &str,
+    payload: serde_json::Value,
+    dedupe_key: &str,
+    delay: Option<Duration>,
+    options: EnqueueOptions,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO jobs (id, organization_id, kind, payload, dedupe_key, not_before) \
-         VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6)) \
+        "INSERT INTO jobs (id, organization_id, kind, payload, dedupe_key, not_before, \
+                           max_attempts, backoff_cap_seconds) \
+         VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), \
+                 COALESCE($7, 5), $8) \
          ON CONFLICT (kind, dedupe_key) WHERE state IN ('pending','running') DO NOTHING",
     )
     .bind(Uuid::new_v4())
@@ -152,28 +256,33 @@ pub async fn enqueue(
     .bind(payload)
     .bind(dedupe_key)
     .bind(delay.unwrap_or_default().as_secs_f64())
+    .bind(options.max_attempts.map(|n| n.max(1)))
+    .bind(options.backoff_cap.as_secs().clamp(1, 86_400) as i32)
     .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
-fn backoff_delay(attempt: i32, after: Option<Duration>) -> Duration {
-    let base = Duration::from_secs(1);
-    let shift = (attempt.saturating_sub(1).min(9)) as u32;
-    let scale: u32 = 1u32 << shift;
-    let delay = base * scale;
+/// `base × 2^(attempt−1)`, capped, with ±25% jitter (ADR 0006).
+fn backoff_delay(attempt: i32, after: Option<Duration>, cap: Duration) -> Duration {
+    let base = Duration::from_secs(BACKOFF_BASE_SECONDS as u64);
+    let shift = (attempt.saturating_sub(1).min(20)) as u32;
+    let scale: u64 = 1u64 << shift;
+    let delay = base * (scale as u32);
     let delay = match after {
         Some(a) => delay.max(a),
         None => delay,
     }
-    .min(Duration::from_secs(600));
+    .min(cap);
     let jitter_pct: f64 = rand::thread_rng().gen_range(-0.25..0.25);
     let jitter_ms = (delay.as_millis() as f64 * jitter_pct) as i64;
-    if jitter_ms < 0 {
+    let jittered = if jitter_ms < 0 {
         delay.saturating_sub(Duration::from_millis(jitter_ms.unsigned_abs()))
     } else {
         delay + Duration::from_millis(jitter_ms as u64)
-    }
+    };
+    // Jitter must never push a retry past the cap the kind asked for.
+    jittered.min(cap)
 }
 
 async fn recover_leases(state: &AppState) {
@@ -195,11 +304,16 @@ async fn recover_leases(state: &AppState) {
 /// budget), falling back to the generic `default_lease_secs`. Selecting the
 /// row and updating it happen in one transaction, so the kind is known before
 /// the lease is chosen without opening a window another worker could claim in.
+/// `backoff_override`, when set, caps every retry delay of the claimed job's
+/// kind. Only tests use it: the production cap is the job's own
+/// `backoff_cap_seconds`, and a test that must observe a 30-minute outage
+/// through `next_attempt_at` cannot wait for real backoffs of minutes.
 async fn claim_one(
     state: &AppState,
     holder: Uuid,
     default_lease_secs: f64,
     leases: &HashMap<&'static str, f64>,
+    backoff_override: Option<Duration>,
 ) -> Option<RunnerClaim> {
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -230,7 +344,8 @@ async fn claim_one(
         "UPDATE jobs SET state = 'running', attempt = attempt + 1, lease_holder = $1, \
          lease_expires_at = now() + $2 * interval '1 second', updated_at = now() \
          WHERE id = $3 \
-         RETURNING id, organization_id, kind, payload, attempt, max_attempts, lease_holder",
+         RETURNING id, organization_id, kind, payload, attempt, max_attempts, \
+                   backoff_cap_seconds, lease_holder",
     )
     .bind(holder)
     .bind(lease_secs)
@@ -248,6 +363,8 @@ async fn claim_one(
                 payload,
                 attempt: row.get("attempt"),
                 max_attempts: row.get("max_attempts"),
+                backoff_cap_seconds: row.get("backoff_cap_seconds"),
+                backoff_override: backoff_override.unwrap_or(Duration::from_secs(86_400)),
                 lease_holder: row.get("lease_holder"),
             }
         }
@@ -269,15 +386,17 @@ async fn claim_one(
 }
 
 async fn apply_outcome(state: &AppState, claim: &RunnerClaim, outcome: &JobOutcome) {
+    let cap = Duration::from_secs(claim.backoff_cap_seconds.clamp(1, 86_400) as u64);
+    let cap = cap.min(claim.backoff_override);
     let (new_state, not_before, last_error): (&str, Option<Duration>, Option<String>) =
         match outcome {
             JobOutcome::Done => ("done", None, None),
             JobOutcome::Retry { after, reason } if claim.attempt < claim.max_attempts => {
-                let d = backoff_delay(claim.attempt, Some(*after));
+                let d = backoff_delay(claim.attempt, Some(*after), cap);
                 ("pending", Some(d), Some(reason.clone()))
             }
             JobOutcome::Retry { reason, .. } => {
-                let d = backoff_delay(claim.attempt, None);
+                let d = backoff_delay(claim.attempt, None, cap);
                 (
                     "dead",
                     Some(d),
@@ -329,6 +448,17 @@ async fn run_job(
     claim: RunnerClaim,
     default_timeout: Duration,
 ) {
+    // The delivery row, when this job carries one, is `delivering` while the
+    // handler runs. A job with no delivery row (every non-outbox kind) makes
+    // this a no-op.
+    let _ = sqlx::query(
+        "UPDATE outbox_deliveries SET state = 'delivering', updated_at = now() \
+         WHERE job_id = $1 AND state IN ('pending', 'delivering')",
+    )
+    .bind(claim.id)
+    .execute(&state.pool)
+    .await;
+
     // A kind with its own budget (housekeeping: every bounded phase of a run)
     // must not be cut off by the generic `job_timeout_seconds`.
     let timeout = registry.budget(&claim.kind).unwrap_or(default_timeout);
@@ -343,6 +473,7 @@ async fn run_job(
                 },
             )
             .await;
+            sync_delivery(&state, claim.id).await;
             return;
         }
     };
@@ -375,6 +506,44 @@ async fn run_job(
     };
 
     apply_outcome(&state, &claim, &result).await;
+    sync_delivery(&state, claim.id).await;
+}
+
+/// Mirrors a job's outcome onto the delivery row that carries it. Best effort:
+/// a failure here is logged and leaves the delivery row as it was, so the next
+/// redelivery of the same event is what repairs it (at least once).
+///
+/// `apply_outcome` is fenced on the claim (id, holder, attempt), so when it
+/// returns the job's own state is settled; a stale claim changed nothing. This
+/// reads the job back rather than trusting the local outcome, so it can never
+/// disagree with what the runner recorded. `done` marks the delivery
+/// delivered, `dead` marks it dead (doctor warns, `jobs requeue` recovers it),
+/// `pending` is a retry waiting for its next attempt time, and `running`
+/// (a claim that has not recorded an outcome yet) is `delivering`.
+async fn sync_delivery(state: &AppState, job_id: Uuid) {
+    if let Err(e) = sqlx::query(
+        "UPDATE outbox_deliveries d SET \
+             state = CASE j.state WHEN 'done' THEN 'delivered' \
+                                  WHEN 'dead' THEN 'dead' \
+                                  WHEN 'pending' THEN 'pending' \
+                                  WHEN 'running' THEN 'delivering' \
+                                  ELSE d.state END, \
+             attempts = j.attempt, \
+             next_attempt_at = CASE j.state WHEN 'pending' THEN j.not_before \
+                                            ELSE d.next_attempt_at END, \
+             last_error = j.last_error, \
+             updated_at = now() \
+         FROM jobs j \
+         WHERE d.job_id = j.id AND j.id = $1 \
+           AND d.state NOT IN ('delivered', 'dead') \
+           AND j.state IN ('pending', 'running', 'done', 'dead')",
+    )
+    .bind(job_id)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(%job_id, error = %e, "delivery row update failed");
+    }
 }
 
 async fn retention_sweep(state: &AppState, retention_days: u64) {
@@ -404,6 +573,7 @@ pub fn spawn(
         let leases = registry.leases();
         // A shutdown waits for the longest budget any handler may use, not
         // just the generic one, before returning its jobs to `pending`.
+        let backoff_override = registry.backoff_override;
         let shutdown_wait = registry
             .longest_budget()
             .unwrap_or(default_timeout)
@@ -417,7 +587,9 @@ pub fn spawn(
             recover_leases(&state).await;
             let mut claimed = false;
             while let Ok(permit) = slots.clone().try_acquire_owned() {
-                let Some(claim) = claim_one(&state, holder, default_lease, &leases).await else {
+                let Some(claim) =
+                    claim_one(&state, holder, default_lease, &leases, backoff_override).await
+                else {
                     break;
                 };
                 claimed = true;
@@ -451,6 +623,15 @@ pub fn spawn(
              updated_at = now() WHERE state = 'running' AND lease_holder = $1",
         )
         .bind(holder)
+        .execute(&state.pool)
+        .await;
+        // The delivery follows the job it was mirrored from: a job returned to
+        // `pending` at shutdown is no longer `delivering`.
+        let _ = sqlx::query(
+            "UPDATE outbox_deliveries d SET state = 'pending', updated_at = now() \
+             FROM jobs j WHERE d.job_id = j.id AND d.state = 'delivering' \
+               AND j.state = 'pending'",
+        )
         .execute(&state.pool)
         .await;
     })

@@ -1025,7 +1025,8 @@ pub async fn record_merge_result(
         // The ref has moved, so Git won: a close that committed after
         // execute_intent revalidated still ends with the pull request merged.
         // Capture the pull request id and whether it actually transitioned to
-        // `merged`, so the notification job is enqueued only on a real merge.
+        // `merged`, so only a real transition extends its pins below; the
+        // merged notification comes from the outbox event, not from here.
         let merged_pr: Option<Uuid> = sqlx::query_scalar(
             "UPDATE pull_requests SET state = 'merged', merged_at = now(), merged_by = $1, \
              updated_at = now() WHERE id = (SELECT pull_request_id FROM merge_intents \
@@ -1102,22 +1103,10 @@ pub async fn record_merge_result(
         .execute(&mut *tx)
         .await?;
 
-        // Notification: only when this transaction actually merged the pull
-        // request, and only for a pull request that exists at this point.
-        if let (Some(org_id), Some(pull_request_id)) = (organization_id, merged_pr) {
-            crate::jobs::enqueue(
-                &mut tx,
-                Some(org_id),
-                "notification.pull_request_merged",
-                serde_json::json!({
-                    "event_id": audit_id,
-                    "pull_request_id": pull_request_id,
-                }),
-                &audit_id.to_string(),
-                None,
-            )
-            .await?;
-        }
+        // The merged notification is the outbox notification consumer's job
+        // (ADR 0006, revised for M4.1): the event above is the only enqueue
+        // input, so one event produces one notification job. The pull request
+        // is the merge intent's, which the handler reads when the job runs.
     }
 
     tx.commit().await?;

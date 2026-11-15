@@ -94,6 +94,7 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [Accounts](docs/operations/accounts.md) | Creating, disabling and re-enabling accounts; password change and reset; failed sign-in bounds |
 | [Backup and restore](docs/operations/backup-restore.md) | Concrete backup/restore procedure and storage verification |
 | [Repository housekeeping](docs/operations/housekeeping.md) | Scheduled repack and pruning: schedule, grace period, manual run, results |
+| [Outbox delivery](docs/operations/outbox.md) | Delivery states, retry budget, dead letters and `jobs requeue`, `doctor` output |
 | [Housekeeping decision](docs/decisions/0013-repository-housekeeping.md) | Which objects are live and how concurrent writers are protected |
 | [Database experiment](experiments/metadata/README.md) | Reproducible lab setup, workload runner, and result interpretation |
 | [Database decision](docs/decisions/0001-metadata-database.md) | Provisional PostgreSQL selection, measured evidence, and remaining qualification gates |

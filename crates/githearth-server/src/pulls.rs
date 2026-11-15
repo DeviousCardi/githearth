@@ -2283,15 +2283,16 @@ pub(crate) async fn create_pull_review(
                 "changes_requested" => "pull_request.changes_requested",
                 _ => "pull_request.reviewed",
             };
-            event(&mut tx, Some(loaded.org_id), actor_id, kind).await?;
-
-            crate::jobs::enqueue(
+            // The review notification is the outbox notification consumer's
+            // job (ADR 0006, revised for M4.1); this path enqueues nothing, so
+            // the one event produces one notification job. The event names the
+            // review it created.
+            event_with(
                 &mut tx,
                 Some(loaded.org_id),
-                "notification.pull_request_reviewed",
-                serde_json::json!({ "review_id": id }),
-                &id.to_string(),
-                None,
+                actor_id,
+                kind,
+                serde_json::json!({ "review_id": id, "pull_request_id": pull.id }),
             )
             .await?;
 
@@ -2428,8 +2429,10 @@ pub(crate) fn reviewer_can_approve(
 
 /// Inserts a review request for `reviewer_id` requested by `requested_by`,
 /// idempotently (`ON CONFLICT DO NOTHING`). A newly inserted request emits the
-/// audit/outbox event and enqueues the review-requested notification, exactly
-/// like the JSON endpoint. Returns whether a new request was created.
+/// audit/outbox event, exactly like the JSON endpoint; the review-requested
+/// notification is the outbox notification consumer's job (ADR 0006, revised
+/// for M4.1), not a second enqueue here. Returns whether a new request was
+/// created.
 pub(crate) async fn insert_review_request(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -2455,21 +2458,11 @@ pub(crate) async fn insert_review_request(
             Some(org_id),
             requested_by,
             "pull_request.review_requested",
-            serde_json::json!({ "pull_request_id": pull_id, "reviewer_id": reviewer_id }),
-        )
-        .await?;
-        crate::jobs::enqueue(
-            tx,
-            Some(org_id),
-            "notification.pull_request_review_requested",
             serde_json::json!({
-                "request_id": request_id,
                 "pull_request_id": pull_id,
                 "reviewer_id": reviewer_id,
-                "requested_by": requested_by,
+                "request_id": request_id,
             }),
-            &request_id.to_string(),
-            None,
         )
         .await?;
     }
