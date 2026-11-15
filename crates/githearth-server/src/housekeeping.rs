@@ -146,6 +146,17 @@ async fn run_job(state: AppState, job: Job) -> JobOutcome {
             reason: "housekeeping concurrency gate closed".into(),
         };
     };
+    // Housekeeping rewrites packs and prunes objects, so it is a storage
+    // writer and must be counted by the fence. The permit is held for the
+    // whole run; if the fence is already up the job goes back to `pending`
+    // without spending one of its attempts.
+    let Some(_write) = state.maintenance.admit_write() else {
+        return JobOutcome::Deferred {
+            after: Duration::from_secs(5),
+            reason: "maintenance fence is up".into(),
+        };
+    };
+    crate::testseam::hold("HOUSEKEEPING").await;
     match run_repository(&state, repository_id).await {
         Ok(Outcome::Completed(report)) => {
             tracing::info!(

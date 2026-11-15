@@ -14,12 +14,67 @@ steps on an **idle** installation, not a stopped one, so its evidence covers
 only a quiescent installation; see the correction in
 [m4-qualification.md](../verification/m4-qualification.md).
 
-M4.1 replaces this procedure with `githearth backup`, which refuses to run
-unless it has proved that no writer can acknowledge a commit — either the
-server is not running, or it is in maintenance mode and has drained. M4.2 adds
-an encrypted online mode for single-node deployments with a filesystem
-snapshot. Until the command ships, an operator who cannot stop the server has
-no supported backup path.
+M4.1 replaces this procedure with `githearth-server backup`, which refuses to
+run unless it has proved that no writer can acknowledge a commit — either the
+server is not running (both its HTTP and SSH bind addresses refuse
+connections), or it is in maintenance mode and has drained. M4.2 adds an
+encrypted online mode for single-node deployments with a filesystem snapshot.
+
+## M4.1 commands
+
+```sh
+# Stop accepting writes and wait until in-flight pushes, API writes and
+# background work (merge, reconcile and housekeeping) finish.
+githearth-server maintenance start --config /etc/githearth/config.toml
+githearth-server maintenance status --config /etc/githearth/config.toml
+
+# Encrypted backup. The key is read from a file or stdin, never an argument.
+githearth-server backup --config /etc/githearth/config.toml \
+  --output /srv/backups/githearth-20261115.ghbackup --key-file /etc/githearth/backup.key
+
+# On a fresh host, with GITHEARTH_DATABASE_URL naming a database that does not exist.
+githearth-server --config /etc/githearth/config.toml restore \
+  --archive /srv/backups/githearth-20261115.ghbackup --key-file /etc/githearth/backup.key \
+  --storage-root /var/lib/githearth/repositories \
+  --ssh-host-key-path /etc/githearth/ssh_host_key
+
+githearth-server maintenance stop --config /etc/githearth/config.toml
+```
+
+`backup` prints and records in its manifest which fence it used
+(`not-running` or `maintenance`). The archive is encrypted with AES-256-GCM
+under an Argon2id-derived key; the manifest records the key id, algorithm and
+wrap method, never the key. Both commands refuse a wrong key, a missing key, a
+corrupted archive and an incomplete archive with distinct messages. `backup`
+re-reads the archive it just wrote, verifies every part, extracts the storage
+snapshot and runs the same storage check `restore` runs before it publishes the
+output path. `restore` verifies every manifest checksum, the journal position of
+every repository and database-to-storage consistency before it publishes
+storage, configuration or the host key; a failed restore removes what it
+created and leaves the destination untouched.
+
+The manifest records `postgres.dump_lsn`, a single `pg_current_wal_lsn()` value
+read beside the dump. It is **advisory only**: it is not the dump transaction's
+snapshot position and `restore` does not compare it. Consistency between the
+database and the storage snapshot is proved by the per-repository journal
+positions, not by the LSN.
+
+The maintenance control endpoint is cryptographically authenticated and is
+reachable only from a loopback client, so it is not exposed off-host even when
+`bind` is not loopback. A loopback bind (or `0.0.0.0`, which the
+client probes on loopback) works for `maintenance start|status|stop` and
+`backup`; with an explicit non-loopback `bind`, stop the server and use the
+`not-running` fence instead.
+
+Configuration keys: `backup_directory` (default `backups`, used when
+`--output` is omitted), `backup_key_file` (default empty; `--key-file`
+overrides it) and `maintenance_drain_timeout_seconds` (default 300, the bound
+`maintenance start` waits for). The environment names are
+`GITHEARTH_BACKUP_DIRECTORY`, `GITHEARTH_BACKUP_KEY_FILE` and
+`GITHEARTH_MAINTENANCE_DRAIN_TIMEOUT_SECONDS`.
+
+The manual procedure below remains the reference for what the archive holds
+and for older installations; the commands are the supported path from M4.1.
 
 1. **Dump the database** snapshot first, so the storage snapshot that follows
    includes any journal records that reference rows in the dump.
@@ -172,8 +227,8 @@ Secrets that are not inside the dump or storage tarball:
   manifest records only a key id, algorithm and wrap method. Losing the key
   means the archive cannot be decrypted; there is no recovery path by design.
   From M4.1 the archive itself is encrypted with this key or passphrase,
-  because the configuration file it contains holds the database and SMTP
-  credentials.
+  because the configuration file it contains holds the database URL with its
+  password and the SSH host key is a part of the same archive.
 
 The M4.1 `backup` command includes the configuration file and the host key in
 its checksummed manifest; until then this manual procedure leaves both outside

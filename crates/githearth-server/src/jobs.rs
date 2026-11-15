@@ -25,8 +25,21 @@ pub struct Job {
 
 pub enum JobOutcome {
     Done,
-    Retry { after: Duration, reason: String },
-    Failed { reason: String },
+    Retry {
+        after: Duration,
+        reason: String,
+    },
+    /// The handler could not start because infrastructure it must not race is
+    /// unavailable (the maintenance write fence). The job returns to
+    /// `pending` and its attempt budget is restored, so a long fence does not
+    /// mark it dead.
+    Deferred {
+        after: Duration,
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 struct Registered {
@@ -388,6 +401,29 @@ async fn claim_one(
 async fn apply_outcome(state: &AppState, claim: &RunnerClaim, outcome: &JobOutcome) {
     let cap = Duration::from_secs(claim.backoff_cap_seconds.clamp(1, 86_400) as u64);
     let cap = cap.min(claim.backoff_override);
+    if let JobOutcome::Deferred { after, reason } = outcome {
+        // A deferred claim never ran, so give the attempt back: otherwise a
+        // fence lasting longer than the backoff budget would mark the job dead.
+        let delay_secs = backoff_delay(claim.attempt, Some(*after), cap).as_secs_f64();
+        if let Err(e) = sqlx::query(
+            "UPDATE jobs SET state = 'pending', \
+             not_before = now() + make_interval(secs => $1), last_error = $2, \
+             attempt = GREATEST(attempt - 1, 0), updated_at = now() \
+             WHERE id = $3 AND state = 'running' AND lease_holder = $4 AND attempt = $5",
+        )
+        .bind(delay_secs)
+        .bind(reason)
+        .bind(claim.id)
+        .bind(claim.lease_holder)
+        .bind(claim.attempt)
+        .execute(&state.pool)
+        .await
+        {
+            tracing::warn!(job_id = %claim.id, error = %e, "fenced outcome update failed");
+        }
+        return;
+    }
+
     let (new_state, not_before, last_error): (&str, Option<Duration>, Option<String>) =
         match outcome {
             JobOutcome::Done => ("done", None, None),
@@ -403,6 +439,7 @@ async fn apply_outcome(state: &AppState, claim: &RunnerClaim, outcome: &JobOutco
                     Some(format!("retry limit exceeded: {reason}")),
                 )
             }
+            JobOutcome::Deferred { .. } => unreachable!("handled above"),
             JobOutcome::Failed { reason } => ("dead", None, Some(reason.clone())),
         };
 

@@ -3,6 +3,7 @@ mod account_admin_ui;
 pub mod audit;
 pub mod audit_retention;
 pub mod auto_merge;
+pub mod backup;
 pub mod branch_protection_ui;
 pub mod browse;
 mod browse_ui;
@@ -25,6 +26,7 @@ mod issues_ui;
 pub mod jobs;
 mod login_throttle;
 pub mod mail;
+pub mod maintenance;
 pub mod membership;
 mod membership_ui;
 pub mod merge;
@@ -54,6 +56,7 @@ pub mod tag_protection;
 mod tag_protection_ui;
 pub mod teams;
 mod teams_ui;
+mod testseam;
 mod tokens;
 pub mod ui;
 
@@ -123,6 +126,11 @@ pub struct AppState {
     /// a series per registered kind instead of per kind in the database. `None`
     /// when no runner was started; the metric then publishes `other` only.
     pub(crate) job_kinds: Option<Arc<[&'static str]>>,
+    /// The write fence `backup` proves before it snapshots (M4.1 U13).
+    pub maintenance: maintenance::Maintenance,
+    /// The on-host bearer token for the maintenance control endpoint. It is
+    /// written to `<storage_root>/run/maintenance.token` with mode 0600.
+    pub(crate) maintenance_token: Arc<str>,
 }
 impl AppState {
     /// Records that `added` bytes of a fork head were copied into `target`,
@@ -155,6 +163,19 @@ impl AppState {
     }
 
     pub async fn new(pool: PgPool, config: Config) -> anyhow::Result<Self> {
+        Self::build(pool, config, true).await
+    }
+
+    /// Builds the state for a one-off command (`housekeeping`) that must not
+    /// touch the running server's control token. The token is only meaningful
+    /// to the process that answers the control endpoint, and rewriting it here
+    /// used to make `maintenance start|status|stop` and `backup` fail with
+    /// `answered 401` until the server restarted.
+    pub async fn for_command(pool: PgPool, config: Config) -> anyhow::Result<Self> {
+        Self::build(pool, config, false).await
+    }
+
+    async fn build(pool: PgPool, config: Config, write_token: bool) -> anyhow::Result<Self> {
         config.validate()?;
         let dummy_hash =
             tokio::task::spawn_blocking(|| hash_password("dummy-password-not-an-account"))
@@ -210,6 +231,26 @@ impl AppState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| anyhow::anyhow!("trusted_proxies: invalid entry"))?;
         let mailer = mail::transport_from_config(&config)?;
+        // The control token is regenerated on every start; the state file is
+        // only an observation, never the fence `backup` trusts. A command that
+        // is not `serve` must not rewrite the token of a running server.
+        let maintenance_token = if write_token {
+            maintenance::write_control_token(
+                &config
+                    .storage_root
+                    .join("run")
+                    .join(maintenance::CONTROL_TOKEN_FILE),
+            )
+            .context("cannot write the maintenance control token")?
+        } else {
+            String::new()
+        };
+        let maintenance = maintenance::Maintenance::new(
+            config
+                .storage_root
+                .join("run")
+                .join(maintenance::STATE_FILE),
+        );
         let state = Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
@@ -225,6 +266,8 @@ impl AppState {
             mailer,
             recorder: Some(Arc::new(metrics::Recorder::new())),
             job_kinds: None,
+            maintenance,
+            maintenance_token: Arc::from(maintenance_token),
         };
         tokio::spawn(crate::git_http::hook_accept_loop(listener, state.clone()));
         Ok(state)
@@ -421,7 +464,12 @@ pub fn router(state: AppState) -> Router {
     // body, and the JSON API's read-only boundary, body limit and JSON
     // rejection rewriting have nothing to say about it. The handler refuses a
     // non-loopback client itself, per request, using the resolved address.
-    let operator = Router::new().route(metrics::PATH, get(metrics::metrics));
+    let operator = Router::new()
+        .route(metrics::PATH, get(metrics::metrics))
+        // The fence routes are mounted here, outside the JSON API's read-only
+        // layer and outside the fence itself: `stop` must remain reachable even
+        // while writes are refused. They authenticate with the on-host token.
+        .merge(maintenance::router());
 
     // The last layer runs first: resolve the client IP before observe logs it.
     // `operator` is merged last because `ui::router()` installs a `fallback`,
@@ -429,6 +477,10 @@ pub fn router(state: AppState) -> Router {
     // shadow `/metrics`. An explicit route added by any merged router would,
     // so `/metrics` must stay claimed only here.
     json.merge(git)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            maintenance::fence,
+        ))
         .merge(operator)
         .layer(axum::middleware::from_fn(observe))
         .layer(axum::middleware::from_fn_with_state(

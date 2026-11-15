@@ -1390,6 +1390,7 @@ dependencies = [
 name = "githearth-server"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "argon2 0.5.3",
  "async-compression",

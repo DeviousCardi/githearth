@@ -1134,6 +1134,10 @@ mod tests {
             mailer: Arc::new(crate::mail::DisabledTransport),
             recorder: None,
             job_kinds: None,
+            maintenance: crate::maintenance::Maintenance::new(
+                std::env::temp_dir().join(format!("githearth-maint-{}.json", uuid::Uuid::new_v4())),
+            ),
+            maintenance_token: Arc::from("test-token"),
         };
 
         let result = review(

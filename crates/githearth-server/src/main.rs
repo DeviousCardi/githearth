@@ -85,6 +85,35 @@ enum Command {
         #[command(subcommand)]
         action: JobsCommand,
     },
+    /// Enter, leave or observe the write fence `backup` proves.
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceCommand,
+    },
+    /// Write an encrypted backup after proving no writer can acknowledge a
+    /// commit. The key is read from --key-file or stdin, never an argument.
+    Backup {
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_stdin")]
+        key_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_file")]
+        key_stdin: bool,
+    },
+    /// Restore a backup on a fresh host and verify database-to-storage
+    /// consistency before publishing anything.
+    Restore {
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long, conflicts_with = "key_stdin")]
+        key_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_file")]
+        key_stdin: bool,
+        #[arg(long)]
+        storage_root: Option<PathBuf>,
+        #[arg(long)]
+        ssh_host_key_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -105,6 +134,16 @@ enum JobsCommand {
     },
     /// List dead deliveries, which `jobs requeue` recovers.
     List,
+}
+
+#[derive(Subcommand)]
+enum MaintenanceCommand {
+    /// Refuse new writes and wait until in-flight work has drained.
+    Start,
+    /// Leave maintenance mode and accept writes again.
+    Stop,
+    /// Print the observable fence state.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -182,7 +221,36 @@ async fn run(args: Args) -> Result<()> {
         )
         .await;
     }
+    if let Command::Restore {
+        archive,
+        key_file,
+        key_stdin,
+        storage_root,
+        ssh_host_key_path,
+    } = args.command
+    {
+        return run_restore(
+            args.config,
+            archive,
+            key_file,
+            key_stdin,
+            storage_root,
+            ssh_host_key_path,
+        )
+        .await;
+    }
     let config = Config::load(args.config.as_deref())?;
+    if let Command::Backup {
+        output,
+        key_file,
+        key_stdin,
+    } = args.command
+    {
+        return run_backup(args.config, config, output, key_file, key_stdin).await;
+    }
+    if let Command::Maintenance { action } = args.command {
+        return run_maintenance(&config, action).await;
+    }
     if let Command::Doctor = args.command {
         let exit_code = doctor::run(&config).await;
         if exit_code != 0 {
@@ -199,6 +267,9 @@ async fn run(args: Args) -> Result<()> {
     match args.command {
         Command::Doctor => unreachable!("handled above"),
         Command::Setup { .. } => unreachable!("handled above"),
+        Command::Backup { .. } | Command::Restore { .. } | Command::Maintenance { .. } => {
+            unreachable!("handled above")
+        }
         Command::Migrate => {
             MIGRATOR.run(&pool).await.map_err(|_| {
                 anyhow::anyhow!(
@@ -312,7 +383,7 @@ async fn run(args: Args) -> Result<()> {
             // share with a running server: stop the server first (see
             // docs/operations/housekeeping.md). It also runs even when
             // `housekeeping_enabled = false`, because it is explicit.
-            let state = AppState::new(pool, config.clone())
+            let state = AppState::for_command(pool, config.clone())
                 .await
                 .context("cannot initialize repository storage")?;
             match githearth_server::housekeeping::run_repository_now(&state, repository).await? {
@@ -592,6 +663,159 @@ fn read_password_from_stdin() -> Result<String> {
         bail!("password input exceeds limit");
     }
     Ok(password.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+async fn run_backup(
+    global_config: Option<PathBuf>,
+    config: Config,
+    output: Option<PathBuf>,
+    key_file: Option<PathBuf>,
+    key_stdin: bool,
+) -> Result<()> {
+    let key = read_backup_key(&config, key_file, key_stdin)?;
+    let output = match output {
+        Some(path) => path,
+        None => {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            config
+                .backup_directory
+                .join(format!("githearth-{seconds}.ghbackup"))
+        }
+    };
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create the backup directory {}", parent.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let report =
+        githearth_server::backup::run_backup(&config, global_config.as_deref(), &key, &output)
+            .await?;
+    println!(
+        "backup written: {} ({} bytes, {} repositories, advisory dump LSN {}, key {})",
+        report.output.display(),
+        report.bytes,
+        report.repositories,
+        report.postgres_lsn,
+        report.key_id
+    );
+    println!(
+        "manifest: key id {}, AES-256-GCM, Argon2id wrap; the key is not in the archive",
+        report.key_id
+    );
+    println!(
+        "fence used: {} ({})",
+        report.fence.kind(),
+        report.fence.detail()
+    );
+    Ok(())
+}
+
+fn read_backup_key(config: &Config, key_file: Option<PathBuf>, key_stdin: bool) -> Result<Vec<u8>> {
+    if let Some(path) = key_file {
+        return githearth_server::backup::read_key_file(&path);
+    }
+    if key_stdin {
+        return githearth_server::backup::read_key_stdin();
+    }
+    if !config.backup_key_file.as_os_str().is_empty() {
+        return githearth_server::backup::read_key_file(&config.backup_key_file);
+    }
+    Err(githearth_server::backup::ArchiveError::MissingKey.into())
+}
+
+async fn run_restore(
+    global_config: Option<PathBuf>,
+    archive: PathBuf,
+    key_file: Option<PathBuf>,
+    key_stdin: bool,
+    storage_root: Option<PathBuf>,
+    ssh_host_key_path: Option<PathBuf>,
+) -> Result<()> {
+    let passphrase = match key_file {
+        Some(path) => githearth_server::backup::read_key_file(&path)?,
+        None if key_stdin => githearth_server::backup::read_key_stdin()?,
+        None => return Err(githearth_server::backup::ArchiveError::MissingKey.into()),
+    };
+    let database_url = std::env::var("GITHEARTH_DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "GITHEARTH_DATABASE_URL must name the fresh destination database; it is never \
+                 accepted as an argument"
+            )
+        })?;
+    let config_path = global_config.unwrap_or_else(|| PathBuf::from("/etc/githearth/config.toml"));
+    let options = githearth_server::backup::RestoreOptions {
+        archive,
+        passphrase,
+        database_url,
+        config_path,
+        storage_root,
+        ssh_host_key_path,
+    };
+    let report = githearth_server::backup::run_restore(&options).await?;
+    println!(
+        "restore complete: database {}, storage {}, configuration {}, {} repositories, key {}",
+        report.database,
+        report.storage_root.display(),
+        report.config_path.display(),
+        report.repositories,
+        report.key_id
+    );
+    println!("database-to-storage consistency verified; nothing was published before it passed");
+    Ok(())
+}
+
+async fn run_maintenance(config: &Config, action: MaintenanceCommand) -> Result<()> {
+    let token = githearth_server::maintenance::control_token(config)?;
+    match action {
+        MaintenanceCommand::Status => {
+            let status = githearth_server::maintenance::request_status(config.bind, &token).await?;
+            println!(
+                "maintenance: {:?} (in_flight {})",
+                status.phase, status.in_flight
+            );
+        }
+        MaintenanceCommand::Stop => {
+            let status = githearth_server::maintenance::request_stop(config.bind, &token).await?;
+            println!("maintenance: {:?}; writes are accepted again", status.phase);
+        }
+        MaintenanceCommand::Start => {
+            let mut status =
+                githearth_server::maintenance::request_start(config.bind, &token).await?;
+            if status.phase == githearth_server::maintenance::Phase::Draining {
+                println!(
+                    "maintenance: draining ({} write(s) in flight); waiting up to {}s",
+                    status.in_flight, config.maintenance_drain_timeout_seconds
+                );
+            }
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(config.maintenance_drain_timeout_seconds);
+            while status.phase == githearth_server::maintenance::Phase::Draining {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "maintenance did not drain within {}s: {} write(s) still in flight",
+                        config.maintenance_drain_timeout_seconds,
+                        status.in_flight
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                status = githearth_server::maintenance::request_status(config.bind, &token).await?;
+            }
+            println!(
+                "maintenance: {:?} (in_flight {}); backup may proceed",
+                status.phase, status.in_flight
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn shutdown() {

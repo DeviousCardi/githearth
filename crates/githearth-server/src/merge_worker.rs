@@ -262,6 +262,15 @@ pub async fn run_once(state: &AppState, repository: Option<Uuid>) -> Result<usiz
     let mut ran = 0usize;
 
     loop {
+        // The fence quiesces background work as well as requests. Taking a
+        // permit *before* claiming counts this intent for the whole run, so a
+        // merge acknowledged before `maintenance start` keeps the phase
+        // draining until its ref and journal are durable. When the fence is up
+        // the pass claims nothing.
+        let Some(_write) = state.maintenance.admit_write() else {
+            tracing::debug!("merge worker paused; maintenance fence is up");
+            break;
+        };
         let mut conn = state.pool.acquire().await?;
         let claim = claim_intent(&mut conn, holder, lease, repository).await?;
         drop(conn);
