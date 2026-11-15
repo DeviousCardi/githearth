@@ -114,14 +114,30 @@ source row, produce one email. A failed send retries the same durable
 duplicate sends nothing. A delivery that exhausts its budget is `dead` and
 `githearth-server jobs requeue` recovers it.
 
+## Preflight: the `email` check
+
+`githearth-server doctor` runs one read-only `email` check. It opens no socket
+and sends no mail. With no `smtp_host` it reports that delivery is disabled; if
+`smtp_from`, `smtp_username` or `smtp_password_file` is set while the host is
+empty, it warns that they are ignored. With an `smtp_host` it:
+
+- checks that `smtp_from` is set and is a valid address;
+- checks that `smtp_username`, when set, has a credential file, and that the
+  file exists, is readable and is not empty (a `-` credential is read from
+  stdin at start-up; `doctor` warns that it cannot verify it without consuming
+  it);
+- warns when the TLS mode does not match the port: `implicit` with a port
+  other than 465, or `starttls`/`none` on 465.
+
+A missing or unreadable credential fails the check, because `serve` reads the
+same file and would refuse to start. A TLS/port mismatch only warns: a relay on
+a non-standard port may still work. The check cannot verify the credential
+against the server, the certificate chain, SPF/DKIM/DMARC, or that the relay
+will accept a message; only a real send proves those. See the check list in
+[install.md](install.md).
+
 ## Things this slice deliberately does not do
 
-- **No `doctor` check for SMTP.** The SMTP diagnostic named by phase 6.3 is
-  deliberately deferred to the runbooks slice (U20), which owns
-  `docs/operations/install.md` and the `doctor` check list. That check should
-  report, without sending mail, whether `smtp_host`, `smtp_from` and the
-  credential file are configured and readable, and whether the configured TLS
-  mode matches the port.
 - **No SPF/DKIM/DMARC or bounce handling.** M4.2's abuse baseline owns those and
   M11a requires them before sign-up. This slice sends through the operator's
   relay with the configured envelope sender.

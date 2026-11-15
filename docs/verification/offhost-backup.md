@@ -34,6 +34,17 @@ The harness subclasses the M2 harness in [`scripts/verify-m2.py`](../../scripts/
 | 4 | Lose the primary, restore from off-host | Stops the server, **drops the database and deletes the storage root**, then rsyncs the three files back into a new directory and verifies the manifest locally.<ul><li>Restores into a **new** database and a **new** storage root.</li><li>`githearth check` exits 0, and the server starts on the restored data.</li><li>An HTTP clone's HEAD equals the commit pushed before the backup, and the issue is readable.</li></ul> | PASS | 1.3 s |
 | 5 | Tamper detection | Overwrites 8 bytes of the tarball on the backup host; `sha256sum -c` then fails. | PASS | 0.4 s |
 
+Correction 2026-11-15: PR #187 re-points this harness at the shipped `backup`
+and `restore` commands and adds the section-3–5 assertions (maintenance and
+stopped-server fences, manifest inspection, the four restore refusals). Those
+assertions have **not run** on the authoring machine. It is Linux-host-shaped:
+its backup host is a container reached over the host's loopback, and under
+Docker Desktop on macOS that loopback belongs to the VM, so
+`verify-offhost-backup.py` stops at `backup host sshd not reachable within 30 s`
+and the new assertions do not execute. The 2026-11-09 PASS above covers the
+older dump/tar/rsync harness only. U20 stays open until both scripts run to
+completion on a Linux host with Docker.
+
 ## Not covered
 
 - A real second machine and network: the backup host is a container on the same host.

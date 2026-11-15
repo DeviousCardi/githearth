@@ -21,7 +21,7 @@ printf '%s' "$ADMIN_PASSWORD" | docker compose exec -T app githearth-server boot
 unset ADMIN_PASSWORD
 ```
 
-Repositories, their journals and the SSH host key live in the `repositories` volume, mounted at the storage root `/var/lib/githearth`. Back it up together with a database dump as described in [backup-restore.md](operations/backup-restore.md): copy the whole storage root (for example `docker compose stop app` and then `docker compose cp app:/var/lib/githearth backup/`), not only `repositories/`.
+Repositories, their journals and the SSH host key live in the `repositories` volume, mounted at the storage root `/var/lib/githearth`. Back it up together with the database as one encrypted archive with `githearth-server backup`, described in [backup-restore.md](operations/backup-restore.md). The older advice to copy the storage root by hand is not a fenced backup: writing a tarball while the server runs can miss a push.
 
 Bootstrap succeeds once. Repeating it fails with an explicit message and never updates an existing administrator or password. It takes a transaction-scoped database lock, creates the account and audit/outbox records atomically, and requires schema migration first. There is no password reset or account provisioning command in M1. Bootstrap is an operator command, never an HTTP route. Passwords are accepted only on stdin, never as CLI options.
 

@@ -589,33 +589,136 @@ class M4Harness(_m2.Harness):
         shutil.rmtree(str(qw), ignore_errors=True)
 
     # ================================================================== S4
+    def _backup_env(self):
+        env = self.server_env(MAIN_DB, self.storage_root)
+        env["GITHEARTH_BIND"] = f"127.0.0.1:{self.server.http_port}"
+        env["GITHEARTH_SSH_BIND"] = (
+            f"127.0.0.1:{self.server.ssh_port}" if self.server.ssh_port
+            else "127.0.0.1:0")
+        return env
+
+    def _backup(self, archive, key, env):
+        return subprocess.run(
+            [self.binary, "backup", "--output", str(archive),
+             "--key-file", str(key)],
+            env=env, capture_output=True, text=True, timeout=300)
+
     def s4_backup_restore(self):
-        dp = self.tmp / "m4.dump"
-        with open(dp, "wb") as d:
-            subprocess.run(
-                ["docker", "exec", self.name, "pg_dump", "-U", "githearth", "-d", MAIN_DB, "-Fc"],
-                check=True, stdout=d)
-        st = self.tmp / "storage.tar"
-        subprocess.run(
-            ["tar", "-C", str(self.storage_root), "--exclude=run", "-cf", str(st), "."],
-            check=True)
+        """`backup` refuses while `serve` accepts writes; a racing push is
+        either in the restore or was refused before acknowledgement."""
+        key = self.tmp / "m4-backup.key"
+        key.write_text(secrets.token_hex(32))
+        key.chmod(0o600)
+        archive = self.tmp / "m4.ghbackup"
+
+        # The server s3 left running accepts writes, so `backup` must refuse
+        # and name the fence it could not prove.
+        refused = self._backup(archive, key, self._backup_env())
+        if refused.returncode == 0:
+            raise HarnessError("backup succeeded while serve accepted writes")
+        refusal = refused.stdout + refused.stderr
+        if "accepting writes" not in refusal:
+            raise HarnessError(f"backup refusal does not name the live writer: {refusal[:400]}")
+
+        # Give the backup real content, then build a push that will race it.
+        race = self.tmp / "race-work"
+        race.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(race),
+                       env=self.git_env(), capture_output=True, check=True)
+        (race / "base.txt").write_text("before the fence\n")
+        for args in (["config", "user.name", "Race"], ["config", "user.email", "race@example.com"],
+                     ["add", "-A"], ["commit", "-m", "before the fence"]):
+            subprocess.run(["git", "-C", str(race)] + args,
+                           capture_output=True, check=True)
+        self.git("push", self.repo_url, "main", cwd=str(race),
+                 user=self.admin_username, password=self.admin_password,
+                 label="s4 base push")
+
+        subprocess.run(["git", "-C", str(race), "checkout", "-b", "racing"],
+                       capture_output=True, check=True)
+        (race / "racing.txt").write_text("raced the backup\n")
+        for args in (["add", "-A"], ["-c", "user.name=Race", "-c", "user.email=race@example.com",
+                                     "commit", "-m", "racing the backup"]):
+            subprocess.run(["git", "-C", str(race)] + args,
+                           capture_output=True, check=True)
+
+        started = subprocess.run(
+            [self.binary, "maintenance", "start"], env=self._backup_env(),
+            capture_output=True, text=True, timeout=120)
+        if started.returncode != 0:
+            raise HarnessError(
+                f"maintenance start failed: {(started.stdout + started.stderr)[:400]}")
+        if "backup may proceed" not in started.stdout and "drained" not in started.stdout:
+            raise HarnessError(f"maintenance did not drain: {started.stdout[:300]}")
+
+        # Start the backup, then push while it runs. The push is either
+        # acknowledged (and must be in the restore) or refused (and must not).
+        backup_proc = subprocess.Popen(
+            [self.binary, "backup", "--output", str(archive),
+             "--key-file", str(key)],
+            env=self._backup_env(), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+        pushed = self.git("push", self.repo_url, "racing", cwd=str(race),
+                          user=self.admin_username, password=self.admin_password,
+                          check=False, label="s4 racing push")
+        backup_out, _ = backup_proc.communicate(timeout=300)
+        if backup_proc.returncode != 0:
+            raise HarnessError(f"backup under maintenance failed: {backup_out[:600]}")
+        if "fence used: maintenance" not in backup_out:
+            raise HarnessError(f"backup did not name the maintenance fence: {backup_out[:400]}")
+        if "fence: maintenance" not in backup_out:
+            raise HarnessError(f"backup did not print the fence kind: {backup_out[:400]}")
+
+        # The archive is encrypted and the printed key id is the header's.
+        raw = archive.read_bytes()
+        if not raw.startswith(b"GITHEARTH-BACKUP1\n"):
+            raise HarnessError("backup output is not an encrypted GITHEARTH-BACKUP1 archive")
+        for forbidden in (key.read_bytes().strip(), self.admin_password.encode(),
+                          b"manifest.json", b"config.toml", b"PGDMP"):
+            if forbidden in raw:
+                raise HarnessError("the encrypted archive leaks plaintext")
+        try:
+            header = json.loads(raw.split(b"\n", 2)[1])
+        except (IndexError, json.JSONDecodeError) as error:
+            raise HarnessError(f"archive header is not JSON: {error}")
+        if header.get("cipher") != "AES-256-GCM" or not str(
+                header.get("kdf", "")).startswith("Argon2id"):
+            raise HarnessError("archive is not AES-256-GCM under an Argon2id key")
+        if f"key {header['key_id']}" not in backup_out:
+            raise HarnessError("backup did not print the header's key id")
+
+        subprocess.run([self.binary, "maintenance", "stop"], env=self._backup_env(),
+                       capture_output=True, text=True, timeout=60)
         self.stop_server()
 
-        self.docker(["exec", self.name, "createdb", "-U", "githearth", RESTORE_DB],
-                    stdout=subprocess.DEVNULL)
-        with open(dp, "rb") as d:
-            subprocess.run(
-                ["docker", "exec", "-i", self.name, "pg_restore",
-                 "-U", "githearth", "--no-owner", "-d", RESTORE_DB],
-                check=True, stdin=d)
-        ns = self.tmp / "storage-restore"; ns.mkdir()
-        subprocess.run(["tar", "-C", str(ns), "-xf", str(st)], check=True)
+        # Restore on a fresh host: fresh database, storage, configuration and
+        # host key. No server is running when `restore` runs.
+        ns = self.tmp / "storage-restore"
+        restored_config = self.tmp / "restored-config.toml"
+        restored_host_key = self.tmp / "restored_host_key"
+        restore_env = {k: v for k, v in os.environ.items()
+                       if not k.startswith("GITHEARTH_")}
+        restore_env["GITHEARTH_DATABASE_URL"] = self.db_url(RESTORE_DB)
+        restored = subprocess.run(
+            [self.binary, "--config", str(restored_config), "restore",
+             "--archive", str(archive), "--key-file", str(key),
+             "--storage-root", str(ns),
+             "--ssh-host-key-path", str(restored_host_key)],
+            env=restore_env, capture_output=True, text=True, timeout=300)
+        if restored.returncode != 0:
+            raise HarnessError(
+                f"restore failed: {(restored.stdout + restored.stderr)[:800]}")
+        if "database-to-storage consistency verified" not in restored.stdout:
+            raise HarnessError("restore did not report its consistency check")
+        if not self.sql("postgres",
+                        "SELECT count(*) FROM pg_database WHERE datname='"
+                        + RESTORE_DB + "'").startswith("1"):
+            raise HarnessError("restore did not create the fresh database")
+        for path in (ns, restored_config, restored_host_key):
+            if not path.exists():
+                raise HarnessError(f"restore did not publish {path.name}")
 
-        p = subprocess.run([self.cli_binary, "check", str(ns)], capture_output=True, text=True)
-        if p.returncode != 0:
-            raise HarnessError(f"restore: githearth check exited {p.returncode}: {p.stderr[:300]}")
-
-        self.generate_ssh_host_key()
+        self.ssh_host_key_path = restored_host_key
         self.start_server(RESTORE_DB, ns, "restored")
         rtok = self.api_session(self.admin_username, self.admin_password)
         r1 = self._try_clone_http(self.admin_username, self.admin_password)
@@ -637,6 +740,24 @@ class M4Harness(_m2.Harness):
             nmr2 = self._try_clone_ssh(self.nonmember_ssh_key)
             if "not-found" not in nmr2:
                 raise HarnessError(f"restore: nonmember SSH should be denied: {nmr2}")
+
+        # The racing push is either in the restore or was refused before it
+        # was acknowledged; nothing may fall between those two.
+        clone = self.tmp / "restored-clone"
+        self.git("clone", self.repo_url, str(clone),
+                 user=self.admin_username, password=self.admin_password,
+                 label="s4 restored clone")
+        refs = subprocess.run(
+            ["git", "-C", str(clone), "branch", "-r", "--list", "origin/racing"],
+            capture_output=True, text=True).stdout
+        in_restore = "origin/racing" in refs
+        if pushed.returncode == 0 and not in_restore:
+            raise HarnessError("racing push was acknowledged but is missing after restore")
+        if pushed.returncode != 0 and in_restore:
+            raise HarnessError("racing push was refused but is present after restore")
+        if pushed.returncode != 0 and "maintenance" not in (pushed.stderr + pushed.stdout):
+            raise HarnessError(
+                f"racing push was refused for an unexpected reason: {pushed.stderr[:400]}")
 
     # ================================================================== S5
     def s5_upgrade_drill(self):

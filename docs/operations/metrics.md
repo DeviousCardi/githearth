@@ -141,9 +141,11 @@ series).
   bytes-before/after numbers a run records are per repository and are in
   `repository_housekeeping` ([housekeeping.md](housekeeping.md#results)).
 
-The outbox delivery states are read from `outbox_events.delivered_at`. The
-per-consumer fan-out relay that M4.1 6.3 adds will add its own states; this
-list changes in the same change that adds them.
+The outbox states are read from `outbox_events.delivered_at` and are still the
+two event-level states in the table. The per-consumer fan-out relay keeps its
+delivery states in `outbox_deliveries` (see [outbox.md](outbox.md)); those are
+deliberately not published here, because the fixed label list does not grow
+with the number of consumers.
 
 ## Sample scrape
 

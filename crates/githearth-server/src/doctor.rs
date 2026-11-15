@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, SmtpTls};
 use sqlx::PgPool;
 use std::path::Path;
 use uuid::Uuid;
@@ -65,6 +65,8 @@ pub async fn report(config: &Config) -> Vec<Check> {
 
     check_disk(config, &mut checks);
 
+    check_email(config, &mut checks);
+
     match db_connect(config).await {
         Ok(pool) => {
             checks.push(Check::ok("database", "connected"));
@@ -91,8 +93,8 @@ pub async fn report(config: &Config) -> Vec<Check> {
             checks.push(outbox_check(&pool).await);
             checks.push(housekeeping_check(&pool, config).await);
             // Only reported when it has something to report: a clean install
-            // has no skipped request. So `doctor` runs nine checks there and
-            // ten on an install whose base backfill warned, which is what
+            // has no skipped request. So `doctor` runs ten checks there and
+            // eleven on an install whose base backfill warned, which is what
             // `docs/operations/install.md` documents.
             if let Some(check) = base_backfill_check(&pool).await {
                 checks.push(check);
@@ -212,6 +214,136 @@ fn check_disk(config: &Config, checks: &mut Vec<Check>) {
         }
         Err(e) => Check::fail("disk", format_args!("{}: {e}", path.display())),
     });
+}
+
+fn tls_name(tls: SmtpTls) -> &'static str {
+    match tls {
+        SmtpTls::Starttls => "starttls",
+        SmtpTls::Implicit => "implicit",
+        SmtpTls::None => "none",
+    }
+}
+
+/// The conventional pairing is implicit TLS on 465 and STARTTLS (or a
+/// cleartext loopback relay) everywhere else. It is a warning, not a refusal:
+/// a relay on a non-standard port is unusual, not unusable.
+fn tls_port_mismatch(tls: SmtpTls, port: u16) -> Option<String> {
+    match tls {
+        SmtpTls::Implicit if port != 465 => Some(format!(
+            "smtp_tls = \"implicit\" is configured on port {port}; port 465 is the usual implicit-TLS port"
+        )),
+        SmtpTls::Starttls | SmtpTls::None if port == 465 => Some(format!(
+            "smtp_tls = \"{}\" is configured on port 465, which expects implicit TLS",
+            tls_name(tls)
+        )),
+        _ => None,
+    }
+}
+
+/// Reports whether SMTP is configured without opening a socket or sending
+/// mail. A mail relay is optional, so an installation with no `smtp_host` is
+/// `ok`; when one is set, an unusable sender or credential is a failure
+/// (start-up reads the same file) and a TLS/port mismatch is a warning.
+fn check_email(config: &Config, checks: &mut Vec<Check>) {
+    if config.smtp_host.is_empty() {
+        let stray = !config.smtp_from.trim().is_empty()
+            || config.smtp_username.is_some()
+            || config.smtp_password_file.is_some();
+        if stray {
+            checks.push(Check::warn(
+                "email",
+                "smtp_host is empty, so delivery is disabled; smtp_from and the credential are ignored",
+            ));
+        } else {
+            checks.push(Check::ok(
+                "email",
+                "not configured (smtp_host is empty); no mail is sent",
+            ));
+        }
+        return;
+    }
+
+    let mut problems = Vec::new();
+    let mut warnings = Vec::new();
+    if config.smtp_from.trim().is_empty() {
+        problems.push("smtp_from is empty".to_owned());
+    } else if !crate::invitations::valid_email(&config.smtp_from) {
+        problems.push(format!(
+            "smtp_from {:?} is not a valid email address",
+            config.smtp_from
+        ));
+    }
+    if config.smtp_username.is_some() && config.smtp_password_file.is_none() {
+        problems.push("smtp_username is set but smtp_password_file is not".to_owned());
+    }
+
+    let credential = match config.smtp_password_file.as_deref() {
+        None => "no credential configured (unauthenticated relay)".to_owned(),
+        Some(path) if path.as_os_str() == "-" => {
+            warnings.push(
+                "the credential is read from stdin at start-up; doctor cannot verify it without consuming it"
+                    .to_owned(),
+            );
+            "credential from stdin".to_owned()
+        }
+        Some(path) => match std::fs::File::open(path) {
+            Ok(mut file) => {
+                use std::io::Read;
+                let mut byte = [0u8; 1];
+                match file.read(&mut byte) {
+                    Ok(0) => {
+                        problems.push(format!("credential file {} is empty", path.display()));
+                        format!("credential file {} is empty", path.display())
+                    }
+                    Ok(_) => format!("credential file {} is readable", path.display()),
+                    Err(error) => {
+                        problems.push(format!(
+                            "credential file {} is not readable: {error}",
+                            path.display()
+                        ));
+                        format!("credential file {} is not readable", path.display())
+                    }
+                }
+            }
+            Err(error) => {
+                problems.push(format!(
+                    "credential file {} is not readable: {error}",
+                    path.display()
+                ));
+                format!("credential file {} is not readable", path.display())
+            }
+        },
+    };
+
+    if let Some(mismatch) = tls_port_mismatch(config.smtp_tls, config.smtp_port) {
+        warnings.push(mismatch);
+    }
+
+    let summary = format!(
+        "{}:{} {}, smtp_from {}, {}",
+        config.smtp_host,
+        config.smtp_port,
+        tls_name(config.smtp_tls),
+        if config.smtp_from.trim().is_empty() {
+            "missing"
+        } else {
+            "set"
+        },
+        credential
+    );
+    if !problems.is_empty() {
+        checks.push(Check::fail(
+            "email",
+            format!("{}; {}", problems.join("; "), summary),
+        ));
+    } else if !warnings.is_empty() {
+        checks.push(Check::warn(
+            "email",
+            format!("{}; {}", warnings.join("; "), summary),
+        ));
+    } else {
+        checks.push(Check::ok("email", summary));
+    }
 }
 
 async fn db_connect(config: &Config) -> anyhow::Result<PgPool> {
@@ -369,14 +501,18 @@ async fn housekeeping_check(pool: &PgPool, config: &Config) -> Check {
 /// with no handler (`job_kind` NULL) holds deliveries that nothing will ever
 /// enqueue; `outbox::register` refuses to create one, so this covers only a
 /// database an older release or a hand edit left behind, and it warns by name.
-/// Otherwise the check reports its counts and passes.
+/// Otherwise the check reports its counts and passes. `pending` is counted:
+/// a backlog that does not move is a stalled relay, and filtering it out made
+/// the check print `0 pending` over exactly that fault. Pending does not warn
+/// by itself: a new consumer's first delivery and a retry waiting out its
+/// backoff are pending by design.
 async fn outbox_check(pool: &PgPool) -> Check {
     let counts: Result<(i64, i64, i64, i64), _> = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE state = 'dead'), \
                 count(*) FILTER (WHERE state = 'pending'), \
                 count(*) FILTER (WHERE state = 'delivering'), \
                 count(*) FILTER (WHERE state = 'delivered') \
-         FROM outbox_deliveries WHERE state <> 'pending'",
+         FROM outbox_deliveries",
     )
     .fetch_one(pool)
     .await;
@@ -534,6 +670,70 @@ mod tests {
         let push_limit = 100_000;
         let (warn, _free) = disk_status(4096, 0, 20, 1, push_limit); // 20*4096 = 81920 < 200_000
         assert!(warn);
+    }
+
+    // ---- SMTP TLS/port tests ----
+
+    #[test]
+    fn tls_port_pairing_warns_only_on_a_mismatch() {
+        assert!(tls_port_mismatch(SmtpTls::Implicit, 465).is_none());
+        assert!(tls_port_mismatch(SmtpTls::Starttls, 587).is_none());
+        assert!(tls_port_mismatch(SmtpTls::Starttls, 25).is_none());
+        assert!(tls_port_mismatch(SmtpTls::None, 25).is_none());
+        assert!(tls_port_mismatch(SmtpTls::Implicit, 587).is_some());
+        assert!(tls_port_mismatch(SmtpTls::Starttls, 465).is_some());
+        assert!(tls_port_mismatch(SmtpTls::None, 465).is_some());
+    }
+
+    #[test]
+    fn email_check_reports_configured_unreadable_and_mismatched() {
+        let dir = temp_dir("doctor-email");
+        std::fs::create_dir_all(&dir).unwrap();
+        let credential = dir.join("smtp-password");
+        std::fs::write(&credential, "secret\n").unwrap();
+
+        let mut config = test_config(&dir.join("storage"));
+        let mut checks = Vec::new();
+        check_email(&config, &mut checks);
+        assert!(matches!(checks[0].status, Status::Ok));
+        assert!(checks[0].detail.contains("not configured"));
+
+        config.smtp_host = "smtp.example.com".into();
+        config.smtp_from = "githearth@example.com".into();
+        config.smtp_username = Some("githearth".into());
+        config.smtp_password_file = Some(credential.clone());
+        let mut checks = Vec::new();
+        check_email(&config, &mut checks);
+        assert!(
+            matches!(checks[0].status, Status::Ok),
+            "{}",
+            checks[0].detail
+        );
+        assert!(checks[0].detail.contains("credential file"));
+        assert!(checks[0].detail.contains("readable"));
+
+        config.smtp_password_file = Some(dir.join("missing"));
+        let mut checks = Vec::new();
+        check_email(&config, &mut checks);
+        assert!(
+            matches!(checks[0].status, Status::Fail),
+            "{}",
+            checks[0].detail
+        );
+        assert!(checks[0].detail.contains("not readable"));
+
+        config.smtp_password_file = Some(credential);
+        config.smtp_tls = SmtpTls::Implicit;
+        config.smtp_port = 587;
+        let mut checks = Vec::new();
+        check_email(&config, &mut checks);
+        assert!(
+            matches!(checks[0].status, Status::Warn),
+            "{}",
+            checks[0].detail
+        );
+        assert!(checks[0].detail.contains("port 465"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- storage tests ----

@@ -4,8 +4,10 @@
 
 ## Before you begin
 
-1. **Final backup** — follow [backup-restore.md](backup-restore.md). Keep the
-   backup and this binary version together so you can restore later.
+1. **Final backup** — stop the server, then run
+   `githearth-server --config <config> backup --output <archive> --key-file <key>`
+   as in [backup-restore.md](backup-restore.md). Keep the encrypted archive, its
+   key and this binary version together so you can restore later.
 2. **Repository mirror export** (optional) — export every repository as a bare
    `git clone --mirror` if you want standalone clones outside GitHearth.
    Loop over repositories listed by the API or read them from the storage root.
