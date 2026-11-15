@@ -2,9 +2,11 @@
 //!
 //! Converges PostgreSQL repository rows with on-disk storage after crashes or
 //! failed requests. One pass (`reconcile_once`) visits every repository whose
-//! row is `creating` or `deleting` and whose `updated_at` is older than a
-//! configurable grace period, brings storage into agreement, and cleans up
-//! orphans, stale tmp entries and expired trash.
+//! row is `creating`, `deleting` or `restoring` and whose `updated_at` is
+//! older than a configurable grace period, brings storage into agreement, and
+//! cleans up orphans, stale tmp entries and expired trash. A `restoring` row
+//! is completed from trash (or from the directory a crash already moved back)
+//! and returns to `deleted` when its trash entry is gone.
 //!
 //! Rows are ordered by `updated_at`; each pass fetches up to 1000 rows.  If
 //! more than 1000 repositories are pending the remainder is handled in
@@ -43,6 +45,7 @@ struct PendingRow {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     pub activated: usize,
+    pub restored: usize,
     pub failed: usize,
     pub deleted: usize,
     pub orphaned: usize,
@@ -55,6 +58,7 @@ pub struct Summary {
 impl Summary {
     pub fn has_changes(&self) -> bool {
         self.activated > 0
+            || self.restored > 0
             || self.failed > 0
             || self.deleted > 0
             || self.orphaned > 0
@@ -140,12 +144,14 @@ pub async fn reconcile_once(
                 reconcile_creating(state, row.id, row.operation_id, attempts).await
             }
             RepositoryStatus::Deleting => reconcile_deleting(state, row.id, &scanned).await,
+            RepositoryStatus::Restoring => reconcile_restoring(state, row.id).await,
             _ => continue,
         };
 
         match result {
             Ok(Some(change)) => match change {
                 Change::Activated => summary.activated += 1,
+                Change::Restored => summary.restored += 1,
                 Change::Failed => summary.failed += 1,
                 Change::Deleted => summary.deleted += 1,
             },
@@ -186,8 +192,13 @@ pub async fn reconcile_once(
                     }
                 }
             }
-            Some(RepositoryStatus::Creating | RepositoryStatus::Deleting) => {
-                // Not an orphan – the directory may legitimately exist.
+            Some(
+                RepositoryStatus::Creating
+                | RepositoryStatus::Deleting
+                | RepositoryStatus::Restoring,
+            ) => {
+                // Not an orphan – the directory may legitimately exist while
+                // the row is mid-lifecycle (a restore is moving it back).
             }
             _ => { /* active, failed – has a valid row, not an orphan */ }
         }
@@ -206,15 +217,63 @@ pub async fn reconcile_once(
     summary.tmp_cleaned = clean_tmp_step(&mut conn, &state.storage, candidates).await?;
     drop(conn);
 
-    // ---- trash purge -------------------------------------------------------
+    // ---- trash purge (serialized with a restore) ---------------------------
+    // Two-phase, like tmp cleanup: list candidates first, then for each one
+    // take the per-repository lock BEFORE its own DB connection and re-read
+    // the row under that lock. A restore sets `restoring` before taking the
+    // same lock, so:
+    //   - purge first: it sees `deleted` and removes the entry; the restore
+    //     then finds no trash entry and is refused (the purge won);
+    //   - restore first: it sets `restoring`, and the purge that follows sees
+    //     `restoring` and leaves the entry alone, even mid-move;
+    //   - a status-only check without the lock would let the purge remove the
+    //     entry between the restore's check and its rename.
     let retention = Duration::from_secs(state.config.trash_retention_seconds);
-    let older_than = SystemTime::now()
+    let cutoff = SystemTime::now()
         .checked_sub(retention)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let storage = state.storage.clone();
-    let purged = tokio::task::spawn_blocking(move || storage.purge_trash(older_than))
+    let candidates = tokio::task::spawn_blocking(move || storage.list_trash())
         .await
-        .map_err(|e| anyhow::anyhow!("purge_trash task panicked: {e}"))??;
+        .map_err(|e| anyhow::anyhow!("list_trash task panicked: {e}"))??;
+    let mut purged = 0usize;
+    for entry in candidates {
+        if entry.seconds >= cutoff {
+            continue;
+        }
+        // Lock before any pool connection (module-level lock ordering).
+        let guard = state.storage.lock_repository(entry.repository).await?;
+        let mut conn = state.pool.acquire().await?;
+        let status = repositories::get(&mut conn, entry.repository)
+            .await?
+            .map(|row| row.status);
+        drop(conn);
+        if status == Some(RepositoryStatus::Restoring) {
+            // The restore owns this entry; leave it for the next pass.
+            continue;
+        }
+        let repository_id = entry.repository;
+        let storage = state.storage.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            storage.remove_trash_entry(&entry)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("trash purge task panicked: {e}"))?
+        {
+            Ok(()) => purged += 1,
+            Err(githearth_git::StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A restore moved it after the listing; nothing left to purge.
+            }
+            Err(e) => {
+                summary.errors += 1;
+                tracing::warn!(repository_id = %repository_id, error = %e, "trash purge failed");
+            }
+        }
+    }
     summary.trash_purged = purged;
 
     // ---- push journal replay ----------------------------------------------
@@ -251,7 +310,7 @@ async fn push_replay(state: &AppState) -> anyhow::Result<()> {
     let mut aborted = 0usize;
     for id in active {
         // Lock BEFORE any pool connection (module-level lock ordering).
-        let guard = state.storage.repository_lock(id).lock_owned().await;
+        let guard = state.storage.lock_repository(id).await?;
 
         let mut conn = state.pool.acquire().await?;
         let applied = pushes::applied_through(&mut conn, id).await?;
@@ -308,7 +367,7 @@ async fn fetch_pending(
     // Compare on the database clock, which also wrote `updated_at`.
     let rows = sqlx::query(
         "SELECT id, status, operation_id FROM repositories \
-         WHERE status IN ('creating','deleting') \
+         WHERE status IN ('creating','deleting','restoring') \
          AND updated_at < now() - make_interval(secs => $1) \
          ORDER BY updated_at LIMIT $2",
     )
@@ -370,6 +429,7 @@ pub async fn clean_tmp_step(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Change {
     Activated,
+    Restored,
     Failed,
     Deleted,
 }
@@ -384,7 +444,7 @@ async fn reconcile_creating(
 
     // Acquire the per-repository filesystem lock *before* any DB connection
     // (see module-level lock-ordering docs).
-    let guard = storage.repository_lock(repo_id).lock_owned().await;
+    let guard = storage.lock_repository(repo_id).await?;
 
     // Re-read the row under the lock: a concurrent API delete may have already
     // removed it, and the reconciler must not recreate the directory.
@@ -464,7 +524,7 @@ async fn reconcile_deleting(
 
     // Acquire the per-repository filesystem lock *before* any DB connection
     // (see module-level lock-ordering docs).
-    let guard = storage.repository_lock(repo_id).lock_owned().await;
+    let guard = storage.lock_repository(repo_id).await?;
 
     let mut conn = state.pool.acquire().await?;
 
@@ -499,9 +559,103 @@ async fn reconcile_deleting(
     }
 }
 
+/// Finish a restore that committed `restoring` but crashed before the row was
+/// `active`. The directory may already be back (the move completed) or still
+/// be in trash; both converge. If the purge removed the entry, the row returns
+/// to `deleted`, which is the same refusal a restore after the purge gives.
+async fn reconcile_restoring(state: &AppState, repo_id: Uuid) -> anyhow::Result<Option<Change>> {
+    let storage = state.storage.clone();
+
+    // Lock before any pool connection (module-level lock ordering).
+    let guard = storage.lock_repository(repo_id).await?;
+
+    let mut conn = state.pool.acquire().await?;
+    let Some(row) = repositories::get(&mut conn, repo_id)
+        .await?
+        .filter(|row| row.status == RepositoryStatus::Restoring)
+    else {
+        return Ok(None);
+    };
+    let actor = row.created_by;
+    drop(conn);
+
+    let restore = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        if storage.has_repository(repo_id) {
+            return Ok(());
+        }
+        match storage.find_trash(repo_id)? {
+            Some(entry) => storage.restore(repo_id, &entry.path).map(|_| ()),
+            None => Err(githearth_git::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "trash entry is gone",
+            ))),
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("restore task panicked: {e}"))?;
+
+    match restore {
+        Ok(()) => {
+            let mut tx = state.pool.begin().await?;
+            if !repositories::finish_restore(&mut tx, repo_id).await? {
+                return Ok(None);
+            }
+            // shortcut: the restoring actor is not stored on the row; a
+            // recovered restore is audited as its creator, like the deleting
+            // reconciler does.
+            crate::event(
+                &mut tx,
+                Some(row.organization_id),
+                actor,
+                "repository.restored",
+            )
+            .await?;
+            tx.commit().await?;
+            tracing::info!(repository_id = %repo_id, "reconciler restored repository");
+            Ok(Some(Change::Restored))
+        }
+        Err(githearth_git::StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut tx = state.pool.begin().await?;
+            // Preserve the original `deleted_at`, like a failed move does.
+            repositories::revert_restore(&mut tx, repo_id).await?;
+            tx.commit().await?;
+            tracing::warn!(repository_id = %repo_id, "restore had no trash entry; reverted to deleted");
+            Ok(Some(Change::Deleted))
+        }
+        Err(e) => Err(anyhow::anyhow!("restore failed: {e}")),
+    }
+}
+
+/// Outcome of [`recover_restore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The directory is back and the row is `active`.
+    Finished,
+    /// The trash entry was gone; the row is `deleted` again.
+    Reverted,
+    /// The row had changed under the lock; nothing was done.
+    Skipped,
+}
+
+/// Finish (or revert) one crashed restore now, without a full pass.
+///
+/// This is exactly the per-repository step [`reconcile_once`] runs for a
+/// `restoring` row. It is public so the crash-recovery test can drive one
+/// repository at a time: a suite that shares one database cannot backdate a
+/// row for its own pass without every other suite's pass also seeing it and
+/// acting on a different storage root.
+pub async fn recover_restore(state: &AppState, repo_id: Uuid) -> anyhow::Result<RestoreOutcome> {
+    Ok(match reconcile_restoring(state, repo_id).await? {
+        Some(Change::Restored) => RestoreOutcome::Finished,
+        Some(Change::Deleted) => RestoreOutcome::Reverted,
+        _ => RestoreOutcome::Skipped,
+    })
+}
+
 async fn orphan_repo(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
     let storage = state.storage.clone();
-    let guard = storage.repository_lock(id).lock_owned().await;
+    let guard = storage.lock_repository(id).await?;
 
     let mut conn = state.pool.acquire().await?;
 
@@ -554,6 +708,7 @@ async fn run_pass(state: &AppState, attempts: &mut HashMap<Uuid, u32>) {
             if summary.has_changes() {
                 tracing::info!(
                     activated = summary.activated,
+                    restored = summary.restored,
                     failed = summary.failed,
                     deleted = summary.deleted,
                     orphaned = summary.orphaned,

@@ -27,6 +27,15 @@ when {
 permit (principal, action in GitHearth::Action::"site_admin", resource)
 when { principal is GitHearth::Account && principal.site_admin };
 
+// Repository restore is available to an organization owner or a site
+// administrator (U23c). It deliberately does not join the `site_admin`
+// action group: that group's forbid makes its actions exclusive to site
+// administrators, which would exclude owners. This permit widens exactly one
+// action for a site administrator and nothing else.
+@id("repository-restore-site-admin")
+permit (principal, action == GitHearth::Action::"repository.restore", resource)
+when { principal is GitHearth::Account && principal.site_admin };
+
 // --- Boundaries --------------------------------------------------------
 
 // Instance administration belongs to site administrators alone, whatever

@@ -297,6 +297,171 @@ pub async fn find_by_name(
     .map(|r| r.as_ref().map(row_to_repository))
 }
 
+/// Find a repository by its current name whatever its status, and then any
+/// redirected name. Deleted and restoring rows are included so a caller can
+/// answer `410 Gone` for a path that still names one, instead of the `404` a
+/// never-existing name gets. Redirects stay a read convenience for a rename;
+/// the `410` rule is decided by the caller from the returned row.
+///
+/// A redirect whose target belongs to another organization is a transfer
+/// tombstone, not a rename redirect, and is **not** followed here: resolving
+/// it would hand the caller a row from the target organization while the
+/// caller is authorized against the source one. The transfer slice's
+/// `transferred_at IS NULL` filter replaces this organization-equality test at
+/// merge time.
+pub async fn find_by_name_any_status(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+) -> Result<Option<RepositoryRow>, sqlx::Error> {
+    if let Some(row) = find_exact_any_status(conn, organization_id, name).await? {
+        return Ok(Some(row));
+    }
+    sqlx::query(
+        "SELECT r.id, r.organization_id, r.name, r.description, r.visibility, r.archived, r.status, r.operation_id, r.created_by, r.object_format, r.parent_repository_id FROM repository_redirects d JOIN repositories r ON r.id = d.repository_id WHERE d.organization_id=$1 AND lower(d.name)=lower($2) AND r.organization_id = d.organization_id",
+    )
+    .bind(organization_id)
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await
+    .map(|r| r.as_ref().map(row_to_repository))
+}
+
+/// The row with exactly this name, whatever its status, without following
+/// redirects. A caller that must not let a live replacement inherit an older
+/// row's answers uses this to tell the two apart.
+pub async fn find_exact_any_status(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+) -> Result<Option<RepositoryRow>, sqlx::Error> {
+    sqlx::query(&format!(
+        "SELECT {REPO_COLS} FROM repositories WHERE organization_id=$1 AND lower(name)=lower($2)"
+    ))
+    .bind(organization_id)
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await
+    .map(|r| r.as_ref().map(row_to_repository))
+}
+
+/// Whether a **transfer tombstone** holds `name` in `organization_id`.
+///
+/// The transfer slice adds `repository_redirects.transferred_at` and filters
+/// redirect lookups with `transferred_at IS NULL`; a tombstone records a path
+/// whose repository moved to another organization. Until that column exists,
+/// the detectable signal is a redirect whose target repository belongs to a
+/// different organization than the redirect row: a rename redirect stays in
+/// the same organization. Re-verifying this is a merge-time item (see the
+/// pull request body).
+pub async fn transfer_tombstone_holds_name(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM repository_redirects d JOIN repositories r ON r.id = d.repository_id \
+         WHERE d.organization_id=$1 AND lower(d.name)=lower($2) AND r.organization_id <> d.organization_id)",
+    )
+    .bind(organization_id)
+    .bind(name)
+    .fetch_one(&mut *conn)
+    .await
+}
+
+/// Retire the rename redirect that still claims `name` for another repository
+/// in this organization.
+///
+/// `rename` keeps the old name as a redirect; after a restore puts the
+/// original repository back at that name, a stale redirect would resolve the
+/// restored path to the renamed repository instead of answering `410`. A
+/// redirect that represents a transfer tombstone (target in another
+/// organization, until `transferred_at` exists) is left intact.
+pub async fn retire_redirect(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM repository_redirects d USING repositories r \
+         WHERE r.id = d.repository_id AND d.organization_id=$1 \
+         AND lower(d.name)=lower($2) AND r.organization_id = d.organization_id",
+    )
+    .bind(organization_id)
+    .bind(name)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// A deleted or in-progress restore row under its exact current name. A live
+/// repository that reused the name is deliberately not returned: restore is
+/// about the trashed row, and a name collision must be refused rather than
+/// resolving to the new owner.
+pub async fn find_restorable(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    name: &str,
+) -> Result<Option<RepositoryRow>, sqlx::Error> {
+    sqlx::query(&format!(
+        "SELECT {REPO_COLS} FROM repositories WHERE organization_id=$1 AND lower(name)=lower($2) AND status IN ('deleted','restoring') ORDER BY (status = 'restoring') DESC, deleted_at DESC NULLS LAST, id LIMIT 1"
+    ))
+    .bind(organization_id)
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await
+    .map(|r| r.as_ref().map(row_to_repository))
+}
+
+/// Deleted repositories of an organization, newest first, for the operator
+/// page that offers a restore form. Callers still authorize each row.
+pub async fn list_deleted(
+    conn: &mut PgConnection,
+    organization_id: Uuid,
+    limit: i64,
+) -> Result<Vec<RepositoryRow>, sqlx::Error> {
+    sqlx::query(&format!(
+        "SELECT {REPO_COLS} FROM repositories WHERE organization_id=$1 AND status='deleted' ORDER BY deleted_at DESC NULLS LAST, id LIMIT $2"
+    ))
+    .bind(organization_id)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await
+    .map(|rows| rows.iter().map(row_to_repository).collect())
+}
+
+/// Complete a restore in the same transaction as its audit event: the row
+/// returns to `active` with no deletion timestamp. The CAS keeps a concurrent
+/// delete or a lost restore claim from making a row active twice.
+pub async fn finish_restore(conn: &mut PgConnection, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE repositories SET status='active', deleted_at=NULL, updated_at=now() \
+         WHERE id=$1 AND status='restoring'",
+    )
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Go back from `restoring` to `deleted` after a failed move or a lost trash
+/// entry, **preserving** the original `deleted_at`.
+///
+/// [`set_status`] stamps `deleted_at=now()` whenever the target is `deleted`,
+/// which would restart the retention clock (and reorder the operator's
+/// deleted list) after an attempt that changed nothing. The row was deleted
+/// before it entered `restoring`, so its timestamp is still the right one.
+pub async fn revert_restore(conn: &mut PgConnection, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE repositories SET status='deleted', updated_at=now() \
+         WHERE id=$1 AND status='restoring'",
+    )
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn get(conn: &mut PgConnection, id: Uuid) -> Result<Option<RepositoryRow>, sqlx::Error> {
     sqlx::query(&format!("SELECT {REPO_COLS} FROM repositories WHERE id=$1"))
         .bind(id)
@@ -310,7 +475,7 @@ pub async fn pending(
     limit: i64,
 ) -> Result<Vec<RepositoryRow>, sqlx::Error> {
     Ok(sqlx::query(&format!(
-        "SELECT {REPO_COLS} FROM repositories WHERE status IN ('creating','deleting','failed') ORDER BY created_at LIMIT $1"
+        "SELECT {REPO_COLS} FROM repositories WHERE status IN ('creating','deleting','restoring','failed') ORDER BY created_at LIMIT $1"
     ))
     .bind(limit)
     .fetch_all(&mut *conn)

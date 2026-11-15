@@ -1,3 +1,4 @@
+use githearth_git::StorageError;
 use githearth_git::layout::{
     ObjectFormat, Storage, StorageOptions, check_git_version, detect_object_format, parse_version,
 };
@@ -5,7 +6,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 struct Fixture(PathBuf);
@@ -313,13 +313,12 @@ fn trash_restore_orphan_purge_scan_clean_tmp() {
     assert!(orphaned.starts_with(root.join("orphans")));
     assert!(!storage.scan().unwrap().repositories.contains(&live));
 
-    // trash again to exercise purge.
+    // trash again to exercise remove_trash_entry.
     let t = storage.trash(gone).unwrap();
-    let future = SystemTime::now() + Duration::from_secs(60);
-    assert_eq!(storage.purge_trash(future).unwrap(), 1);
+    let entry = storage.find_trash(gone).unwrap().expect("trash entry");
+    storage.remove_trash_entry(&entry).unwrap();
     assert!(!t.exists());
-    let past = SystemTime::now() - Duration::from_secs(60);
-    assert_eq!(storage.purge_trash(past).unwrap(), 0);
+    assert!(storage.find_trash(gone).unwrap().is_none());
 
     // clean_tmp (two-phase) removes only entries with no live operation.
     let op_live = Uuid::new_v4();
@@ -562,7 +561,7 @@ fn rejects_repository_escaping_root_via_symlink() {
 }
 
 #[test]
-fn purge_trash_keeps_recent_and_ignores_non_directories() {
+fn remove_trash_entry_removes_only_the_named_entry() {
     let fixture = Fixture::new();
     let root = fixture.0.join("storage");
     let storage = Storage::open(&root).unwrap();
@@ -571,15 +570,15 @@ fn purge_trash_keeps_recent_and_ignores_non_directories() {
         .create(id, Uuid::new_v4(), ObjectFormat::Sha1)
         .unwrap();
     let t = storage.trash(id).unwrap();
-    // A recent entry is not old enough to purge.
-    let past = SystemTime::now() - Duration::from_secs(60);
-    assert_eq!(storage.purge_trash(past).unwrap(), 0);
-    assert!(t.exists());
-    // A stray non-directory entry is ignored while the old entry is removed.
+    // A stray non-directory entry is ignored by the listing.
     fs::write(root.join("trash").join("stray"), b"").unwrap();
-    let future = SystemTime::now() + Duration::from_secs(60);
-    assert_eq!(storage.purge_trash(future).unwrap(), 1);
+    let entry = storage.find_trash(id).unwrap().expect("trash entry");
+    storage.remove_trash_entry(&entry).unwrap();
+    assert!(!t.exists());
     assert!(root.join("trash").join("stray").exists());
+    // Removing an entry that is already gone is an ordinary NotFound.
+    let err = storage.remove_trash_entry(&entry).unwrap_err();
+    assert!(matches!(err, StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound));
 }
 
 #[test]
@@ -601,7 +600,7 @@ fn trashing_one_repository_twice_in_a_second_keeps_both() {
 
 #[cfg(unix)]
 #[test]
-fn purge_trash_removes_what_it_can_and_reports_the_failure() {
+fn remove_trash_entry_reports_a_removal_failure() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     let root = fixture.0.join("storage");
@@ -617,11 +616,13 @@ fn purge_trash_removes_what_it_can_and_reports_the_failure() {
     // A read-only directory inside one entry makes its removal fail.
     let locked = trashed[0].join("objects");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
-    let future = SystemTime::now() + Duration::from_secs(60);
-    let result = storage.purge_trash(future);
+    let stuck_entry = storage.find_trash(stuck).unwrap().expect("trash entry");
+    let free_entry = storage.find_trash(free).unwrap().expect("trash entry");
+    let result = storage.remove_trash_entry(&stuck_entry);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(result.is_err());
-    assert!(!trashed[1].exists(), "the removable entry was still purged");
+    storage.remove_trash_entry(&free_entry).unwrap();
+    assert!(!trashed[1].exists(), "the removable entry was not removed");
 }
 
 // ---------------------------------------------------------------------------

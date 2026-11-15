@@ -278,6 +278,91 @@ pub(crate) fn auth_required() -> UiError {
     UiError(Box::new(Redirect::to("/login").into_response()))
 }
 
+/// `410 Gone` for a deleted or restoring repository path. A viewer who may
+/// restore sees a CSRF-protected form; everyone else sees only the gone page.
+/// This is the web half of the lifecycle rule: the old path never redirects,
+/// and after a successful restore it resolves again because the row is active.
+pub(crate) async fn repository_gone_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    account: Option<&crate::Account>,
+    auth_age: Option<u64>,
+    org_slug: &str,
+    name: &str,
+) -> UiError {
+    let username = account.map(|account| account.username.as_str());
+    let is_admin = account.is_some_and(|account| account.is_admin);
+    let csrf = account.and_then(|_| browser_token_hash(headers).map(|hash| csrf_expected(&hash)));
+    let mut restoring = false;
+    let mut can_restore = false;
+    if let (Some(account), Some(auth_age), Some(_)) = (account, auth_age, &csrf)
+        && let Some((org_id, row)) =
+            crate::repository_restore::deleted_row(state, org_slug, name).await
+    {
+        restoring = row.status == githearth_core::RepositoryStatus::Restoring;
+        if let Ok(mut conn) = state.pool.acquire().await
+            && let Ok(Some(facts)) = facts::load(&mut conn, account.id, org_id).await
+        {
+            can_restore = crate::repository_restore::may_restore(state, &facts, &row, auth_age);
+        }
+    }
+    let mut action = String::new();
+    if can_restore {
+        if restoring {
+            action.push_str(
+                "<p class=\"muted\">A restore is already in progress. Reload in a moment.</p>",
+            );
+        } else if let Some(csrf) = &csrf {
+            action.push_str(&format!(
+                "<form class=\"card\" method=\"post\" action=\"/organizations/{}/repositories/{}/restore\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<input type=\"hidden\" name=\"idempotency_key\" value=\"{}\">\
+<p><button type=\"submit\">Restore repository</button></p></form>",
+                url_encode(org_slug),
+                url_encode(name),
+                esc(csrf),
+                esc(&Uuid::new_v4().simple().to_string()),
+            ));
+        }
+    }
+    let body = format!(
+        "<h1>Repository gone</h1><p>This repository was deleted. Its path returns 410 until a restore completes.</p>{action}"
+    );
+    UiError(Box::new(
+        (
+            StatusCode::GONE,
+            Html(render_page(
+                "Repository gone",
+                username,
+                csrf.as_deref(),
+                is_admin,
+                &body,
+            )),
+        )
+            .into_response(),
+    ))
+}
+
+/// A generic `410 Gone` page for sub-pages of a deleted repository (issues,
+/// pull requests, settings) that do not carry enough route context to render
+/// the restore form. The repository landing page and browse pages use
+/// [`repository_gone_page`], which can offer the form.
+pub(crate) fn gone_page(username: Option<&str>) -> UiError {
+    UiError(Box::new(
+        (
+            StatusCode::GONE,
+            Html(render_page(
+                "Repository gone",
+                username,
+                None,
+                false,
+                "<h1>Repository gone</h1><p>This repository was deleted. The path returns 410 until a restore completes.</p>",
+            )),
+        )
+            .into_response(),
+    ))
+}
+
 pub(crate) fn not_found_page(username: Option<&str>) -> UiError {
     UiError(Box::new(
         (
@@ -796,6 +881,34 @@ async fn organization(
     if !any {
         items.push_str("<li>No repositories you can read.</li>");
     }
+    // A restore is offered only to a viewer the engine permits to restore the
+    // specific row. The deleted list itself is never shown to anyone else.
+    let deleted = repositories::list_deleted(&mut conn, org_id, 100)
+        .await
+        .map_err(|_| unavailable_page(Some(&account.username)))?;
+    let csrf_value = csrf_expected(&browser_token_hash(&headers).unwrap_or_default());
+    let mut restorable = String::new();
+    for row in deleted {
+        if !crate::repository_restore::may_restore(&state, &facts, &row, auth_age) {
+            continue;
+        }
+        restorable.push_str(&format!(
+            "<li><form method=\"post\" action=\"/organizations/{}/repositories/{}/restore\">\
+<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+<input type=\"hidden\" name=\"idempotency_key\" value=\"{}\">\
+<span>{}</span> <button type=\"submit\">Restore</button></form></li>",
+            url_encode(&slug),
+            url_encode(&row.name),
+            esc(&csrf_value),
+            esc(&Uuid::new_v4().simple().to_string()),
+            esc(&row.name),
+        ));
+    }
+    let deleted_section = if restorable.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"card\"><h2>Deleted repositories</h2><ul>{restorable}</ul></div>")
+    };
     let can_create = state
         .authz
         .authorize(&facts.request(
@@ -856,11 +969,12 @@ async fn organization(
     })
     .collect::<String>();
     let body = format!(
-        "<h1>{}</h1><p class=\"muted\">{}</p>{}<div class=\"card\"><ul>{}</ul></div>{}{}",
+        "<h1>{}</h1><p class=\"muted\">{}</p>{}<div class=\"card\"><ul>{}</ul></div>{}{}{}",
         esc(&org_name),
         esc(&slug),
         new_repo_link,
         items,
+        deleted_section,
         members_link,
         admin_links
     );
@@ -929,6 +1043,14 @@ struct NewOrgForm {
     csrf_token: String,
     slug: String,
     name: String,
+}
+
+#[derive(Deserialize)]
+struct RestoreForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    idempotency_key: String,
 }
 
 #[derive(Deserialize)]
@@ -1218,6 +1340,82 @@ async fn new_repository_submit(
     }
 }
 
+/// Browser submit for restore. It checks the session's CSRF token and then
+/// calls the same JSON handler the API uses, so the operation, authorization,
+/// idempotency key and audit event are identical on both surfaces.
+async fn restore_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, name)): Path<(String, String)>,
+    Form(form): Form<RestoreForm>,
+) -> Result<Response, UiError> {
+    let token_hash = browser_token_hash(&headers).ok_or_else(auth_required)?;
+    if !csrf_matches(&form.csrf_token, &csrf_expected(&token_hash)) {
+        return Err(forbidden_page());
+    }
+    let (account, auth_age) = match browser_auth(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => return Err(auth_required()),
+        Err(_) => return Err(unavailable_page(None)),
+    };
+    if !idempotency::valid_key(&form.idempotency_key) {
+        return Ok(error_form_page(
+            &account.username,
+            StatusCode::BAD_REQUEST,
+            "Reload the page and submit the form again.",
+            "",
+        ));
+    }
+    let token = browser_token(&headers).ok_or_else(auth_required)?;
+    let mut api_headers = HeaderMap::new();
+    api_headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| unavailable_page(Some(&account.username)))?,
+    );
+    api_headers.insert(
+        "idempotency-key",
+        HeaderValue::from_str(&form.idempotency_key)
+            .map_err(|_| unavailable_page(Some(&account.username)))?,
+    );
+    match repository_api::restore(
+        State(state.clone()),
+        api_headers,
+        Path((slug.clone(), name.clone())),
+    )
+    .await
+    {
+        Ok(_) => Ok(Redirect::to(&format!(
+            "/organizations/{}/repositories/{}",
+            url_encode(&slug),
+            url_encode(&name)
+        ))
+        .into_response()),
+        Err(e) if e.status_code() == StatusCode::GONE => Err(repository_gone_page(
+            &state,
+            &headers,
+            Some(&account),
+            Some(auth_age),
+            &slug,
+            &name,
+        )
+        .await),
+        Err(e) => {
+            let back = format!(
+                "<p><a href=\"/organizations/{}/repositories/{}\">Back to repository</a></p>",
+                url_encode(&slug),
+                url_encode(&name)
+            );
+            Ok(error_form_page(
+                &account.username,
+                e.status_code(),
+                e.message(),
+                &back,
+            ))
+        }
+    }
+}
+
 async fn repository(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1226,18 +1424,35 @@ async fn repository(
     let (repo, username, csrf, account_id, auth_age, is_admin) =
         match browser_auth(&state, &headers).await {
             Ok((account, auth_age)) => {
-                let loaded = repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
-                    .await
-                    .map_err(|e| {
-                        if matches!(
-                            e.status_code(),
-                            StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
-                        ) {
-                            not_found_page(Some(&account.username))
-                        } else {
-                            unavailable_page(Some(&account.username))
+                let loaded =
+                    match repository_api::load_repo(&state, account.id, auth_age, &slug, &name)
+                        .await
+                    {
+                        Ok(loaded) => loaded,
+                        Err(e) if e.status_code() == StatusCode::GONE => {
+                            return Err(repository_gone_page(
+                                &state,
+                                &headers,
+                                Some(&account),
+                                Some(auth_age),
+                                &slug,
+                                &name,
+                            )
+                            .await);
                         }
-                    })?;
+                        Err(e) => {
+                            return Err(
+                                if matches!(
+                                    e.status_code(),
+                                    StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+                                ) {
+                                    not_found_page(Some(&account.username))
+                                } else {
+                                    unavailable_page(Some(&account.username))
+                                },
+                            );
+                        }
+                    };
                 if repository_api::require(&state, &loaded, githearth_authz::Action::RepositoryRead)
                     .is_err()
                 {
@@ -1254,10 +1469,23 @@ async fn repository(
                 )
             }
             Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
-                // An anonymous visitor may read public repositories only.
+                // An anonymous visitor may read public repositories only. The
+                // live lookup comes first: a new public repository that reused
+                // a deleted name must still resolve, not inherit the old row's
+                // `410`. A private deleted row, or a private replacement, is
+                // the ordinary sign-in challenge — never a `410` that confirms
+                // the name existed.
                 match repository_api::load_public_anonymous(&state, &slug, &name).await {
                     Some(repo) => (repo, None, None, None, None, false),
-                    None => return Err(auth_required()),
+                    None => {
+                        if crate::repository_restore::anonymous_gone(&state, &slug, &name).await {
+                            return Err(repository_gone_page(
+                                &state, &headers, None, None, &slug, &name,
+                            )
+                            .await);
+                        }
+                        return Err(auth_required());
+                    }
                 }
             }
             Err(_) => return Err(unavailable_page(None)),
@@ -1643,6 +1871,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/organizations/{slug}/repositories/{name}/fork",
             axum::routing::post(fork_submit),
+        )
+        .route(
+            "/organizations/{slug}/repositories/{name}/restore",
+            axum::routing::post(restore_submit),
         )
         .merge(crate::issues_ui::router())
         .merge(crate::pulls_ui::router())

@@ -91,6 +91,7 @@ fn repo_href(slug: &str, name: &str) -> String {
 fn api_error(s: &Session, slug: &str, name: &str, error: crate::ApiError) -> ui::UiError {
     match error.status_code() {
         StatusCode::UNAUTHORIZED => ui::auth_required(),
+        StatusCode::GONE => ui::gone_page(Some(&s.account.username)),
         StatusCode::NOT_FOUND => ui::not_found_page(Some(&s.account.username)),
         StatusCode::FORBIDDEN => {
             let body = format!(
@@ -144,6 +145,9 @@ async fn render_settings(
     let (rules, _, can_manage) =
         match tag_protection::list_rules(state, s.account.id, s.auth_age, slug, name).await {
             Ok(v) => v,
+            Err(e) if e.status_code() == StatusCode::GONE => {
+                return Err(ui::gone_page(Some(&s.account.username)));
+            }
             Err(e)
                 if matches!(
                     e.status_code(),

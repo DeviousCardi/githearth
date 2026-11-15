@@ -282,6 +282,7 @@ impl Site<'_> {
             | RepositoryArchive
             | RepositoryUnarchive
             | RepositoryDelete
+            | RepositoryRestore
             | IssueCreate
             | PullRequestCreate => Resource::Repository(repository),
             RefPush | RefForcePush | RefDelete => Resource::Ref(repository, &self.reference),
@@ -337,7 +338,15 @@ fn is_public_read(action: Action) -> bool {
 #[test]
 fn decision_table() {
     let engine = Engine::new().unwrap();
-    let w = World::new();
+    let mut w = World::new();
+    // A plain organization admin, so the restore rows below can pin that
+    // `repository.restore` is owner-only rather than admin-and-above.
+    let org_admin = account(&[w.acme.id], &[]);
+    w.grants.push(grant(
+        BuiltinRole::Admin,
+        Subject::Account(org_admin.id),
+        Scope::Organization(w.acme.id),
+    ));
     let approved = Some(Merge {
         approvals: 2,
         checks_passed: true,
@@ -388,6 +397,11 @@ fn decision_table() {
         ("nested team member pushes feature", (Principal::Account(&w.developer), RefPush, &w.acme, Resource::Ref(&w.private, &w.feature), None), true),
         ("nested team member labels issue", (Principal::Account(&w.developer), IssueLabel, &w.acme, Resource::Issue(&w.private, &w.issue), None), true),
         ("write cannot change settings", (Principal::Account(&w.developer), RepositoryUpdate, &w.acme, Resource::Repository(&w.private), None), false),
+        // Restore is narrower than delete: owner and site administrator only.
+        ("owner restores repo", (Principal::Account(&w.owner), RepositoryRestore, &w.acme, Resource::Repository(&w.private), None), true),
+        ("write cannot restore repo", (Principal::Account(&w.developer), RepositoryRestore, &w.acme, Resource::Repository(&w.private), None), false),
+        ("org admin cannot restore repo", (Principal::Account(&org_admin), RepositoryRestore, &w.acme, Resource::Repository(&w.private), None), false),
+        ("site admin restores repo", (Principal::Account(&w.site_admin), RepositoryRestore, &w.acme, Resource::Repository(&w.private), None), true),
         ("write cannot read other repos", (Principal::Account(&w.developer), RepositoryRead, &w.acme, Resource::Repository(&w.archived), None), false),
         // Branch protection
         ("unprotected force push", (Principal::Account(&w.developer), RefForcePush, &w.acme, Resource::Ref(&w.private, &w.feature), None), true),
@@ -538,6 +552,20 @@ fn suspended_organization_blocks_everyone_but_site_admins() {
         None,
     );
     assert_eq!(d, Decision::Deny(vec!["suspended-organization".into()]));
+    // Restore is a deny for both halves of its authority: the forbid runs
+    // before the permit, so neither the owner nor a non-member site
+    // administrator may restore inside a suspended organization.
+    for who in [&w.owner, &w.site_admin] {
+        let d = w.decide(
+            &engine,
+            who,
+            Action::RepositoryRestore,
+            &acme,
+            Resource::Repository(&w.private),
+            None,
+        );
+        assert_eq!(d, Decision::Deny(vec!["suspended-organization".into()]));
+    }
     let d = w.decide(
         &engine,
         &w.site_admin,

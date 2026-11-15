@@ -28,6 +28,16 @@ fn not_active() -> ApiError {
 fn name_taken() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository name already taken")
 }
+pub(crate) fn gone() -> ApiError {
+    ApiError(StatusCode::GONE, "repository is gone")
+}
+
+fn storage_error() -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "storage operation failed",
+    )
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -108,9 +118,38 @@ pub(crate) async fn load_repo(
         return Err(org_not_found());
     };
 
-    let Some(repo) = repositories::find_by_name(&mut conn, org_id, name).await? else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "not found"));
+    let repo = match repositories::find_by_name(&mut conn, org_id, name).await? {
+        Some(repo) => repo,
+        None => {
+            // A deleted or restoring row still owns this path: `410 Gone` until
+            // the restore completes, never a redirect to another repository.
+            match repositories::find_by_name_any_status(&mut conn, org_id, name).await? {
+                Some(row) if is_gone(row.status) => row,
+                _ => return Err(not_found()),
+            }
+        }
     };
+
+    if is_gone(repo.status) {
+        // `find_by_name` includes `restoring` (only `deleted` is excluded), so
+        // both gone states are checked here. The path is 410 until the row is
+        // active again — but only for a caller that could have seen the
+        // repository anyway: one that may read it (public, or a grant) or may
+        // restore it (owner, site administrator). Anyone else gets the shared
+        // 404, so `410` is not an existence oracle for a deleted private name.
+        let loaded = Loaded {
+            actor_id,
+            auth_age,
+            org_id,
+            facts,
+            repo,
+        };
+        return if may_see_gone(state, &loaded) {
+            Err(gone())
+        } else {
+            Err(not_found())
+        };
+    }
 
     Ok(Loaded {
         actor_id,
@@ -119,6 +158,34 @@ pub(crate) async fn load_repo(
         facts,
         repo,
     })
+}
+
+/// Whether a caller may learn that the path is gone rather than missing: it
+/// may read the row, or it may restore it.
+fn may_see_gone(state: &AppState, loaded: &Loaded) -> bool {
+    permitted(state, loaded, Action::RepositoryRead)
+        || permitted(state, loaded, Action::RepositoryRestore)
+}
+
+/// Whether the policy engine permits `action` for this row, with no
+/// read-fallback rewriting of the result (unlike [`require`]).
+pub(crate) fn permitted(state: &AppState, loaded: &Loaded, action: Action) -> bool {
+    let authz_repo = repositories::authz_repository(&loaded.repo);
+    state
+        .authz
+        .authorize(&loaded.facts.request(
+            action,
+            Resource::Repository(&authz_repo),
+            Some(Duration::from_secs(loaded.auth_age)),
+        ))
+        .is_allowed()
+}
+
+fn is_gone(status: RepositoryStatus) -> bool {
+    matches!(
+        status,
+        RepositoryStatus::Deleted | RepositoryStatus::Restoring
+    )
 }
 
 /// Mutations must name the repository's current name; renamed-away names only redirect reads.
@@ -339,7 +406,10 @@ pub(crate) async fn create(
             // operator is still running.
             let repo_id = repo.id;
             let storage = state.storage.clone();
-            let guard = storage.repository_lock(repo_id).lock_owned().await;
+            let guard = storage
+                .lock_repository(repo_id)
+                .await
+                .map_err(|_| storage_error())?;
             let current_status = {
                 let mut conn = state.pool.acquire().await?;
                 let row = repositories::get(&mut conn, repo_id)
@@ -743,7 +813,10 @@ pub(crate) async fn delete(
             // still running.
             let repo_id = loaded.repo.id;
             let storage = state.storage.clone();
-            let guard = storage.repository_lock(repo_id).lock_owned().await;
+            let guard = storage
+                .lock_repository(repo_id)
+                .await
+                .map_err(|_| storage_error())?;
             let trash_result = tokio::task::spawn_blocking(move || {
                 let _guard = guard;
                 if was_failed {
@@ -789,6 +862,52 @@ pub(crate) async fn delete(
     )
     .await?;
     Ok(status)
+}
+
+/// Restore a deleted repository from trash (U23c). Shares the operation with
+/// the browser form and the CLI; this handler adds authentication,
+/// idempotency and the JSON envelope only.
+pub(crate) async fn restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((org_slug, name)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<RepositoryJson>), ApiError> {
+    let (actor, auth_age) = authenticate(&state.pool, &headers).await?;
+    let state = &state;
+    let path_str = format!("/api/v1/organizations/{org_slug}/repositories/{name}/restore");
+    let key = idempotency::extract_key(&headers).transpose()?;
+
+    idempotency::run(
+        &state.pool,
+        actor.id,
+        "POST",
+        &path_str,
+        b"",
+        key,
+        |idem| async move {
+            let row = crate::repository_restore::restore_repository(
+                state,
+                actor.id,
+                auth_age,
+                &org_slug,
+                &name,
+                idem.prior_operation_id,
+                Some(&idem),
+            )
+            .await?;
+            let result_json = RepositoryJson::from(&row);
+            let status = StatusCode::OK;
+            let body = serde_json::to_value(&result_json).unwrap();
+            let mut tx = state.pool.begin().await?;
+            if !idem.store(&mut tx, status, &body).await? {
+                return Err(idempotency::claim_lost());
+            }
+            tx.commit().await?;
+            Ok((status, body))
+        },
+    )
+    .await
+    .map(|(_, value)| (StatusCode::OK, Json(serde_json::from_value(value).unwrap())))
 }
 
 #[derive(Serialize, Deserialize)]

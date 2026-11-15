@@ -31,9 +31,11 @@ Actions are named `object.verb` and grouped. Templates name only groups, so a ne
 | `write` | `ref.push`, `ref.force_push`, `ref.delete`, `pull_request.approve`, `pull_request.merge` |
 | `maintain` | `repository.update` (branch and tag protection mutations) |
 | `admin` | `repository.manage_access`, `archive`, `unarchive`, `delete` |
-| `owner` | `organization.update`, `manage_members`, `delete`, `team.create`, `invitation.read`, `invitation.create`, `invitation.revoke` |
+| `owner` | `organization.update`, `manage_members`, `delete`, `team.create`, `invitation.read`, `invitation.create`, `invitation.revoke`, `repository.restore` |
 | `site_admin` | `organization.suspend`, `organization.unsuspend`, `account.create`, `account.disable`, `account.enable`, `account.reset_password` |
-| `sensitive` | sudo mode: an action here also sits in its functional group above — `organization.update`, `manage_members`, `delete`, `organization.suspend`, `unsuspend`, `team.create`, `repository.manage_access`, `archive`, `unarchive`, `delete`, `ref.force_push`, `ref.delete`, `account.disable`, `account.enable`, `account.reset_password`, `invitation.create`, `invitation.revoke` |
+| `sensitive` | sudo mode: an action here also sits in its functional group above — `organization.update`, `manage_members`, `delete`, `organization.suspend`, `unsuspend`, `team.create`, `repository.manage_access`, `archive`, `unarchive`, `delete`, `repository.restore`, `ref.force_push`, `ref.delete`, `account.disable`, `account.enable`, `account.reset_password`, `invitation.create`, `invitation.revoke` |
+
+`repository.restore` is deliberately narrower than `repository.delete`: it joins `owner` and `sensitive`, not `admin`, so a repository admin who can delete cannot restore. Restoring a deleted repository is an organization-owner decision (U23c); a site administrator holds it through one explicitly scoped permit rather than through the `site_admin` group, because that group's forbid is exclusive to site administrators and would exclude owners.
 
 Built-in roles: `member` and `owner` (organization scope only), plus `read`, `triage`, `write`, `maintain` and `admin` (organization or repository scope). Each role includes the groups below it. The M1 membership values `owner`/`member` map onto the first two.
 

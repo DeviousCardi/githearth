@@ -373,9 +373,9 @@ async fn receive_pack(
     // records of one ref transaction stay adjacent.
     let repo_guard = state
         .storage
-        .repository_lock(admitted.repository.id)
-        .lock_owned()
-        .await;
+        .lock_repository(admitted.repository.id)
+        .await
+        .map_err(|_| GitHttpError::ServerError)?;
     let repo_id = admitted.repository.id;
 
     // Remove lock files left by a receive-pack killed mid-update (we hold the

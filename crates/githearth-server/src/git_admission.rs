@@ -212,8 +212,69 @@ enum FetchAuth {
     Admitted(RepositoryRow),
     /// Missing, inactive, or not readable.
     Denied,
+    /// The row is `deleted` or `restoring`: the path exists but the repository
+    /// is gone, so the caller answers `410 Gone` (or the SSH equivalent).
+    Gone,
     /// Readable but not clonable (only produced when a clone is requested).
     NotClonable,
+}
+
+/// The row is `deleted` or `restoring`: the path exists but the repository is
+/// gone, so an authorized caller answers `410 Gone` (or the SSH equivalent).
+fn is_gone(status: githearth_core::RepositoryStatus) -> bool {
+    matches!(
+        status,
+        githearth_core::RepositoryStatus::Deleted | githearth_core::RepositoryStatus::Restoring
+    )
+}
+
+/// Whether a fetch caller may be told that the path is gone.
+///
+/// Same rule as the API's `410`: the caller must be able to see the
+/// repository anyway — read it (public for an anonymous visitor, or a grant)
+/// or restore it (an account owner or site administrator). Otherwise the
+/// refusal is the ordinary `401`/`404`, so `410` is not an existence oracle
+/// for a deleted private repository. Git credentials count as fresh (ADR
+/// 0002's stated exception), so the recency passed to the engine is zero.
+fn fetch_may_see_gone(
+    state: &AppState,
+    requester: Requester<'_>,
+    organization: &Organization,
+    row: &RepositoryRow,
+) -> bool {
+    let authz_repo = repositories::authz_repository(row);
+    let read = match requester {
+        Requester::Account(facts) => facts.request(
+            Action::RepositoryRead,
+            Resource::Repository(&authz_repo),
+            Some(Duration::from_secs(0)),
+        ),
+        Requester::Anonymous => Request {
+            principal: Principal::Anonymous,
+            teams: &[],
+            grants: &[],
+            action: Action::RepositoryRead,
+            organization,
+            resource: Resource::Repository(&authz_repo),
+            merge: None,
+            auth_age: None,
+            read_only: false,
+        },
+    };
+    if state.authz.authorize(&read).is_allowed() {
+        return true;
+    }
+    match requester {
+        Requester::Account(facts) => state
+            .authz
+            .authorize(&facts.request(
+                Action::RepositoryRestore,
+                Resource::Repository(&authz_repo),
+                Some(Duration::from_secs(0)),
+            ))
+            .is_allowed(),
+        Requester::Anonymous => false,
+    }
 }
 
 /// Loads the organization and repository for a fetch and runs the read (and,
@@ -251,12 +312,33 @@ async fn authorize_fetch(
         }
     };
 
-    let Some(repo) = repositories::find_by_name(&mut conn, organization.id, repo_name)
+    let repo = match repositories::find_by_name(&mut conn, organization.id, repo_name)
         .await
         .map_err(unavailable)?
-    else {
-        return Ok(FetchAuth::Denied);
+    {
+        Some(repo) => repo,
+        None => {
+            // A deleted or restoring row still owns this path. Only a caller
+            // that could have seen it anyway is told that (see
+            // `fetch_may_see_gone`); everyone else gets the ordinary refusal.
+            match repositories::find_by_name_any_status(&mut conn, organization.id, repo_name)
+                .await
+                .map_err(unavailable)?
+            {
+                Some(row) if is_gone(row.status) => row,
+                _ => return Ok(FetchAuth::Denied),
+            }
+        }
     };
+    if is_gone(repo.status) {
+        return Ok(
+            if fetch_may_see_gone(state, requester, &organization, &repo) {
+                FetchAuth::Gone
+            } else {
+                FetchAuth::Denied
+            },
+        );
+    }
     if repo.status != githearth_core::RepositoryStatus::Active {
         return Ok(FetchAuth::Denied);
     }
@@ -326,6 +408,7 @@ async fn admit_anonymous(
     let unauthorized = || AuthError(StatusCode::UNAUTHORIZED, "invalid or expired credentials");
     match authorize_fetch(state, Requester::Anonymous, org_slug, repo_name, true).await? {
         FetchAuth::Admitted(repo) => Ok(repo),
+        FetchAuth::Gone => Err(AuthError(StatusCode::GONE, "repository is gone")),
         FetchAuth::Denied | FetchAuth::NotClonable => Err(unauthorized()),
     }
 }
@@ -402,6 +485,7 @@ pub async fn admit_account(
     .await?
     {
         FetchAuth::Admitted(repo) => repo,
+        FetchAuth::Gone => return Err(AuthError(StatusCode::GONE, "repository is gone")),
         FetchAuth::Denied => return Err(AuthError(StatusCode::NOT_FOUND, "not found")),
         FetchAuth::NotClonable => return Err(AuthError(StatusCode::FORBIDDEN, "not permitted")),
     };
@@ -462,11 +546,22 @@ pub async fn reload(state: &AppState, admitted: &Admitted) -> Result<Admitted, A
     .await
     .map_err(unavailable)?
     .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
-    let repository = repositories::get(&mut conn, admitted.repository.id)
+    let repository = match repositories::get(&mut conn, admitted.repository.id)
         .await
         .map_err(unavailable)?
-        .filter(|r| r.status == githearth_core::RepositoryStatus::Active)
-        .ok_or(AuthError(StatusCode::NOT_FOUND, "not found"))?;
+    {
+        Some(row) if row.status == githearth_core::RepositoryStatus::Active => row,
+        Some(row)
+            if matches!(
+                row.status,
+                githearth_core::RepositoryStatus::Deleted
+                    | githearth_core::RepositoryStatus::Restoring
+            ) =>
+        {
+            return Err(AuthError(StatusCode::GONE, "repository is gone"));
+        }
+        _ => return Err(AuthError(StatusCode::NOT_FOUND, "not found")),
+    };
     let rules = crate::protection::load_rules(&mut conn, admitted.repository.id)
         .await
         .map_err(unavailable)?;

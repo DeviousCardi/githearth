@@ -1379,6 +1379,7 @@ name = "githearth-git"
 version = "0.0.1"
 dependencies = [
  "githearth-core",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

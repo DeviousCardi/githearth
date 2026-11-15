@@ -44,6 +44,7 @@ pub mod pushes;
 pub mod reconcile;
 pub mod repositories;
 pub mod repository_api;
+pub mod repository_restore;
 mod settings_ui;
 pub mod setup;
 pub mod ssh;
@@ -392,6 +393,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/organizations/{org}/repositories/{name}/unarchive",
             post(repository_api::unarchive),
+        )
+        .route(
+            "/api/v1/organizations/{org}/repositories/{name}/restore",
+            post(repository_api::restore),
         )
         .route(
             "/api/v1/organizations/{org}/repositories/{name}/access",

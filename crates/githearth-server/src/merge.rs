@@ -237,21 +237,11 @@ pub async fn execute_intent(
     // lock is held to the end.
     let cross_repo = source_repository_id != repository_id;
     let _source_guard = if cross_repo {
-        Some(
-            state
-                .storage
-                .repository_lock(source_repository_id)
-                .lock_owned()
-                .await,
-        )
+        Some(state.storage.lock_repository(source_repository_id).await?)
     } else {
         None
     };
-    let _guard = state
-        .storage
-        .repository_lock(repository_id)
-        .lock_owned()
-        .await;
+    let _guard = state.storage.lock_repository(repository_id).await?;
 
     let repo_path = state.storage.repository_path(repository_id);
     let hooks_dir = state.config.storage_root.join("hooks");

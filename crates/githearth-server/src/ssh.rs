@@ -275,6 +275,7 @@ impl russh::server::Handler for SshHandler {
             Ok(a) => a,
             Err(e) => {
                 let msg = match e.0 {
+                    axum::http::StatusCode::GONE => "githearth: repository is gone\n",
                     axum::http::StatusCode::NOT_FOUND => "githearth: repository not found\n",
                     _ => "githearth: not permitted\n",
                 };
@@ -296,7 +297,16 @@ impl russh::server::Handler for SshHandler {
         let repo_id = admitted.repository.id;
 
         let repo_guard = if want == Want::Push {
-            let guard = state.storage.repository_lock(repo_id).lock_owned().await;
+            let guard = match state.storage.lock_repository(repo_id).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return refuse(
+                        session,
+                        channel,
+                        "githearth: service unavailable\n".as_bytes(),
+                    );
+                }
+            };
             if let Err(e) = state.storage.remove_stale_locks(repo_id) {
                 tracing::warn!(repository_id = %repo_id, error = %e, "cannot remove stale ref locks");
             }
