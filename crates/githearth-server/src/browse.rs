@@ -693,7 +693,7 @@ mod tests {
         let state = AppState {
             pool,
             config: crate::config::Config {
-                storage_root: root,
+                storage_root: root.clone(),
                 database_url: "postgres://localhost/unused".into(),
                 ..crate::config::Config::default()
             },
@@ -703,6 +703,9 @@ mod tests {
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(Engine::new().unwrap()),
             storage: Arc::new(storage),
+            objects: Arc::new(
+                githearth_git::object_store::FsObjectStore::open(root.join("objects")).unwrap(),
+            ),
             hook_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             hook_socket_path: std::path::PathBuf::from("/nonexistent/hook.sock"),
             trusted_proxies: Vec::new(),
