@@ -116,7 +116,7 @@ GitHearth does not need to be restarted — it never sees the certificate.
 | Personal access token expiry | chosen at creation: 1–3650 days, or none | `tokens.rs` `create_token` |
 | CSRF token size | 128 bits (16 bytes hex → 32 chars) | `ui.rs:317` |
 | Auth concurrency | 2 concurrent argon2 verifications; queue 2 s timeout | `config.rs:64`, `lib.rs:506` |
-| Failed sign-in throttling | 10 per username and 50 per client address in a 900 s sliding window (`login_throttle_*`) | `config.rs`, `login_throttle.rs` |
+| Failed sign-in throttling | 5 per username and 20 per client address in a 900 s sliding window, with an exponential wait after the fifth failure (`login_throttle_*`) | `config.rs`, `login_throttle.rs` |
 | `Cache-Control: no-store` | all responses (JSON, UI and Git), set by the `observe` middleware | `lib.rs` `observe` |
 | `X-Frame-Options: DENY` | all browser pages | `ui.rs` `page_headers` |
 | `X-Content-Type-Options: nosniff` | all responses | `lib.rs` `observe` |

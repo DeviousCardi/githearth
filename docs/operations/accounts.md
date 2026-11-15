@@ -96,16 +96,25 @@ superseded or expired code is refused with the same fixed message, and the code
 is never logged or stored in plaintext.
 
 If an administrator has lost their password and no other administrator can
-sign in, restore them from the host. The password is read from stdin, never
-from the command line:
+sign in, restore them from the host. The command takes no password: it issues
+the same single-use, expiring code the reset API issues, prints it once on
+stdout and stores only its hash:
 
 ```
-printf '%s\n' "$NEW_PASSWORD" | githearth-server reset-admin --username alice
+githearth-server reset-admin --username alice
+single-use credential (shown once): 0123…cdef
+redeem before: 2026-11-15T12:00:00Z
 ```
 
-This restores an existing account as an enabled site administrator and revokes
-its sessions, access tokens, SSH keys and reset codes. It is audited as
-`administrator.reset`.
+This restores an existing account as an enabled site administrator, revokes
+its sessions, access tokens, SSH keys and any earlier reset codes, sets
+`must_change_password` and is audited as `administrator.reset` (on the site
+audit chain, with no code in the payload). The operator hands the printed code
+to the person, who redeems it at `/reset` or `POST
+/api/v1/password-reset/redeem` exactly as for an API-issued code; it works
+once and expires after 60 minutes. Nothing — API, browser, Git HTTP or Git
+SSH — works until then. If the code is lost or expires, run `reset-admin`
+again: the previous unredeemed code stops working.
 
 ## Failed sign-in throttling
 
@@ -114,14 +123,17 @@ client address inside a sliding window:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `login_throttle_max_per_username` | `10` | Failed sign-ins allowed for one username in the window |
-| `login_throttle_max_per_client` | `50` | Failed sign-ins allowed from one client address in the window |
-| `login_throttle_window_seconds` | `900` | Window length in seconds |
+| `login_throttle_max_per_username` | `5` | Failed sign-ins allowed for one username in the window |
+| `login_throttle_max_per_client` | `20` | Failed sign-ins allowed from one client address in the window |
+| `login_throttle_window_seconds` | `900` | Window length in seconds (15 minutes) |
+| `login_throttle_delay_base_ms` | `200` | First wait imposed after the fifth recorded failure |
+| `login_throttle_delay_max_ms` | `2000` | Longest wait one password attempt can be made to endure |
 
-The same counters cover the JSON login, the browser sign-in form and Git
-password authentication. The client address is resolved exactly as for the
-audit log, so `trusted_proxies` applies and an untrusted client cannot spoof it
-with `X-Forwarded-For`.
+These are the plan's published defaults (5 per account and 20 per address per
+15 minutes). The same counters cover the JSON login, the browser sign-in form
+and Git password authentication. The client address is resolved exactly as for
+the audit log, so `trusted_proxies` applies and an untrusted client cannot spoof
+it with `X-Forwarded-For`.
 
 The bounds are expressed as a burst of attempts inside a window, not as a
 lockout:
@@ -129,6 +141,16 @@ lockout:
 - a throttled sign-in is refused **before** the password is hashed, with
   `429 {"error":"too many sign-in attempts; try again later"}` (the browser
   shows "Too many sign-in attempts");
+- after the **fifth** recorded failure in the window, every password attempt
+  first waits `login_throttle_delay_base_ms × 2^(failures − 5)`, capped at
+  `login_throttle_delay_max_ms`. "Failures" is the larger of the account's and
+  the client address's counts inside the window, so a spray across many
+  accounts from one address grows the wait too. The wait is charged before the
+  password is hashed, applies to a correct password as well (which is still
+  refused while its bound is reached), and disappears as the failures age out
+  of the window — it can never become a permanent lockout. Token and SSH-key
+  authentication never enter this path and are therefore never delayed or
+  refused by it;
 - the refusal is identical for an existing and an unknown username, so it
   reveals nothing about which accounts exist;
 - a successful sign-in clears that username's counter;

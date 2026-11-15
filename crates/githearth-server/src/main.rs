@@ -30,8 +30,10 @@ enum Command {
         #[arg(long)]
         username: String,
     },
-    /// Break-glass: restore an existing account as an enabled site administrator.
-    /// The password is read from stdin (never command arguments).
+    /// Break-glass: restore an existing account as an enabled site
+    /// administrator and print a single-use credential, shown once. No
+    /// password is read or set; the account must redeem the credential and
+    /// choose its own password before anything works.
     ResetAdmin {
         #[arg(long)]
         username: String,
@@ -296,14 +298,23 @@ async fn run(args: Args) -> Result<()> {
             }
         }
         Command::ResetAdmin { username } => {
-            let password = read_password_from_stdin()?;
-            match reset_admin(&pool, &username, password).await {
-                Ok(id) => tracing::info!(%id, "administrator reset"),
+            match reset_admin(&pool, &username).await {
+                Ok(credential) => {
+                    // Printed once, on stdout, so the operator can hand it to
+                    // the person; the audit log and the server log never see it.
+                    tracing::info!(id = %credential.id, "administrator reset");
+                    println!("single-use credential (shown once): {}", credential.code);
+                    println!("redeem before: {}", credential.expires_at);
+                    println!(
+                        "redeem with: POST /api/v1/password-reset/redeem \
+                         {{\"username\":\"{username}\",\"code\":\"<credential>\",\"new_password\":\"…\"}} \
+                         or /reset in the browser"
+                    );
+                }
                 Err(error) => {
                     let message = error.to_string();
                     if message.starts_with("no account named")
                         || message.starts_with("username must")
-                        || message.starts_with("password must")
                     {
                         bail!("{message}");
                     }

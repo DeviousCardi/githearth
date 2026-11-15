@@ -1,4 +1,4 @@
-//! Bounded failed sign-ins (M4.1, acceptance case U03).
+//! Bounded failed sign-ins (M4.1, acceptance cases U03 and U18).
 //!
 //! Each failed password check is recorded twice: once against the attempted
 //! username and once against the resolved client address (the same
@@ -12,17 +12,34 @@
 //! Nothing is ever locked: once an attempt leaves the window it stops
 //! counting, and a successful sign-in clears its username's counter, so an
 //! administrator can always wait out (or reset) a throttle. A refused sign-in
-//! is not recorded, so throttling can never extend itself.
+//! is not recorded, so throttling can never extend itself — in particular, a
+//! client cannot keep an account throttled by continuing to knock.
+//!
+//! After the fifth recorded failure inside the window, every password attempt
+//! also waits. The wait is a function of the failure count alone —
+//! `base * 2^(failures - 5)` milliseconds, capped at the configured maximum —
+//! taking the larger of the account's and the address's counts, so it grows
+//! when an attacker sprays many accounts from one address. It is charged
+//! before the password is hashed and before an authentication slot is taken,
+//! and it applies to a correct password too: inside the window the attempt is
+//! refused as before, only more slowly. It never locks anyone out permanently:
+//! the count that drives it ages out with the window, a successful sign-in
+//! clears the account's count, and `reset-admin` clears it as well. Token and
+//! SSH-key authentication never pass through this module, so they are exempt.
 //!
 //! Rows hold a SHA-256 of the normalized username and the resolved address,
 //! never a password, and are pruned once they are a day old (beyond every
 //! allowed window).
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use crate::{ApiError, CLIENT_IP};
+
+/// The failure count at which the exponential delay begins (U18).
+pub(crate) const DELAY_AFTER_FAILURES: i64 = 5;
 
 /// The address a sign-in attempt came from, resolved once per request by the
 /// client-IP middleware and re-used by every sign-in path in that request.
@@ -73,14 +90,43 @@ async fn subject_address(pool: &sqlx::PgPool, ip: IpAddr) -> Result<String, sqlx
         .await
 }
 
-/// Whether this username or client address has used up its failed attempts.
-/// A refusal is the same whether or not the username exists.
-pub(crate) async fn throttled(
+/// The decision for one password attempt: whether the bound refuses it and how
+/// long it must wait first.
+pub(crate) struct Attempt {
+    pub(crate) blocked: bool,
+    pub(crate) delay: Duration,
+}
+
+/// The exponential wait after the fifth recorded failure (U18).
+///
+/// It is a function of the failure count alone, not of how long the window has
+/// left: `base * 2^(failures - 5)` milliseconds, capped at
+/// `login_throttle_delay_max_ms`. The window matters only by making failures
+/// expire, after which the delay is zero again. A cap that is not a power of
+/// the base still bounds the wait; the delay never grows without limit.
+pub fn retry_delay(config: &crate::config::Config, failures: i64) -> Duration {
+    if failures < DELAY_AFTER_FAILURES {
+        return Duration::ZERO;
+    }
+    // The cap is at most 600 s, so 20 doublings always reach it; clamping the
+    // exponent also keeps the shift in range.
+    let exponent = (failures - DELAY_AFTER_FAILURES).clamp(0, 20) as u32;
+    let millis = config
+        .login_throttle_delay_base_ms
+        .saturating_mul(1u64 << exponent);
+    Duration::from_millis(millis.min(config.login_throttle_delay_max_ms))
+}
+
+/// Reads the two counters for this attempt and decides both its refusal and
+/// its delay. One statement, so the account and address bounds read the same
+/// clock and the same window; a NULL address counts zero, so the address bound
+/// never counts an unidentifiable caller.
+pub(crate) async fn examine(
     pool: &sqlx::PgPool,
     config: &crate::config::Config,
     request: Request,
     username: &str,
-) -> Result<bool, ApiError> {
+) -> Result<Attempt, ApiError> {
     let window = config.login_throttle_window_seconds as f64;
     let per_username = config.login_throttle_max_per_username.min(i64::MAX as u64) as i64;
     let per_address = config.login_throttle_max_per_client.min(i64::MAX as u64) as i64;
@@ -88,28 +134,42 @@ pub(crate) async fn throttled(
         Some(ip) => Some(subject_address(pool, ip).await?),
         None => None,
     };
-    // One statement, so both bounds read the same clock and the same window.
-    // A NULL address matches nothing, so the address bound never counts an
-    // unidentifiable caller.
-    let blocked: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-   SELECT 1 FROM login_attempts WHERE scope = 'username' AND subject = $1
-     AND attempted_at > clock_timestamp() - $4 * interval '1 second'
-   HAVING count(*) >= $3
- ) OR EXISTS (
-   SELECT 1 FROM login_attempts WHERE scope = 'client_ip' AND subject = $2
-     AND attempted_at > clock_timestamp() - $4 * interval '1 second'
-   HAVING count(*) >= $5
- )",
+    let (username_failures, address_failures): (i64, i64) = sqlx::query_as(
+        "SELECT
+   (SELECT count(*) FROM login_attempts WHERE scope = 'username' AND subject = $1
+      AND attempted_at > clock_timestamp() - $3 * interval '1 second'),
+   (SELECT count(*) FROM login_attempts WHERE scope = 'client_ip' AND subject = $2
+      AND attempted_at > clock_timestamp() - $3 * interval '1 second')",
     )
     .bind(subject_username(username))
     .bind(address)
-    .bind(per_username)
     .bind(window)
-    .bind(per_address)
     .fetch_one(pool)
     .await?;
-    Ok(blocked)
+    Ok(Attempt {
+        blocked: username_failures >= per_username || address_failures >= per_address,
+        delay: retry_delay(config, username_failures.max(address_failures)),
+    })
+}
+
+/// Charges the delay, then refuses a used-up bound. Shared by the JSON login,
+/// the browser form, Git HTTP basic authentication and the current-password
+/// checks in re-authentication and password change, so all of them share one
+/// bound and one wait.
+pub(crate) async fn enforce(
+    pool: &sqlx::PgPool,
+    config: &crate::config::Config,
+    request: Request,
+    username: &str,
+) -> Result<(), ApiError> {
+    let attempt = examine(pool, config, request, username).await?;
+    if !attempt.delay.is_zero() {
+        tokio::time::sleep(attempt.delay).await;
+    }
+    if attempt.blocked {
+        return Err(crate::too_many_attempts());
+    }
+    Ok(())
 }
 
 /// Records one failed sign-in against both its username and its address, and
@@ -174,5 +234,42 @@ mod tests {
         assert!(Request::default().client_ip().is_none());
         let ip = "203.0.113.9".parse().unwrap();
         assert_eq!(Request::at(ip).client_ip(), Some(ip));
+    }
+
+    #[test]
+    fn the_delay_starts_after_the_fifth_failure_doubles_and_is_capped() {
+        let c = crate::config::Config::default();
+        for failures in 0..DELAY_AFTER_FAILURES {
+            assert_eq!(
+                retry_delay(&c, failures),
+                Duration::ZERO,
+                "failures {failures}"
+            );
+        }
+        // Defaults: 200 ms after the fifth failure, doubling per failure, with
+        // a 2 s cap.
+        let expected = [
+            (5, 200),
+            (6, 400),
+            (7, 800),
+            (8, 1_600),
+            (9, 2_000),
+            (10, 2_000),
+            (1_000, 2_000),
+        ];
+        for (failures, millis) in expected {
+            assert_eq!(
+                retry_delay(&c, failures),
+                Duration::from_millis(millis),
+                "failures {failures}"
+            );
+        }
+        // A configured cap below one doubling step still bounds the wait.
+        let mut small = c.clone();
+        small.login_throttle_delay_base_ms = 10;
+        small.login_throttle_delay_max_ms = 25;
+        assert_eq!(retry_delay(&small, 5), Duration::from_millis(10));
+        assert_eq!(retry_delay(&small, 6), Duration::from_millis(20));
+        assert_eq!(retry_delay(&small, 7), Duration::from_millis(25));
     }
 }
