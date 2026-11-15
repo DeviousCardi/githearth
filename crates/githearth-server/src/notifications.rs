@@ -68,6 +68,7 @@ pub const OUTBOX_EVENT_KINDS: &[&str] = &[
     "pull_request.approved",
     "pull_request.changes_requested",
     "pull_request.review_requested",
+    "account.email_verification_requested",
 ];
 
 /// The consumer registered at start-up; migration `0050` inserts the same row
@@ -78,7 +79,14 @@ pub fn outbox_consumer() -> crate::outbox::Consumer {
 }
 
 pub fn register(registry: &mut jobs::Registry) {
-    registry.register(OUTBOX_JOB_KIND, outbox_handler());
+    // The outbox handler composes and sends email too, so it gets a budget
+    // larger than the generic timeout: a slow SMTP conversation must not be
+    // cut off mid-send and retried as if the event were bad.
+    registry.register_with_budget(
+        OUTBOX_JOB_KIND,
+        outbox_handler(),
+        std::time::Duration::from_secs(120),
+    );
     // Upgrade compatibility only: jobs of these kinds may still be pending from
     // the previous release. Nothing enqueues them now.
     registry.register(
@@ -206,6 +214,12 @@ async fn from_outbox(state: &AppState, job: &Job) -> JobOutcome {
                 return JobOutcome::Done;
             };
             review_requested(state, request_id).await
+        }
+        "account.email_verification_requested" => {
+            let Some(verification_id) = event_uuid("verification_id") else {
+                return JobOutcome::Done;
+            };
+            crate::email_verification::send_requested(state, verification_id).await
         }
         other => JobOutcome::Failed {
             reason: format!("no notification for event kind: {other}"),
@@ -354,6 +368,10 @@ fn db_retry() -> JobOutcome {
 /// Idempotent insert, keyed on `(event_id, account_id)`. `event_id` is the
 /// notification's **stable key**: the id of the source row the event is about
 /// (a merge intent, a review, a review request), which the column name predates.
+///
+/// The email intent is written in the same transaction, and the send happens
+/// after the commit, still inside this durable outbox job. A redelivery finds
+/// the notification and the intent already there and sends nothing new.
 async fn insert_notification(
     state: &AppState,
     event_id: Uuid,
@@ -362,10 +380,14 @@ async fn insert_notification(
     account_id: Uuid,
     actor_id: Option<Uuid>,
 ) -> JobOutcome {
-    match sqlx::query(
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return db_retry(),
+    };
+    let inserted: Result<Option<Uuid>, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO notifications (id, account_id, kind, event_id, pull_request_id, actor_id) \
          VALUES ($1, $2, $3, $4, $5, $6) \
-         ON CONFLICT (event_id, account_id) DO NOTHING",
+         ON CONFLICT (event_id, account_id) DO NOTHING RETURNING id",
     )
     .bind(Uuid::new_v4())
     .bind(account_id)
@@ -373,12 +395,37 @@ async fn insert_notification(
     .bind(event_id)
     .bind(pull_request_id)
     .bind(actor_id)
-    .execute(&state.pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await;
+    let id = match inserted {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            match sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM notifications WHERE event_id = $1 AND account_id = $2",
+            )
+            .bind(event_id)
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) => return db_retry(),
+                Err(_) => return db_retry(),
+            }
+        }
+        Err(_) => return db_retry(),
+    };
+    // A muted kind or an unverified address writes no intent at all.
+    if crate::notification_email::queue(&mut tx, id, account_id, kind)
+        .await
+        .is_err()
     {
-        Ok(_) => JobOutcome::Done,
-        Err(_) => db_retry(),
+        return db_retry();
     }
+    if tx.commit().await.is_err() {
+        return db_retry();
+    }
+    crate::notification_email::deliver(state, id).await
 }
 
 const NOTIFICATION_COLUMNS: &str = "n.id, n.kind, n.pull_request_id, a.username AS actor_username, \

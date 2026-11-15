@@ -1131,6 +1131,7 @@ mod tests {
             hook_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             hook_socket_path: std::path::PathBuf::from("/nonexistent/hook.sock"),
             trusted_proxies: Vec::new(),
+            mailer: Arc::new(crate::mail::DisabledTransport),
             recorder: None,
             job_kinds: None,
         };

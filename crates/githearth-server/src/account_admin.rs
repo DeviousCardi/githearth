@@ -113,7 +113,10 @@ fn session_credential(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
 /// refusal the codebase uses for every administrator-only action, `403 not
 /// permitted`; a stale session gets a machine-readable re-authentication
 /// denial so a client or page can prompt and retry.
-async fn administrator(state: &AppState, headers: &HeaderMap) -> ApiResult<(Account, Vec<u8>)> {
+pub(crate) async fn administrator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<(Account, Vec<u8>)> {
     let token_hash = session_credential(headers)?;
     let (account, auth_age) = authenticate_token_hash(&state.pool, token_hash.clone()).await?;
     if !account.is_admin {
@@ -176,10 +179,15 @@ pub struct AccountView {
     /// An administrator reset is outstanding: the account cannot sign in until
     /// it redeems the code and chooses a new password.
     pub(crate) must_change_password: bool,
+    /// The primary address and when it was verified. An unverified address is
+    /// never a destination for notification, recovery or sign-up mail.
+    pub(crate) email: Option<String>,
+    pub(crate) email_verified_at: Option<String>,
     pub(crate) created_at: String,
 }
 
-const ACCOUNT_COLUMNS: &str = "id, username, is_admin, suspended, must_change_password, \
+const ACCOUNT_COLUMNS: &str = "id, username, is_admin, suspended, must_change_password, email, \
+  to_char(email_verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS email_verified_at, \
   to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at";
 
 async fn create_account(

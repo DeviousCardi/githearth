@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use githearth_server::mail::{EmailMessage, MailFuture, MailTransport, MemoryTransport};
 use githearth_server::{
     AppState, MIGRATOR, config::Config, connect, jobs, merge::execute_intent, router,
 };
@@ -24,6 +25,7 @@ use sqlx::{
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -213,6 +215,10 @@ fn merge_href(org: &str, repo: &str, number: i64) -> String {
 /// A real repository with `main` and `feature` and an open pull request
 /// `feature -> main`, authored by the fixture owner.
 async fn build_fixture(database_url: &str) -> Fixture {
+    build_fixture_with(database_url, Arc::new(MemoryTransport::new())).await
+}
+
+async fn build_fixture_with(database_url: &str, mailer: Arc<dyn MailTransport>) -> Fixture {
     let storage_root = std::env::temp_dir().join(format!("githearth-notif-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
     let config = Config {
@@ -222,6 +228,7 @@ async fn build_fixture(database_url: &str) -> Fixture {
         storage_root: storage_root.clone(),
         hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
         job_poll_interval_ms: 50,
+        public_url: "https://forge.example".into(),
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
@@ -231,7 +238,10 @@ async fn build_fixture(database_url: &str) -> Fixture {
     let author_token = fixture_session(&pool, author).await;
     let (org_id, org_slug) = fixture_organization(&pool, author).await;
 
-    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let state = AppState::new(pool.clone(), config)
+        .await
+        .unwrap()
+        .with_mailer(mailer);
     let app = router(state.clone());
 
     let repo_name = tag("repo");
@@ -402,6 +412,8 @@ async fn run_jobs(state: &AppState, org_id: Option<Uuid>) {
         .expect("outbox fan-out");
     let mut registry = githearth_server::jobs::Registry::new();
     githearth_server::notifications::register(&mut registry);
+    // Retry tests reach a second attempt without waiting for a real backoff.
+    registry.backoff_override = Some(std::time::Duration::from_millis(50));
     let shutdown = tokio_util::sync::CancellationToken::new();
     let runner = githearth_server::jobs::spawn(state.clone(), registry, shutdown.clone());
     // The runner has to be started before the first look, or it waits a full
@@ -1013,6 +1025,10 @@ async fn a_second_event_for_the_same_source_row_notifies_once() {
 
 /// Builds an `AppState` on an already-migrated pool.
 async fn sql_state(pool: &PgPool) -> AppState {
+    sql_state_with_mailer(pool, Arc::new(MemoryTransport::new())).await
+}
+
+async fn sql_state_with_mailer(pool: &PgPool, mailer: Arc<dyn MailTransport>) -> AppState {
     // The state shares the pool the test writes through; nothing here opens a
     // second connection, so the runner drains the rows the test created.
     let config = Config {
@@ -1021,9 +1037,13 @@ async fn sql_state(pool: &PgPool) -> AppState {
         database_max_connections: 4,
         storage_root: std::env::temp_dir().join(format!("githearth-notif-{}", Uuid::new_v4())),
         job_poll_interval_ms: 50,
+        public_url: "https://forge.example".into(),
         ..Config::default()
     };
-    AppState::new(pool.clone(), config).await.unwrap()
+    AppState::new(pool.clone(), config)
+        .await
+        .unwrap()
+        .with_mailer(mailer)
 }
 
 /// Inserts an org/repo/pull request (authored by `author`) and a review by
@@ -1079,8 +1099,10 @@ async fn insert_reviewed_rows(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn handler_is_idempotent_across_redelivery() {
     let db = TestDb::new().await;
-    let state = sql_state(&db.pool).await;
-    let (_author, _actor, _pull_request_id, review_id) = insert_reviewed_rows(&db.pool).await;
+    let mail = Arc::new(MemoryTransport::new());
+    let state = sql_state_with_mailer(&db.pool, mail.clone()).await;
+    let (author, _actor, _pull_request_id, review_id) = insert_reviewed_rows(&db.pool).await;
+    set_email(&db.pool, author, true).await;
 
     // Enqueue the reviewed job twice (the second is a redelivery with a fresh
     // dedupe key, as after a crash or retry), and run the runner both times.
@@ -1108,6 +1130,16 @@ async fn handler_is_idempotent_across_redelivery() {
         count, 1,
         "the same review must produce exactly one notification"
     );
+    assert_eq!(
+        mail.delivered().len(),
+        1,
+        "a redelivered notification job must send exactly one email"
+    );
+    let intents: i64 = sqlx::query_scalar("SELECT count(*) FROM email_intents")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(intents, 1);
 
     db.drop_db().await;
 }
@@ -1209,6 +1241,455 @@ async fn malformed_payload_fails_the_job() {
         );
     }
 
+    db.drop_db().await;
+}
+
+// ---------------------------------------------------------------------------
+// Email delivery (U08)
+// ---------------------------------------------------------------------------
+
+async fn set_email(pool: &PgPool, account: Uuid, verified: bool) -> String {
+    let email = format!("{}@example.com", tag("mail"));
+    sqlx::query(
+        "UPDATE accounts SET email = $2, email_verified_at = \
+         CASE WHEN $3 THEN clock_timestamp() ELSE NULL END WHERE id = $1",
+    )
+    .bind(account)
+    .bind(&email)
+    .bind(verified)
+    .execute(pool)
+    .await
+    .unwrap();
+    email
+}
+
+async fn merge_as_other(f: &Fixture) -> Uuid {
+    let (_merger, merger_token) = add_owner(&f.pool, f.org_id).await;
+    let op = create_merge_intent(f, &f.feature_head, &merger_token).await;
+    sqlx::query("UPDATE merge_intents SET state = 'executing' WHERE operation_id = $1")
+        .bind(op)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    execute_intent(&f.state, op).await.unwrap();
+    op
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn an_unverified_address_receives_no_email() {
+    let db = TestDb::new().await;
+    let mail = Arc::new(MemoryTransport::new());
+    let f = build_fixture_with(&db.url, mail.clone()).await;
+    // The address is present but never verified: U23a says it receives
+    // nothing. The in-app notification still exists.
+    set_email(&f.pool, f.author_id, false).await;
+    merge_as_other(&f).await;
+    run_jobs(&f.state, Some(f.org_id)).await;
+
+    assert_eq!(
+        mail.attempts(),
+        0,
+        "an unverified address must not even be attempted"
+    );
+    assert!(mail.delivered().is_empty());
+    let intents: i64 = sqlx::query_scalar("SELECT count(*) FROM email_intents")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        intents, 0,
+        "no mail intent is queued for an unverified address"
+    );
+    let in_app: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(in_app, 1);
+
+    // Revert: drop `email_verified_at IS NOT NULL` from
+    // `notification_email::queue`; the intent and email appear here.
+    finish(f).await;
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn an_address_unverified_after_queueing_is_not_mailed_at_send_time() {
+    let db = TestDb::new().await;
+    let mail = Arc::new(MemoryTransport::new());
+    let state = sql_state_with_mailer(&db.pool, mail.clone()).await;
+    let (author, actor, pull_request_id, review_id) = insert_reviewed_rows(&db.pool).await;
+    set_email(&db.pool, author, true).await;
+    let organization_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT organization_id FROM repositories LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+    // The queue and the send are the same job, so the intent cannot be written
+    // by running the job: write the notification and the intent the queue
+    // would have written while the address is verified.
+    let notification_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO notifications (id, account_id, kind, event_id, pull_request_id, actor_id) \
+         VALUES ($1, $2, 'pull_request.reviewed', $3, $4, $5)",
+    )
+    .bind(notification_id)
+    .bind(author)
+    .bind(review_id)
+    .bind(pull_request_id)
+    .bind(actor)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO email_intents (id, notification_id, account_id, kind) \
+         VALUES ($1, $2, $3, 'pull_request.reviewed')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(notification_id)
+    .bind(author)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // The address is no longer verified when the send runs. This is U08's
+    // "only a verified address" at the last moment, not only at queue time.
+    // Revert: remove `email_verified_at IS NOT NULL` from the send-time query
+    // in `notification_email::deliver`; the attempt count becomes one.
+    sqlx::query("UPDATE accounts SET email_verified_at = NULL WHERE id = $1")
+        .bind(author)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // The reviewed event delivers this notification: the handler finds the
+    // existing row and the existing intent, then `deliver` reads the address
+    // again.
+    let event = write_event(
+        &db.pool,
+        organization_id,
+        actor,
+        "pull_request.reviewed",
+        json!({ "review_id": review_id }),
+    )
+    .await;
+    run_jobs(&state, organization_id).await;
+    await_deliveries(&state, &[event]).await;
+
+    assert_eq!(
+        mail.attempts(),
+        0,
+        "an address unverified before the send must not be attempted"
+    );
+    assert!(mail.delivered().is_empty());
+    let present: bool = sqlx::query_scalar(
+        "SELECT email IS NOT NULL AND email_verified_at IS NULL FROM accounts WHERE id = $1",
+    )
+    .bind(author)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(present, "the address is still held, only unverified");
+    let sent: bool = sqlx::query_scalar(
+        "SELECT sent_at IS NOT NULL FROM email_intents WHERE notification_id = $1",
+    )
+    .bind(notification_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(sent, "the intent is closed rather than retried for ever");
+    let notifications: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(notifications, 1);
+
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_muted_preference_queues_no_email_at_all() {
+    let db = TestDb::new().await;
+    let mail = Arc::new(MemoryTransport::new());
+    let f = build_fixture_with(&db.url, mail.clone()).await;
+    let email = set_email(&f.pool, f.author_id, true).await;
+
+    // Mute one kind through the API; the default for the others stays on.
+    let (status, body) = request(
+        &f.app,
+        "PUT",
+        "/api/v1/user/notification-preferences",
+        Some(&f.author_token),
+        json!({"pull_request.merged": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let merged = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["kind"] == "pull_request.merged")
+        .unwrap();
+    assert_eq!(merged["email"], false);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE kind = 'account.notification_preferences_changed' AND actor_id = $1",
+    )
+    .bind(f.author_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(audits, 1);
+
+    merge_as_other(&f).await;
+    run_jobs(&f.state, Some(f.org_id)).await;
+
+    assert!(mail.delivered().is_empty(), "a muted kind sends no mail");
+    assert_eq!(mail.attempts(), 0);
+    let intents: i64 = sqlx::query_scalar("SELECT count(*) FROM email_intents")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        intents, 0,
+        "a muted kind queues nothing, not even an intent"
+    );
+    let in_app: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(in_app, 1);
+    assert!(!email.is_empty());
+
+    // Revert: ignore the preference row in `queue`; the intent and email
+    // appear here.
+    finish(f).await;
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn the_same_event_twice_sends_one_email() {
+    let db = TestDb::new().await;
+    let mail = Arc::new(MemoryTransport::new());
+    let state = sql_state_with_mailer(&db.pool, mail.clone()).await;
+    let (author, actor, _pull_request_id, review_id) = insert_reviewed_rows(&db.pool).await;
+    let email = set_email(&db.pool, author, true).await;
+    let organization_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT organization_id FROM repositories LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+    // Two events naming the same source row, as a replay does.
+    let payload = json!({ "review_id": review_id, "pull_request_id": _pull_request_id });
+    let events = vec![
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.approved",
+            payload.clone(),
+        )
+        .await,
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.approved",
+            payload,
+        )
+        .await,
+    ];
+    run_jobs(&state, organization_id).await;
+    await_deliveries(&state, &events).await;
+
+    assert_eq!(mail.delivered().len(), 1, "two events, one email");
+    assert_eq!(mail.delivered()[0].to, email);
+    assert!(!mail.delivered()[0].body.contains("token"));
+    let intents: i64 = sqlx::query_scalar("SELECT count(*) FROM email_intents")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(intents, 1);
+    let notifications: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(notifications, 1);
+
+    // Revert: key the intent on the event id rather than the notification id;
+    // the second event gets a second intent and a second email.
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_failed_send_retries_from_the_intent_and_a_late_duplicate_does_not_resend() {
+    let db = TestDb::new().await;
+    let mail = Arc::new(MemoryTransport::new());
+    mail.fail_next(1);
+    let state = sql_state_with_mailer(&db.pool, mail.clone()).await;
+    let (author, actor, _pull_request_id, review_id) = insert_reviewed_rows(&db.pool).await;
+    set_email(&db.pool, author, true).await;
+    let organization_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT organization_id FROM repositories LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let payload = json!({ "review_id": review_id, "pull_request_id": _pull_request_id });
+    let event = write_event(
+        &db.pool,
+        organization_id,
+        actor,
+        "pull_request.approved",
+        payload.clone(),
+    )
+    .await;
+
+    // First attempt fails; the runner retries the same outbox delivery from the
+    // durable intent and the second attempt is delivered.
+    run_jobs(&state, organization_id).await;
+    await_deliveries(&state, &[event]).await;
+    assert!(mail.attempts() >= 2, "the failed send must retry");
+    assert_eq!(mail.delivered().len(), 1, "one delivered email");
+    let sent: bool = sqlx::query_scalar(
+        "SELECT sent_at IS NOT NULL FROM email_intents \
+         WHERE notification_id = (SELECT id FROM notifications LIMIT 1)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(sent, "the intent records the delivery");
+    let job: String = sqlx::query_scalar(
+        "SELECT state FROM jobs WHERE kind = 'notification.outbox' ORDER BY created_at LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(job, "done");
+
+    // A third event naming the same row arrives after the send: the intent has
+    // `sent_at`, so it is not delivered again.
+    let late = write_event(
+        &db.pool,
+        organization_id,
+        actor,
+        "pull_request.approved",
+        payload,
+    )
+    .await;
+    run_jobs(&state, organization_id).await;
+    await_deliveries(&state, &[late]).await;
+    assert_eq!(
+        mail.delivered().len(),
+        1,
+        "a delivered email is never resent"
+    );
+
+    // Revert: clear `sent_at` before retrying (or key the intent on the event
+    // id); the count becomes two.
+    db.drop_db().await;
+}
+
+/// Signals when a send has started and waits until the test releases it.
+struct BlockingTransport {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    released: std::sync::atomic::AtomicBool,
+    delivered: std::sync::Mutex<Vec<EmailMessage>>,
+}
+
+impl BlockingTransport {
+    fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+impl MailTransport for BlockingTransport {
+    fn send<'a>(&'a self, message: &'a EmailMessage) -> MailFuture<'a> {
+        Box::pin(async move {
+            if !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.delivered.lock().unwrap().push(message.clone());
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_blocked_email_does_not_block_the_request_that_produced_the_event() {
+    let db = TestDb::new().await;
+    let mail = Arc::new(BlockingTransport {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        released: std::sync::atomic::AtomicBool::new(false),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let f = build_fixture_with(&db.url, mail.clone()).await;
+    set_email(&f.pool, f.author_id, true).await;
+    // The first notification job is created and starts sending.
+    let (_reviewer, reviewer_token) = add_owner(&f.pool, f.org_id).await;
+    approve(&f, "approved", &f.feature_head, &reviewer_token).await;
+    githearth_server::outbox::register_builtin(&f.state)
+        .await
+        .unwrap();
+    githearth_server::outbox::fan_out_batch(&f.state, 10_000)
+        .await
+        .unwrap();
+    let mut registry = githearth_server::jobs::Registry::new();
+    githearth_server::notifications::register(&mut registry);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let runner = githearth_server::jobs::spawn(f.state.clone(), registry, shutdown.clone());
+    tokio::time::timeout(Duration::from_secs(20), mail.entered.notified())
+        .await
+        .expect("the email job did not reach the transport");
+
+    // A second review writes its event and returns while the first email job
+    // is still blocked in the runner. The pull request stays open.
+    let (_second, second_token) = add_owner(&f.pool, f.org_id).await;
+    let approval = tokio::time::timeout(
+        Duration::from_secs(5),
+        approve(&f, "approved", &f.feature_head, &second_token),
+    )
+    .await;
+    assert!(
+        approval.is_ok(),
+        "an email send in the job runner must not block the originating request"
+    );
+
+    // Revert: send the email inline in the notification consumer's caller or
+    // in the request path; this timeout fires.
+    mail.release();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE state IN ('pending','running') \
+             AND kind = 'notification.outbox'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        if pending == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "notification jobs did not drain after release"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), runner).await;
+    finish(f).await;
     db.drop_db().await;
 }
 

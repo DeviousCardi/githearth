@@ -1,6 +1,6 @@
 # M1: experimental server foundation
 
-The `githearth-server` binary runs independently of the existing local `githearth` Git prototype. M1 provides PostgreSQL migrations, one-time administrator bootstrap, password login, expiring/revocable bearer sessions, and membership-scoped organizations. Git HTTP/SSH hosting, issues, pull requests and reviews, the server-rendered UI, forks, protection rules and single-node operations are implemented and documented in the sections below. It has no public account registration, CI execution, packaging/security scanning, or replicated storage.
+The `githearth-server` binary runs independently of the existing local `githearth` Git prototype. M1 provides PostgreSQL migrations, one-time administrator bootstrap, password login, expiring/revocable bearer sessions, and membership-scoped organizations. Git HTTP/SSH hosting, issues, pull requests and reviews, the server-rendered UI, forks, protection rules and single-node operations are implemented and documented in the sections below. It has no public account registration, CI execution, packaging/security scanning, or replicated storage. SMTP notification and verification email are delivered when configured ([operations/email](operations/email.md)); the SPF/DKIM/DMARC and bounce baseline, and public sign-up, are not part of M4.1.
 
 ## Local Docker Compose
 
@@ -61,6 +61,13 @@ Skip bootstrap when the Compose installation already has its administrator. Use 
 | `body_limit_bytes` | `GITHEARTH_BODY_LIMIT_BYTES` | 524288 / 1024–1048576 bytes |
 | `auth_concurrency` | `GITHEARTH_AUTH_CONCURRENCY` | 2 / 1–16 concurrent password verifications |
 | `trusted_proxies` | `GITHEARTH_TRUSTED_PROXIES` | Empty (no trusted proxies) / comma-separated IPs or CIDRs |
+| `smtp_host` | `GITHEARTH_SMTP_HOST` | Empty: email delivery disabled |
+| `smtp_port` | `GITHEARTH_SMTP_PORT` | 587 / 1–65535 |
+| `smtp_tls` | `GITHEARTH_SMTP_TLS` | `starttls` / `starttls`, `implicit` or `none` |
+| `smtp_from` | `GITHEARTH_SMTP_FROM` | Empty unless `smtp_host` is set; then a valid lower-case address |
+| `smtp_username` | `GITHEARTH_SMTP_USERNAME` | Unset; requires `smtp_password_file` when set |
+| `smtp_password_file` | `GITHEARTH_SMTP_PASSWORD_FILE` | Unset; a file path or `-` for stdin, read once at start-up |
+| `public_url` | `GITHEARTH_PUBLIC_URL` | `http://127.0.0.1:8080`; base of links in mail |
 
 `trusted_proxies` is a TOML array of IP addresses or CIDR ranges. When a request arrives from a trusted proxy, `X-Forwarded-For` is walked from right to left to find the first untrusted entry, which becomes the client IP. When the peer is not trusted, the header is ignored entirely. A malformed header, an empty header, or an all-trusted chain falls back to the peer address. `X-Real-IP` and the structured `Forwarded` header are not implemented.
 
@@ -215,6 +222,61 @@ In-app notifications are the first real handlers on the [ADR 0006](decisions/000
 | `POST /api/v1/user/notifications/{id}/read` | Session bearer only; sets `read_at` and returns 204; idempotent; 404 for an unknown id or another account's notification |
 
 The two kinds are `pull_request.merged` and `pull_request.reviewed`. The recipient is always the pull request author, and a notification is skipped when the author is the one who merged or reviewed. The `notifications` table's `actor_id` set to null when the acting account is deleted, `pull_request_id` cascades on pull request deletion, and `account_id` cascades on account deletion.
+
+### Email delivery and preferences
+
+When SMTP is configured, the same outbox consumer that writes the in-app row
+also sends a plain-text email. It sends **only** to `accounts.email` when
+`accounts.email_verified_at` is set; an unverified or absent address gets no
+mail. Each notification to a verified, unmuted address writes one
+`email_intents` row in the same transaction as the in-app row, keyed uniquely
+on the notification, so a redelivered event or a second event naming the same
+source row cannot produce a second email. A
+sent intent records `sent_at`; a retry after a failed send sends again, and a
+later duplicate sees `sent_at` and sends nothing. The send runs in the durable
+`notification.outbox` job, not the request: an SMTP failure retries with the
+outbox delivery's backoff and becomes a `dead` delivery that `jobs requeue`
+recovers, and it never delays the merge or review that produced the event.
+No notification body contains a token, a secret or another account's data.
+`docs/operations/email.md` lists the messages and the SMTP settings.
+
+Per-account preferences are managed at
+`GET|PUT /api/v1/user/notification-preferences` (session bearer only):
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /api/v1/user/notification-preferences` | Returns one row per kind (`pull_request.merged`, `pull_request.reviewed`, `pull_request.review_requested`) with `email` true by default |
+| `PUT /api/v1/user/notification-preferences` | JSON object of kind to boolean, e.g. `{"pull_request.merged":false}`; unknown kinds are 400; an empty object is a no-op; the change is audited as `account.notification_preferences_changed` |
+
+A missing preference row means enabled. The send path reads the same
+`notification_preferences` table with the same "missing means true" rule as the
+API, so the two cannot disagree. A muted kind writes no `email_intents` row at
+all: there is nothing queued to discard. Preferences cover notification email
+only; verification and reset mail are transactional.
+
+## Email verification
+
+An account owner (`POST /api/v1/me/email-verification`) or an administrator
+(`POST /api/v1/admin/accounts/{id}/email-verification`, with the same fresh-auth
+rule as other administrator actions) requests a link with
+`{"email":"alice@example.com"}`. The address is normalised to lower case,
+validated, and stored as the account's primary address only while it is
+unverified. A duplicate address is refused by the unique index `0049` as
+`409 {"error":"email address is already in use"}`, naming no account, username
+or id. Replacing an already verified address is the identity slice's
+change-of-address flow and is refused here.
+
+The response is `202` with `expires_at` and **no token**. The outbox consumer
+mints a 256-bit token, stores only its SHA-256 in `email_verifications` and
+mails a single-use link valid for 24 hours. The row records the address it
+verifies; redemption also requires the account still to hold that same address,
+so a link requested before a change of address cannot verify the new one.
+`POST /api/v1/email-verification/redeem` with `{"token":"…"}` sets
+`email_verified_at` once and answers `204`; an expired, reused or wrong-address
+token answers the same `401 {"error":"invalid or expired verification token"}`.
+The browser form at `/verify-email/{token}` performs the same redemption.
+Every request and redemption is audited, and the plaintext token appears in no
+text or json column — only its digest in `email_verifications.token_hash`.
 
 ## Settings
 

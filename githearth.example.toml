@@ -57,3 +57,15 @@ auth_concurrency = 2
 # is accepted only together with `metrics_enabled = true` above (on its own it
 # is refused at load, because it would do nothing).
 # metrics_allow_non_loopback = true
+# Outbound email (docs/operations/email.md). Disabled while smtp_host is empty.
+# The verification link and notification mail are queued durably; when SMTP is
+# configured they are delivered from the outbox consumer, never from a request.
+# smtp_host = "smtp.example.com"
+# smtp_port = 587
+# smtp_tls = "starttls"            # starttls | implicit | none (none is refused with smtp_username)
+# smtp_from = "githearth@example.com"
+# smtp_username = "githearth"
+# smtp_password_file = "/etc/githearth/smtp-password"  # read once at start-up;
+#                                                     # never a TOML value, never logged.
+#                                                     # "-" reads one line from stdin.
+# public_url = "https://githearth.example"  # base of links in mail; no trailing slash needed

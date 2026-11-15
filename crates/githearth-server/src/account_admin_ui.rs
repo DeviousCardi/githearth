@@ -555,6 +555,8 @@ mod tests {
             is_admin: false,
             suspended,
             must_change_password: false,
+            email: None,
+            email_verified_at: None,
             created_at: "2026-11-15T00:00:00Z".to_owned(),
         }
     }
