@@ -1802,18 +1802,30 @@ async fn a_purge_waits_for_a_lock_held_by_another_process() {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-slice: the transfer slice's tombstone (M4)
+// Cross-slice: transfer tombstones and rename redirects
 // ---------------------------------------------------------------------------
 
-/// Shape of the check that must run **after `m41/transfer` merges**: a name
-/// transferred out of an organization leaves a tombstone; a deleted duplicate
-/// at that name must neither take the name back (restore refused) nor delete
-/// the tombstone, and the old path must not resolve to the moved repository.
+/// The reconciliation between this slice and `m41/transfer`, which is now on
+/// `main`.
 ///
-/// It cannot run on this branch: `repository_redirects.transferred_at` is
-/// added by the transfer slice, so it self-skips until that column exists.
+/// A name transferred out of an organization leaves a **tombstone**
+/// (`repository_redirects.transferred_at`), as does every alias a rename left
+/// behind before the move. The two slices agree:
+///
+/// * the transfer's tombstone wins over restore's redirect lookups, and over
+///   the deleted duplicate row a restore would take the name from;
+/// * a restore into a transferred name is refused, and it neither deletes the
+///   tombstone nor retires a retired alias;
+/// * the old path stays `410` on the API and the page, and like a missing
+///   repository on Git — never a redirect to the row in the new organization,
+///   even though a deleted duplicate row with that name exists.
+///
+/// The duplicate is created and deleted **before** the tombstone is written:
+/// the transfer refuses a create or rename onto a retired name (pinned by
+/// `transfer.rs`), so a pre-existing trashed row is the only realistic way a
+/// duplicate can be present when a restore is attempted.
 #[tokio::test]
-#[ignore = "cross-slice: needs m41/transfer's repository_redirects.transferred_at; run after that slice merges"]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn transferred_name_tombstone_survives_a_duplicate_restore() {
     let env = setup_with(false).await;
     let has_column: bool = sqlx::query_scalar(
@@ -1823,14 +1835,23 @@ async fn transferred_name_tombstone_survives_a_duplicate_restore() {
     .fetch_one(&env.pool)
     .await
     .unwrap();
-    if !has_column {
-        eprintln!("SKIP: repository_redirects.transferred_at does not exist yet");
-        return;
-    }
+    assert!(
+        has_column,
+        "m41/transfer's repository_redirects.transferred_at is missing; this test is the \
+         cross-slice acceptance evidence and must not self-skip"
+    );
 
-    // A repository that moved to another organization: a tombstone at `name`
-    // in this organization points at a row owned by the other one.
     let name = tag("transferred");
+    let alias = tag("transferred-alias");
+
+    // The trashed duplicate exists before the move, through the real API.
+    let duplicate = create_repo(&env, &name).await;
+    delete_repo(&env, &name).await;
+    assert_eq!(row_status(&env, duplicate).await, "deleted");
+
+    // The repository moved to another organization: `name` is the tombstone
+    // for the name it left, `alias` is a rename alias retired by the same
+    // move. Both rows point at a repository owned by the other organization.
     let other_org = Uuid::new_v4();
     sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Other Org')")
         .bind(other_org)
@@ -1840,12 +1861,165 @@ async fn transferred_name_tombstone_survives_a_duplicate_restore() {
         .unwrap();
     let moved = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO repositories (id,organization_id,name,operation_id,created_by) \
-         VALUES ($1,$2,$3,$4,$5)",
+        "INSERT INTO repositories (id,organization_id,name,status,operation_id,created_by) \
+         VALUES ($1,$2,$3,'active',$4,$5)",
     )
     .bind(moved)
     .bind(other_org)
     .bind(&name)
+    .bind(Uuid::new_v4())
+    .bind(env.owner)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    for (old_name, row_id) in [(&name, moved), (&alias, moved)] {
+        sqlx::query(
+            "INSERT INTO repository_redirects (organization_id,name,repository_id,transferred_at) \
+             VALUES ($1,$2,$3,now())",
+        )
+        .bind(env.org_id)
+        .bind(old_name)
+        .bind(row_id)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    }
+
+    // Restore must be refused while the tombstone holds the name, and it must
+    // leave the trashed row alone.
+    let (status, body) = restore_repo(&env, &name, &env.owner_token, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "repository name already taken");
+    assert_eq!(
+        row_status(&env, duplicate).await,
+        "deleted",
+        "the refused restore changed the row"
+    );
+
+    // Neither the tombstone nor the retired alias was deleted or un-retired.
+    assert_eq!(
+        redirect_rows(&env, &name).await,
+        1,
+        "the restore deleted a transfer tombstone"
+    );
+    assert_eq!(
+        redirect_rows(&env, &alias).await,
+        1,
+        "the restore deleted a retired transfer alias"
+    );
+
+    // The API answers `410` for the transferred name and for its alias: never
+    // the moved repository, which lives in another organization.
+    for old_name in [&name, &alias] {
+        let (status, body) = api(
+            &env.app,
+            "GET",
+            &env.api_path(&format!("/{old_name}")),
+            Some(&env.owner_token),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{old_name}: {body}");
+        assert_eq!(body["error"], "this repository has moved");
+        assert_ne!(body["id"], json!(moved), "{old_name} resolved to the move");
+    }
+
+    // The page is `410` too and does not name the new organization.
+    let cookie = format!("githearth_session={}", env.owner_token);
+    let (status, html) = page(&env.app, &env.web_path(&name), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(
+        !html.contains("Other Org") && !html.contains(&other_org.to_string()),
+        "the moved-away page leaks the target: {html}"
+    );
+
+    // Git is answered like a missing repository (the transfer slice's Git
+    // rendering of gone), so a clone cannot reach the moved row either.
+    let stderr = git_fail(git_cmd(&["ls-remote", &env.git_url(&name)])).await;
+    assert!(
+        stderr.contains("not found"),
+        "Git HTTP answered something other than not found: {stderr}"
+    );
+
+    // A lookup through the trashed row's own path is still `410`, not the
+    // moved repository and not a redirect.
+    assert_eq!(redirect_rows(&env, &name).await, 1);
+}
+
+/// The other half of the ordering: a **rename** inside one organization keeps
+/// its pre-existing redirect, and a **transfer** tombstone never becomes one.
+///
+/// This is the disagreement with ADR 0003 that both slices left open (ADR says
+/// a renamed-away name is also `410`); this test pins today's behaviour so a
+/// later change has to be deliberate. It also pins that the two row kinds
+/// coexist: a tombstone elsewhere does not turn a rename redirect into `410`,
+/// and the rename redirect does not make a tombstone resolve.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_rename_redirect_resolves_and_a_transfer_tombstone_never_does() {
+    let env = setup_with(false).await;
+
+    // Rename away inside the organization: the old name keeps redirecting.
+    let renamed_away = tag("renamed-away");
+    let renamed_to = tag("renamed-to");
+    let repo = create_repo(&env, &renamed_away).await;
+    let (status, body) = api(
+        &env.app,
+        "PATCH",
+        &env.api_path(&format!("/{renamed_away}")),
+        Some(&env.owner_token),
+        None,
+        Some(json!({"name": renamed_to})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let live_redirects: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM repository_redirects \
+         WHERE organization_id=$1 AND lower(name)=lower($2) AND transferred_at IS NULL",
+    )
+    .bind(env.org_id)
+    .bind(&renamed_away)
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(live_redirects, 1, "a rename writes a live redirect");
+
+    let (status, body) = api(
+        &env.app,
+        "GET",
+        &env.api_path(&format!("/{renamed_away}")),
+        Some(&env.owner_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rename redirect stopped resolving: {body}"
+    );
+    assert_eq!(body["id"], json!(repo));
+
+    // A transferred-away name, in the same organization, stays `410` while
+    // the rename redirect keeps working: the tombstone wins only its own name.
+    let moved_away = tag("moved-away");
+    let other_org = Uuid::new_v4();
+    sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,'Other Org')")
+        .bind(other_org)
+        .bind(tag("other-org"))
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let moved = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO repositories (id,organization_id,name,status,operation_id,created_by) \
+         VALUES ($1,$2,$3,'active',$4,$5)",
+    )
+    .bind(moved)
+    .bind(other_org)
+    .bind(&moved_away)
     .bind(Uuid::new_v4())
     .bind(env.owner)
     .execute(&env.pool)
@@ -1856,49 +2030,35 @@ async fn transferred_name_tombstone_survives_a_duplicate_restore() {
          VALUES ($1,$2,$3,now())",
     )
     .bind(env.org_id)
-    .bind(&name)
+    .bind(&moved_away)
     .bind(moved)
     .execute(&env.pool)
     .await
     .unwrap();
 
-    // A deleted duplicate at the same name in the source organization.
-    let duplicate = create_repo(&env, &name).await;
-    assert_ne!(duplicate, moved);
-    delete_repo(&env, &name).await;
-
-    // Restore must be refused while the tombstone holds the name.
-    let (status, body) = restore_repo(&env, &name, &env.owner_token, None).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"], "repository name already taken");
-    assert_eq!(row_status(&env, duplicate).await, "deleted");
-
-    // The tombstone is intact (it is not a rename redirect to retire).
-    let tombstones: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM repository_redirects \
-         WHERE organization_id=$1 AND lower(name)=lower($2) AND transferred_at IS NOT NULL",
-    )
-    .bind(env.org_id)
-    .bind(&name)
-    .fetch_one(&env.pool)
-    .await
-    .unwrap();
-    assert_eq!(tombstones, 1, "the restore deleted a transfer tombstone");
-
-    // The old path must not resolve to the moved repository. The transfer
-    // slice owns the exact `410`; this asserts the dangerous outcome (200
-    // resolving to the repository in another organization) cannot happen.
     let (status, body) = api(
         &env.app,
         "GET",
-        &env.api_path(&format!("/{name}")),
+        &env.api_path(&format!("/{moved_away}")),
         Some(&env.owner_token),
         None,
         None,
     )
     .await;
-    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::GONE, "{body}");
     assert_ne!(body["id"], json!(moved));
+
+    let (status, body) = api(
+        &env.app,
+        "GET",
+        &env.api_path(&format!("/{renamed_away}")),
+        Some(&env.owner_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], json!(repo));
 }
 
 // ---------------------------------------------------------------------------
