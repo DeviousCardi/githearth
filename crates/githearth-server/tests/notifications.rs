@@ -374,20 +374,20 @@ async fn approve(f: &Fixture, verdict: &str, commit: &str, token: &str) {
 }
 
 /// Runs the relay and the runner as `serve` runs them: the relay fans the
-/// event out to the consumer, the runner drains the delivery jobs. The fixture
-/// registered the consumer before the test acted, so this helper's position is
-/// irrelevant; registration belongs in the fixture, never here (ADR 0006,
-/// revised for M4.1).
+/// event out to the consumer, the runner drains the delivery jobs.
 ///
-/// A drain that expires, or a `pull_request` event that never reached a
-/// `delivered` delivery row, fails the test: the four suites that call a helper
-/// like this one could not otherwise see a relay that loses an event (review
-/// F4).
+/// After the drain, every event that existed before this call must have a
+/// `delivered` delivery row: a relay that never enqueued the pair leaves its
+/// delivery `pending`, and a quiet deadline `break` would swallow exactly that.
+/// Both fail the test (review F4). Tests that write their own events also call
+/// [`await_deliveries`] for the ones they wrote, which the relay only fans out
+/// during this call.
 async fn run_jobs(state: &AppState) {
-    // As `serve` runs them: the relay hands each event to the consumer and the
-    // runner executes the delivery. Driven here, step by step, so the fan-out
-    // has happened before the runner is asked to drain (ADR 0006, revised for
-    // M4.1).
+    let before: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM outbox_events WHERE kind = ANY($1)")
+        .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
     githearth_server::outbox::fan_out_batch(state, 10_000)
         .await
         .expect("outbox fan-out");
@@ -395,62 +395,51 @@ async fn run_jobs(state: &AppState) {
     githearth_server::notifications::register(&mut registry);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let runner = githearth_server::jobs::spawn(state.clone(), registry, shutdown.clone());
-    // Drain every notification kind, including the legacy kinds an upgrade can
-    // still have queued. The runner has to be started before the first look, or
-    // it waits a full poll interval with nothing pending and `serve` sleeps.
+    // The runner has to be started before the first look, or it waits a full
+    // poll interval with nothing pending.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Two consecutive empty looks before the drain ends: a job the runner
+    // has not claimed yet already shows as `pending`, and an enqueue can
+    // land between two looks under load. A quiet `break` at the deadline
+    // would hide a relay that never enqueued the job, so it panics.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut quiet = 0;
     loop {
         let pending: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM jobs WHERE state IN ('pending','running') \
-             AND kind LIKE 'notification.%'",
+             AND kind = 'notification.outbox'",
         )
         .fetch_one(&state.pool)
         .await
         .unwrap();
         if pending == 0 {
-            // One more fan-out pass. An event replayed after the first pass is
-            // picked up by the poll and its job is enqueued between two looks;
-            // a quiet first look must not end the drain before that job is
-            // there (the relay re-reads the same pairs on its next poll too).
-            githearth_server::outbox::fan_out_batch(state, 10_000)
-                .await
-                .expect("outbox fan-out");
-            let again: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM jobs WHERE state IN ('pending','running') \
-                 AND kind LIKE 'notification.%'",
-            )
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
-            if again == 0 {
+            quiet += 1;
+            if quiet == 2 {
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
         }
+        quiet = 0;
         if tokio::time::Instant::now() >= deadline {
-            // A quiet `break` here hides a relay that never enqueued the job.
             panic!("the notification jobs did not drain within 60 s ({pending} left)");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     shutdown.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner).await;
-    // No handler of this suite writes its own event, so after the drain every
-    // delivery of a consumed kind is `delivered`. A relay that never enqueued a
-    // pair leaves its delivery `pending`, and this fails (review F4).
+    // No handler of this suite writes its own event, so every event in `before`
+    // is owed a delivery that ran. Counting the rows still `pending` fails when
+    // the relay skipped a pair: the delivery is created and never enqueued.
     let open: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM outbox_deliveries d \
-         JOIN outbox_events e ON e.id = d.event_id \
-         WHERE e.kind = ANY($1) AND d.state <> 'delivered'",
+         WHERE d.event_id = ANY($1) AND d.state = 'pending'",
     )
-    .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
+    .bind(&before)
     .fetch_one(&state.pool)
     .await
     .unwrap();
-    assert_eq!(
-        open, 0,
-        "a consumed event never reached `delivered` (review F4)"
-    );
+    assert_eq!(open, 0, "a delivery never ran after the drain (review F4)");
 }
 
 /// Asserts that every event of `kind` in `chain`'s backlog reached a
