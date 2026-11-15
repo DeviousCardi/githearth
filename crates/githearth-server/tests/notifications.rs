@@ -314,6 +314,14 @@ async fn build_fixture(database_url: &str) -> Fixture {
     assert_eq!(status, StatusCode::CREATED, "{pull}");
     let number = pull["number"].as_i64().unwrap();
 
+    // Register the outbox consumer before the test acts. Its position is this
+    // fixture's head, so the merge or review the test performs next is newer
+    // than the registration and is delivered; the rows built above are not owed
+    // to it (ADR 0006, revised for M4.1).
+    githearth_server::outbox::register_builtin(&state)
+        .await
+        .unwrap();
+
     Fixture {
         state,
         pool,
@@ -365,16 +373,147 @@ async fn approve(f: &Fixture, verdict: &str, commit: &str, token: &str) {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
-/// Runs the durable runner with the notification registry until the pending job
-/// queue is drained, then stops it.
+/// Runs the relay and the runner as `serve` runs them: the relay fans the
+/// event out to the consumer, the runner drains the delivery jobs. The fixture
+/// registered the consumer before the test acted, so this helper's position is
+/// irrelevant; registration belongs in the fixture, never here (ADR 0006,
+/// revised for M4.1).
+///
+/// A drain that expires, or a `pull_request` event that never reached a
+/// `delivered` delivery row, fails the test: the four suites that call a helper
+/// like this one could not otherwise see a relay that loses an event (review
+/// F4).
 async fn run_jobs(state: &AppState) {
-    let mut registry = jobs::Registry::new();
+    // As `serve` runs them: the relay hands each event to the consumer and the
+    // runner executes the delivery. Driven here, step by step, so the fan-out
+    // has happened before the runner is asked to drain (ADR 0006, revised for
+    // M4.1).
+    githearth_server::outbox::fan_out_batch(state, 10_000)
+        .await
+        .expect("outbox fan-out");
+    let mut registry = githearth_server::jobs::Registry::new();
     githearth_server::notifications::register(&mut registry);
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let handle = jobs::spawn(state.clone(), registry, shutdown.clone());
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let runner = githearth_server::jobs::spawn(state.clone(), registry, shutdown.clone());
+    // Drain every notification kind, including the legacy kinds an upgrade can
+    // still have queued. The runner has to be started before the first look, or
+    // it waits a full poll interval with nothing pending and `serve` sleeps.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE state IN ('pending','running') \
+             AND kind LIKE 'notification.%'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        if pending == 0 {
+            // One more fan-out pass. An event replayed after the first pass is
+            // picked up by the poll and its job is enqueued between two looks;
+            // a quiet first look must not end the drain before that job is
+            // there (the relay re-reads the same pairs on its next poll too).
+            githearth_server::outbox::fan_out_batch(state, 10_000)
+                .await
+                .expect("outbox fan-out");
+            let again: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM jobs WHERE state IN ('pending','running') \
+                 AND kind LIKE 'notification.%'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            if again == 0 {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // A quiet `break` here hides a relay that never enqueued the job.
+            panic!("the notification jobs did not drain within 60 s ({pending} left)");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner).await;
+    // No handler of this suite writes its own event, so after the drain every
+    // delivery of a consumed kind is `delivered`. A relay that never enqueued a
+    // pair leaves its delivery `pending`, and this fails (review F4).
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_deliveries d \
+         JOIN outbox_events e ON e.id = d.event_id \
+         WHERE e.kind = ANY($1) AND d.state <> 'delivered'",
+    )
+    .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        open, 0,
+        "a consumed event never reached `delivered` (review F4)"
+    );
+}
+
+/// Asserts that every event of `kind` in `chain`'s backlog reached a
+/// `delivered` delivery row for the built-in consumer. A relay that skips a
+/// pair never enqueues its job, so the drain has nothing to wait for and only
+/// this row is missing.
+async fn deliveries_delivered(state: &AppState, kind: &str) -> i64 {
+    // Every delivery the fan-out created for `kind` is finished, and at least
+    // one exists: a relay that skipped the pair creates none, which a plain
+    // "no row is unfinished" check would read as success.
+    let created: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_deliveries d \
+         JOIN outbox_events e ON e.id = d.event_id \
+         WHERE e.kind = $1 AND d.consumer_id = \
+               (SELECT id FROM outbox_consumers WHERE name = 'notification.outbox')",
+    )
+    .bind(kind)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let delivered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_deliveries d \
+         JOIN outbox_events e ON e.id = d.event_id \
+         WHERE e.kind = $1 AND d.state = 'delivered' AND d.consumer_id = \
+               (SELECT id FROM outbox_consumers WHERE name = 'notification.outbox')",
+    )
+    .bind(kind)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert!(created > 0, "no {kind} delivery was created at all");
+    assert_eq!(
+        created, delivered,
+        "a {kind} event never reached a `delivered` delivery row"
+    );
+    delivered
+}
+
+/// Waits until every one of `events` has a delivery row for the built-in
+/// consumer and that row is `delivered` or `dead`. A relay that skipped a pair
+/// leaves a delivery missing and this times out, naming the lost event.
+async fn await_deliveries(state: &AppState, events: &[Uuid]) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let unfinished: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM unnest($1::uuid[]) AS e(id) \
+             WHERE NOT EXISTS (SELECT 1 FROM outbox_deliveries d \
+                               JOIN outbox_consumers c ON c.id = d.consumer_id \
+                               WHERE d.event_id = e.id AND c.name = 'notification.outbox' \
+                                 AND d.state IN ('delivered', 'dead'))",
+        )
+        .bind(events)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        if unfinished == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{unfinished} of the test's events never reached a finished delivery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 fn replace_db_name(url: &str, new_db: &str) -> String {
@@ -458,7 +597,30 @@ async fn merge_by_someone_else_notifies_author_once() {
         .await
         .unwrap();
 
+    // At the path that writes the event: no handler enqueued a job beside it,
+    // and after the relay there is exactly one notification job for it.
+    let event: Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox_events WHERE kind = 'pull_request.merged' ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    let direct: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind LIKE 'notification.%'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(direct, 0, "the merge path writes the event, not a job");
     run_jobs(&f.state).await;
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind LIKE 'notification.%' \
+         AND payload->>'event_id' = $1",
+    )
+    .bind(event.to_string())
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 1, "one merged event, one notification job");
 
     let rows: Vec<(Uuid, String, Option<Uuid>, Uuid)> =
         sqlx::query_as("SELECT account_id, kind, actor_id, event_id FROM notifications")
@@ -513,7 +675,30 @@ async fn review_by_someone_else_notifies_author_once() {
     let (_reviewer, reviewer_token) = add_owner(&f.pool, f.org_id).await;
     approve(&f, "approved", &f.feature_head, &reviewer_token).await;
 
+    // At the review path: one event, no job beside it, then one job from the
+    // relay (not one direct plus one from the consumer).
+    let event: Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox_events WHERE kind = 'pull_request.approved' ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    let direct: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind LIKE 'notification.%'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(direct, 0, "the review path writes the event, not a job");
     run_jobs(&f.state).await;
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind LIKE 'notification.%' \
+         AND payload->>'event_id' = $1",
+    )
+    .bind(event.to_string())
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 1, "one review event, one notification job");
 
     let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT account_id, kind FROM notifications")
         .fetch_all(&f.pool)
@@ -561,11 +746,214 @@ async fn self_review_notifies_nobody() {
 }
 
 // ---------------------------------------------------------------------------
-// Handler idempotency and deleted targets (no Git fixture required)
+// One notification per source row, however many events name it (review F1)
 // ---------------------------------------------------------------------------
+
+/// Records an outbox event for `kind` and returns its id, the way a writer
+/// does: the chain row, then the audit row, so `outbox_assign` gives the event
+/// its `(chain, seq)`. Each call is one event, whatever it names.
+async fn write_event(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    actor_id: Uuid,
+    kind: &str,
+    payload: Value,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO audit_chain (chain, last_seq, last_hash) \
+         VALUES (COALESCE($1, '00000000-0000-0000-0000-000000000000'::uuid), 0, sha256('')) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(organization_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audit_events (id, organization_id, actor_id, kind) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(organization_id)
+    .bind(actor_id)
+    .bind(kind)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_events (id, organization_id, kind, payload) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(organization_id)
+    .bind(kind)
+    .bind(payload)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    id
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_second_event_for_the_same_source_row_notifies_once() {
+    let db = TestDb::new().await;
+    let state = sql_state(&db.pool).await;
+    let (author, actor, pull_request_id, review_id) = insert_reviewed_rows(&db.pool).await;
+
+    // One merged event per intent: the payload every `pull_request.merged`
+    // event carries. A replayed journal entry writes a second one under a new
+    // event id, which is the shape the direct job never had.
+    let organization_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT organization_id FROM repositories LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let operation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO merge_intents (operation_id, repository_id, pull_request_id, source_ref, \
+             source_oid, target_ref, expected_target_oid, method, policy_generation, \
+             checks_approvals_digest, actor_id, state) \
+         SELECT $1, r.id, $2, 'refs/heads/feature', fixed_oid, 'refs/heads/main', fixed_oid, \
+                'merge', 0, '', $3, 'merged' \
+         FROM repositories r, LATERAL (SELECT repeat('a', 40) AS fixed_oid) o",
+    )
+    .bind(operation_id)
+    .bind(pull_request_id)
+    .bind(actor)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE pull_requests SET state = 'merged', merged_by = $2 WHERE id = $1")
+        .bind(pull_request_id)
+        .bind(actor)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let merged_payload = json!({
+        "repository_id": sqlx::query_scalar::<_, Uuid>("SELECT id FROM repositories LIMIT 1")
+            .fetch_one(&db.pool).await.unwrap(),
+        "operation_id": operation_id,
+        "actor_id": actor,
+    });
+    let merged_events = vec![
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.merged",
+            merged_payload.clone(),
+        )
+        .await,
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.merged",
+            merged_payload,
+        )
+        .await,
+    ];
+
+    // One reviewed event per review.
+    let reviewed_payload = json!({ "review_id": review_id, "pull_request_id": pull_request_id });
+    let review_events = vec![
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.approved",
+            reviewed_payload.clone(),
+        )
+        .await,
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.approved",
+            reviewed_payload,
+        )
+        .await,
+    ];
+
+    // One review-requested event per request. The reviewer is a third account:
+    // a request the author made of themself notifies nobody.
+    let reviewer =
+        fixture_account(&db.pool, &tag("reviewer"), "correct horse battery staple").await;
+    let request_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO pull_request_review_requests (pull_request_id, reviewer_id, requested_by) \
+         VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(pull_request_id)
+    .bind(reviewer)
+    .bind(actor)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let request_payload = json!({ "request_id": request_id, "pull_request_id": pull_request_id });
+    let request_events = vec![
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.review_requested",
+            request_payload.clone(),
+        )
+        .await,
+        write_event(
+            &db.pool,
+            organization_id,
+            actor,
+            "pull_request.review_requested",
+            request_payload,
+        )
+        .await,
+    ];
+
+    // The relay creates one delivery per event; the runner applies the handler.
+    let mut all = merged_events.clone();
+    all.extend(&review_events);
+    all.extend(&request_events);
+    run_jobs(&state).await;
+    await_deliveries(&state, &all).await;
+    for (kind, events) in [
+        ("pull_request.merged", &merged_events),
+        ("pull_request.approved", &review_events),
+        ("pull_request.review_requested", &request_events),
+    ] {
+        assert_eq!(
+            deliveries_delivered(&state, kind).await,
+            events.len() as i64,
+            "every {kind} event was delivered"
+        );
+    }
+
+    let rows: Vec<(String, Uuid, Uuid)> =
+        sqlx::query_as("SELECT kind, account_id, event_id FROM notifications ORDER BY kind")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("pull_request.merged".to_string(), author, operation_id),
+            ("pull_request.reviewed".to_string(), author, review_id),
+            (
+                "pull_request.review_requested".to_string(),
+                reviewer,
+                request_id
+            ),
+        ],
+        "one notification per source row, keyed on the row and not the event"
+    );
+
+    db.drop_db().await;
+}
 
 /// Builds an `AppState` on an already-migrated pool.
 async fn sql_state(pool: &PgPool) -> AppState {
+    // The state shares the pool the test writes through; nothing here opens a
+    // second connection, so the runner drains the rows the test created.
     let config = Config {
         database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL")
             .expect("set GITHEARTH_TEST_DATABASE_URL"),
