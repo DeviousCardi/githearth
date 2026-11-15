@@ -88,3 +88,10 @@ auth_concurrency = 2
 # backup_directory = "backups"          # --output overrides the file name
 # backup_key_file = "/etc/githearth/backup.key"  # mode 0600; --key-file overrides
 # maintenance_drain_timeout_seconds = 300  # how long `maintenance start` waits
+# Secrets at rest (ADR 0014 §3, docs/operations/secrets-at-rest.md). Every
+# stored secret is wrapped by this operator key. Mode 0600, outside
+# storage_root and outside every backup; losing it loses the secrets.
+# installation_key_file = "/etc/githearth/installation.key"
+# installation_key_previous_file = "/etc/githearth/installation.previous.key"
+# installation_key_method = "file"       # file | kms (no built-in KMS adapter)
+# installation_key_passphrase_file = "/etc/githearth/installation.passphrase"

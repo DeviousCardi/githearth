@@ -569,7 +569,8 @@ async fn receive_pack(
     // the replay or leak the token.
     let after_exit: futures_util::future::BoxFuture<'static, ()> = {
         let state = state.clone();
-        Box::pin(async move {
+        let keys = state.installation_keys.clone();
+        Box::pin(crate::secrets::scope(keys, async move {
             // Guards live inside the future: they drop when it completes or is
             // itself dropped, never before the hook has had a chance to run.
             let _guard = repo_guard;
@@ -609,7 +610,7 @@ async fn receive_pack(
                     );
                 }
             }
-        })
+        }))
     };
 
     let (done_tx, done_rx) = oneshot::channel();

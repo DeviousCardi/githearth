@@ -23,6 +23,11 @@ const INPUT_LIMIT: u64 = 1026;
 /// given: `<config dir>/ssh_host_key`, the path Compose and the runbooks use.
 pub const DEFAULT_HOST_KEY_FILE: &str = "ssh_host_key";
 
+/// Name of the installation key `setup` creates when the configuration does not
+/// name one: `<config dir>/installation.key`. It lives beside the configuration,
+/// outside `storage_root`, so the storage tar never carries it.
+pub const DEFAULT_INSTALLATION_KEY_FILE: &str = "installation.key";
+
 /// Explicit settings for the configuration file `setup` writes.
 pub struct Options {
     /// Where to write the configuration; the default is `/etc/githearth/config.toml`.
@@ -85,6 +90,12 @@ impl Options {
                 PathBuf::new()
             },
             git_push_limit_bytes: self.git_push_limit_bytes,
+            installation_key_file: self
+                .config
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join(DEFAULT_INSTALLATION_KEY_FILE),
             ..Config::default()
         };
         if self.database_url.is_empty() {
@@ -207,6 +218,10 @@ pub async fn run(options: &Options, password: &mut dyn PasswordSource) -> Result
         }
     };
     report.step("configuration", configuration)?;
+    report.step(
+        "installation key",
+        installation_key(&config.installation_key_file),
+    )?;
     report.step(
         "storage directory",
         prepare_directories(&config.storage_root),
@@ -442,6 +457,10 @@ fn write_config(path: &Path, config: &Config) -> Result<Outcome> {
                 existing.ssh_host_key_path != config.ssh_host_key_path,
             ),
             (
+                "installation_key_file",
+                existing.installation_key_file != config.installation_key_file,
+            ),
+            (
                 "git_push_limit_bytes",
                 existing.git_push_limit_bytes != config.git_push_limit_bytes,
             ),
@@ -547,7 +566,7 @@ fn render(config: &Config) -> String {
     for (name, value) in rows {
         out.push_str(&format!("{name} = {value}\n"));
     }
-    let rows: [(&str, String); 6] = [
+    let rows: [(&str, String); 7] = [
         (
             "git_push_limit_bytes",
             config.git_push_limit_bytes.to_string(),
@@ -557,6 +576,10 @@ fn render(config: &Config) -> String {
         (
             "ssh_host_key_path",
             toml_string(&path_text(&config.ssh_host_key_path)),
+        ),
+        (
+            "installation_key_file",
+            toml_string(&path_text(&config.installation_key_file)),
         ),
         ("job_concurrency", config.job_concurrency.to_string()),
         (
@@ -727,6 +750,38 @@ fn prepare_directories(path: &Path) -> Result<Outcome> {
             "{label} (mode {mode:04o}, owned by the current user)"
         ))),
     }
+}
+
+/// Generates the installation key beside the configuration when it is absent,
+/// and checks the mode and ownership when it is present. The key protects every
+/// stored secret; a loose key file fails the step rather than being repaired
+/// silently.
+fn installation_key(path: &Path) -> Result<Outcome> {
+    if path.as_os_str().is_empty() {
+        bail!(
+            "the configuration does not name installation_key_file; add \
+             installation_key_file = \"<path>\" and run setup again"
+        );
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            crate::secrets::generate_raw_key_file(path)?;
+            return Ok(Outcome::Created(format!(
+                "{} (mode 0600, outside storage_root; keep it out of backups)",
+                path.display()
+            )));
+        }
+        Err(e) => bail!("cannot inspect {}: {e}", path.display()),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("{} is a symbolic link; refusing to use it", path.display());
+    }
+    crate::secrets::check_private_file(path, "installation key file")?;
+    Ok(Outcome::AlreadyPresent(format!(
+        "{} (mode 0600, owned by the current user)",
+        path.display()
+    )))
 }
 
 fn host_key(path: &Path) -> Result<Outcome> {

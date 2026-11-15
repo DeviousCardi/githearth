@@ -121,6 +121,7 @@ pub async fn report(config: &Config) -> Vec<Check> {
                 Err(d) => Check::fail("schema", d),
             });
             checks.push(legacy_tokens_check(&pool, config).await);
+            checks.push(installation_key_check(config, &pool).await);
             checks.push(
                 match lifecycle_check(&pool, config.reconcile_grace_seconds).await {
                     Ok(0) => Check::ok("lifecycle", "no stuck repositories"),
@@ -151,6 +152,7 @@ pub async fn report(config: &Config) -> Vec<Check> {
             checks.push(Check::fail("database", e));
             checks.push(Check::skip("schema"));
             checks.push(Check::skip("tokens"));
+            checks.push(Check::skip("installation key"));
             checks.push(Check::skip("lifecycle"));
             checks.push(Check::skip("jobs"));
             checks.push(Check::skip("outbox"));
@@ -159,6 +161,71 @@ pub async fn report(config: &Config) -> Vec<Check> {
     }
 
     checks
+}
+
+/// The installation key is the operator's half of the envelope. Doctor reports
+/// its id and rotation state, never key material. A failure here is the same
+/// failure `serve` and `migrate` refuse to start with.
+async fn installation_key_check(config: &Config, pool: &PgPool) -> Check {
+    let keys = match crate::secrets::InstallationKeySet::from_config(config) {
+        Ok(keys) => keys,
+        Err(error) => return Check::fail("installation key", format_args!("{error:#}")),
+    };
+    let report = match crate::secrets::status(pool, keys.as_ref()).await {
+        Ok(report) => report,
+        Err(error) => return Check::fail("installation key", format_args!("{error:#}")),
+    };
+    if report.legacy_plaintext > 0 {
+        return Check::fail(
+            "installation key",
+            format_args!(
+                "{} plaintext audit IP key(s) remain; run `githearth-server migrate` with the \
+                 installation key",
+                report.legacy_plaintext
+            ),
+        );
+    }
+    if !report.unknown_key_ids.is_empty() {
+        return Check::fail(
+            "installation key",
+            format_args!(
+                "data keys wrapped by unconfigured key id(s): {}",
+                report.unknown_key_ids.join(", ")
+            ),
+        );
+    }
+    if !report.unreadable_key_ids.is_empty() {
+        return Check::fail(
+            "installation key",
+            format_args!(
+                "data keys under configured key id(s) cannot be unwrapped (damaged wrapper): {}",
+                report.unreadable_key_ids.join(", ")
+            ),
+        );
+    }
+    match (&report.current_key_id, report.rotation_complete) {
+        (Some(id), true) => Check::ok(
+            "installation key",
+            format_args!(
+                "{id}, {} secret(s), rotation complete",
+                report.keys.iter().map(|k| k.secrets).sum::<i64>()
+            ),
+        ),
+        (Some(id), false) => Check::warn(
+            "installation key",
+            format_args!(
+                "{id}, rotation incomplete; keep the previous key and run `secrets rotate`"
+            ),
+        ),
+        (None, _) if report.keys.is_empty() => Check::warn(
+            "installation key",
+            "not configured; required before the first secret is written",
+        ),
+        (None, _) => Check::fail(
+            "installation key",
+            "stored secrets exist but installation_key_file is not configured",
+        ),
+    }
 }
 
 fn check_git(checks: &mut Vec<Check>) {

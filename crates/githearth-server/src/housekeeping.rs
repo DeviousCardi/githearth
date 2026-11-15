@@ -869,7 +869,8 @@ pub async fn enqueue_due(state: &AppState) -> Result<usize, sqlx::Error> {
 /// The scheduler task: enqueue due runs every `housekeeping_interval_seconds`,
 /// never more often than once a minute. Never panics or exits on errors.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    let keys = state.installation_keys.clone();
+    tokio::spawn(crate::secrets::scope(keys, async move {
         if !state.config.housekeeping_enabled {
             return;
         }
@@ -890,5 +891,5 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 }
             }
         }
-    })
+    }))
 }

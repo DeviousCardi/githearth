@@ -696,11 +696,11 @@ async fn an_smtp_credential_is_not_in_an_error_body_or_a_job_error() {
     let db = Db::new().await;
     let logs = install_log_capture();
     logs.0.lock().unwrap().clear();
-    let storage_root =
-        std::env::temp_dir().join(format!("githearth-email-cred-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&storage_root).unwrap();
+    let directory = std::env::temp_dir().join(format!("githearth-email-cred-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let storage_root = directory.join("repositories");
     let secret = "smtp-credential-must-not-appear-7f3a";
-    let credential_file = storage_root.join("smtp-password");
+    let credential_file = directory.join("smtp-password");
     std::fs::write(&credential_file, format!("{secret}\n")).unwrap();
     let config = Config {
         database_url: db.url.clone(),
@@ -787,7 +787,7 @@ async fn an_smtp_credential_is_not_in_an_error_body_or_a_job_error() {
         "a log line leaked the SMTP credential"
     );
 
-    let _ = std::fs::remove_dir_all(&storage_root);
+    let _ = std::fs::remove_dir_all(&directory);
     pool.close().await;
     db.drop_db().await;
 }

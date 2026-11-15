@@ -155,7 +155,7 @@ before any check runs. One such error: `storage_root` must be short enough (at m
 107-byte Unix socket path limit. The checks below are only reached when the configuration
 is valid.
 
-This runs eleven read-only checks:
+This runs twelve read-only checks:
 
 - **git** — verifies Git ≥ 2.40 is available
 - **storage** — checks the storage root exists, is a writable directory, is not a symlink, is not world-writable, and every subdirectory (`repositories/`, `tmp/`, `trash/`, `orphans/`) that already exists is a real writable directory
@@ -164,18 +164,20 @@ This runs eleven read-only checks:
 - **database** — connects to PostgreSQL and verifies connectivity
 - **schema** — compares applied migrations against the binary; detects pending, failed, or tampered migrations
 - **tokens** — reports how many legacy `repo:read`/`repo:write` tokens remain and the enforced cutoff (the UTC midnight after `legacy_token_deprecation_date`, default 2027-06-30; see [tokens](tokens.md))
+- **installation key** — reports the installation key id, the number of stored secrets and whether rotation is complete; fails when secrets exist and the key is missing or wrong, or when a plaintext audit IP key remains. It prints no key material
 - **lifecycle** — warns about repositories stuck in `creating` or `deleting` past the reconcile grace period (the reconciler retries them)
 - **jobs** — warns about dead jobs; warns about late pending jobs; fails when running jobs have an expired lease, meaning the runner isn't running
 - **outbox** — warns when an outbox delivery is `dead` (names `jobs requeue`, see [outbox.md](outbox.md)); warns when a registered consumer has no handler; otherwise reports the pending, delivering and delivered counts
 - **housekeeping** — warns when an active repository has never run housekeeping or is more than two `housekeeping_interval_seconds` overdue (the scheduler has stopped), or when a repository's last run failed or was deferred; reports ok when housekeeping is disabled by configuration
 
-A twelfth **base backfill** check appears only when a pull request's base could
+A thirteenth **base backfill** check appears only when a pull request's base could
 not be reconstructed because its target branch was deleted before the upgrade;
 it is a warning naming the affected requests. A clean install therefore prints
-`11 checks`, and an installation with recorded skips prints `12 checks`.
+`12 checks`, and an installation with recorded skips prints `13 checks`.
 
-When the database cannot be reached the `schema`, `tokens`, `lifecycle`, `jobs`, `outbox`
-and `housekeeping` and `tokens` checks are skipped (`skip <name>: database unavailable`) rather than counted
+When the database cannot be reached the `schema`, `tokens`, `installation key`,
+`lifecycle`, `jobs`, `outbox` and `housekeeping` checks are skipped
+(`skip <name>: database unavailable`) rather than counted
 as failures, so one outage counts as one failure, not five.
 
 Exit code is 0 when all checks pass (warnings and skips are allowed), 1 otherwise.
@@ -189,11 +191,12 @@ ok   storage: /data/githearth/repositories writable
 ok   disk: 47.82 GiB free
 ok   email: not configured (smtp_host is empty); no mail is sent
 ok   database: connected
-ok   schema: latest v55
+ok   schema: latest v56
 ok   tokens: no legacy tokens; legacy repo:read/repo:write tokens are refused from the day after 2027-06-30
+ok   installation key: sha256:…, 1 secret(s), rotation complete
 ok   lifecycle: no stuck repositories
 ok   jobs: no dead, late or stuck jobs
 ok   outbox: 0 pending, 0 delivering, 0 delivered delivery(ies)
 ok   housekeeping: repositories are up to date
-11 checks, 0 failed, 0 warnings, 0 skipped
+12 checks, 0 failed, 0 warnings, 0 skipped
 ```

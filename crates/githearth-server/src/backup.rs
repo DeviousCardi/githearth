@@ -41,9 +41,10 @@ use std::{
 use uuid::Uuid;
 
 const MAGIC: &str = "GITHEARTH-BACKUP1";
-/// Version 2 added the required object manifest. Version 1 archives are still
-/// read (they predate objects); this binary only writes 2.
-const FORMAT_VERSION: u32 = 2;
+/// Version 2 added the required object manifest; version 3 added the
+/// installation-key record (`key_id`, algorithm and wrap method, never the key).
+/// Older archives are still read; this binary only writes 3.
+const FORMAT_VERSION: u32 = 3;
 const MIN_FORMAT_VERSION: u32 = 1;
 const CHUNK_BYTES: usize = 1 << 20;
 const CIPHER: &str = "AES-256-GCM";
@@ -122,6 +123,11 @@ pub struct Manifest {
     pub objects: Vec<ObjectRecord>,
     pub config: ConfigPart,
     pub ssh_host_key: Option<Part>,
+    /// The installation key that wraps every stored secret: id, algorithm and
+    /// wrap method, never key material (ADR 0014 §3). Absent in archives
+    /// written before format 3.
+    #[serde(default)]
+    pub installation: Option<crate::secrets::InstallationRecord>,
     pub parts: Vec<Part>,
     pub encryption: EncryptionRecord,
     pub excluded: Vec<String>,
@@ -514,6 +520,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// The storage tar carries `storage_root` verbatim, so private operator files
+/// inside it would travel in every backup. The check lives in
+/// [`Config::validate`] so `serve` and `migrate` refuse at start too.
 pub fn read_key_file(path: &Path) -> Result<Vec<u8>> {
     let mut key =
         fs::read(path).with_context(|| format!("cannot read key file {}", path.display()))?;
@@ -1054,6 +1063,7 @@ pub async fn run_backup(
     passphrase: &[u8],
     output: &Path,
 ) -> Result<BackupReport> {
+    config.validate()?;
     if passphrase.is_empty() {
         return Err(ArchiveError::MissingKey.into());
     }
@@ -1096,6 +1106,34 @@ async fn build_backup(
     postgres: PostgresPosition,
     fence: crate::maintenance::Fence,
 ) -> Result<BackupReport> {
+    // A backup publishes a database dump. Encrypt any plaintext audit IP key
+    // first, and refuse when the configured installation key cannot unwrap the
+    // existing set: a dump taken outside the envelope is exactly what U28
+    // forbids, and an archive whose secrets the operator cannot read is worse
+    // than no archive.
+    let installation_keys = crate::secrets::InstallationKeySet::from_config(config)?;
+    let startup = crate::secrets::startup(
+        pool,
+        installation_keys.as_ref(),
+        crate::secrets::BACKFILL_BATCH,
+    )
+    .await
+    .context("cannot prove every stored secret is encrypted before the backup")?;
+    // A backup manifest records the current key id. An archive taken while a
+    // rotation is unfinished also needs the retired key to restore, which the
+    // operator is not told. Refuse and let rotation finish; storing every key
+    // id would still need both key files at restore, so failing closed is the
+    // simpler contract.
+    if !startup.retired_key_ids.is_empty() {
+        bail!(
+            "installation key rotation is incomplete: data keys remain under {}; run \
+             `githearth-server secrets rotate` and retry the backup so the archive can be \
+             restored with the current key alone",
+            startup.retired_key_ids.join(", ")
+        );
+    }
+    config.check_private_paths_outside_storage()?;
+
     // Dump the database first, so the storage snapshot that follows includes
     // every journal record that references a row in the dump.
     dump_database(&config.database_url, &staging.join("database.dump"))?;
@@ -1213,6 +1251,7 @@ async fn build_backup(
         objects,
         config: config_part,
         ssh_host_key: host_key_part,
+        installation: installation_keys.as_ref().map(|keys| keys.record()),
         parts,
         encryption: EncryptionRecord {
             key_id: material.key_id.clone(),
@@ -1237,6 +1276,10 @@ async fn build_backup(
             "The PostgreSQL position is advisory: `dump_lsn` is pg_current_wal_lsn() read beside \
              the dump, not the dump's snapshot position, and restore does not compare it. \
              Database-to-storage consistency is proved by the per-repository journal positions."
+                .into(),
+            "The manifest records the installation key id, algorithm and wrap method only. The \
+             installation key itself is never written to the database or the archive; without it \
+             the stored secret columns stay unreadable by design."
                 .into(),
         ],
     };
@@ -1453,6 +1496,35 @@ pub struct RestoreOptions {
     pub ssh_host_key_path: Option<PathBuf>,
 }
 
+/// The key set a restore should use: an environment override wins (the operator
+/// restoring to a fresh host has not edited the archived configuration yet),
+/// otherwise the paths recorded in the archived configuration. An empty path
+/// means no key, which is only valid for an archive that predates the envelope.
+fn restored_installation_keys(
+    archived: &Config,
+) -> Result<Option<crate::secrets::InstallationKeySet>> {
+    let env_path = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let current = env_path("GITHEARTH_INSTALLATION_KEY_FILE")
+        .unwrap_or_else(|| archived.installation_key_file.clone());
+    if current.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let previous = env_path("GITHEARTH_INSTALLATION_KEY_PREVIOUS_FILE")
+        .unwrap_or_else(|| archived.installation_key_previous_file.clone());
+    let passphrase = env_path("GITHEARTH_INSTALLATION_KEY_PASSPHRASE_FILE")
+        .or_else(|| archived.installation_key_passphrase_file.clone());
+    crate::secrets::InstallationKeySet::from_paths(
+        &current,
+        Some(previous.as_path()),
+        passphrase.as_deref(),
+    )
+}
+
 pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
     if options.passphrase.is_empty() {
         return Err(ArchiveError::MissingKey.into());
@@ -1495,6 +1567,22 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
             .context("the archive has no readable config.toml")?,
     )
     .map_err(|_| anyhow::anyhow!("the archived configuration is not valid TOML"))?;
+    let installation_keys = restored_installation_keys(&archived)?;
+    if let Some(record) = &manifest.installation {
+        let keys = installation_keys.as_ref().context(format!(
+            "the archive was written with installation key id {}; place that key where \
+             installation_key_file points or set GITHEARTH_INSTALLATION_KEY_FILE before restoring",
+            record.key_id
+        ))?;
+        if keys.current().id() != record.key_id {
+            bail!(
+                "wrong installation key: the archive records key id {}, but the supplied key is \
+                 {}. The archive was not changed",
+                record.key_id,
+                keys.current().id()
+            );
+        }
+    }
     let destination_storage = options
         .storage_root
         .clone()
@@ -1541,6 +1629,27 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
         })
         .await?;
         let verification = verify_restored(&pool, &storage, &manifest).await;
+        let verification = match verification {
+            Ok(()) => {
+                // The restored database must be readable with the installation
+                // key the destination holds. This runs before the storage tree
+                // or configuration is published; a failure drops the database
+                // below, so the restore never leaves unreadable secrets.
+                if manifest.installation.is_some() || installation_keys.is_some() {
+                    crate::secrets::startup(
+                        &pool,
+                        installation_keys.as_ref(),
+                        crate::secrets::BACKFILL_BATCH,
+                    )
+                    .await
+                    .context("the restored database's secrets do not match the installation key")
+                    .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        };
         pool.close().await;
         verification?;
         // Every object's recorded checksum, and the manifest's inventory,
@@ -1555,6 +1664,11 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
             &options.database_url,
             &destination_storage,
             &destination_host_key,
+            std::env::var("GITHEARTH_INSTALLATION_KEY_FILE")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .as_deref(),
         )?;
         write_private(&options.config_path, rewritten.as_bytes())?;
         config_written = true;
@@ -1685,6 +1799,7 @@ fn rewrite_configuration(
     database_url: &str,
     storage_root: &Path,
     ssh_host_key_path: &Path,
+    installation_key_file: Option<&Path>,
 ) -> Result<String> {
     let text = fs::read_to_string(source)?;
     let mut value: toml::Value = toml::from_str(&text)
@@ -1704,6 +1819,12 @@ fn rewrite_configuration(
         "ssh_host_key_path".into(),
         toml::Value::String(ssh_host_key_path.display().to_string()),
     );
+    if let Some(path) = installation_key_file {
+        table.insert(
+            "installation_key_file".into(),
+            toml::Value::String(path.display().to_string()),
+        );
+    }
     let rendered = toml::to_string(&value)?;
     let config: Config = toml::from_str(&rendered)
         .map_err(|_| anyhow::anyhow!("the restored configuration does not parse"))?;
@@ -1868,6 +1989,7 @@ mod tests {
                 note: String::new(),
             },
             ssh_host_key: None,
+            installation: None,
             parts,
             encryption: EncryptionRecord {
                 key_id: material.key_id.clone(),

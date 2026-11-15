@@ -3,8 +3,9 @@
 Date: 2026-11-15.
 
 Status: **decision accepted for M4.2; the object-store half is implemented in
-increment 7A and its detailed design is recorded below.** The token, secret,
-fairness and export halves remain open decisions.
+increment 7A and the secrets-at-rest half in increment 7C, and their detailed
+designs are recorded below.** The token, fairness and export halves remain open
+decisions.
 
 ## Context
 
@@ -330,8 +331,10 @@ its own outbound connection.
    issuance API shape and the exact legacy deprecation date are decided
    2026-11-16 in section 2a (bounded, monotone, non-null cutoff enforced at
    `2027-07-01T00:00:00Z`).
-3. KMS adapter interface and the passphrase-derived key parameters.
-4. Re-wrap batch size and the operator signal that rotation is complete.
+3. **Resolved in M4.2 increment 7C** — KMS adapter interface and the
+   passphrase-derived key parameters, below.
+4. **Resolved in M4.2 increment 7C** — re-wrap batch size and the operator
+   signal that rotation is complete, below.
 5. **Resolved in M4.2 increment 7A** — object-verification depth for backup
    and restore, below. The filesystem snapshot mechanism itself remains the
    operator's choice; the single-node path uses the proved write fence and a
@@ -609,3 +612,237 @@ same `ObjectStore` operations, so a backend change in M5 cannot change the
 contract. The metadata JSON Lines schema and the export/import harness are not
 defined here yet; they are the remaining half of increment 7A, so open item 7
 is only partly closed.
+
+## Resolutions recorded by M4.2 increment 7C
+
+### The envelope, and where each piece lives
+
+`secret_data_keys` holds one row per stored secret's **data key**: a random
+32-byte DEK, wrapped by the installation key, with `kek_id`, `algorithm` and
+`wrap_method`. `stored_secrets` holds the secret itself: a random 12-byte GCM
+nonce and the AES-256-GCM ciphertext under that DEK, named by its logical owner
+(for example `audit_ip_key/<uuid>`). The secret's id is bound into the AAD
+together with the data-key id, so a ciphertext moved to another row fails
+authentication instead of decrypting.
+
+A data-key wrap is AES-256-GCM over the 32-byte DEK with a fresh 12-byte
+nonce; the stored blob is `nonce || ciphertext || tag` (60 bytes). Its AAD is
+`"githearth-dek-wrap-v1\0" || kek_id || 0 || data_key_id || 0 || wrap_method`.
+The wrap method is part of the AAD, so changing the method string without
+re-wrapping fails. The installation key never appears in either table.
+
+### The installation key
+
+`installation_key_file` names an operator-owned file with mode `0600`, owned by
+the server account and not a symlink. It is read at `serve` and `migrate`
+start-up and is never written to PostgreSQL, the storage tar, or a backup.
+`installation_key_previous_file` is the decrypt-only predecessor kept during a
+rotation. `GITHEARTH_INSTALLATION_KEY_FILE` and
+`GITHEARTH_INSTALLATION_KEY_PREVIOUS_FILE` are the bootstrap alternatives.
+
+The file is either:
+
+- a versioned TOML descriptor with `method = "raw"` and a base64 32-byte key
+  (`secrets keygen --output <path>` writes this), or
+- a versioned TOML descriptor with `method = "passphrase"` and a base64 16-byte
+  salt; the passphrase is read from `installation_key_passphrase_file`
+  (`secrets keygen --output <path> --passphrase`), or
+- a bare 32-byte, 64-hex-character, or base64 key file, for an operator who
+  generated it with `openssl rand`.
+
+The key id is `sha256:` plus the first 16 bytes of
+`SHA-256("githearth-installation-key-id-v1\0" || key)`. It is what the manifest,
+`doctor`, `secrets status` and every error name; the key itself is never
+printed, including in `Debug` and error bodies. A fresh installation with no
+stored secrets may start without a key: there is nothing to read, and the first
+secret write fails with "no installation key is configured" rather than storing
+plaintext. `setup` always generates one, and `doctor` warns until it exists.
+
+### KMS adapter interface (open item 3)
+
+A KMS adapter implements the same `KeyProvider` contract as the file provider:
+`key_id()`, `wrap(data_key_id, dek)`, and `unwrap(data_key_id, method, blob)`.
+It must use the AAD above, return the same `nonce || ciphertext || tag` shape,
+record its own algorithm and wrap method, and keep the DEK outside the database.
+`installation_key_method = "kms"` selects it; the 7C binary ships **no vendor
+adapter** and refuses to start with a clear "no KMS adapter is built into this
+binary" error rather than silently falling back to a file. A deployment that
+uses KMS supplies the adapter out of tree; the file provider is the supported
+single-node form. This closes the interface shape without putting a vendor SDK
+in the core.
+
+### Passphrase-derived key parameters (open item 3)
+
+Argon2id v19, memory **64 MiB (65,536 KiB)**, iterations **3**, parallelism
+**1**, 32-byte output, 16-byte random per-installation salt written in the
+descriptor. The wrap method string records the parameters
+(`argon2id-m65536-t3-p1-aes256gcm`), so a later parameter change is a new method
+and an explicit re-wrap, not an ambiguous load. A wrong passphrase derives a
+different key id and fails with "not configured" or "does not match"; it never
+starts with unreadable secrets.
+
+### Inventory: what the schema stores, and what is still plaintext
+
+| Material | Today | After 7C |
+| --- | --- | --- |
+| `audit_ip_keys.key` (the HMAC key for `client_ip_digest`) | plaintext 32-byte `bytea` in PostgreSQL | encrypted envelope; `key` is cleared after the 0056 backfill, `secret_id` names the `stored_secrets` row |
+| SMTP credential | operator file named by `smtp_password_file`; read once at start-up | unchanged: never in the database, never a TOML value, not in the archive |
+| SSH host key | operator file; included in the archive because restore needs it | unchanged; it is operator-owned private material the archive is allowed to carry |
+| `database_url` in the configuration | operator value in `config.toml` | unchanged; the archive is encrypted and the value is operator-owned |
+| `accounts.password_hash` | Argon2id verifier | unchanged; it is a one-way verifier, not a plaintext secret |
+| `sessions`, `access_tokens`, `invitations`, `password_reset_tokens`, `email_verifications` token columns | SHA-256 digests of high-entropy tokens | unchanged; the plaintext token never reaches the database, and re-encrypting a lookup digest would break constant-time lookup |
+| `audit_events.client_ip` raw address and `client_ip_digest` | personal data, not a secret; pruned by retention | unchanged; the digest is an HMAC value, not the key |
+| TOTP seeds, OIDC client secrets, CI secrets, deployment credentials | not in the schema yet (M11a/M6) | each will be a `stored_secrets` row with its own data key; the envelope is ready |
+
+The only secret column the schema holds today is `audit_ip_keys.key`; it is
+encrypted. Nothing else is a plaintext secret. The raw IP address remains
+plaintext until retention prunes it, by design: it is personal data, not a
+credential, and the digest already lets the log survive the prune.
+
+### The audit IP key: wrapped, not moved out
+
+The key stays in PostgreSQL as an envelope rather than moving to a file or a
+process setting. `audit_events.client_ip_key_id` deliberately has no foreign
+key, and `audit drop-ip-keys` deletes a key to shred the digest binding while
+the audit chain still verifies. Keeping the key row keeps that row-level
+crypto-shredding in one transaction: dropping the key deletes its
+`stored_secrets` row and `secret_data_keys` row too. Moving the key to a file
+would give the installation a second key store to rotate and back up, and would
+make "which key wrote this digest" a file-management problem; the envelope
+already gives the same brute-force protection because a dump contains only a
+wrapped DEK and ciphertext. The existing `audit rotate-ip-key` command still
+rotates the HMAC key, and its new row is wrapped like every other.
+
+### Migration 0056 and the operator order
+
+`0056_secrets_at_rest.sql` is schema-only: it creates `secret_data_keys` and
+`stored_secrets`, adds `audit_ip_keys.secret_id`, makes `key` nullable and drops
+its 32-byte check. It does not encrypt anything, because the installation key is
+not a database value. The binary encrypts existing plaintext rows in
+`migrate`/`serve` start-up, in **100-row transactions** (`BACKFILL_BATCH`),
+before serving. Re-running resumes; a transaction either commits the data-key
+row, the secret row and the cleared `key` together or rolls all three back.
+0055 is the token-subjects migration (7B) on `main`; this branch was cut before
+it and takes the next number, 0056, so sqlx applies both in version order on a
+fresh install and neither half renumbers the other.
+
+After the backfill, start-up **re-counts** `secret_id IS NULL AND key IS NOT
+NULL` and refuses when the count is non-zero. An empty `FOR UPDATE SKIP LOCKED`
+batch is not proof of completion: another `serve`, `migrate` or `backup` holding
+a row lock makes the batch empty while plaintext remains. The re-count is the
+single source of truth, so `migrate`, `serve` and `backup` all fail visibly
+instead of printing success and then letting `pg_dump` write the plaintext key.
+The same rule applies at use: if a mixed-version writer inserts a plaintext row
+after start-up, the audit read path refuses with `installation key unavailable`
+and tells the operator to stop every writer and re-run `migrate`; it never
+returns the plaintext key.
+
+Order of operations for an existing installation:
+
+1. Stop the server. Do not let an old binary keep writing while the schema is
+   ahead of it.
+2. Create the key outside `storage_root` and outside the backup directory:
+   `githearth-server secrets keygen --output /etc/githearth/installation.key`.
+   Keep a copy off-host; losing it loses the secrets, by design.
+3. Set `installation_key_file` in the configuration (or export
+   `GITHEARTH_INSTALLATION_KEY_FILE`).
+4. Run `githearth-server migrate` with the key. It applies 0056, encrypts every
+   plaintext audit IP key, and verifies that every wrapped key id is readable.
+   With no key it stops before touching a row and says the installation key is
+   required. The schema may already be applied; supplying the key and re-running
+   is safe.
+5. Start `serve`. Start-up repeats the verification; a wrong or missing key
+   names the key id and refuses to listen.
+6. Take a backup. The v3 manifest records `installation.key_id`, algorithm and
+   wrap method only. Keep the archive key and the installation key separately.
+
+Unrecoverable if interrupted:
+
+- A migration interrupted **before** a row's transaction commits leaves that
+  row plaintext in the old `key` column and readable; the next run resumes.
+- A migration interrupted **after** commit leaves an encrypted row. If the
+  installation key file is then lost, that secret is unrecoverable; a database
+  dump alone cannot restore it. This is the intended property, not a bug.
+- A rotation interrupted mid-batch leaves some data keys under the new key and
+  some under the old; both are configured, so every secret stays readable. If
+  the old key is destroyed before `secrets status` reports completion, the rows
+  still under it are unrecoverable. Never remove the predecessor early.
+
+After a successful backfill, run `VACUUM (FULL, ANALYZE) audit_ip_keys` (or let
+autovacuum catch up before a physical base backup). The update clears the
+plaintext `key` column, but the old tuple remains in the table and WAL until
+vacuum, so a **physical** base backup or a raw data-directory copy taken before
+vacuum can still contain it. U28 covers a logical `pg_dump` and this binary's
+archives, not physical base backups. Likewise, a manual `pg_dump` taken during
+an interrupted migration still contains whatever plaintext rows remain; use
+`githearth-server backup`, which backfills first and refuses if that is
+impossible.
+
+The migration is forward-only: an old binary reading 0056 would see ciphertext
+in `key` and must not be run. `backup` writes format version 3; versions 1 and 2
+are still read, and a pre-envelope archive is restored as the plaintext data it
+is (it cannot be shredded).
+
+### Rotation (U29's rotation clause)
+
+Rotation introduces a new installation key and re-wraps every data key. It
+**never decrypts a secret**: it unwraps a 32-byte DEK under the old key and
+wraps the same DEK under the new key, then updates `kek_id`, `wrap_method` and
+`wrapped_key` in one row update. Secret ciphertext, nonce and AAD are untouched.
+A rotation therefore costs two AEAD operations per secret, not a decrypt of the
+secret's payload.
+
+An in-flight request is safe: it reads `(kek_id, wrapped_key)` in one row and
+unwraps with the named key. A request that already opened a DEK finishes with
+it; a request that reads the row after the update sees the new pair. The update
+is atomic per row, so no request can see a new key id with an old blob or the
+reverse. Both the new and retired keys must be configured for the whole
+rotation; the server does not pick a key by guessing.
+
+### Re-wrap batch size and the completion signal (open item 4)
+
+One rotation transaction re-wraps at most **256 data keys** (`ROTATE_BATCH`),
+selected with `FOR UPDATE SKIP LOCKED`, so a second rotation command can take a
+different batch and a crash leaves every row readable by one of the two keys.
+256 keeps a transaction short even when each row is a synchronous local update,
+bounds WAL per commit, and gives a progress line roughly every 256 rows. The
+backfill uses 100 rows because each row also inserts a data key and a secret;
+that is the heavier transaction.
+
+The operator signal is `githearth-server secrets status`: it prints the current
+key id and, per key id, the number of data keys and secrets, then
+`rotation complete` and exits zero only when every data key is under the current
+key, every key id is configured, **one sample wrapper per key id actually
+unwraps**, and no plaintext row remains. Otherwise it prints what is left and
+exits non-zero. `secrets rotate` prints `rotation complete` when its own
+remaining count reaches zero. `doctor` reports the same state as a check named
+`installation key`, including a damaged wrapper under a configured key id, and
+warns while a retired key is still in use. Neither output contains key material.
+
+A stale or absent installation key at request time is a configuration error, not
+a database outage: the API returns `503 {"error":"installation key unavailable"}`
+and the server log records the cause at `error` level, naming key ids only. This
+keeps "rotate before restarting `serve`" from looking like a total database
+outage.
+
+### Backup and restore
+
+`backup` runs the same start-up check before it dumps, so an archive is never
+written while a plaintext audit key exists, and it **refuses while a rotation is
+incomplete** because the manifest records only the current key id while some
+rows still need the predecessor. It refuses when the installation key, its
+passphrase, the SMTP credential or the archive key is inside `storage_root`,
+because the storage tar would carry it; `Config::validate` applies that check to
+`serve` and `migrate` too, not only to `backup`. The manifest's `installation`
+record is `{ key_id, algorithm, wrap_method }`; no key. The archive's
+`config.toml` still carries the operator's `database_url` (and the
+`From:`/username values, which are not credentials), and the `ssh_host_key` is
+carried because restore needs it.
+
+`restore` reads the archive with the operator's archive key, checks the
+manifest's installation key id against the destination key (an environment
+override wins over the archived path), and after restoring the database verifies
+that every wrapped data key opens. A wrong key, a missing key or an unreadable
+row fails before the storage tree or configuration is published and drops the
+partially restored database. Switching the destination installation key is a
+separate rotation, not part of restore.

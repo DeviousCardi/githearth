@@ -77,6 +77,11 @@ enum Command {
         #[command(subcommand)]
         action: AuditCommand,
     },
+    /// Installation-key operations for secrets at rest (ADR 0014 §3).
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsCommand,
+    },
     /// Repack one repository and prune unreachable objects now (ADR 0013).
     Housekeeping {
         #[arg(long)]
@@ -186,6 +191,30 @@ enum AuditCommand {
         dry_run: bool,
     },
 }
+
+#[derive(Subcommand)]
+enum SecretsCommand {
+    /// Generate an installation key file. `--passphrase` writes a descriptor
+    /// whose passphrase comes from installation_key_passphrase_file; the
+    /// default writes a random 32-byte key. Never overwrites.
+    Keygen {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        passphrase: bool,
+    },
+    /// Report whether every data key is under the current installation key and
+    /// no plaintext secret remains. Prints ids and counts, never key material.
+    /// Exits non-zero when rotation is incomplete.
+    Status,
+    /// Re-wrap every data key under the current installation key, keeping the
+    /// retired key configured as installation_key_previous_file until it
+    /// reports completion.
+    Rotate {
+        #[arg(long, default_value_t = githearth_server::secrets::ROTATE_BATCH)]
+        batch: usize,
+    },
+}
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -198,7 +227,8 @@ async fn main() {
         .init();
     if let Err(error) = run(args).await {
         // Only configuration and explicitly sanitized application errors are printed here.
-        eprintln!("{error}");
+        // `{:#}` keeps the operator-actionable cause (the key id or path), not just the context.
+        eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
@@ -241,6 +271,27 @@ async fn run(args: Args) -> Result<()> {
         )
         .await;
     }
+    if let Command::Secrets {
+        action: SecretsCommand::Keygen { output, passphrase },
+    } = &args.command
+    {
+        if *passphrase {
+            githearth_server::secrets::generate_passphrase_key_file(output)?;
+            println!(
+                "passphrase key descriptor written: {} (mode 0600); put the passphrase in \
+                 installation_key_passphrase_file",
+                output.display()
+            );
+        } else {
+            githearth_server::secrets::generate_raw_key_file(output)?;
+            println!(
+                "installation key written: {} (mode 0600); keep it outside storage_root and \
+                 outside every backup",
+                output.display()
+            );
+        }
+        return Ok(());
+    }
     let config = Config::load(args.config.as_deref())?;
     if let Command::Backup {
         output,
@@ -278,7 +329,30 @@ async fn run(args: Args) -> Result<()> {
                     "migration failed; inspect database availability and migration history"
                 )
             })?;
-            tracing::info!("schema migrated");
+            // 0056 is schema-only. The plaintext audit IP key rows are
+            // encrypted here, before this command reports success, so a dump
+            // taken after `migrate` contains no plaintext secret. A missing or
+            // wrong key names the key id and leaves every row readable.
+            let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?;
+            let report = githearth_server::secrets::startup(
+                &pool,
+                keys.as_ref(),
+                githearth_server::secrets::BACKFILL_BATCH,
+            )
+            .await?;
+            if report.backfilled > 0 {
+                println!(
+                    "encrypted {} existing plaintext audit IP key(s)",
+                    report.backfilled
+                );
+            }
+            println!(
+                "schema migrated; {} secret(s) under key id {}",
+                report.secrets,
+                keys.as_ref()
+                    .map(|keys| keys.current().id())
+                    .unwrap_or("(no installation key configured)")
+            );
         }
         Command::BootstrapAdmin { username } => {
             let password = read_password_from_stdin()?;
@@ -326,6 +400,24 @@ async fn run(args: Args) -> Result<()> {
         Command::Serve => {
             if let Err(message) = doctor::schema_check(&pool).await {
                 bail!("database schema does not match this binary: {message}");
+            }
+            // A wrong or missing installation key must stop start-up here,
+            // before a listener accepts a request: starting with unreadable
+            // secrets would be silent data loss. A fresh installation with no
+            // secrets may start without a key; the first secret write then
+            // fails rather than storing plaintext.
+            let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?;
+            let secrets = githearth_server::secrets::startup(
+                &pool,
+                keys.as_ref(),
+                githearth_server::secrets::BACKFILL_BATCH,
+            )
+            .await?;
+            if secrets.backfilled > 0 {
+                tracing::info!(
+                    backfilled = secrets.backfilled,
+                    "encrypted existing plaintext audit IP keys"
+                );
             }
             let mut state = AppState::new(pool, config.clone())
                 .await
@@ -472,7 +564,12 @@ async fn run(args: Args) -> Result<()> {
                 }
             }
             AuditCommand::RotateIpKey { dry_run } => {
-                let id = audit_retention::rotate_ip_key(&pool, dry_run).await?;
+                let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?
+                    .context(
+                        "audit rotate-ip-key needs installation_key_file; the new key is stored \
+                         wrapped by it",
+                    )?;
+                let id = audit_retention::rotate_ip_key(&pool, &keys, dry_run).await?;
                 if dry_run {
                     println!("DRY RUN: would create new key (id: {id})");
                 } else {
@@ -494,6 +591,66 @@ async fn run(args: Args) -> Result<()> {
                 }
                 for id in &result.skipped_in_use {
                     println!("skipped key still in use (id: {id})");
+                }
+            }
+        },
+        Command::Secrets { action } => match action {
+            SecretsCommand::Keygen { .. } => unreachable!("handled before configuration load"),
+            SecretsCommand::Status => {
+                let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?;
+                let report = githearth_server::secrets::status(&pool, keys.as_ref()).await?;
+                println!(
+                    "current key id: {}",
+                    report.current_key_id.as_deref().unwrap_or("(none)")
+                );
+                for key in &report.keys {
+                    println!(
+                        "key id {}: {} data key(s), {} secret(s)",
+                        key.key_id, key.data_keys, key.secrets
+                    );
+                }
+                if report.legacy_plaintext > 0 {
+                    println!(
+                        "{} plaintext audit IP key(s) still need `migrate` with the installation key",
+                        report.legacy_plaintext
+                    );
+                }
+                for key_id in &report.unknown_key_ids {
+                    println!("key id {key_id} is not configured; no key can unwrap it");
+                }
+                for key_id in &report.unreadable_key_ids {
+                    println!(
+                        "key id {key_id} is configured, but a wrapped data key cannot be \
+                         unwrapped (damaged wrapper or wrong key)"
+                    );
+                }
+                if report.rotation_complete {
+                    println!("rotation complete");
+                } else {
+                    bail!(
+                        "rotation is not complete: data keys remain under a retired key or \
+                         plaintext secrets remain; keep installation_key_previous_file configured \
+                         and run `secrets rotate`"
+                    );
+                }
+            }
+            SecretsCommand::Rotate { batch } => {
+                let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?
+                    .context("secrets rotate needs installation_key_file")?;
+                let report = githearth_server::secrets::rotate(&pool, &keys, batch).await?;
+                println!(
+                    "re-wrapped {} data key(s) under key id {}",
+                    report.rewrapped,
+                    keys.current().id()
+                );
+                if report.remaining == 0 {
+                    println!("rotation complete");
+                } else {
+                    bail!(
+                        "{} data key(s) still use a retired key; keep \
+                         installation_key_previous_file configured and run `secrets rotate` again",
+                        report.remaining
+                    );
                 }
             }
         },

@@ -526,9 +526,10 @@ async fn run_job(
 
     // Run handler under timeout in a spawned task to catch panics.
     let state_for_handler = state.clone();
-    let handle = tokio::spawn(async move {
+    let keys = state_for_handler.installation_keys.clone();
+    let handle = tokio::spawn(crate::secrets::scope(keys, async move {
         tokio::time::timeout(timeout, handler(state_for_handler, job)).await
-    });
+    }));
 
     let result = match handle.await {
         Ok(Ok(outcome)) => outcome,

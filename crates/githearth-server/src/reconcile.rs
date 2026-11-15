@@ -717,7 +717,8 @@ async fn orphan_repo(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
 /// every `reconcile_interval_seconds`.  Never panics or exits the loop on
 /// errors.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    let keys = state.installation_keys.clone();
+    tokio::spawn(crate::secrets::scope(keys, async move {
         let interval = Duration::from_secs(state.config.reconcile_interval_seconds);
         let mut attempts: HashMap<Uuid, u32> = HashMap::new();
 
@@ -730,7 +731,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             tick.tick().await;
             run_pass(&state, &mut attempts).await;
         }
-    })
+    }))
 }
 
 async fn run_pass(state: &AppState, attempts: &mut HashMap<Uuid, u32>) {
