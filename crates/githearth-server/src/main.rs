@@ -107,6 +107,23 @@ enum Command {
         #[arg(long, conflicts_with = "key_file")]
         key_stdin: bool,
     },
+    /// Write the versioned export contract (U30a): JSON Lines metadata, native
+    /// Git history and an object manifest with checksums.
+    Export {
+        /// New directory to write; it must not exist or must be empty.
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        storage_root: Option<PathBuf>,
+    },
+    /// Import an export into a fresh installation. The destination database
+    /// must not exist and the storage root must be missing or empty.
+    Import {
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        storage_root: PathBuf,
+    },
     /// Restore a backup on a fresh host and verify database-to-storage
     /// consistency before publishing anything.
     Restore {
@@ -253,6 +270,13 @@ async fn run(args: Args) -> Result<()> {
         )
         .await;
     }
+    if let Command::Import {
+        archive,
+        storage_root,
+    } = args.command
+    {
+        return run_import(archive, storage_root).await;
+    }
     if let Command::Restore {
         archive,
         key_file,
@@ -293,6 +317,13 @@ async fn run(args: Args) -> Result<()> {
         return Ok(());
     }
     let config = Config::load(args.config.as_deref())?;
+    if let Command::Export {
+        archive,
+        storage_root,
+    } = args.command
+    {
+        return run_export(config, archive, storage_root).await;
+    }
     if let Command::Backup {
         output,
         key_file,
@@ -320,9 +351,11 @@ async fn run(args: Args) -> Result<()> {
     match args.command {
         Command::Doctor => unreachable!("handled above"),
         Command::Setup { .. } => unreachable!("handled above"),
-        Command::Backup { .. } | Command::Restore { .. } | Command::Maintenance { .. } => {
-            unreachable!("handled above")
-        }
+        Command::Backup { .. }
+        | Command::Restore { .. }
+        | Command::Export { .. }
+        | Command::Import { .. }
+        | Command::Maintenance { .. } => unreachable!("handled above"),
         Command::Migrate => {
             MIGRATOR.run(&pool).await.map_err(|_| {
                 anyhow::anyhow!(
@@ -895,6 +928,57 @@ fn read_backup_key(config: &Config, key_file: Option<PathBuf>, key_stdin: bool) 
         return githearth_server::backup::read_key_file(&config.backup_key_file);
     }
     Err(githearth_server::backup::ArchiveError::MissingKey.into())
+}
+
+async fn run_export(config: Config, archive: PathBuf, storage_root: Option<PathBuf>) -> Result<()> {
+    let options = githearth_server::export::ExportOptions {
+        archive,
+        database_url: config.database_url.clone(),
+        storage_root: storage_root.unwrap_or_else(|| config.storage_root.clone()),
+    };
+    let report = githearth_server::export::run_export(&options).await?;
+    println!(
+        "export written: {} (format version {}, {} metadata records, {} repositories, {} objects, {} object bytes)",
+        report.archive.display(),
+        report.format_version,
+        report.metadata_records,
+        report.repositories,
+        report.objects,
+        report.payload_bytes
+    );
+    Ok(())
+}
+
+async fn run_import(archive: PathBuf, storage_root: PathBuf) -> Result<()> {
+    let database_url = std::env::var("GITHEARTH_DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "GITHEARTH_DATABASE_URL must name the fresh destination database; it is never \
+                 accepted as an argument"
+            )
+        })?;
+    let options = githearth_server::export::ImportOptions {
+        archive,
+        database_url,
+        storage_root,
+    };
+    let report = githearth_server::export::run_import(&options).await?;
+    println!(
+        "import complete: database {}, storage {} (format version {}, {} metadata records, {} repositories, {} objects)",
+        report.database,
+        report.storage_root.display(),
+        report.format_version,
+        report.metadata_records,
+        report.repositories,
+        report.objects
+    );
+    println!(
+        "no password hashes, tokens, keys or configuration were imported; run `reset-admin` \
+         for an administrator and `setup` supplies the rest of a fresh host"
+    );
+    Ok(())
 }
 
 async fn run_restore(

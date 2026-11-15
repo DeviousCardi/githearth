@@ -275,12 +275,70 @@ Default values, recorded so the exit can be tested and later revised:
 
 M4.2 defines the export format the later milestones must round-trip: versioned
 JSON Lines for metadata, native Git for history, and an object manifest with
-checksums for large objects. The round-trip harness (export, import into a
-fresh installation, compare counts, checksums and sampled content) is not part
-of this increment; open item 7 records it as the remaining work. M12 builds the
-full product export, importers and the CLI; M7, M8 and M10 add a round-trip
-test for the data they introduce. The contract exists here because M4.2 already
-owns the objects and the metadata that an export must carry.
+checksums for large objects. The contract is a directory, not an encrypted
+container:
+
+```text
+manifest.json              format name, format_version, part checksums and counts
+metadata.jsonl             format header, then one product record per line
+objects.jsonl              format header, then one tenant/key/SHA-256/size record
+objects/data/<tenant>/...  the bytes named by objects.jsonl
+git/<repository>.git/      native bare Git repositories
+```
+
+`format_version` is **1** and is written in `manifest.json` and in both JSON
+Lines headers. A reader accepts that version only; it refuses any other rather
+than guessing, because a reader that skipped an unknown part would report a
+successful import with missing data. The version is independent of the backup
+archive's `format_version` (**3**, since 7C added the installation-key record;
+versions 1 and 2 are still read), which covers a different container.
+
+Metadata covers organizations, accounts (the identity mapping: stable account
+UUID, username, email and its verification, administrator/suspension state),
+memberships, teams and team members, active repositories (including a fork's
+parent, whichever order the parent and child ids sort in), active and unexpired
+grants, issues, pull requests and reviews. Passwords, sessions, access-token and
+SSH-key material, push credentials, reset/verification tokens, the audit IP key,
+SMTP credentials and configuration are absent; so are issue and pull-request
+comments, pending invitations and their token hashes, pull-request review
+requests, repository rename/transfer redirects, auto-merge configuration,
+notification preferences, the authorization event and cache tables, jobs,
+notifications, outbox deliveries, audit events, branch/tag protection and code
+owners, deleted or non-active repositories, revoked grants, and the
+per-repository journal position. Audit retention rules are absent because M4.2
+persists none: `audit prune-ips` and `audit drop-ip-keys` take the age as a
+command argument. Each export records these omissions in `manifest.excluded`,
+so a reader is not expected to infer them.
+
+The export is plaintext, not an encrypted container: it carries account email
+addresses, issue and pull-request bodies and repository contents. It is created
+as a `0700` directory with `0600` part files and must be kept on storage trusted
+at least as much as the database and its backups. Git history travels as native
+bare repositories, so a plain `git clone` of one part is the history.
+
+The object manifest is the object store's `inventory()`: one record per object
+with tenant, key, SHA-256, size and whether it is appendable, plus the path of
+its payload. Importing uses the same `ObjectStore` operations, so an M5 backend
+change cannot change the contract. Comparison tolerances are exact, not
+approximate: record counts must be equal, every object checksum must be equal,
+Git refs digests must be equal, and sampled content is compared byte for byte.
+A missing object, an extra object, a missing Git directory, or a checksum that
+differs is a failed round trip, never a warning.
+
+`githearth-server export` writes the directory; `githearth-server import`
+reads it into a fresh installation. Import validates the version, every part
+checksum, the metadata references and every object payload before it creates a
+database or writes storage; it refuses a database that already exists and a
+storage root that is not empty, and it is refusable rather than idempotent
+because a whole-installation snapshot re-applied to itself would either
+duplicate rows or hide a partial import behind a success. The round-trip
+harness is an ignored integration test
+(`crates/githearth-server/tests/export_import.rs`) and is part of the gate.
+Its deliberate failures alter a sampled object's bytes, change a count, drop an
+object from the manifest, and alter one metadata field; each must make the
+import refuse before it writes anything. M12 builds the full product export,
+importers and the CLI surface on this contract; M7, M8 and M10 add a
+round-trip test for the data they introduce.
 
 ### 7. Outbound request client
 
@@ -401,10 +459,9 @@ returned.
    whole-root tar, so no filesystem-specific snapshot API is required here.
 6. The measured fairness bound on the reference machine, and the defaults
    above revised from it.
-7. **Partly resolved in M4.2 increment 7A** — export format versioning and
-   comparison tolerances, and the object manifest, below. The metadata JSON
-   Lines schema and the export/import harness remain open: they are the rest
-   of increment 7A, not done by the object half.
+7. **Resolved in M4.2 increment 7A** — export format versioning, the metadata
+   JSON Lines schema, the object manifest and its comparison tolerances, and
+   the export/import harness, below.
 
 ## Resolutions recorded by M4.2 increment 7A
 
@@ -655,23 +712,85 @@ implicit:
 
 ### Open item 7: export contract versioning and tolerances
 
+**One version domain per container.** The export format is version **1**;
+the backup archive is its own domain at version **3** (1 and 2 are still
+read), so neither number moves when the other container changes. They do not
+share a number because they do not share a reader. `manifest.json` and both
+JSON Lines headers carry the export version, and the reader accepts 1 only. A
+future bump is required whenever a version-1 reader would accept the new bytes
+and then skip or misread a part. Strict record parsing (`deny_unknown_fields`)
+makes an unknown field a refusal rather than a silent partial read, but it is
+not a substitute for the version: the bump is what tells a reader that the
+parts themselves changed.
 
+**Layout.** `manifest.json` holds the format name, version, creation time,
+per-kind record counts, the SHA-256 and byte/line count of each JSON Lines
+part, the SHA-256 of `objects.jsonl`, one entry per Git repository (path, ref
+count, refs digest, symbolic HEAD), and `excluded`. `metadata.jsonl` begins
+with a header line and then carries one record per line, ordered by kind and
+then by stable identity, so two exports of the same installation differ only
+in the headers' creation timestamp. `objects.jsonl` begins with a header and
+then carries `tenant`, `key`, `bytes`, `sha256`, `appendable` and `path`.
+`objects/data/<tenant>/<key>` holds the payload and `git/<uuid>.git` holds a
+native bare repository made by `git clone --mirror --no-hardlinks`.
 
-The export contract is versioned JSON Lines for metadata, native Git for
-history, and an object manifest for large objects. The object manifest is the
-backup inventory above, versioned by the archive's `format_version` (**2**;
-version 1 archives are still read, but only 2 is written): one record per
-object carrying tenant, key, SHA-256 and size. Version 2 exists because a
-reader of version 1 would accept a manifest carrying objects and silently skip
-object verification; the bump makes that impossible. Comparison tolerances are
-exact, not approximate: object counts must be equal, every object checksum
-must be equal, and sampled content is compared byte for byte.
-A missing object, an extra object, or a checksum that differs is a failed
-round trip, never a warning. Importing into a fresh installation uses the
-same `ObjectStore` operations, so a backend change in M5 cannot change the
-contract. The metadata JSON Lines schema and the export/import harness are not
-defined here yet; they are the remaining half of increment 7A, so open item 7
-is only partly closed.
+**Coverage.** The metadata kinds are `account` (identity mapping), `organization`,
+`membership`, `team`, `team_member`, `repository`, `grant`, `issue`,
+`pull_request` and `pull_request_review`. Repositories are limited to
+`status = 'active'` with no `deleted_at`; issues and pull requests that point
+only at non-exported repositories are omitted; grants are active
+(`revoked_at IS NULL`), unexpired, and limited to exported repositories. These
+kinds and the omissions below are the contract for this version; M12's full
+product export extends both lists. `excluded` records: credentials and secrets,
+configuration, the SSH host key, sessions, tokens, SSH keys, issue and
+pull-request comments, pending invitations and their token hashes, review
+requests, repository rename/transfer redirects, auto-merge configuration,
+notification preferences, the authorization event and cache tables, jobs,
+notifications, outbox, audit events and the IP key, protection/code-owner
+policy, revoked grants and the journal position. Audit retention rules are
+absent because no rule row exists in M4.2; the prune commands take
+`--older-than` per invocation.
+
+**Import.** Validation is complete before the first write: format version,
+both part checksums and counts, strict record parsing (unknown fields and
+unknown kinds are refused), referential integrity, the Git parts' refs
+digests and HEADs, every object payload's size and SHA-256, and exact equality
+between the manifest's object paths and the payload files present (an extra
+payload is a failure). Then the command requires a database that does not
+exist and a storage root that is missing or empty, creates the database, runs
+the migrations, builds Git and objects in a staging tree, inserts the metadata
+in one transaction, verifies the row counts and the object inventory, commits,
+and publishes the storage tree. A failure removes the staging tree and drops
+the database it created; a database this import did not create (a concurrent
+import won the name) is left untouched. Re-running a successful import is
+refused: the export is a snapshot, not a delta.
+
+**Tolerances and harness.** Counts must be equal, each object's checksum must
+be equal, Git refs digests must be equal, and sampled metadata, object bytes
+and Git content are compared exactly. `tests/export_import.rs` seeds
+organizations, accounts, a repository with two commits, an issue, a pull
+request and review, a team with a member and grant, and an object; it exports,
+imports into a fresh installation, exports again and compares. Every seeded
+count and every sampled field is anchored to the source, so an exporter that
+drops a kind or swaps two fields fails the harness rather than agreeing with
+itself. Its deliberate failures damage a sampled object's bytes, change a count
+in the manifest, drop an object from the manifest while restating its part
+checksum, alter one metadata field while restating the metadata part, and set
+an unknown version; each must make the import refuse before it writes. A fork
+seeded in both UUID orders must keep its parent through export and import. A
+round trip that cannot fail is not evidence.
+
+The format is unsigned and unanchored, so a deliberately rewritten archive that
+restates every count and checksum imports as a smaller installation; the harness
+cannot distinguish that from a smaller source. Only a signature or an external
+anchor (M12) closes that, and this version deliberately has neither.
+
+**Not closed here.** Export is not an online snapshot and proves no fence: it
+takes a repeatable-read metadata snapshot and refuses if the object inventory
+changed during the copy, but Git is copied repository by repository. M12's
+full product export owns export while writers run, importers for other
+products, and any payload signature or anchoring; this contract deliberately
+has none.
 
 ## Resolutions recorded by M4.2 increment 7C
 

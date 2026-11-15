@@ -12,6 +12,7 @@ pub mod codeowners;
 pub mod config;
 pub mod doctor;
 pub mod email_verification;
+pub mod export;
 pub mod facts;
 pub mod forks;
 pub mod git_admission;
