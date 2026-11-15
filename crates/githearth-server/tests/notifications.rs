@@ -314,10 +314,12 @@ async fn build_fixture(database_url: &str) -> Fixture {
     assert_eq!(status, StatusCode::CREATED, "{pull}");
     let number = pull["number"].as_i64().unwrap();
 
-    // Register the outbox consumer before the test acts. Its position is this
-    // fixture's head, so the merge or review the test performs next is newer
-    // than the registration and is delivered; the rows built above are not owed
-    // to it (ADR 0006, revised for M4.1).
+    // The built-in consumer's first registration. On this fixture's fresh
+    // database it draws nothing: there are no position rows, and the fan-out
+    // reads a missing position as zero, so every event the test writes is
+    // delivered anyway. `0050` already wrote the same row on an upgraded
+    // database. Kept because a test is the only caller that registers a
+    // consumer before its handler exists (ADR 0006, revised for M4.1).
     githearth_server::outbox::register_builtin(&state)
         .await
         .unwrap();
