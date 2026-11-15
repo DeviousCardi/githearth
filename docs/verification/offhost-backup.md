@@ -36,14 +36,26 @@ The harness subclasses the M2 harness in [`scripts/verify-m2.py`](../../scripts/
 
 Correction 2026-11-15: PR #187 re-points this harness at the shipped `backup`
 and `restore` commands and adds the section-3–5 assertions (maintenance and
-stopped-server fences, manifest inspection, the four restore refusals). Those
-assertions have **not run** on the authoring machine. It is Linux-host-shaped:
-its backup host is a container reached over the host's loopback, and under
-Docker Desktop on macOS that loopback belongs to the VM, so
-`verify-offhost-backup.py` stops at `backup host sshd not reachable within 30 s`
-and the new assertions do not execute. The 2026-11-09 PASS above covers the
-older dump/tar/rsync harness only. U20 stays open until both scripts run to
-completion on a Linux host with Docker.
+stopped-server fences, manifest inspection, the four restore refusals). On
+2026-11-15, with Docker Desktop 4.97.0 (Engine 29.9.2) on macOS arm64, the
+command passed `fresh_install` and `push_and_issue` and then stopped at
+`backup host sshd not reachable within 30 s`. The backup host runs with
+`--network host`, which under Docker Desktop joins the Linux VM's network
+namespace: `ssh-keyscan 127.0.0.1:<port>` succeeds inside that container and
+finds nothing on the macOS host. Publishing the port instead succeeds, so the
+limitation is the harness's host-loopback assumption, not the product.
+
+A Linux runner container on the same engine was also attempted. The host disk
+filled during that attempt, the engine's metadata database corrupted (`bbolt:
+Page expected to be: 145, but self identifies as 0`), and Docker Desktop would
+not restart without destroying images and volumes this run did not create. The
+`backup`/`restore`, fence, manifest and refusal assertions therefore did not
+execute on either attempt. On the same day, `scripts/verify-m4.py`'s
+backup/restore scenario did run: two harness defects were found and fixed, and
+the real s1–s6 scenario methods passed against a local PostgreSQL 17 (see
+[backup-restore.md](../operations/backup-restore.md#what-this-does-not-cover)).
+U20 stays open until this harness runs to completion on a Linux host with
+Docker, where `--network host` shares the host loopback.
 
 ## Not covered
 

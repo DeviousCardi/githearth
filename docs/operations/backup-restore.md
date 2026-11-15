@@ -211,13 +211,21 @@ old audit keys still exist inside older encrypted archives — see
 - **Rotated/archived journals** (`journal.<first>`): the storage check reads the
   live `journal` file. Search indexes are rebuilt after restore.
 - **The advisory PostgreSQL LSN.** It is recorded, not compared.
-- **The drill harnesses on this machine.** `scripts/verify-m4.py` and
-  `scripts/verify-offhost-backup.py` drive these commands, but they require a
-  Linux host with Docker: their backup host and `sshd` live in containers and
-  must share the host's loopback, which Docker Desktop does not. They have not
-  run to completion on this machine, so their `backup`/`restore` assertions are
-  not proven here; run both on a Linux Docker host before treating them as
-  evidence.
+- **The drill harnesses on this machine.** On 2026-11-15, with Docker
+  Desktop 4.97.0 (Engine 29.9.2) on macOS arm64, `scripts/verify-m4.py` ran
+  to 11/13 scenarios. Its `s4_backup_restore` failed on two defects in the
+  harness, not the product: it pushed a fresh history onto the `main` that
+  earlier scenarios had already created, and it demanded the word
+  "maintenance" from a fenced push that git reports as `HTTP 503`. Both are
+  fixed on this branch; the real s1–s6 scenario methods then passed against a
+  local PostgreSQL 17. That is not a full run: s7–s13 need Docker, and the
+  engine was corrupted when the host disk filled. `scripts/verify-offhost-backup.py`
+  passed `fresh_install` and `push_and_issue` and then stopped at `backup host
+  sshd not reachable within 30 s`: its backup host runs with `--network host`,
+  which under Docker Desktop joins the Linux VM's network namespace, not the
+  macOS host's loopback. It has **not** executed its `backup`/`restore`,
+  fence, manifest or refusal assertions. A Linux Docker host is still required
+  for that harness, and U20 stays open.
 
 The manual `pg_dump` / `tar` / `SHA256SUMS` / `rsync` procedure in older
 releases did not fence writers. Do not combine it with these commands; use
