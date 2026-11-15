@@ -122,6 +122,13 @@ fn not_active() -> ApiError {
     ApiError(StatusCode::CONFLICT, "repository is not active")
 }
 
+fn storage_error() -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "storage operation failed",
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewFork {
@@ -295,8 +302,14 @@ pub(crate) async fn create_fork(
             // refs and objects in (ADR 0008 chooses a full copy). Both locks are
             // taken before any pool connection (lock ordering).
             let storage = state.storage.clone();
-            let fork_guard = storage.repository_lock(fork_id).lock_owned().await;
-            let parent_guard = storage.repository_lock(parent_id).lock_owned().await;
+            let fork_guard = storage
+                .lock_repository(fork_id)
+                .await
+                .map_err(|_| storage_error())?;
+            let parent_guard = storage
+                .lock_repository(parent_id)
+                .await
+                .map_err(|_| storage_error())?;
             let current_status = {
                 let mut conn = state.pool.acquire().await?;
                 let row = repositories::get(&mut conn, fork_id)

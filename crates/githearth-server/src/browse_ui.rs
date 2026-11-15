@@ -79,9 +79,22 @@ async fn load_repo_ui(
 ) -> Result<(Option<String>, bool, Uuid), ui::UiError> {
     match ui::browser_auth(state, headers).await {
         Ok((account, auth_age)) => {
-            let loaded = repository_api::load_repo(state, account.id, auth_age, slug, name)
-                .await
-                .map_err(|error| load_error(error, Some(&account.username)))?;
+            let loaded =
+                match repository_api::load_repo(state, account.id, auth_age, slug, name).await {
+                    Ok(loaded) => loaded,
+                    Err(error) if error.status_code() == StatusCode::GONE => {
+                        return Err(ui::repository_gone_page(
+                            state,
+                            headers,
+                            Some(&account),
+                            Some(auth_age),
+                            slug,
+                            name,
+                        )
+                        .await);
+                    }
+                    Err(error) => return Err(load_error(error, Some(&account.username))),
+                };
             if repository_api::require(state, &loaded, Action::RepositoryRead).is_err() {
                 return Err(ui::not_found_page(Some(&account.username)));
             }
@@ -93,7 +106,16 @@ async fn load_repo_ui(
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
             match repository_api::load_public_anonymous(state, slug, name).await {
                 Some(repo) => Ok((None, false, repo.id)),
-                None => Err(ui::auth_required()),
+                None => {
+                    // Only a public deleted row justifies `410` for an
+                    // anonymous visitor; a private one (or a private live
+                    // replacement) gets the sign-in prompt.
+                    if crate::repository_restore::anonymous_gone(state, slug, name).await {
+                        Err(ui::gone_page(None))
+                    } else {
+                        Err(ui::auth_required())
+                    }
+                }
             }
         }
         Err(_) => Err(ui::unavailable_page(None)),

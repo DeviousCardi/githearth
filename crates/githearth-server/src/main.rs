@@ -65,6 +65,11 @@ enum Command {
         #[arg(long)]
         ssh_host_key_path: Option<PathBuf>,
     },
+    /// Repository lifecycle commands.
+    Repository {
+        #[command(subcommand)]
+        action: RepositoryCommand,
+    },
     /// Audit log IP retention management.
     Audit {
         #[command(subcommand)]
@@ -100,6 +105,22 @@ enum JobsCommand {
     },
     /// List dead deliveries, which `jobs requeue` recovers.
     List,
+}
+
+#[derive(Subcommand)]
+enum RepositoryCommand {
+    /// Restore a deleted repository from trash as the named account. The
+    /// account must be an organization owner or a site administrator: the
+    /// command runs the same operation and authorization as the API and the
+    /// browser, with no host-operator exception.
+    Restore {
+        #[arg(long)]
+        organization: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        actor: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -319,6 +340,35 @@ async fn run(args: Args) -> Result<()> {
                 }
             }
         }
+        Command::Repository { action } => match action {
+            RepositoryCommand::Restore {
+                organization,
+                name,
+                actor,
+            } => {
+                let state = AppState::new(pool, config.clone())
+                    .await
+                    .context("cannot initialize repository storage")?;
+                match githearth_server::repository_restore::restore_by_username(
+                    &state,
+                    &organization,
+                    &name,
+                    &actor,
+                )
+                .await
+                {
+                    Ok(row) => println!(
+                        "restored {}/{} ({}) as {}",
+                        organization, row.name, row.id, actor
+                    ),
+                    Err(error) => anyhow::bail!(
+                        "restore refused: {} ({})",
+                        error.message(),
+                        error.status_code()
+                    ),
+                }
+            }
+        },
         Command::Audit { action } => match action {
             AuditCommand::PruneIps {
                 older_than,

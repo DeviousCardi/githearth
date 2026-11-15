@@ -94,27 +94,34 @@ impl Default for StorageOptions {
 
 /// A guard that holds the per-repository filesystem lock.
 ///
-/// Callers acquire it with
-/// [`tokio::sync::Mutex::lock_owned`](tokio::sync::Mutex::lock_owned)`.await`
-/// (async) or
-/// [`tokio::sync::Mutex::blocking_lock_owned`](tokio::sync::Mutex::blocking_lock_owned)
-/// (sync) and **must** move the guard into the `spawn_blocking` closure that
-/// performs the directory operation.  Moving the guard into the blocking
-/// worker prevents a cancelled request from dropping the lock while the
-/// directory operator is still running.
+/// It holds two locks: an in-process [`tokio::sync::Mutex`] and, on Unix, an
+/// exclusive `flock` on `<storage-root>/locks/<repository id>`. The mutex
+/// serialises tasks inside one process; the file lock serialises **separate
+/// processes** that act on the same storage root — the server's reconciler
+/// (trash purge) and the `githearth repository restore` CLI, which is its own
+/// process and performs the trash → `repositories/` rename itself.
 ///
-/// **Shortcut:** this lock is single-process only.  If the server ever runs
-/// as multiple processes on one node it must be replaced with an
-/// inter-process lock.
-pub type RepositoryGuard = tokio::sync::OwnedMutexGuard<()>;
+/// Callers acquire it with [`Storage::lock_repository`] and **must** move the
+/// guard into the `spawn_blocking` closure that performs the directory
+/// operation.  Moving the guard into the blocking worker prevents a cancelled
+/// request from dropping the lock while the directory operator is still
+/// running.
+pub struct RepositoryGuard {
+    /// In-process half: the same mutex [`Storage::repository_lock`] returns.
+    _mutex: tokio::sync::OwnedMutexGuard<()>,
+    /// Inter-process half. Closing the descriptor releases the `flock`; the
+    /// explicit struct field keeps it open for the guard's whole lifetime.
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
 
 /// Durable repository storage.
 ///
 /// All public methods on this type are lock-free — they do **not** acquire
 /// the per-repository filesystem lock internally.  Callers are responsible
-/// for acquiring the lock via [`Storage::repository_lock`] before calling
-/// [`create`](Storage::create), [`trash`](Storage::trash), or
-/// [`orphan`](Storage::orphan), and for moving the resulting
+/// for acquiring the lock via [`Storage::lock_repository`] before calling
+/// [`create`](Storage::create), [`trash`](Storage::trash), [`restore`](Storage::restore),
+/// or [`orphan`](Storage::orphan), and for moving the resulting
 /// [`RepositoryGuard`] into the `spawn_blocking` closure that performs the
 /// directory operation.
 pub struct Storage {
@@ -137,6 +144,31 @@ fn now_seconds() -> u64 {
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
+}
+
+/// Open (creating if needed) `<root>/locks/<id>` and take an exclusive
+/// `flock` on it, blocking until another process releases it.
+///
+/// The lock directory is created here as well as by [`Storage::open`] so a
+/// storage opened read-only (the `githearth check` CLI) can still be locked
+/// if a caller needs to.
+#[cfg(unix)]
+fn lock_file(root: &Path, repository: Uuid) -> io::Result<fs::File> {
+    let dir = root.join("locks");
+    fs::create_dir_all(&dir)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(simple(repository)))?;
+    loop {
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
+            Ok(()) => return Ok(file),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -202,7 +234,7 @@ impl Storage {
             ));
         }
         let root = fs::canonicalize(root)?;
-        for sub in ["repositories", "tmp", "trash", "orphans"] {
+        for sub in ["repositories", "tmp", "trash", "orphans", "locks"] {
             mkdir0700(&root.join(sub))?;
         }
         Ok(Self {
@@ -247,6 +279,11 @@ impl Storage {
     /// Return the per-repository lock for `repository`, creating it if the
     /// [`Weak`] is dead or missing.
     ///
+    /// This is only the **in-process** half of [`Storage::lock_repository`]:
+    /// it does not exclude another process.  Production callers must use
+    /// [`Storage::lock_repository`], which also takes the inter-process
+    /// `flock`.
+    ///
     /// Two calls for the same id while any [`Arc`] is alive return the same
     /// mutex ([`Arc::ptr_eq`]); different ids never block each other.
     ///
@@ -279,6 +316,42 @@ impl Storage {
         let arc = Arc::new(tokio::sync::Mutex::new(()));
         map.insert(repository, Arc::downgrade(&arc));
         arc
+    }
+
+    /// Acquire the per-repository filesystem lock for every action that moves
+    /// or removes a repository directory.
+    ///
+    /// Takes the in-process mutex ([`Storage::repository_lock`]) first, then
+    /// blocks for the inter-process `flock`.  Both are held by the returned
+    /// [`RepositoryGuard`]; move it into the `spawn_blocking` closure that
+    /// performs the directory operation.
+    ///
+    /// The file lock is what makes the server's trash purge and a CLI restore
+    /// mutually exclusive: they are different processes, so an in-process
+    /// mutex alone lets `remove_dir_all` delete entries out of a directory
+    /// that is being renamed into `repositories/`, losing restored objects.
+    ///
+    /// # Lock ordering
+    ///
+    /// As with [`Storage::repository_lock`], acquire this **before** any
+    /// database pool connection.
+    pub async fn lock_repository(&self, repository: Uuid) -> Result<RepositoryGuard, StorageError> {
+        let mutex = self.repository_lock(repository).lock_owned().await;
+        #[cfg(unix)]
+        {
+            let root = self.root.clone();
+            let file = tokio::task::spawn_blocking(move || lock_file(&root, repository))
+                .await
+                .map_err(|_| StorageError::Invalid("repository lock task panicked".to_owned()))??;
+            Ok(RepositoryGuard {
+                _mutex: mutex,
+                _file: file,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(RepositoryGuard { _mutex: mutex })
+        }
     }
 
     /// Number of entries currently in the lock map (including dead [`Weak`]
@@ -661,15 +734,10 @@ impl Storage {
         Some((id, secs.parse().ok()?))
     }
 
-    pub fn purge_trash(&self, older_than: SystemTime) -> Result<usize, StorageError> {
-        let cutoff = older_than
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut removed = 0;
-        // One unremovable entry must not keep the rest of the trash forever: try them
-        // all, then report the first failure.
-        let mut first_error = None;
+    /// One entry in `trash/`. `seconds` is the encoded move time used by the
+    /// retention sweep; `repository` is the row id parsed back out of it.
+    pub fn list_trash(&self) -> Result<Vec<TrashEntry>, StorageError> {
+        let mut entries = Vec::new();
         for entry in fs::read_dir(self.root.join("trash"))? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -677,19 +745,43 @@ impl Storage {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if Self::timestamped(&name).is_some_and(|(_, secs)| secs < cutoff) {
-                match fs::remove_dir_all(entry.path()) {
-                    Ok(()) => removed += 1,
-                    Err(e) => {
-                        first_error.get_or_insert(e);
-                    }
-                }
+            if let Some((id, secs)) = Self::timestamped(&name)
+                && let Ok(repository) = Uuid::parse_str(id)
+            {
+                entries.push(TrashEntry {
+                    repository,
+                    seconds: secs,
+                    path: entry.path(),
+                });
             }
         }
-        match first_error {
-            Some(e) => Err(e.into()),
-            None => Ok(removed),
-        }
+        entries.sort_by_key(|entry| (entry.repository, entry.seconds));
+        Ok(entries)
+    }
+
+    /// The newest trash entry for `repository`, or `None` when the purge has
+    /// already removed it (the restore must then be refused). A delete after a
+    /// restore starts a new cycle and adds a newer entry, so newest is the one
+    /// the current `deleted` row owns.
+    pub fn find_trash(&self, repository: Uuid) -> Result<Option<TrashEntry>, StorageError> {
+        Ok(self
+            .list_trash()?
+            .into_iter()
+            .filter(|entry| entry.repository == repository)
+            .max_by_key(|entry| entry.seconds))
+    }
+
+    /// Remove one trash entry. Used by the reconciler after it has taken the
+    /// repository lock and re-checked the row, so a mid-restore move is never
+    /// mistaken for an expired entry.
+    ///
+    /// There is deliberately no batch "purge everything older than" helper:
+    /// retention is applied per entry, under the repository lock, after a
+    /// status re-read (see `reconcile::reconcile_once`).  A blind sweep would
+    /// reintroduce the unlock/remove race this per-entry API prevents.
+    pub fn remove_trash_entry(&self, entry: &TrashEntry) -> Result<(), StorageError> {
+        fs::remove_dir_all(&entry.path)?;
+        Ok(())
     }
 
     pub fn upload_pack(
@@ -887,6 +979,14 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// An entry under `trash/`, parsed from its `<id>.<seconds>.git` name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashEntry {
+    pub repository: Uuid,
+    pub seconds: u64,
+    pub path: PathBuf,
 }
 
 /// A single entry under `tmp/` returned by [`Storage::list_tmp`].

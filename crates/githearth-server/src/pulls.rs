@@ -584,9 +584,9 @@ pub(crate) async fn fetch_cross_repo_head(
     let cap = state.config.housekeeping_fork_fetch_limit_bytes;
     let guard = state
         .storage
-        .repository_lock(repository_id)
-        .lock_owned()
-        .await;
+        .lock_repository(repository_id)
+        .await
+        .map_err(|_| storage_error())?;
     let storage = state.storage.clone();
     let source = source_repository_id;
     let oid = head.clone();
@@ -1698,9 +1698,9 @@ pub(crate) async fn set_draft(
             // nor race a merge that is already swapping the ref (ADR 0009).
             let _guard = state
                 .storage
-                .repository_lock(loaded.repo.id)
-                .lock_owned()
-                .await;
+                .lock_repository(loaded.repo.id)
+                .await
+                .map_err(|_| storage_error())?;
 
             let mut tx = state.pool.begin().await?;
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
@@ -3021,9 +3021,9 @@ pub(crate) async fn apply_pull_suggestion(
     // whole mutation.
     let _guard = state
         .storage
-        .repository_lock(loaded.repo.id)
-        .lock_owned()
-        .await;
+        .lock_repository(loaded.repo.id)
+        .await
+        .map_err(|_| storage_error())?;
     // Re-check under the lock: a protection rule added or a grant revoked
     // between the early check and now must not let a stale permission through.
     require_apply_permission_locked(state, &loaded, &pull).await?;

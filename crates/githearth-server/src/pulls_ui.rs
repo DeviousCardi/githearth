@@ -200,6 +200,7 @@ fn message_page(s: &Session, status: StatusCode, title: &str, message: &str) -> 
 fn api_error(s: &Session, error: crate::ApiError) -> ui::UiError {
     match error.status_code() {
         StatusCode::UNAUTHORIZED => ui::auth_required(),
+        StatusCode::GONE => ui::gone_page(Some(&s.account.username)),
         StatusCode::NOT_FOUND => ui::not_found_page(Some(&s.account.username)),
         StatusCode::FORBIDDEN => message_page(
             s,

@@ -227,9 +227,9 @@ async fn run(
     // so a cancelled request cannot release it while Git still runs.
     let guard = state
         .storage
-        .repository_lock(repository_id)
-        .lock_owned()
-        .await;
+        .lock_repository(repository_id)
+        .await
+        .map_err(|e| HousekeepingError::Storage(e.to_string()))?;
 
     // Read the facts under the lock: a delete or archive that commits while
     // the lock is pending must not be overtaken by this run.

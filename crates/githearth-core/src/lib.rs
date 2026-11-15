@@ -84,6 +84,7 @@ pub enum RepositoryStatus {
     Active,
     Deleting,
     Deleted,
+    Restoring,
     Failed,
 }
 
@@ -94,6 +95,7 @@ impl RepositoryStatus {
             Self::Active => "active",
             Self::Deleting => "deleting",
             Self::Deleted => "deleted",
+            Self::Restoring => "restoring",
             Self::Failed => "failed",
         }
     }
@@ -113,6 +115,7 @@ impl FromStr for RepositoryStatus {
             "active" => Ok(Self::Active),
             "deleting" => Ok(Self::Deleting),
             "deleted" => Ok(Self::Deleted),
+            "restoring" => Ok(Self::Restoring),
             "failed" => Ok(Self::Failed),
             _ => Err(InvalidId("unknown repository status")),
         }
@@ -154,6 +157,7 @@ mod tests {
             RepositoryStatus::Active,
             RepositoryStatus::Deleting,
             RepositoryStatus::Deleted,
+            RepositoryStatus::Restoring,
             RepositoryStatus::Failed,
         ] {
             let s = status.as_str();

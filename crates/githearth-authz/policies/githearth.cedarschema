@@ -216,6 +216,17 @@ namespace GitHearth {
       resource: Repository,
       context: Auth,
     };
+  // Restore is narrower than delete: an organization owner (the `owner`
+  // group) or a site administrator (the dedicated built-in permit below),
+  // never a repository-scoped admin. It is not in the `site_admin` group,
+  // whose built-in forbid makes every action in it exclusive to site
+  // administrators.
+  action "repository.restore" in ["owner", "sensitive"]
+    appliesTo {
+      principal: [Account, Anonymous],
+      resource: Repository,
+      context: Auth,
+    };
   action "status.create" in ["write"]
     appliesTo {
       principal: [Account, Anonymous],
