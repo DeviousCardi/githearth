@@ -55,13 +55,12 @@ async fn scratch_url() -> String {
 }
 
 async fn scratch_pool() -> PgPool {
-    let mut config = Config {
+    let config = Config {
         database_url: scratch_url().await,
         database_max_connections: 4,
         storage_root: temp_storage(),
         ..Config::default()
     };
-    config.storage_root = temp_storage();
     let pool = connect(&config).await.expect("connect");
     MIGRATOR.run(&pool).await.expect("migrate");
     pool
@@ -591,104 +590,144 @@ async fn every_emitted_metric_and_label_is_published() {
     pool.close().await;
 }
 
-/// U14, B1: a scrape whose database read fails is still a scrape an operator
-/// sees. `outbox_events` is dropped in the scratch database — the outage every
-/// database statement is subject to — and the answer must be a `200`
-/// exposition of the **whole** published list, with the unread gauges at `0`
-/// and `githearth_metrics_scrape_failures_total` incremented. A `5xx` would be
-/// discarded by Prometheus and would hide both the failure and the four
-/// database gauges.
-#[tokio::test]
-#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
-async fn a_failed_query_still_answers_the_full_exposition_with_the_failure_counted() {
-    let pool = scratch_pool().await;
-    // `outbox_events` is renamed away in the scratch database: the outage every
-    // database statement is subject to, and the one that takes the outbox gauge
-    // with it. It is renamed back immediately after the scrapes, before any
-    // assertion, so a failing assertion cannot leave the schema short a table
-    // (a migration will not re-create a dropped one: its version is recorded).
-    sqlx::query("ALTER TABLE outbox_events RENAME TO outbox_events_forced_outage")
-        .execute(&pool)
+/// Renames a table, so the query that reads it fails until it is renamed back.
+/// The names are fixed here, never interpolated from data.
+async fn rename(pool: &PgPool, from: &str, to: &str) {
+    sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
+        .execute(pool)
         .await
-        .expect("rename outbox_events to force a query failure");
-    let (state, root) =
-        state_with(&pool, |config: &mut Config| config.metrics_enabled = true).await;
-    let (shutdown, port) = serve(state).await;
+        .unwrap_or_else(|error| panic!("rename {from} to {to}: {error}"));
+}
 
-    let response = scrape(port).await;
-    // The next scrape fails the same way and the counter keeps moving; it is a
-    // counter, not a one-off flag.
-    let again = scrape(port).await;
-
-    let _ = shutdown.send(());
-    cleanup(&root);
-    sqlx::query("ALTER TABLE outbox_events_forced_outage RENAME TO outbox_events")
-        .execute(&pool)
-        .await
-        .expect("put outbox_events back");
-    // The suite leaves the scratch database as it found it.
-    MIGRATOR.run(&pool).await.expect("re-apply the migrations");
-
+/// A `200` exposition of the **whole** published list, whatever the source did.
+fn assert_whole_exposition(source: &str, response: &Response) {
     assert_eq!(
         response.status, 200,
-        "a failed query must still be a scrape Prometheus keeps: {}",
+        "the {source} scrape must still be one Prometheus keeps: {}",
         response.body
     );
-    assert_eq!(response.header("content-type"), Some(metrics::CONTENT_TYPE));
+    assert_eq!(
+        response.header("content-type"),
+        Some(metrics::CONTENT_TYPE),
+        "{source}"
+    );
     let parsed = Exposition::parse(&response.body);
     let published: BTreeSet<&str> = metrics::PUBLISHED.iter().map(|def| def.name).collect();
     let emitted: BTreeSet<&str> = parsed.metrics.keys().map(String::as_str).collect();
     assert_eq!(
         emitted, published,
-        "the failed scrape did not carry the whole published list"
+        "the {source} scrape did not carry the whole published list"
     );
+}
 
-    // The database gauges are present and 0: the source that could not be read
-    // is not invented, and its series does not disappear.
-    assert_eq!(
-        sample_value(&response.body, "githearth_jobs", "state=\"running\""),
-        0.0
-    );
-    assert_eq!(
-        sample_value(
-            &response.body,
-            "githearth_housekeeping_repositories",
-            "outcome=\"completed\""
-        ),
-        0.0
-    );
-    assert_eq!(
-        sample_value(
-            &response.body,
-            "githearth_outbox_events",
-            "state=\"delivered\""
-        ),
-        0.0
-    );
-    // The counter moved, in the body of the failed scrape itself.
-    let failures = sample_value(
+fn failures(response: &Response) -> f64 {
+    sample_value(
         &response.body,
         "githearth_metrics_scrape_failures_total",
         "",
-    );
-    assert!(
-        failures >= 1.0,
-        "the failed scrape did not count itself: {failures}\n{}",
-        response.body
-    );
-    assert_eq!(again.status, 200, "{}", again.body);
+    )
+}
+
+/// U14, B1: a scrape whose database read fails is still a scrape an operator
+/// sees. Each database source is renamed away in turn — the outage every
+/// database statement is subject to — and the answer must be a `200`
+/// exposition of the **whole** published list, with that source's gauges at `0`
+/// and `githearth_metrics_scrape_failures_total` incremented. `jobs` is forced
+/// explicitly: it is the largest gauge, and a failed read that left the counter
+/// still would be indistinguishable from a genuine zero. A `5xx` would be
+/// discarded by Prometheus and would hide both the failure and the gauges.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL"]
+async fn a_failed_query_still_answers_the_full_exposition_with_the_failure_counted() {
+    let pool = scratch_pool().await;
+    let (state, root) =
+        state_with(&pool, |config: &mut Config| config.metrics_enabled = true).await;
+    let (shutdown, port) = serve(state).await;
+
+    // Each source is renamed away, scraped twice, then put back and scraped
+    // once more. Every rename is undone before any assertion, so a failure
+    // cannot leave the schema short a table (a migration will not re-create a
+    // dropped one: its version is recorded).
+    rename(&pool, "jobs", "jobs_forced_outage").await;
+    let jobs_failed = scrape(port).await;
+    // The next scrape fails the same way and the counter keeps moving; it is a
+    // counter, not a one-off flag.
+    let jobs_failed_again = scrape(port).await;
+    rename(&pool, "jobs_forced_outage", "jobs").await;
+    let jobs_restored = scrape(port).await;
+
+    rename(&pool, "outbox_events", "outbox_events_forced_outage").await;
+    let outbox_failed = scrape(port).await;
+    let outbox_failed_again = scrape(port).await;
+    rename(&pool, "outbox_events_forced_outage", "outbox_events").await;
+
+    let _ = shutdown.send(());
+    cleanup(&root);
+    // The suite leaves the scratch database as it found it.
+    MIGRATOR.run(&pool).await.expect("re-apply the migrations");
+
+    for (source, response) in [
+        ("jobs", &jobs_failed),
+        ("jobs again", &jobs_failed_again),
+        ("jobs restored", &jobs_restored),
+        ("outbox_events", &outbox_failed),
+        ("outbox_events again", &outbox_failed_again),
+    ] {
+        assert_whole_exposition(source, response);
+    }
+
+    // The source that could not be read is not invented: its series are present
+    // and 0, rather than disappearing.
+    for response in [&jobs_failed, &jobs_failed_again] {
+        assert_eq!(
+            sample_value(&response.body, "githearth_jobs", "state=\"pending\""),
+            0.0
+        );
+        assert_eq!(
+            sample_value(&response.body, "githearth_jobs", "state=\"running\""),
+            0.0
+        );
+        assert_eq!(
+            sample_value(
+                &response.body,
+                "githearth_jobs_by_kind",
+                "kind=\"other\",state=\"pending\""
+            ),
+            0.0
+        );
+    }
+    for response in [&outbox_failed, &outbox_failed_again] {
+        assert_eq!(
+            sample_value(
+                &response.body,
+                "githearth_outbox_events",
+                "state=\"delivered\""
+            ),
+            0.0
+        );
+        assert_eq!(
+            sample_value(
+                &response.body,
+                "githearth_outbox_events",
+                "state=\"undelivered\""
+            ),
+            0.0
+        );
+    }
+
+    // The counter moves once for each failed scrape, for both sources, and does
+    // not move for the healthy scrape in between. It is the signal that tells
+    // an unreadable gauge from a genuine zero.
     assert_eq!(
-        sample_value(
-            &again.body,
-            "githearth_outbox_events",
-            "state=\"delivered\""
-        ),
-        0.0
-    );
-    assert!(
-        sample_value(&again.body, "githearth_metrics_scrape_failures_total", "") > failures,
-        "the failure counter did not move on the second failed scrape:\n{}",
-        again.body
+        [
+            failures(&jobs_failed),
+            failures(&jobs_failed_again),
+            failures(&jobs_restored),
+            failures(&outbox_failed),
+            failures(&outbox_failed_again),
+        ],
+        [1.0, 2.0, 2.0, 3.0, 4.0],
+        "the failure counter did not move once per failed source"
     );
 
     pool.close().await;

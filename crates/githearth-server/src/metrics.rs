@@ -667,7 +667,9 @@ pub fn permits_in_use(slots: &tokio::sync::Semaphore, configured: usize) -> f64 
 ///
 /// A failed database read is **not** a `5xx`: the full published list is still
 /// rendered, the unread gauges at `0`, and `githearth_metrics_scrape_failures_total`
-/// moves, so the answer is a scrape Prometheus keeps.
+/// moves, so the answer is a scrape Prometheus keeps. Nothing this endpoint can
+/// answer is a `5xx`: a renderer defect is logged and counted at `200` rather
+/// than handed to a scraper as a body it would discard.
 pub async fn metrics(State(state): State<AppState>, client: ResolvedIp) -> Response {
     if !state.config.metrics_enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -688,15 +690,12 @@ pub async fn metrics(State(state): State<AppState>, client: ResolvedIp) -> Respo
     let mut failures = state.recorder.as_deref().map_or(0, |recorder| {
         recorder.scrape_failures.load(Ordering::Relaxed)
     });
-    if render(&state, registry, &mut text, &mut failures).await {
-        // A renderer that cannot produce the published list at all (a metric
-        // with a name the format refuses) is a build-time defect, not an
-        // outage; it must not look like a successful empty scrape either.
-        return exposition(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "# metric collection failed: the published list could not be rendered\n".to_owned(),
-        );
-    }
+    // A published line the format refuses is a build-time defect, not an
+    // outage: `render` skips it, logs it and counts it, so the answer here is
+    // always the `200` exposition a scraper keeps. No `5xx` arm exists, because
+    // Prometheus discards the body of a failed scrape and would hide both the
+    // rest of the list and the failure counter.
+    render(&state, registry, &mut text, &mut failures).await;
     exposition(StatusCode::OK, text)
 }
 
@@ -726,15 +725,16 @@ pub fn is_loopback(addr: IpAddr) -> bool {
 /// the output cannot contain a metric the document does not list.
 ///
 /// `failures` is the scrape-failure counter this scrape publishes: a database
-/// read that fails adds one and is visible in the same body. Returns `true`
-/// only when a line was refused by the format, which no published metric can
-/// cause.
+/// read that fails adds one and is visible in the same body. A published line
+/// the format refuses is a build-time defect; it is skipped, logged and counted
+/// the same way, so rendering always completes and the caller always answers
+/// `200`.
 pub async fn render(
     state: &AppState,
     registered_kinds: &[&'static str],
     out: &mut String,
     failures: &mut u64,
-) -> bool {
+) {
     let db = DatabaseState::load(state).await;
     if db.any_failed() {
         *failures += 1;
@@ -763,12 +763,24 @@ pub async fn render(
                 value
             };
             if !write_sample(out, def.name, &pairs, &number(value)) {
-                debug_assert!(false, "a published metric has a name the format refuses");
-                return true;
+                // Every name, key and value is a compile-time constant tested
+                // by `every_published_metric_is_named_and_bounded`, so this
+                // cannot be reached from data or configuration. Do not fail the
+                // scrape for it: skip the line, log the defect, and move the
+                // failure counter (whose sample is written last, so this one is
+                // in the same body).
+                tracing::error!(
+                    metric = def.name,
+                    "a published metric was refused by the exposition format; its sample is \
+                     omitted"
+                );
+                *failures += 1;
+                if let Some(recorder) = recorder {
+                    recorder.scrape_failed();
+                }
             }
         }
     }
-    false
 }
 
 /// The label-value combinations one metric emits, in publication order. The
@@ -977,37 +989,41 @@ impl DatabaseState {
     async fn load(state: &AppState) -> Self {
         let mut db = Self::default();
         let registered = state.job_kinds.as_deref().unwrap_or(&[]);
-        let jobs = sqlx::query("SELECT state, kind, count(*) AS n FROM jobs GROUP BY state, kind")
-            .fetch_all(&state.pool)
-            .await;
-        for row in jobs.into_iter().flatten() {
-            // A row whose columns a schema change broke is skipped, not counted
-            // as a zero and not allowed to poison the whole collection.
-            let Ok(count) = row.try_get::<i64, _>("n") else {
-                continue;
-            };
-            let count = count as f64;
-            let Ok(kind) = row.try_get::<String, _>("kind") else {
-                continue;
-            };
-            let Ok(state_name) = row.try_get::<String, _>("state") else {
-                continue;
-            };
-            match state_name.as_str() {
-                "pending" => {
-                    db.jobs_pending += count;
-                    add_kind(&mut db.jobs_pending_by_kind, &kind, count, registered);
+        if let Ok(rows) =
+            sqlx::query("SELECT state, kind, count(*) AS n FROM jobs GROUP BY state, kind")
+                .fetch_all(&state.pool)
+                .await
+        {
+            for row in &rows {
+                // A row whose columns a schema change broke is skipped, not
+                // counted as a zero and not allowed to poison the whole
+                // collection.
+                let Ok(count) = row.try_get::<i64, _>("n") else {
+                    continue;
+                };
+                let count = count as f64;
+                let Ok(kind) = row.try_get::<String, _>("kind") else {
+                    continue;
+                };
+                let Ok(state_name) = row.try_get::<String, _>("state") else {
+                    continue;
+                };
+                match state_name.as_str() {
+                    "pending" => {
+                        db.jobs_pending += count;
+                        add_kind(&mut db.jobs_pending_by_kind, &kind, count, registered);
+                    }
+                    "running" => {
+                        db.jobs_running += count;
+                        add_kind(&mut db.jobs_running_by_kind, &kind, count, registered);
+                    }
+                    "done" => db.jobs_done += count,
+                    "dead" => db.jobs_dead += count,
+                    _ => {}
                 }
-                "running" => {
-                    db.jobs_running += count;
-                    add_kind(&mut db.jobs_running_by_kind, &kind, count, registered);
-                }
-                "done" => db.jobs_done += count,
-                "dead" => db.jobs_dead += count,
-                _ => {}
             }
+            db.jobs_read = true;
         }
-        db.jobs_read = true;
 
         // One row per repository that has a housekeeping record. A repository
         // with no row has never been scheduled and is not counted, so the total

@@ -147,15 +147,16 @@ list changes in the same change that adds them.
 
 ## Sample scrape
 
-An enabled endpoint, scraped from loopback with no trusted proxy configured:
+An enabled endpoint, scraped from loopback with no trusted proxy configured.
+This is an **excerpt** of the body: it starts with `githearth_http_requests_total`,
+and the excerpt below is the `in_flight` block further down:
 
 ```console
-$ curl -s http://127.0.0.1:8080/metrics | head
+$ curl -s http://127.0.0.1:8080/metrics \
+    | grep -A2 '^# HELP githearth_http_requests_in_flight'
 # HELP githearth_http_requests_in_flight HTTP requests currently being answered, including the scrape that reads this.
 # TYPE githearth_http_requests_in_flight gauge
 githearth_http_requests_in_flight 1
-# HELP githearth_http_request_duration_mean_seconds ...
-...
 ```
 
 `in_flight` reads `1`: the scrape counts itself while it runs.
