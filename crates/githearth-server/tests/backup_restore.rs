@@ -1294,6 +1294,88 @@ fn objects_survive_restart_and_backup_restore_and_corruption_is_refused() {
 }
 
 #[test]
+fn a_committed_object_with_a_missing_payload_refuses_backup() {
+    let installation = Installation::new("objects-missing-payload");
+    installation.setup();
+    githearth_git::layout::Storage::open(installation.storage()).unwrap();
+    let tenant = TenantId::new(Uuid::new_v4());
+    let artifact = ObjectKey::parse("ci/artifacts/release.bin").unwrap();
+    let log = ObjectKey::parse("ci/logs/run.log").unwrap();
+    let object_root = installation.storage().join("objects");
+    {
+        let store = FsObjectStore::open(&object_root).unwrap();
+        store.put(tenant, &artifact, b"artifact bytes").unwrap();
+        store.put(tenant, &log, b"log bytes").unwrap();
+    }
+
+    // A sidecar whose payload is gone is damage to a committed object, not the
+    // unacknowledged payload-without-sidecar crash window. Removing the
+    // payload must fail the backup instead of publishing a short object set.
+    let payload = object_root
+        .join("data")
+        .join(tenant.as_uuid().simple().to_string())
+        .join("ci/artifacts/release.bin");
+    fs::remove_file(&payload).unwrap();
+
+    let key = key_file(&installation.path, "objects.key", "objects-passphrase");
+    let archive = installation.path.join("missing-payload.ghbackup");
+    let output = installation.backup(&archive, &key);
+    assert!(
+        !output.status.success(),
+        "a short object set must not be published: {}",
+        both(&output)
+    );
+    let text = both(&output);
+    assert!(text.contains("fails verification"), "{text}");
+    assert!(text.contains("payload is missing"), "{text}");
+    assert!(
+        !archive.exists(),
+        "a refused backup must not publish an archive"
+    );
+}
+
+#[test]
+fn a_committed_object_with_an_unreadable_sidecar_refuses_backup() {
+    let installation = Installation::new("objects-corrupt-sidecar");
+    installation.setup();
+    githearth_git::layout::Storage::open(installation.storage()).unwrap();
+    let tenant = TenantId::new(Uuid::new_v4());
+    let artifact = ObjectKey::parse("ci/artifacts/release.bin").unwrap();
+    let log = ObjectKey::parse("ci/logs/run.log").unwrap();
+    let object_root = installation.storage().join("objects");
+    {
+        let store = FsObjectStore::open(&object_root).unwrap();
+        store.put(tenant, &artifact, b"artifact bytes").unwrap();
+        store.put(tenant, &log, b"log bytes").unwrap();
+    }
+
+    // A sidecar that cannot be read is not a missing sidecar: the payload's
+    // commitment exists but is damaged, so the object must not vanish from the
+    // manifest silently.
+    let sidecar = object_root
+        .join("meta")
+        .join(tenant.as_uuid().simple().to_string())
+        .join("ci/artifacts/release.bin.json");
+    fs::write(&sidecar, b"not json").unwrap();
+
+    let key = key_file(&installation.path, "objects.key", "objects-passphrase");
+    let archive = installation.path.join("corrupt-sidecar.ghbackup");
+    let output = installation.backup(&archive, &key);
+    assert!(
+        !output.status.success(),
+        "an unreadable committed sidecar must not be published: {}",
+        both(&output)
+    );
+    let text = both(&output);
+    assert!(text.contains("fails verification"), "{text}");
+    assert!(text.contains("sidecar is unreadable"), "{text}");
+    assert!(
+        !archive.exists(),
+        "a refused backup must not publish an archive"
+    );
+}
+
+#[test]
 fn wrong_missing_corrupt_and_incomplete_archives_are_refused_distinctly_and_touch_nothing() {
     let mut installation = Installation::new("failures");
     installation.setup();

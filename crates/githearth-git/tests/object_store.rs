@@ -105,6 +105,11 @@ fn put_get_stat_checksum_list_and_delete_round_trip() {
     // Delete is idempotent and removes the metadata with the bytes.
     store.delete(tenant, &key).unwrap();
     store.delete(tenant, &key).unwrap();
+    // A tenant that has never written has no parent directory to fsync;
+    // deleting there is still the promised idempotent success.
+    store
+        .delete(Fixture::tenant(), &Fixture::key("ci/artifacts/none"))
+        .unwrap();
     assert!(store.list(tenant, "ci/").unwrap().is_empty());
     assert!(matches!(
         store.get(tenant, &key, None),
@@ -441,7 +446,8 @@ fn a_backup_style_inventory_verifies_the_whole_store() {
     assert!(
         problems
             .iter()
-            .any(|problem| problem.message.contains("payload is missing")),
+            .any(|problem| problem.kind == ObjectProblemKind::Corrupt
+                && problem.message.contains("payload is missing")),
         "{problems:?}"
     );
 }
@@ -584,17 +590,16 @@ fn a_payload_without_a_sidecar_does_not_break_listing_or_inventory() {
     assert!(
         problems
             .iter()
-            .all(|problem| problem.kind == ObjectProblemKind::Orphan)
+            .any(|problem| problem.kind == ObjectProblemKind::Orphan
+                && problem.message.contains("sidecar is missing"))
     );
+    // An unreadable sidecar means the payload's commitment cannot be read:
+    // that is damage, not the crash window, and must fail verification.
     assert!(
         problems
             .iter()
-            .any(|problem| problem.message.contains("sidecar is missing"))
-    );
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem.message.contains("sidecar is unreadable"))
+            .any(|problem| problem.kind == ObjectProblemKind::Corrupt
+                && problem.message.contains("sidecar is unreadable"))
     );
 
     // A later put adopts both kinds of orphan for the same key.
@@ -733,6 +738,48 @@ fn a_stale_usage_counter_is_reconciled_from_the_objects() {
         .put(tenant, &Fixture::key("ci/three"), &[0u8; 40])
         .unwrap();
     assert_eq!(store.usage(tenant).unwrap().bytes, 100);
+}
+
+#[test]
+fn a_counter_only_tenant_is_reconciled_before_it_can_be_wedged() {
+    let fixture = Fixture::new("counter-only");
+    let tenant = Fixture::tenant();
+    // Create the store's trees, then plant the state a crash between the
+    // reservation and the payload's directory creation leaves: a counter with
+    // no `data/` or `uploads/` directory for this tenant.
+    drop(fixture.store());
+    let counter = fixture
+        .0
+        .join("objects/usage")
+        .join(format!("{}.json", tenant.as_uuid().simple()));
+    fs::write(
+        &counter,
+        format!(
+            r#"{{"version":1,"tenant":"{}","bytes":80}}"#,
+            tenant.as_uuid()
+        ),
+    )
+    .unwrap();
+
+    let store = fixture.store_with(ObjectStoreOptions {
+        quota_bytes: 100,
+        ..ObjectStoreOptions::default()
+    });
+    assert_eq!(
+        store.usage(tenant).unwrap().bytes,
+        0,
+        "a counter with no objects is repaired to zero"
+    );
+    assert!(
+        fs::read_to_string(&counter)
+            .unwrap()
+            .contains("\"bytes\":0"),
+        "reconciliation rewrites the counter"
+    );
+    store
+        .put(tenant, &Fixture::key("ci/artifacts/after"), &[0u8; 40])
+        .unwrap();
+    assert_eq!(store.usage(tenant).unwrap().bytes, 40);
 }
 
 #[test]

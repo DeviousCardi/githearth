@@ -232,11 +232,13 @@ pub struct AbandonedUpload {
 /// [`FsObjectStore::verify_all`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectProblemKind {
-    /// The object's bytes or sidecar disagree with the recorded checksum.
+    /// The object's bytes or sidecar disagree with the recorded checksum, a
+    /// committed object's payload is missing, or its sidecar is unreadable.
+    /// Damage to a committed object is always refused by backup and restore.
     Corrupt,
-    /// A payload with no usable sidecar, or a sidecar with no payload. This is
-    /// the residue a crash in a two-file write can leave; it is reported for a
-    /// repair command but does not fail backup verification (ADR 0014).
+    /// A payload with no sidecar. The unacknowledged residue of a crash between
+    /// the payload write and the sidecar rename; it is reported for a repair
+    /// command but does not fail backup verification (ADR 0014).
     Orphan,
 }
 
@@ -1075,10 +1077,12 @@ impl FsObjectStore {
         Ok(parts)
     }
 
-    /// Re-read every object and every chunk, and report the two orphan states
-    /// a crash between the payload and sidecar writes can leave. Corruption is
-    /// `Corrupt`; crash residue is `Orphan`, which backup verification
-    /// tolerates (ADR 0014).
+    /// Re-read every object and every chunk, and report the crash residue a
+    /// crash between the payload and sidecar writes can leave. Corruption,
+    /// including a committed object whose payload is missing or whose sidecar
+    /// is unreadable, is `Corrupt` and fails backup verification. Only a
+    /// payload with no sidecar is `Orphan`, which backup verification tolerates
+    /// (ADR 0014).
     pub fn verify_all(&self) -> Result<Vec<ObjectProblem>, ObjectStoreError> {
         let mut problems = Vec::new();
         // Payloads first: a payload with no usable sidecar is the residue of a
@@ -1128,7 +1132,7 @@ impl FsObjectStore {
                 }),
                 Err(ObjectStoreError::Corrupt { reason, .. }) => problems.push(ObjectProblem {
                     key: key_text,
-                    kind: ObjectProblemKind::Orphan,
+                    kind: ObjectProblemKind::Corrupt,
                     message: format!(
                         "payload exists but its metadata sidecar is unreadable: {reason}"
                     ),
@@ -1136,8 +1140,10 @@ impl FsObjectStore {
                 Err(error) => return Err(error),
             }
         }
-        // A sidecar with no payload is the residue of a delete or a restore
-        // that lost bytes. It is reported, not fatal.
+        // A sidecar with no payload is damage to a committed object: no store
+        // write can produce it (`put`, `complete` and `append` write the
+        // payload first; `delete` removes the sidecar first). It must fail
+        // verification rather than be dropped from a backup's manifest.
         let mut metas = Vec::new();
         collect_files(&self.root.join("meta"), &mut metas)?;
         for meta_path in metas {
@@ -1155,7 +1161,7 @@ impl FsObjectStore {
             if !self.data_path(tenant, &key).is_file() {
                 problems.push(ObjectProblem {
                     key: key.to_string(),
-                    kind: ObjectProblemKind::Orphan,
+                    kind: ObjectProblemKind::Corrupt,
                     message: "metadata exists but the payload is missing".into(),
                 });
             }
@@ -1396,10 +1402,18 @@ impl ObjectStore for FsObjectStore {
         // Sidecar first: a crash between the two leaves an orphan payload,
         // which listing, inventory and backup tolerate, rather than an object
         // that `stat` reports and `get` refuses.
+        let had_data = data.exists();
+        let had_meta = meta.exists();
         remove_file_if_present(&meta)?;
         remove_file_if_present(&data)?;
-        sync_parent(&data)?;
-        sync_parent(&meta)?;
+        // A tenant that has never written has no parent directory to fsync;
+        // deleting there is still the promised idempotent success.
+        if had_data {
+            sync_parent(&data)?;
+        }
+        if had_meta {
+            sync_parent(&meta)?;
+        }
         if let Some(meta) = existing {
             self.adjust_usage(tenant, -(meta.bytes as i64))?;
         }
@@ -1905,10 +1919,22 @@ impl FsObjectStore {
             }
             for entry in fs::read_dir(&root)? {
                 let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
-                if let Ok(tenant) = Uuid::parse_str(&entry.file_name().to_string_lossy()) {
+                let file_type = entry.file_type()?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // `data/` and `uploads/` are keyed by directory; a counter is
+                // `usage/<tenant>.json`. A tenant whose only footprint is a
+                // counter is the residue of a crash between the reservation
+                // and the payload's directory creation, and must still be
+                // reconciled or its over-charge is permanent.
+                let tenant = if file_type.is_dir() {
+                    Uuid::parse_str(&name).ok()
+                } else if tree == "usage" && name.ends_with(".json") {
+                    Uuid::parse_str(name.trim_end_matches(".json")).ok()
+                } else {
+                    None
+                };
+                if let Some(tenant) = tenant {
                     tenants.insert(tenant);
                 }
             }

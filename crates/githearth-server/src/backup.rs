@@ -1383,11 +1383,14 @@ fn verify_objects(storage_root: &Path, expected: &[ObjectRecord]) -> Result<()> 
     }
     let store = FsObjectStore::open_existing(&root)?;
     let problems = store.verify_all()?;
-    // An orphan (a payload without a sidecar, or a sidecar without a payload)
-    // is crash residue, not damage to a committed object. It is carried inside
-    // the archive's tar so an operator can repair it, but it is not part of
-    // the manifest or of the exact inventory comparison (ADR 0014, "Crash
-    // consistency").
+    // An orphan is a payload without a sidecar: the unacknowledged residue of
+    // a crash between the payload write and the sidecar rename. It is carried
+    // inside the archive's tar so an operator can repair it, but it is not part
+    // of the manifest or of the exact inventory comparison (ADR 0014, "Crash
+    // consistency"). Every other problem, including a committed object whose
+    // payload is missing or whose sidecar is unreadable, is `Corrupt` and
+    // refuses the backup: publishing a short object set would lose data
+    // silently.
     if let Some(first) = problems
         .iter()
         .find(|problem| problem.kind == ObjectProblemKind::Corrupt)

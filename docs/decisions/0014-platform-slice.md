@@ -33,8 +33,10 @@ secrets and tokens, three incompatible limit schemes), or to defer them to M11
 - One trait with S3-shaped operations: put, ranged get, delete, checksum,
   prefix listing, multipart or resumable upload, and append for a stream that
   is still being written (CI logs). Reads are byte ranges, not whole objects.
-- Keys are prefixed by tenant (`org/<organization_id>/...`) and by purpose, so
-  a quota, a delete and a backup can act on a prefix without scanning.
+- Keys are relative to a tenant and written under `data/<organization uuid>/`, so
+  a quota, a delete and a backup can act on a tenant without scanning another
+  tenant's namespace. Every operation takes the tenant explicitly; the
+  authenticated organization is resolved to it by the caller (M6/M7).
 - The filesystem backend is the single-node implementation and is built in
   M4.2. Each object is a file written to a temporary name, fsynced, then
   renamed; a checksum is stored beside it and verified on read and on backup
@@ -186,11 +188,12 @@ Default values, recorded so the exit can be tested and later revised:
 
 M4.2 defines the export format the later milestones must round-trip: versioned
 JSON Lines for metadata, native Git for history, and an object manifest with
-checksums for large objects. It ships a harness that exports, imports into a
-fresh installation and compares counts, checksums and sampled content. M12
-builds the full product export, importers and the CLI; M7, M8 and M10 add a
-round-trip test for the data they introduce. The contract exists here because
-M4.2 already owns the objects and the metadata that an export must carry.
+checksums for large objects. The round-trip harness (export, import into a
+fresh installation, compare counts, checksums and sampled content) is not part
+of this increment; open item 7 records it as the remaining work. M12 builds the
+full product export, importers and the CLI; M7, M8 and M10 add a round-trip
+test for the data they introduce. The contract exists here because M4.2 already
+owns the objects and the metadata that an export must carry.
 
 ### 7. Outbound request client
 
@@ -375,9 +378,19 @@ write is in flight, scanning `data/` and `uploads/`, and rewriting the
 counter; `open_with` does the same at startup before any writer exists. A
 crash between the payload and the counter therefore cannot leave an
 under-count across a restart, and a stale counter can only over-charge in the
-window before the next pass. The cost is one scan per tenant per reconcile
-pass (default interval is the reconciler's) instead of one scan per write:
-writes are O(1) in the number of objects, while the sweep remains O(all
+window before the next pass. The reconciler enumerates tenants from `data/`,
+`uploads/` **and** `usage/*.json`. A counter with no data or upload directory
+is the state a crash between the reservation and the payload's directory
+creation leaves; including it means that tenant is repaired to zero on the
+next pass instead of being wedged at `QuotaExceeded` for the life of the
+installation. The cost is one extra `readdir` of `usage/` per pass; for a
+counter-only tenant the scan finds no objects and rewrites one small file, and
+in steady state every tenant in that loop already has a `data/` or `uploads/`
+directory. The alternative — creating the tenant's data directory before the
+reservation — would make the state impossible but adds a directory and an
+fsync to every first write, and still leaves counters for tenants whose
+directory was later removed, so reconciliation is the cheaper complete answer.
+Writes are O(1) in the number of objects, while the sweep remains O(all
 objects). `usage()` itself still scans, because it reports exact current
 figures; no write path calls it. A corrupt or missing counter is discarded and
 rebuilt rather than trusted. `append` is charged like a put with the existing
@@ -405,17 +418,19 @@ sequential read. Repositories keep the existing depth (journal position, then
 bounded by the same command that already verifies it today.
 
 Verification distinguishes **corruption** from **crash residue**. A payload
-that disagrees with its sidecar is `Corrupt` and fails backup and restore. A
-payload with no usable sidecar, or a sidecar with no payload, is an *orphan*:
-it is reported by `verify_all` for a future repair command, but backup
-tolerates it, because the tar carries the bytes and sidecars for repair and the
-manifest lists only objects that can be verified. Listing and inventory skip
-orphans instead of returning a fatal `NotFound` for the whole tenant. `usage`
-counts only a readable sidecar whose payload exists, so a phantom is not
-charged and a corrupt sidecar cannot refuse an entire tenant's writes. A torn
-tail on a live log is not a problem at all (see "Torn tails"): reads and
-verification stop at the committed length, and the next append truncates the
-tail.
+that disagrees with its sidecar, a committed object whose payload is missing,
+and a payload whose sidecar is present but unreadable are all `Corrupt` and
+fail backup and restore: no store write can produce those states, so accepting
+them would drop a committed object from the manifest silently. Only a payload
+with no sidecar at all is an *orphan*: it is reported by `verify_all` for a
+future repair command, but backup tolerates it, because the tar carries the
+bytes for repair and the manifest lists only objects that can be verified.
+Listing and inventory skip orphans instead of returning a fatal `NotFound` for
+the whole tenant. `usage` counts only a readable sidecar whose payload exists,
+so a phantom is not charged and a corrupt sidecar cannot refuse an entire
+tenant's writes. A torn tail on a live log is not a problem at all (see "Torn
+tails"): reads and verification stop at the committed length, and the next
+append truncates the tail.
 
 ### Crash consistency between the payload and the sidecar
 
@@ -431,9 +446,12 @@ made survivable rather than eliminated:
   leaves an orphan payload, not a phantom object that `stat` reports and `get`
   refuses. `usage` counts only a sidecar whose payload exists, so a phantom is
   not charged.
-- A sidecar that exists with no payload is reported as an orphan too. It is
-  left for the repair path rather than silently deleted, but it does not fail
-  a backup.
+- A sidecar that exists with no payload is **not** an orphan: `put`, `complete`
+  and `append` write the payload first, and `delete` removes the sidecar first,
+  so no crash produces it. It is damage to a committed object, reported as
+  `Corrupt`, and it fails a backup or a restore rather than being dropped from
+  the manifest. The same applies to a payload whose sidecar is present but
+  unreadable.
 - **Append** writes the payload, fsyncs, then rewrites the sidecar. A crash
   in between leaves more bytes than the sidecar commits; that is a torn tail,
   below.
