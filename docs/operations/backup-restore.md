@@ -211,21 +211,32 @@ old audit keys still exist inside older encrypted archives — see
 - **Rotated/archived journals** (`journal.<first>`): the storage check reads the
   live `journal` file. Search indexes are rebuilt after restore.
 - **The advisory PostgreSQL LSN.** It is recorded, not compared.
-- **The drill harnesses on this machine.** On 2026-11-15, with Docker
-  Desktop 4.97.0 (Engine 29.9.2) on macOS arm64, `scripts/verify-m4.py` ran
-  to 11/13 scenarios. Its `s4_backup_restore` failed on two defects in the
-  harness, not the product: it pushed a fresh history onto the `main` that
-  earlier scenarios had already created, and it demanded the word
-  "maintenance" from a fenced push that git reports as `HTTP 503`. Both are
-  fixed on this branch; the real s1–s6 scenario methods then passed against a
-  local PostgreSQL 17. That is not a full run: s7–s13 need Docker, and the
-  engine was corrupted when the host disk filled. `scripts/verify-offhost-backup.py`
-  passed `fresh_install` and `push_and_issue` and then stopped at `backup host
-  sshd not reachable within 30 s`: its backup host runs with `--network host`,
-  which under Docker Desktop joins the Linux VM's network namespace, not the
-  macOS host's loopback. It has **not** executed its `backup`/`restore`,
-  fence, manifest or refusal assertions. A Linux Docker host is still required
-  for that harness, and U20 stays open.
+- **The drill harnesses — demonstrated on macOS.** On 2026-11-16, with Docker
+  Desktop 4.97.0 (Engine 29.9.2) on macOS 26.6 arm64, both harnesses ran to
+  completion against the release builds:
+  - `scripts/verify-offhost-backup.py` — **5/5 scenarios**. It exercised the
+    `maintenance` and `not-running` fences (printed and recorded in the
+    manifest), the encrypted archive and its manifest (key id, AES-256-GCM,
+    Argon2id with 64 MiB / 3 iterations, and no key), the four distinct restore
+    refusals, the off-host copy (one file, SHA-256 equal on both ends) and the
+    disaster restore. The 2026-11-15 attempt stopped at `backup host sshd not
+    reachable within 30 s`; the harness now publishes the backup host's sshd
+    port on the host loopback when the platform is Darwin and keeps
+    `--network host` on Linux. That is harness plumbing only — no assertion
+    changed. See [offhost-backup.md](../verification/offhost-backup.md).
+  - `scripts/verify-m4.py` — **13/13 scenarios**, including
+    `s4_backup_restore` and `s5_upgrade_drill`.
+  - A very long `$TMPDIR` breaks a legitimate step: the restored storage root
+    would put the hook socket over the product's 107-byte Unix limit, and
+    `restore` refuses it correctly. Use a short temp root (`/tmp` on Linux, and
+    the harness moves itself under `/tmp` on Darwin).
+  - Both harnesses work in a temporary directory. On this machine a shared
+    `/tmp` was being pruned by another session mid-run, which produced spurious
+    failures (a `cargo` build losing its object files, then `SSH listening log
+    line not seen within 30s`); the passing runs used a private temp root. This
+    is an environment hazard, not a product defect.
+
+  U20's clause — both harnesses use `backup`/`restore` and pass — is met.
 
 The manual `pg_dump` / `tar` / `SHA256SUMS` / `rsync` procedure in older
 releases did not fence writers. Do not combine it with these commands; use
