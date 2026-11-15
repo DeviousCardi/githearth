@@ -1900,6 +1900,14 @@ async fn a_request_whose_target_branch_is_gone_is_reported_by_the_base_backfill(
         backfill.status,
         githearth_server::doctor::Status::Warn
     ));
+    // Only reported when it has something to report: nine checks on a clean
+    // install, ten here (docs/operations/install.md).
+    assert_eq!(
+        checks.len(),
+        10,
+        "the base-backfill warning is the tenth check: {:?}",
+        checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+    );
     assert!(
         backfill.detail.contains(&fx.repo_id.to_string())
             && backfill.detail.contains(&format!("#PR-{number}"))

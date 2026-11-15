@@ -313,6 +313,16 @@ async fn fixture() -> Fixture {
     ]))
     .await;
 
+    // The built-in consumer's first registration. On this fixture's
+    // fresh database it draws nothing: there are no position rows, and the
+    // fan-out reads a missing position as zero, so every event the test writes
+    // is delivered anyway. `0050` already wrote the same row on an upgraded
+    // database. Kept because a test is the only caller that registers a
+    // consumer before its handler exists (ADR 0006, revised for M4.1).
+    githearth_server::outbox::register_builtin(&app_state)
+        .await
+        .unwrap();
+
     Fixture {
         app,
         state: app_state,
@@ -403,17 +413,78 @@ async fn main_tip(f: &Fixture) -> String {
     .await
 }
 
-/// Runs the shared job queue long enough to drain the fixture's jobs, then stops
-/// it. Registers the same handlers the server does for the paths under test.
+/// Runs the relay and the runner as `serve` runs them: the relay fans the
+/// event out to the consumer, the runner drains the delivery jobs. A drain that
+/// expires, or a consumed event that never reached a `delivered` delivery row,
+/// fails the test: the suite could not otherwise see a relay that loses an
+/// event (review F4).
 async fn run_jobs(state: &AppState) {
+    // As `serve` runs them: the relay hands each event to the consumer and the
+    // runner executes the delivery. Driven here, step by step, so the fan-out
+    // has happened before the runner is asked to drain (ADR 0006, revised for
+    // M4.1).
+    githearth_server::outbox::fan_out_batch(state, 10_000)
+        .await
+        .expect("outbox fan-out");
     let mut registry = githearth_server::jobs::Registry::new();
     githearth_server::notifications::register(&mut registry);
     githearth_server::codeowners::register(&mut registry);
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let handle = githearth_server::jobs::spawn(state.clone(), registry, shutdown.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    let runner = githearth_server::jobs::spawn(state.clone(), registry, shutdown.clone());
+    // Drain every notification job. The runner has to be started before the
+    // first look, or it waits a full poll interval with nothing pending.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE state IN ('pending','running') \
+             AND kind = 'notification.outbox'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        if pending == 0 {
+            // One more fan-out pass: an event nobody had fanned out when the
+            // first look ran is enqueued between two looks, and a quiet first
+            // look must not end the drain before its job exists.
+            githearth_server::outbox::fan_out_batch(state, 10_000)
+                .await
+                .expect("outbox fan-out");
+            let again: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM jobs WHERE state IN ('pending','running') \
+                 AND kind = 'notification.outbox'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            if again == 0 {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // A quiet `break` here hides a relay that never enqueued the job.
+            panic!("the notification jobs did not drain within 60 s ({pending} left)");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     shutdown.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner).await;
+    // No handler of this suite writes its own event, so after the drain every
+    // delivery of a consumed kind is `delivered`. A relay that never enqueued a
+    // pair leaves its delivery `pending`, and this fails (review F4).
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_deliveries d \
+         JOIN outbox_events e ON e.id = d.event_id \
+         WHERE e.kind = ANY($1) AND d.state <> 'delivered'",
+    )
+    .bind(githearth_server::notifications::OUTBOX_EVENT_KINDS)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        open, 0,
+        "a consumed event never reached `delivered` (review F4)"
+    );
 }
 
 #[tokio::test]
