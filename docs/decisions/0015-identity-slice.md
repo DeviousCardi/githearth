@@ -74,7 +74,9 @@ verification token and the reset token remain M4.1's.
 ### Sign-in and linking
 
 - OIDC is configured per installation: one issuer set, one client, one
-  callback. Each organization has a policy for whether federation is offered,
+  callback. An organization's own identity provider on a shared installation
+  is not in this slice; it arrives with SAML and SCIM in the later part of
+  M11. Discovery and token requests go through the M4.2 outbound client. Each organization has a policy for whether federation is offered,
   required for its members, or restricted to an email domain.
 - Linking an external identity to an existing account requires a **verified**
   email that equals the provider's verified email. An unverified or absent
@@ -108,7 +110,10 @@ Off by default, in configuration and in the UI. When enabled:
   pseudonymous ID. Clear or destroy username, email, display name, password
   hash, second factors, sessions, access tokens, SSH keys and stored
   credentials. The append-only trigger gains no update or delete path, and no
-  synthetic actor replaces the account. The tombstone is audited.
+  synthetic actor replaces the account. The tombstone is audited. An account
+  that is the last owner of an organization, or the last site administrator,
+  cannot be deleted: the request is refused with the list of organizations
+  until ownership is transferred or the organization is deleted.
 - **Organization:** tombstone the organization and remove its repositories,
   forks, trash, stored objects and quota. Audit rows keep their actor.
 - **Backups:** every account and every organization has a data key under the

@@ -168,6 +168,14 @@ afterwards requires the property to be visible to Raft:
   set that holds the objects, so any majority that commits an entry also holds
   it. Without this rule the two majorities can differ, and a leader election
   can hand the repository to a member that never received the pack.
+- The rule has a cost that is stated, not hidden. A Raft log is contiguous, so
+  a member that cannot append one entry cannot append any later entry of the
+  group: while it waits for one repository's pack it falls behind on every
+  repository in the group. The leader proposes only after a majority holds the
+  pack, so the group keeps committing; the third member lags and catches up.
+  With one member already down, a slow transfer to the remaining follower
+  stalls the whole group's writes. Whether the chosen library lets a follower
+  defer an append this way is part of the library spike (open item 1).
 - A member may serve as leader for writes, or serve reads, only if it holds
   every manifest up to the commit index for the repositories it serves. A
   member that does not steps down from write service and requests catch-up;
@@ -185,8 +193,9 @@ repository:
 
 - Entries carry `repo_id`; apply runs concurrently per repository, and a
   per-repository barrier stops a read from overtaking its own repository's
-  apply. A slow pack on one repository does not stall another repository's
-  apply or reads.
+  apply. On a member that has appended the entries, a slow apply on one
+  repository does not stall another repository's apply or reads. Append is
+  different: see the cost stated under object completeness.
 - A read serves only a member that has both applied the required position and
   holds the objects. Those are separate conditions (ADR 0012).
 - The read-index default is defined per endpoint in ADR 0012; an anonymous
@@ -232,8 +241,14 @@ repository:
   up from the log.
 - Compaction may discard entries below the minimum of the applied position and
   the oldest retained backup's position, **and** is bounded by a retention size
-  with an alert. A stalled backup or a PostgreSQL outage must not fill the
-  disk; the log is trimmed by size before it is trimmed by position.
+  with an alert. A stalled backup must not fill the disk; the log is trimmed by
+  size before it is trimmed by the backup's position.
+- **An entry whose metadata commit has not been confirmed in PostgreSQL is
+  never trimmed.** The reconciler's only source for that commit is the entry.
+  When unreconciled entries reach the retention size during a PostgreSQL
+  outage, the group stops accepting ref writes with a stated error instead of
+  discarding them; reads continue. The size bound therefore limits how long Git
+  writes outlive a metadata outage, and that limit is published.
 - A backup carries the entries it needs to bring a restored snapshot forward,
   so restore does not depend on a log that has already been compacted.
 
@@ -294,8 +309,10 @@ repository:
 2. Object transfer: pack shipping format, resumption, verification depth, and
    what a lagging member fetches during catch-up.
 3. Snapshot format and the seeding procedure for a rebuilt member.
-4. Membership change protocol (single-step or joint consensus) and the
-   proof sketch that a removed or partitioned member cannot publish.
+4. Membership change protocol and the proof sketch that a removed or
+   partitioned member cannot publish. Expansion from one voter to three in one
+   change (ADR 0012) requires joint consensus; whether replacing one member
+   uses single-step changes is the remaining choice.
 5. Group sizing and split policy.
 6. The exact hook abort mechanism (signal, socket close, process kill) and how
    the client's retry carries the operation ID.

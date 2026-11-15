@@ -22,7 +22,7 @@ sentence rather than a per-endpoint contract. This ADR replaces both.
 
 ### Placement table
 
-PostgreSQL records the mapping, and nothing else, is authoritative for it:
+PostgreSQL records the mapping, and nothing else is authoritative for it:
 
 - `repository_groups(id, generation)` — one row per group.
 - `group_members(group_id, node_id, state)` — a cache of Raft membership, never
@@ -122,9 +122,13 @@ A single-node installation is a one-member group.
    losing either node stops writes, and the original node is then the only
    remaining member.
 4. PostgreSQL is expanded by its own procedure: add two nodes, let them catch
-   up, raise `synchronous_node_count` to 2 and set strict mode only when both
-   are in sync. Introducing strict mode earlier would stop writes; later would
-   keep the weaker guarantee.
+   up, and set `synchronous_mode_strict` with `synchronous_node_count: 1`
+   (ADR 0011) only when one of them is in sync. Introducing strict mode
+   earlier would stop writes; later would keep the weaker guarantee.
+
+Promoting both learners at once takes the group from one voter to three in one
+change, which requires joint consensus. That closes the single-step-or-joint
+question in ADR 0010 for this case.
 
 Restoring a backup into a new cluster remains available as the fallback.
 
@@ -136,8 +140,8 @@ Conversion is a maintenance-window procedure, not an online migration:
 2. Take a verified backup (M4.2 online path or the maintenance-window path).
 3. Migrate each repository's journal into the replicated log, one repository
    at a time, with a checkpoint; a failure returns to the backup.
-4. Add the two PostgreSQL nodes, catch up, then enable strict two-standby
-   commit.
+4. Add the two PostgreSQL nodes, catch up, then enable strict synchronous
+   commit with one synchronous standby (ADR 0011).
 5. Add the two Git learners, catch up, promote both.
 6. Run the re-qualification drills, then leave maintenance mode.
 7. **Rollback** is a restore of the taken backup plus journal replay; the loss
@@ -151,10 +155,12 @@ Conversion is a maintenance-window procedure, not an online migration:
   apply it; an older voter **applies and ignores** an unknown entry kind and
   still advances its apply index. Ignoring is not the same as refusing: a
   follower that refuses to apply stalls replication and can cost quorum.
-- GitHearth refuses to start on a schema newer than the binary, so a rolling
-  upgrade requires N/N+1 schema compatibility for the metadata database too.
-  That schema work is M11's; M5 owns the Git log format and the mixed-version
-  test for it.
+- GitHearth refuses to start on a schema that does not match the binary, so a
+  rolling upgrade requires N/N+1 schema compatibility for the metadata
+  database too. M5 owns that window as well as the Git log format and the
+  mixed-version test: migrations for the releases M5 supports are expand-only
+  and the start-up check accepts the N and N+1 schema (ADR 0011). The general
+  expand/contract discipline for later releases is M11's.
 
 ### Backup interaction
 
@@ -179,6 +185,19 @@ Conversion is a maintenance-window procedure, not an online migration:
   etcd) and three storage nodes holding one group. Co-locating a metadata node
   and a storage member on one machine is unsupported, because one machine loss
   would then remove both a database node and a group member.
+- The other roles are placed, not left implied. A gateway and worker run on
+  each of the three storage machines in the minimum topology, or on separate
+  machines; at least two gateways are always reachable behind the operator's
+  load balancer or DNS. Each gateway runs its own local primary-discovery proxy
+  for PostgreSQL (ADR 0011), so no single proxy is a point of failure. The
+  shared object store is operator-provided on its own failure domains and is
+  not counted in the six. CI runners are never on a metadata or storage
+  machine.
+- The initial numbers are deliberately conservative and they have a cost: at
+  1,000 repositories per group and three group members per node, the Hosting
+  profile's 100,000 repositories would need about 100 groups and 100 storage
+  machines. The capacity item exists to replace these numbers with measured
+  ones before any hosting claim.
 - Groups per node, repositories per group and the many-organization profile are
   measured in M5's capacity item and published with the numbers above revised
   from measurement, not asserted here.

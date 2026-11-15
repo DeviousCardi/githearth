@@ -71,7 +71,8 @@ secrets and tokens, three incompatible limit schemes), or to defer them to M11
   server stores only a hash. Delivery to a job is a file whose path is in an
   environment variable, plus a masked variable for tools that need it inline.
 - Revocation is a row state checked on every admission. A run token is
-  invalid the moment the run ends, including on cancellation.
+  invalid the moment the run ends, including on cancellation. Runs arrive in
+  M6, so M4.2 tests this subject against a stub run record.
 - The existing two-scope `repo:read`/`repo:write` tokens keep working under a
   deprecation window; the end date is a configuration value and the `doctor`
   command reports how many remain.
@@ -187,6 +188,17 @@ fresh installation and compares counts, checksums and sampled content. M12
 builds the full product export, importers and the CLI; M7, M8 and M10 add a
 round-trip test for the data they introduce. The contract exists here because
 M4.2 already owns the objects and the metadata that an export must carry.
+
+### 7. Outbound request client
+
+Every request the server itself makes goes through one client: an egress
+allowlist, no redirect to a different host, no link-local, loopback,
+private-range or cloud-metadata address unless the operator allows it, the
+resolved address pinned for the connection, bounded size and time, and a
+recorded reason. It is built here because the abuse baseline needs it and its
+first users follow immediately — OIDC discovery (M11a), external action
+sources (M6), webhooks, mirrors and importers (M12). No later feature opens
+its own outbound connection.
 
 ## Alternatives considered
 
