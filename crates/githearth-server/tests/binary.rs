@@ -480,6 +480,79 @@ fn bootstrap_admin_validates_and_refuses_duplicates() {
 
 #[test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn reset_admin_prints_a_single_use_credential_and_takes_no_password() {
+    let schema = Schema::new();
+    let migrated = migrate(&schema);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+    let boot = bootstrap(&schema, "breakglass", b"correct horse battery staple");
+    assert!(boot.status.success(), "{}", stderr(&boot));
+
+    let run_reset = || {
+        let mut command = server();
+        command.env("GITHEARTH_DATABASE_URL", schema.url());
+        command.args(["reset-admin", "--username", "breakglass"]);
+        // stdin is /dev/null: the command must not wait for or accept a password.
+        run(command)
+    };
+    let output = run_reset();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let code = text
+        .lines()
+        .find_map(|line| line.strip_prefix("single-use credential (shown once): "))
+        .unwrap_or_else(|| panic!("no credential on stdout: {text}"))
+        .trim()
+        .to_owned();
+    assert_eq!(code.len(), 64);
+    assert!(code.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(text.contains("redeem before:"), "{text}");
+
+    let (live, must_change, hash_len, stored): (i64, bool, i32, String) =
+        runtime().block_on(async {
+            let pool = sqlx::PgPool::connect(&schema.url).await.unwrap();
+            let row = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM password_reset_tokens WHERE used_at IS NULL), \
+             (SELECT must_change_password FROM accounts WHERE username = 'breakglass'), \
+             (SELECT length(password_hash) FROM accounts WHERE username = 'breakglass'), \
+             (SELECT encode(token_hash, 'hex') FROM password_reset_tokens \
+                WHERE used_at IS NULL LIMIT 1)",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+            row
+        });
+    assert_eq!(live, 1, "exactly one live credential");
+    assert!(must_change, "the account must set a new password");
+    assert!(hash_len > 20, "the stored value is a hash, not the code");
+    assert_ne!(stored, code, "the plaintext code is never stored");
+
+    // A second run retires the first, so an old printout stops working.
+    let second = run_reset();
+    assert!(second.status.success(), "{}", stderr(&second));
+    let second_text = stdout(&second);
+    assert!(
+        !second_text.contains(&code),
+        "the old code is not printed again"
+    );
+    let (live, used): (i64, i64) = runtime().block_on(async {
+        let pool = sqlx::PgPool::connect(&schema.url).await.unwrap();
+        let row = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM password_reset_tokens WHERE used_at IS NULL), \
+             (SELECT count(*) FROM password_reset_tokens WHERE used_at IS NOT NULL)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        row
+    });
+    assert_eq!((live, used), (1, 1), "the first credential is retired");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 fn bootstrap_admin_reports_missing_schema() {
     let schema = Schema::new();
     let output = bootstrap(&schema, "operator", b"correct horse battery staple");

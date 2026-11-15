@@ -45,9 +45,13 @@ auth_concurrency = 2
 # trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
 # Failed sign-ins allowed per username and per client address inside the window.
 # See docs/operations/accounts.md; no account is ever locked permanently.
-# login_throttle_max_per_username = 10
-# login_throttle_max_per_client = 50
+# After the fifth recorded failure every password attempt also waits
+# base*2^(failures-5) ms, capped at the delay maximum (both are adjustable).
+# login_throttle_max_per_username = 5
+# login_throttle_max_per_client = 20
 # login_throttle_window_seconds = 900
+# login_throttle_delay_base_ms = 200
+# login_throttle_delay_max_ms = 2000
 # Metrics endpoint (docs/operations/metrics.md). Off by default; when on it
 # answers only a loopback client and publishes the documented metric and label
 # list, which carries no organization, repository or account identifier.

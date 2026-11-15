@@ -833,21 +833,29 @@ pub async fn bootstrap_admin(
     Ok(id)
 }
 
+/// The single-use credential the host `reset-admin` command prints once.
+/// The plaintext code is never stored, and redemption uses the same table and
+/// endpoint as the administrator-reset API.
+pub struct ResetCredential {
+    pub id: Uuid,
+    pub code: String,
+    pub expires_at: String,
+}
+
 /// Break-glass recovery from the host: restores an existing account as an
-/// enabled site administrator with a password read from stdin. Every existing
-/// credential (sessions, access tokens, SSH keys, reset codes) is revoked in
-/// the same transaction, and the action is audited without the password.
-/// It never creates an account: the operator bootstrap does that.
-pub async fn reset_admin(pool: &PgPool, username: &str, password: String) -> anyhow::Result<Uuid> {
+/// enabled site administrator by issuing the same single-use, expiring reset
+/// code the administrator-reset API issues. No password is read, chosen or
+/// stored: the account is in `must_change_password` until it redeems the code
+/// and sets its own password, so nothing (API, browser, Git HTTP, Git SSH)
+/// works before that. Every existing credential (sessions, access tokens, SSH
+/// keys, reset codes) is revoked in the same transaction, and the action is
+/// audited without the code. It never creates an account: the operator
+/// bootstrap does that.
+pub async fn reset_admin(pool: &PgPool, username: &str) -> anyhow::Result<ResetCredential> {
     anyhow::ensure!(
         valid_username(username),
         "username must contain 3..64 lowercase ASCII letters, digits, underscores or hyphens"
     );
-    anyhow::ensure!(
-        (12..=1024).contains(&password.len()) && !has_nul(&password),
-        "password must contain 12..1024 bytes without NUL"
-    );
-    let hash = tokio::task::spawn_blocking(move || hash_password(&password)).await??;
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(706918231)")
         .execute(&mut *tx)
@@ -860,12 +868,13 @@ pub async fn reset_admin(pool: &PgPool, username: &str, password: String) -> any
     let Some(id) = id else {
         anyhow::bail!("no account named `{username}`; create one with bootstrap-admin first");
     };
+    // No password hash is written: the account cannot sign in with any
+    // password until it redeems the code below and stores its own.
     sqlx::query(
-        "UPDATE accounts SET password_hash = $2, is_admin = true, suspended = false, \
-         must_change_password = false WHERE id = $1",
+        "UPDATE accounts SET is_admin = true, suspended = false, \
+         must_change_password = true WHERE id = $1",
     )
     .bind(id)
-    .bind(&hash)
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM sessions WHERE account_id = $1")
@@ -886,23 +895,30 @@ pub async fn reset_admin(pool: &PgPool, username: &str, password: String) -> any
     .bind(id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE password_reset_tokens SET used_at = clock_timestamp() \
-         WHERE account_id = $1 AND used_at IS NULL",
-    )
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
     // A forgotten password is often accompanied by failed guesses; clear the
-    // counter so the restored password is usable without waiting out the
+    // counter so the account can redeem its credential without waiting out the
     // window.
     sqlx::query("DELETE FROM login_attempts WHERE scope = 'username' AND subject = $1")
         .bind(login_throttle::subject_username(username))
         .execute(&mut *tx)
         .await?;
-    event(&mut tx, None, id, "administrator.reset").await?;
+    // The same issuance the administrator-reset API uses; it also retires any
+    // earlier unredeemed code, so a previously printed credential is dead.
+    let (code, expires_at) = account_admin::issue_password_reset_code(&mut tx, id).await?;
+    event_with(
+        &mut tx,
+        None,
+        id,
+        "administrator.reset",
+        serde_json::json!({"account_id": id, "reset_expires_at": expires_at}),
+    )
+    .await?;
     tx.commit().await?;
-    Ok(id)
+    Ok(ResetCredential {
+        id,
+        code,
+        expires_at,
+    })
 }
 
 #[derive(Deserialize)]
@@ -995,15 +1011,24 @@ pub(crate) async fn sign_in(
     password: &str,
     request: login_throttle::Request,
 ) -> ApiResult<Option<Uuid>> {
-    // Take an authentication slot before the throttle query: a saturated queue
-    // refuses the request with 429 without reading PostgreSQL, and a throttled
-    // guess is then refused before any Argon2 work.
-    let permit = acquire_auth_slot(state).await?;
-    // Refused before the hash so a throttled guess costs nothing; a missing or
-    // disabled account is still charged like a failed password.
-    if login_throttle::throttled(&state.pool, &state.config, request, username).await? {
+    // A saturated authentication queue is refused without reading PostgreSQL.
+    let mut permit = Some(acquire_auth_slot(state).await?);
+    // The same throttle decision as the browser form and Git HTTP basic. The
+    // exponential delay (U18) is charged before any Argon2 work, but not while
+    // holding a hashing slot: a client that keeps knocking must not make the
+    // authentication queue unavailable to everyone else.
+    let attempt = login_throttle::examine(&state.pool, &state.config, request, username).await?;
+    if !attempt.delay.is_zero() {
+        permit = None;
+        tokio::time::sleep(attempt.delay).await;
+    }
+    if attempt.blocked {
         return Err(too_many_attempts());
     }
+    let permit = match permit {
+        Some(permit) => permit,
+        None => acquire_auth_slot(state).await?,
+    };
     match verify_password_with(state, username, password, permit).await {
         Ok(Some(id)) => {
             login_throttle::succeeded(&state.pool, username).await?;

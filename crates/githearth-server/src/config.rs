@@ -89,7 +89,7 @@ pub struct Config {
     /// Empty by default; every entry is validated at load.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
-    /// Failed sign-ins allowed per username inside the window (M4.1 U03).
+    /// Failed sign-ins allowed per username inside the window (M4.1 U03/U18).
     #[serde(default = "default_login_throttle_max_per_username")]
     pub login_throttle_max_per_username: u64,
     /// Failed sign-ins allowed per client address inside the window.
@@ -98,6 +98,15 @@ pub struct Config {
     /// Length of the sliding sign-in window in seconds.
     #[serde(default = "default_login_throttle_window_seconds")]
     pub login_throttle_window_seconds: u64,
+    /// The first step of the exponential delay imposed after the fifth
+    /// recorded failure inside the window, in milliseconds. Each further
+    /// failure doubles it up to `login_throttle_delay_max_ms`.
+    #[serde(default = "default_login_throttle_delay_base_ms")]
+    pub login_throttle_delay_base_ms: u64,
+    /// The longest delay one password attempt can wait, in milliseconds.
+    /// Bounded so a refusal never holds a connection indefinitely.
+    #[serde(default = "default_login_throttle_delay_max_ms")]
+    pub login_throttle_delay_max_ms: u64,
     /// Answer `GET /metrics` (M4.1 U14). Off by default: until an operator asks
     /// for it the handler refuses every scrape, loopback or not.
     #[serde(default)]
@@ -214,6 +223,8 @@ impl Default for Config {
             login_throttle_max_per_username: default_login_throttle_max_per_username(),
             login_throttle_max_per_client: default_login_throttle_max_per_client(),
             login_throttle_window_seconds: default_login_throttle_window_seconds(),
+            login_throttle_delay_base_ms: default_login_throttle_delay_base_ms(),
+            login_throttle_delay_max_ms: default_login_throttle_delay_max_ms(),
             metrics_enabled: false,
             metrics_allow_non_loopback: false,
             smtp_host: String::new(),
@@ -242,13 +253,19 @@ fn default_maintenance_drain_timeout_seconds() -> u64 {
     300
 }
 fn default_login_throttle_max_per_username() -> u64 {
-    10
+    5
 }
 fn default_login_throttle_max_per_client() -> u64 {
-    50
+    20
 }
 fn default_login_throttle_window_seconds() -> u64 {
     900
+}
+fn default_login_throttle_delay_base_ms() -> u64 {
+    200
+}
+fn default_login_throttle_delay_max_ms() -> u64 {
+    2_000
 }
 fn default_secure_cookies() -> bool {
     true
@@ -423,6 +440,14 @@ impl Config {
             login_throttle_window_seconds,
             "GITHEARTH_LOGIN_THROTTLE_WINDOW_SECONDS"
         );
+        env!(
+            login_throttle_delay_base_ms,
+            "GITHEARTH_LOGIN_THROTTLE_DELAY_BASE_MS"
+        );
+        env!(
+            login_throttle_delay_max_ms,
+            "GITHEARTH_LOGIN_THROTTLE_DELAY_MAX_MS"
+        );
         env!(metrics_enabled, "GITHEARTH_METRICS_ENABLED");
         env!(
             metrics_allow_non_loopback,
@@ -548,6 +573,9 @@ impl Config {
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_username)
             || !(1..=1_000_000).contains(&self.login_throttle_max_per_client)
             || !(1..=86_400).contains(&self.login_throttle_window_seconds)
+            || !(1..=60_000).contains(&self.login_throttle_delay_base_ms)
+            || !(1..=600_000).contains(&self.login_throttle_delay_max_ms)
+            || self.login_throttle_delay_max_ms < self.login_throttle_delay_base_ms
             || self.backup_directory.as_os_str().is_empty()
             || !(1..=86_400).contains(&self.maintenance_drain_timeout_seconds)
             || !(60..=2_592_000).contains(&self.housekeeping_interval_seconds)
@@ -564,7 +592,7 @@ impl Config {
             || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, login throttle delay base 1..60000ms and max 1..600000ms (max >= base), backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -766,9 +794,12 @@ mod tests {
             database_url: "postgres://localhost/test".into(),
             ..Config::default()
         };
-        assert_eq!(c.login_throttle_max_per_username, 10);
-        assert_eq!(c.login_throttle_max_per_client, 50);
+        // The plan's published defaults (04-forge-roadmap "Accounts", U18).
+        assert_eq!(c.login_throttle_max_per_username, 5);
+        assert_eq!(c.login_throttle_max_per_client, 20);
         assert_eq!(c.login_throttle_window_seconds, 900);
+        assert_eq!(c.login_throttle_delay_base_ms, 200);
+        assert_eq!(c.login_throttle_delay_max_ms, 2_000);
         assert!(c.validate().is_ok());
         for (limit, window) in [(0, 900), (10, 0), (10, 86_401), (1_000_001, 900)] {
             c.login_throttle_max_per_username = limit;
@@ -779,6 +810,17 @@ mod tests {
         c.login_throttle_window_seconds = 1;
         c.login_throttle_max_per_client = 1;
         assert!(c.validate().is_ok(), "the smallest bounds are accepted");
+        // The delay's cap must not be below its first step, or the setting
+        // would silently do nothing but the cap.
+        c.login_throttle_delay_base_ms = 500;
+        c.login_throttle_delay_max_ms = 100;
+        assert!(c.validate().is_err());
+        c.login_throttle_delay_base_ms = 0;
+        c.login_throttle_delay_max_ms = 100;
+        assert!(c.validate().is_err());
+        c.login_throttle_delay_base_ms = 100;
+        c.login_throttle_delay_max_ms = 100;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

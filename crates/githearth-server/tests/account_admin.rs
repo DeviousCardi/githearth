@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::ServiceExt;
@@ -1867,10 +1867,10 @@ async fn administrators_can_be_promoted_and_demoted_but_not_the_last_one() {
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
-async fn reset_admin_restores_an_account_and_revokes_its_credentials() {
+async fn reset_admin_issues_a_single_use_credential_and_revokes_every_credential() {
     let f = Fixture::new().await;
     let username = tag("forgotten");
-    insert_account(&f.pool, &username, MEMBER_PASSWORD, false).await;
+    let id = insert_account(&f.pool, &username, MEMBER_PASSWORD, false).await;
     let old_session = login_ok(&f.app, &username, MEMBER_PASSWORD).await;
     let (status, _, body) = send(
         &f.app,
@@ -1888,7 +1888,44 @@ async fn reset_admin_restores_an_account_and_revokes_its_credentials() {
         .unwrap()
         .to_owned();
 
-    // The forgotten account may already be throttled; break-glass clears the
+    // A registered SSH key, so "revokes the old administrator sessions" also
+    // covers the key class on the path the SSH server itself calls.
+    let key_dir = std::env::temp_dir().join(format!("githearth-reset-key-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let client_key = key_dir.join("id_ed25519");
+    let output = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-f",
+            &client_key.to_string_lossy(),
+            "-N",
+            "",
+            "-q",
+        ])
+        .output()
+        .expect("ssh-keygen");
+    assert!(output.status.success());
+    let public_key = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+    let (status, _, body) = send(
+        &f.app,
+        json_request(
+            "POST",
+            "/api/v1/user/ssh-keys",
+            Some(&old_session),
+            Some(serde_json::json!({"name": "before reset", "public_key": public_key})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let fingerprint: String =
+        sqlx::query_scalar("SELECT fingerprint FROM ssh_keys WHERE account_id = $1")
+            .bind(id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+
+    // The forgotten account is already throttled; break-glass clears the
     // failed-sign-in counter along with the other credentials.
     for _ in 0..2 {
         assert_eq!(
@@ -1901,10 +1938,15 @@ async fn reset_admin_restores_an_account_and_revokes_its_credentials() {
         StatusCode::TOO_MANY_REQUESTS
     );
 
-    githearth_server::reset_admin(&f.pool, &username, NEW_PASSWORD.to_owned())
+    let credential = githearth_server::reset_admin(&f.pool, &username)
         .await
         .unwrap();
+    assert_eq!(credential.id, id);
+    assert_eq!(credential.code.len(), 64, "a 256-bit code, like the API's");
+    assert!(credential.code.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!credential.expires_at.is_empty());
 
+    // No credential survives: old session, token and SSH key.
     assert_eq!(
         get_json(&f.app, "/api/v1/me", &old_session).await.0,
         StatusCode::UNAUTHORIZED,
@@ -1915,11 +1957,18 @@ async fn reset_admin_restores_an_account_and_revokes_its_credentials() {
         StatusCode::UNAUTHORIZED,
         "break-glass revokes access tokens"
     );
-    let token = login_ok(&f.app, &username, NEW_PASSWORD).await;
-    assert_eq!(
-        get_json(&f.app, "/api/v1/me", &token).await.0,
-        StatusCode::OK
+    let mut conn = f.pool.acquire().await.unwrap();
+    assert!(
+        githearth_server::ssh_keys::authenticate(&mut conn, &fingerprint)
+            .await
+            .unwrap()
+            .is_none(),
+        "break-glass revokes SSH keys"
     );
+    drop(conn);
+
+    // Administration is restored, and the account must set its own password
+    // before anything works.
     let (is_admin, suspended, must_change): (bool, bool, bool) = sqlx::query_as(
         "SELECT is_admin, suspended, must_change_password FROM accounts WHERE username = $1",
     )
@@ -1929,7 +1978,31 @@ async fn reset_admin_restores_an_account_and_revokes_its_credentials() {
     .unwrap();
     assert!(is_admin, "reset-admin restores administration");
     assert!(!suspended);
-    assert!(!must_change);
+    assert!(must_change, "the old password cannot be used at all");
+    assert_eq!(
+        login(&f.app, &username, MEMBER_PASSWORD).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The credential works exactly once and stores the account's own password.
+    assert_eq!(
+        redeem(&f, &username, &credential.code, NEW_PASSWORD)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        redeem(&f, &username, &credential.code, NEW_PASSWORD)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "a used credential is refused"
+    );
+    let token = login_ok(&f.app, &username, NEW_PASSWORD).await;
+    assert_eq!(
+        get_json(&f.app, "/api/v1/me", &token).await.0,
+        StatusCode::OK
+    );
     assert_eq!(
         send(
             &f.app,
@@ -1940,18 +2013,61 @@ async fn reset_admin_restores_an_account_and_revokes_its_credentials() {
         StatusCode::CREATED,
         "the restored administrator can administer"
     );
-    assert!(
-        audit_kinds(&f.pool)
-            .await
-            .iter()
-            .any(|kind| kind == "administrator.reset")
+
+    // An expired credential is refused and leaves the account locked until a
+    // fresh one is issued, which is the same rule the API's codes follow.
+    let expired = githearth_server::reset_admin(&f.pool, &username)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE password_reset_tokens SET expires_at = clock_timestamp() - interval '1 minute' \
+         WHERE account_id = $1 AND used_at IS NULL",
+    )
+    .bind(id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        redeem(&f, &username, &expired.code, NEW_PASSWORD).await.0,
+        StatusCode::UNAUTHORIZED,
+        "an expired credential is refused"
     );
+    assert_eq!(
+        login(&f.app, &username, NEW_PASSWORD).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the account stays in must_change_password until it redeems a live code"
+    );
+
+    // The action is audited on the site chain, and the code never appears in
+    // the audit or outbox record.
+    let resets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events \
+         WHERE kind = 'administrator.reset' AND actor_id = $1 AND organization_id IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(resets, 2, "one row per break-glass run");
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload::text FROM outbox_events WHERE kind = 'administrator.reset'",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert!(!payloads.is_empty());
+    for payload in &payloads {
+        assert!(!payload.contains(&credential.code));
+        assert!(!payload.contains(&expired.code));
+        assert!(!payload.contains(NEW_PASSWORD));
+    }
     assert!(
-        githearth_server::reset_admin(&f.pool, &tag("nobody"), NEW_PASSWORD.to_owned())
+        githearth_server::reset_admin(&f.pool, &tag("nobody"))
             .await
             .is_err(),
         "an unknown account cannot be reset"
     );
+    let _ = std::fs::remove_dir_all(&key_dir);
     f.finish().await;
 }
 
@@ -2001,6 +2117,239 @@ async fn age_login_attempts(pool: &PgPool, seconds: i64) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// A fixture whose throttle bounds are the running configuration's defaults,
+/// not the suite's small values, so U18 asserts what an operator actually gets.
+/// Only the delay steps are shortened, to keep the test's wall time small; the
+/// delay's own shape is asserted separately.
+async fn defaults_fixture() -> Fixture {
+    let defaults = Config::default();
+    Fixture::from_config(|c, _| {
+        c.login_throttle_max_per_username = defaults.login_throttle_max_per_username;
+        c.login_throttle_max_per_client = defaults.login_throttle_max_per_client;
+        c.login_throttle_window_seconds = defaults.login_throttle_window_seconds;
+        c.login_throttle_delay_base_ms = 5;
+        c.login_throttle_delay_max_ms = 20;
+    })
+    .await
+}
+
+/// U18: 5 failures per account and 20 per address inside 900 s, taken from the
+/// running configuration rather than from a literal in the test.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn the_plan_throttle_defaults_are_the_running_configuration() {
+    let f = defaults_fixture().await;
+    let username = tag("defaults");
+    insert_account(&f.pool, &username, MEMBER_PASSWORD, false).await;
+
+    // The fifth failure is accepted; the sixth attempt is refused — even with
+    // the correct password — before it is hashed.
+    for attempt in 1..=5 {
+        assert_eq!(
+            login(&f.app, &username, "wrong password").await.0,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} is inside the five-failure bound"
+        );
+    }
+    assert_eq!(
+        login(&f.app, &username, MEMBER_PASSWORD).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the account bound is 5, not 10"
+    );
+
+    // The window is 900 s: the refusal survives most of it and clears once the
+    // recorded failures have left it (aged in two steps to stay clear of the
+    // boundary).
+    age_login_attempts(&f.pool, 880).await;
+    assert_eq!(
+        login(&f.app, &username, MEMBER_PASSWORD).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the window has not passed yet"
+    );
+    age_login_attempts(&f.pool, 30).await;
+    login_ok(&f.app, &username, MEMBER_PASSWORD).await;
+
+    // The address bound is 20, not 50: twenty failures from one address for
+    // twenty distinct usernames are accepted, the twenty-first is refused.
+    let attacker = "203.0.113.20";
+    for probe in 1..=20 {
+        assert_eq!(
+            login_from(
+                &f.app,
+                &tag(&format!("probe{probe}")),
+                "wrong password",
+                Some(attacker)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED,
+            "address failure {probe} is inside the bound"
+        );
+    }
+    assert_eq!(
+        login_from(&f.app, &tag("probe21"), "wrong password", Some(attacker))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the address bound is 20, not 50"
+    );
+    // Another caller without that address is unaffected.
+    let other = tag("other");
+    insert_account(&f.pool, &other, MEMBER_PASSWORD, false).await;
+    login_ok(&f.app, &other, MEMBER_PASSWORD).await;
+    f.finish().await;
+}
+
+/// The delay is a function of the failure count, so it starts after the fifth
+/// failure and doubles per further failure. The account is left inside its
+/// bound (10 here) so the delayed attempts are accepted, which is the case the
+/// evidence found missing.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn the_fifth_failure_starts_the_exponential_delay() {
+    let f = Fixture::with_config(|c| {
+        c.login_throttle_max_per_username = 10;
+        c.login_throttle_max_per_client = 1000;
+        c.login_throttle_delay_base_ms = 500;
+        c.login_throttle_delay_max_ms = 2_000;
+    })
+    .await;
+    let m = members(&f).await;
+
+    // The first four failures are not delayed; their fastest time is the
+    // baseline. (Asserting against the fastest, not one sample, keeps a busy
+    // test machine from masquerading as a delay.)
+    let mut baseline = Duration::MAX;
+    for _ in 0..4 {
+        let started = Instant::now();
+        assert_eq!(
+            login(&f.app, &m.member_username, "wrong password").await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        baseline = baseline.min(started.elapsed());
+    }
+    // The fifth failure is recorded without a wait.
+    assert_eq!(
+        login(&f.app, &m.member_username, "wrong password").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let started = Instant::now();
+    assert_eq!(
+        login(&f.app, &m.member_username, "wrong password").await.0,
+        StatusCode::UNAUTHORIZED,
+        "the sixth attempt is still accepted below the ten-failure bound"
+    );
+    let sixth = started.elapsed();
+    let started = Instant::now();
+    assert_eq!(
+        login(&f.app, &m.member_username, "wrong password").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let seventh = started.elapsed();
+
+    assert!(
+        sixth >= Duration::from_millis(450) && sixth > baseline,
+        "the sixth attempt waits after the fifth failure: fastest baseline \
+         {baseline:?}, sixth {sixth:?}"
+    );
+    assert!(
+        seventh >= sixth + Duration::from_millis(350),
+        "the delay doubles per failure: sixth {sixth:?}, seventh {seventh:?}"
+    );
+    f.finish().await;
+}
+
+/// U18: token and SSH-key authentication are exempt from the per-account
+/// ceiling, so an attacker cannot lock the owner out through it.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_throttled_account_still_uses_its_token_and_ssh_key() {
+    let f = Fixture::with_config(|c| c.login_throttle_max_per_username = 2).await;
+    let m = members(&f).await;
+
+    let (status, _, body) = send(
+        &f.app,
+        json_request(
+            "POST",
+            "/api/v1/user/tokens",
+            Some(&m.member_token),
+            Some(serde_json::json!({"name": "throttle exempt", "scopes": ["repo:read"]})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pat = serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let key_dir = std::env::temp_dir().join(format!("githearth-throttle-key-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let client_key = key_dir.join("id_ed25519");
+    let output = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-f",
+            &client_key.to_string_lossy(),
+            "-N",
+            "",
+            "-q",
+        ])
+        .output()
+        .expect("ssh-keygen");
+    assert!(output.status.success());
+    let public_key = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+    let (status, _, body) = send(
+        &f.app,
+        json_request(
+            "POST",
+            "/api/v1/user/ssh-keys",
+            Some(&m.member_token),
+            Some(serde_json::json!({"name": "throttle exempt", "public_key": public_key})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let fingerprint: String =
+        sqlx::query_scalar("SELECT fingerprint FROM ssh_keys WHERE account_id = $1")
+            .bind(m.member_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+
+    // The password path is refused, even for the right password.
+    for _ in 0..2 {
+        assert_eq!(
+            login(&f.app, &m.member_username, "wrong password").await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        login(&f.app, &m.member_username, MEMBER_PASSWORD).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // The token and the key are not charged to the password bound.
+    assert_eq!(
+        get_json(&f.app, "/api/v1/me", &pat).await.0,
+        StatusCode::OK,
+        "an access token is exempt from the per-account ceiling"
+    );
+    let mut conn = f.pool.acquire().await.unwrap();
+    assert!(
+        githearth_server::ssh_keys::authenticate(&mut conn, &fingerprint)
+            .await
+            .unwrap()
+            .is_some(),
+        "an SSH key is exempt from the per-account ceiling"
+    );
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&key_dir);
+    f.finish().await;
 }
 
 #[tokio::test]

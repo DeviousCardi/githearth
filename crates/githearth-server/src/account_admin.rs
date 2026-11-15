@@ -599,9 +599,7 @@ pub(crate) async fn reauthenticate_session(
     password: &str,
 ) -> ApiResult<()> {
     let request = login_throttle::Request::from_current();
-    if login_throttle::throttled(&state.pool, &state.config, request, &account.username).await? {
-        return Err(crate::too_many_attempts());
-    }
+    login_throttle::enforce(&state.pool, &state.config, request, &account.username).await?;
     if crate::verify_password(state, &account.username, password)
         .await?
         .is_none()
@@ -641,6 +639,41 @@ pub struct ResetCode {
 
 /// How long a reset code stays redeemable.
 const PASSWORD_RESET_TTL_MINUTES: i64 = 60;
+
+/// Issues a single-use, expiring password-reset code in the caller's
+/// transaction and retires every earlier unredeemed code for the account.
+/// Returns the plaintext code (shown once, never stored) and its expiry. Both
+/// the administrator API and the host `reset-admin` command use this one
+/// function, so both issue the same credential into the same table and redeem
+/// it through the same path.
+pub async fn issue_password_reset_code(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+) -> Result<(String, String), sqlx::Error> {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let code = hex::encode(bytes);
+    let token_hash = Sha256::digest(code.as_bytes()).to_vec();
+    sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = clock_timestamp() \
+         WHERE account_id = $1 AND used_at IS NULL",
+    )
+    .bind(account_id)
+    .execute(&mut **tx)
+    .await?;
+    let expires_at: String = sqlx::query_scalar(
+        "INSERT INTO password_reset_tokens (id, account_id, token_hash, expires_at) \
+         VALUES ($1, $2, $3, clock_timestamp() + $4 * interval '1 minute') \
+         RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(account_id)
+    .bind(&token_hash)
+    .bind(PASSWORD_RESET_TTL_MINUTES as f64)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((code, expires_at))
+}
 
 /// The account's own password change; the current password is required and
 /// checked through the same throttled sign-in as a login, so this endpoint
@@ -688,9 +721,7 @@ pub async fn change_password(
     // A wrong current password is charged to the same failed-sign-in bounds as
     // a wrong login, and a throttled attempt is refused before hashing.
     let request = login_throttle::Request::from_current();
-    if login_throttle::throttled(&state.pool, &state.config, request, &username).await? {
-        return Err(crate::too_many_attempts());
-    }
+    login_throttle::enforce(&state.pool, &state.config, request, &username).await?;
     if crate::verify_password(state, &username, current_password)
         .await?
         .is_none()
@@ -813,11 +844,6 @@ async fn reset_password(
 /// single-use, expiring code, its existing credentials are revoked and it may
 /// do nothing until it redeems the code and sets its own password.
 pub async fn reset_password_inner(state: &AppState, actor: Uuid, id: Uuid) -> ApiResult<ResetCode> {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let code = hex::encode(bytes);
-    let token_hash = Sha256::digest(code.as_bytes()).to_vec();
-
     let mut tx = state.pool.begin().await?;
     let username: Option<String> =
         sqlx::query_scalar("SELECT username FROM accounts WHERE id = $1 FOR UPDATE")
@@ -837,25 +863,7 @@ pub async fn reset_password_inner(state: &AppState, actor: Uuid, id: Uuid) -> Ap
         .execute(&mut *tx)
         .await?;
     // A new reset supersedes any earlier unredeemed code.
-    sqlx::query(
-        "UPDATE password_reset_tokens SET used_at = clock_timestamp() \
-         WHERE account_id = $1 AND used_at IS NULL",
-    )
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-    let token_id = Uuid::new_v4();
-    let expires_at: String = sqlx::query_scalar(
-        "INSERT INTO password_reset_tokens (id, account_id, token_hash, expires_at) \
-         VALUES ($1, $2, $3, clock_timestamp() + $4 * interval '1 minute') \
-         RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
-    )
-    .bind(token_id)
-    .bind(id)
-    .bind(&token_hash)
-    .bind(PASSWORD_RESET_TTL_MINUTES as f64)
-    .fetch_one(&mut *tx)
-    .await?;
+    let (code, expires_at) = issue_password_reset_code(&mut tx, id).await?;
     event_with(
         &mut tx,
         None,
