@@ -369,7 +369,7 @@ async fn run(args: Args) -> Result<()> {
                     "migration failed; inspect database availability and migration history"
                 )
             })?;
-            // 0058 repairs 0045's fixed 30-day backfill with the documented
+            // 0059 repairs 0045's fixed 30-day backfill with the documented
             // default; this raises it further if the operator configured a
             // longer retention. A SQL migration cannot read the config file.
             let extended = githearth_server::pins::extend_backfilled_pins(
