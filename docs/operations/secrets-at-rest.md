@@ -82,7 +82,9 @@ U28 covers `pg_dump` and this binary's archives, not physical base backups.
    transaction without decrypting any secret; in-flight requests keep working
    because each row names the key that wrapped it.
 4. `githearth-server secrets status` prints `rotation complete` and exits zero
-   only when no data key is left under the old key. Until then, keep both keys,
+   only when no data key is left under the old key or an older wrap method (a
+   renamed key descriptor can leave rows whose key id is current but whose
+   method is not; `rotate` re-wraps those too). Until then, keep both keys,
    and `backup` refuses rather than write an archive that restores only with a
    key the operator was not told to keep.
 5. Remove `installation_key_previous_file`, restart, and destroy the old key.

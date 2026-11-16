@@ -2,12 +2,15 @@
 //!
 //! These cases run the real binary: `setup`, `serve`, `backup` and `restore`.
 //! The online path is selected by probing the storage filesystem for
-//! copy-on-write cloning; a writer that races the brief gate is either in the
-//! restore or was refused before acknowledgement. The fallback case forces
-//! `backup_snapshot_mode = "fence"` to prove the maintenance-window path still
-//! works when the filesystem offers no snapshot.
+//! copy-on-write cloning. A write that starts before the recorded position is
+//! either in the restore or was refused before acknowledgement; a write
+//! acknowledged after the recorded position is outside that guarantee and is
+//! absent by point-in-time design, which its case states. The fallback case
+//! forces `backup_snapshot_mode = "fence"` to prove the maintenance-window path
+//! still works when the filesystem offers no snapshot.
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
@@ -601,7 +604,8 @@ fn open_archive(archive: &Path, secret: &str) -> OpenedArchive {
         String::from_utf8_lossy(&output.stderr)
     );
     OpenedArchive {
-        key_id: header.key_id,
+        key_id: header.key_id.clone(),
+        header,
         root,
         work,
     }
@@ -611,6 +615,7 @@ fn open_archive(archive: &Path, secret: &str) -> OpenedArchive {
 /// when the test case ends.
 struct OpenedArchive {
     key_id: String,
+    header: githearth_server::backup::ArchiveHeader,
     root: PathBuf,
     work: PathBuf,
 }
@@ -841,12 +846,12 @@ fn online_backup_with_a_writer_running_restores_consistently() {
 }
 
 #[test]
-fn a_write_racing_an_online_backup_is_in_the_restore_or_was_refused() {
+fn a_write_that_starts_before_the_recorded_position_is_restored_or_refused() {
     let mut installation = Installation::new("race-online");
     installation.setup();
     if !copy_on_write(
         &installation,
-        "a_write_racing_an_online_backup_is_in_the_restore_or_was_refused",
+        "a_write_that_starts_before_the_recorded_position_is_restored_or_refused",
     ) {
         return;
     }
@@ -1248,6 +1253,152 @@ fn restore_into(
     ))
 }
 
+fn sha256_file(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap();
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    hex::encode(digest.finalize())
+}
+
+/// An archive the current `backup` refuses to write: it wraps one data key
+/// wrongly, which can only happen to an archive written by an older binary or
+/// edited by hand. `restore` must refuse it end to end — after `pg_restore`,
+/// while verifying the restored database — and publish no database, storage,
+/// configuration or host key.
+#[test]
+fn a_damaged_wrapper_archive_is_refused_end_to_end_and_published_nowhere() {
+    let mut installation = Installation::new("damaged-archive");
+    installation.setup();
+    installation.start();
+    installation.create_org_and_repo();
+    let work = installation.path.join("work");
+    prepare_work(&work);
+    commit(&work, "baseline");
+    assert!(push(&work, &installation.url()).status.success());
+    installation.stop();
+
+    let key = key_file(
+        &installation.path,
+        "damaged-archive.key",
+        "damaged-archive-passphrase",
+    );
+    let good = installation.path.join("good.ghbackup");
+    let output = installation.backup(&good, &key);
+    assert!(output.status.success(), "backup: {}", both(&output));
+
+    // Rebuild a well-formed container around a dump that carries one damaged
+    // wrapper under the current key id. The manifest part checksum is updated,
+    // so the refusal below is the wrapper check, not a corrupt archive.
+    let opened = open_archive(&good, "damaged-archive-passphrase");
+    let mut manifest = opened.manifest();
+    let installation_record = manifest
+        .installation
+        .clone()
+        .expect("a format-3 archive records the installation key");
+    let data_key_id = Uuid::new_v4();
+    runtime().block_on(async {
+        let pool = sqlx::PgPool::connect(&installation.database.url)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO secret_data_keys (id, kek_id, algorithm, wrap_method, wrapped_key) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(data_key_id)
+        .bind(&installation_record.key_id)
+        .bind(&installation_record.algorithm)
+        .bind(&installation_record.wrap_method)
+        // Correct length (12-byte nonce + 32-byte key + 16-byte tag), so the
+        // refusal is authentication, not a shape check.
+        .bind(vec![0u8; 60])
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    });
+    let dump = opened.root.join("database.dump");
+    let status = Command::new("pg_dump")
+        .args(["--format=custom", "--no-owner", "--no-acl", "--file"])
+        .arg(&dump)
+        .arg(&installation.database.url)
+        .status()
+        .unwrap();
+    assert!(status.success(), "pg_dump of the damaged database failed");
+    let part = manifest
+        .parts
+        .iter_mut()
+        .find(|part| part.name == "database.dump")
+        .expect("the archive carries database.dump");
+    part.bytes = fs::metadata(&dump).unwrap().len();
+    part.sha256 = sha256_file(&dump);
+    fs::write(
+        opened.root.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let payload = opened.work.join("rebuilt.tar");
+    let status = Command::new("tar")
+        .args(["-cf"])
+        .arg(&payload)
+        .arg("-C")
+        .arg(&opened.root)
+        .arg(".")
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot rebuild the archive payload");
+    let damaged = installation.path.join("damaged-wrapper.ghbackup");
+    let salt: [u8; 16] = BASE64
+        .decode(&opened.header.salt)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    // Same passphrase and KDF salt, so the archive key id (and therefore
+    // `manifest.encryption.key_id`) still matches the header; only the GCM
+    // nonce is fresh.
+    githearth_server::backup::encrypt_file_with_salt(
+        &payload,
+        &damaged,
+        b"damaged-archive-passphrase",
+        &salt,
+    )
+    .unwrap();
+
+    let destination = restore_destination("damaged-archive-dest");
+    let output = restore_into(
+        &destination,
+        &damaged,
+        "damaged-archive-passphrase",
+        &installation.installation_key(),
+    );
+    assert!(
+        !output.status.success(),
+        "restore must refuse an archive whose wrapper cannot be opened: {}",
+        both(&output)
+    );
+    let text = both(&output);
+    assert!(
+        text.contains("cannot be opened") || text.contains("do not match the installation key"),
+        "the refusal must name the unreadable wrapper: {text}"
+    );
+    assert!(
+        !destination.database.exists(),
+        "the partially restored database was not dropped"
+    );
+    assert!(
+        !destination.path.join("restored-storage").exists(),
+        "a refused restore published storage"
+    );
+    assert!(
+        !destination.path.join("restored-config.toml").exists(),
+        "a refused restore wrote configuration"
+    );
+    assert!(
+        !destination.path.join("restored-ssh-host-key").exists(),
+        "a refused restore wrote the host key"
+    );
+}
+
 #[test]
 fn a_snapshot_that_loses_a_journaled_ref_is_refused_and_published_nowhere() {
     let mut installation = Installation::new("short-journaled");
@@ -1440,12 +1591,12 @@ fn a_write_between_the_snapshot_and_the_ref_check_is_refused() {
 }
 
 #[test]
-fn a_write_after_the_gate_is_acknowledged_but_absent_from_the_restore() {
+fn a_write_after_the_recorded_position_is_acknowledged_and_absent_by_design() {
     let mut installation = Installation::new("after-gate");
     installation.setup();
     if !copy_on_write(
         &installation,
-        "a_write_after_the_gate_is_acknowledged_but_absent_from_the_restore",
+        "a_write_after_the_recorded_position_is_acknowledged_and_absent_by_design",
     ) {
         return;
     }
@@ -1473,9 +1624,11 @@ fn a_write_after_the_gate_is_acknowledged_but_absent_from_the_restore() {
     wait_marker(&marker);
 
     // The gate is released before the dump runs. This write is acknowledged
-    // with no fence in the way; the dump is pinned to the exported snapshot, so
-    // it must be absent from the restore rather than neither restored nor
-    // refused.
+    // with no fence in the way, but it starts *after* the recorded position, so
+    // it is outside U29's write-racing guarantee (a write that starts before
+    // the recorded position is in the restore or was refused). The dump is
+    // pinned to the exported snapshot, so the write must be absent from the
+    // restore by point-in-time design.
     let after_gate = commit(&work, "after-gate");
     let pushed = push(&work, &installation.url());
     assert!(

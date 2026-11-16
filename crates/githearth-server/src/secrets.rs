@@ -172,12 +172,38 @@ impl InstallationKey {
     ) -> Result<[u8; DATA_KEY_BYTES]> {
         if method != self.method {
             bail!(
-                "data key {} was wrapped with method {method}, but installation key {} uses {}",
+                "data key {} was wrapped with method {method}, but installation key {} uses {}; \
+                 run `secrets rotate` to re-wrap it under the current method",
                 data_key_id,
                 self.id,
                 self.method
             );
         }
+        self.open(data_key_id, method, wrapped)
+    }
+
+    /// Opens a data key with the method recorded on its row, without requiring
+    /// that method to match how this key is configured now. The row's `kek_id`
+    /// already names the key material, so the method is only the AAD suffix:
+    /// a row written before a descriptor-format rename can still be opened and
+    /// re-wrapped. Only rotation uses this; startup and restore keep the
+    /// strict check above, because a mismatch there must be healed by
+    /// `secrets rotate`, not silently accepted forever.
+    fn unwrap_recorded(
+        &self,
+        data_key_id: Uuid,
+        method: &str,
+        wrapped: &[u8],
+    ) -> Result<[u8; DATA_KEY_BYTES]> {
+        self.open(data_key_id, method, wrapped)
+    }
+
+    fn open(
+        &self,
+        data_key_id: Uuid,
+        method: &str,
+        wrapped: &[u8],
+    ) -> Result<[u8; DATA_KEY_BYTES]> {
         if wrapped.len() != NONCE_BYTES + DATA_KEY_BYTES + 16 {
             bail!("wrapped data key {} has an invalid length", data_key_id);
         }
@@ -192,7 +218,7 @@ impl InstallationKey {
                 &Nonce::from(nonce),
                 Payload {
                     msg: ciphertext,
-                    aad: &wrap_aad(&self.id, &data_key_id, &self.method),
+                    aad: &wrap_aad(&self.id, &data_key_id, method),
                 },
             )
             .map_err(|_| {
@@ -1000,9 +1026,11 @@ pub async fn rotate(
         let mut tx = pool.begin().await?;
         let rows: Vec<WrappedDataKey> = sqlx::query_as(
             "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys \
-             WHERE kek_id <> $1 ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED",
+             WHERE kek_id <> $1 OR wrap_method <> $2 ORDER BY id LIMIT $3 \
+             FOR UPDATE SKIP LOCKED",
         )
         .bind(keys.current.id())
+        .bind(keys.current.method())
         .bind(batch as i64)
         .fetch_all(&mut *tx)
         .await
@@ -1019,7 +1047,7 @@ pub async fn rotate(
                     row.id, row.kek_id
                 )
             })?;
-            let data_key = source.unwrap(row.id, &row.wrap_method, &row.wrapped_key)?;
+            let data_key = source.unwrap_recorded(row.id, &row.wrap_method, &row.wrapped_key)?;
             let wrapped = keys.current.wrap(row.id, &data_key)?;
             sqlx::query(
                 "UPDATE secret_data_keys SET kek_id = $1, wrap_method = $2, wrapped_key = $3 \
@@ -1037,12 +1065,14 @@ pub async fn rotate(
         rewrapped += rows.len() as u64;
         tracing::info!(rows = rows.len(), rewrapped, "re-wrapped data keys");
     }
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM secret_data_keys WHERE kek_id <> $1")
-            .bind(keys.current.id())
-            .fetch_one(pool)
-            .await
-            .context("cannot count data keys still under a retired key")?;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM secret_data_keys WHERE kek_id <> $1 OR wrap_method <> $2",
+    )
+    .bind(keys.current.id())
+    .bind(keys.current.method())
+    .fetch_one(pool)
+    .await
+    .context("cannot count data keys still under a retired key or older wrap method")?;
     Ok(RotationReport {
         rewrapped,
         remaining,
@@ -1066,6 +1096,11 @@ pub struct StatusReport {
     /// wrapper or a wrong key with the same id (impossible in practice, so this
     /// is damage). `status`/`doctor` must not call these "complete".
     pub unreadable_key_ids: Vec<String>,
+    /// Data keys under a configured key id whose `wrap_method` is not the
+    /// method that key is configured with now. They still open (the id names
+    /// the key material), but rotation must re-wrap them before the set is
+    /// complete.
+    pub outdated_wrap_method: i64,
     pub rotation_complete: bool,
 }
 
@@ -1096,6 +1131,7 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
     .context("cannot read the wrapped data keys for status")?;
     let mut unknown = Vec::new();
     let mut unreadable = Vec::new();
+    let mut outdated_wrap_method = 0i64;
     let mut complete = legacy_plaintext == 0;
     let mut out = Vec::new();
     for (key_id, data_keys, secrets) in rows {
@@ -1105,6 +1141,14 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
             complete = false;
         }
         if let Some(key) = configured {
+            let outdated = wrapped
+                .iter()
+                .filter(|row| row.kek_id == key_id && row.wrap_method != key.method())
+                .count() as i64;
+            if outdated > 0 {
+                outdated_wrap_method += outdated;
+                complete = false;
+            }
             // Every wrapper is checked, not a sample: a damaged second wrapper
             // is an unreadable secret and must not be reported as "rotation
             // complete". `startup` unwraps the same set and refuses to start.
@@ -1112,7 +1156,7 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
                 .iter()
                 .filter(|row| row.kek_id == key_id)
                 .filter(|row| {
-                    key.unwrap(row.id, &row.wrap_method, &row.wrapped_key)
+                    key.unwrap_recorded(row.id, &row.wrap_method, &row.wrapped_key)
                         .is_err()
                 })
                 .count();
@@ -1139,6 +1183,7 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
         legacy_plaintext,
         unknown_key_ids: unknown,
         unreadable_key_ids: unreadable,
+        outdated_wrap_method,
         rotation_complete: complete,
     })
 }

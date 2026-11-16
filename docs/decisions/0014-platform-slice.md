@@ -989,6 +989,26 @@ is atomic per row, so no request can see a new key id with an old blob or the
 reverse. Both the new and retired keys must be configured for the whole
 rotation; the server does not pick a key by guessing.
 
+A row is selected for re-wrapping when its `kek_id` is not the current key
+**or** its `wrap_method` is not the current method. The second term covers a
+row whose key material is unchanged but whose method label differs from the one
+the same material is configured with now — a descriptor-format rename, or a row
+written by a release that spelled the method differently. The key id still
+names the key material, so `rotate` opens the row with the method the row
+records and writes it back under the current method. Start-up and restore keep
+the strict method check and refuse such a row until it has been re-wrapped; the
+invariant they need is that every row opens the way it will be used, and
+rotation is the one command that can restore it without decrypting a secret.
+`secrets status` counts those rows in `outdated_wrap_method` and does not call
+the set complete until they are re-wrapped.
+
+The condition's example — moving the same material from a raw key file to a
+passphrase descriptor — cannot produce this shape: a passphrase descriptor
+derives its own 32 bytes, and therefore its own key id, from the passphrase. It
+is a different key, handled by an ordinary rotation under the old key id, not a
+method mismatch. The method term closes the general same-id/different-label
+case; it is not what makes that migration work.
+
 ### Re-wrap batch size and the completion signal (open item 4)
 
 One rotation transaction re-wraps at most **256 data keys** (`ROTATE_BATCH`),
@@ -1136,23 +1156,47 @@ storage snapshot and the database dump: it is not in the restore, and nothing
 suggested it would be. The case evidence asserts exactly that with a real push
 between the gate release and the dump.
 
+The write guarantee U29 states is therefore bounded by the recorded position.
+A write that **starts before** the recorded position is in the restore or was
+refused before acknowledgement; a write acknowledged **after** the recorded
+position is outside that guarantee and is absent from both parts by
+point-in-time design. This ADR does not claim the literal "any write during the
+command" reading: the two racing cases are named for the boundary they cover
+(`a_write_that_starts_before_the_recorded_position_is_restored_or_refused` and
+`a_write_after_the_recorded_position_is_acknowledged_and_absent_by_design`).
+
 Test evidence and its limits. The online cases probe the storage filesystem and
 report a skip, with the reason, when it cannot clone, so on the project's ext4
-runner six of the ten cases report `skipping ...: does not support copy-on-write
-cloning` and return; the four that need no clone still run there (the six
-distinct key failures, the manifest that records only the key id, algorithm and
-wrap method, the forced fence fallback, and the gate drain-timeout release).
+runner six of the eleven cases report `skipping ...: does not support
+copy-on-write cloning` and return; the five that need no clone still run there
+(the key failure modes with their six distinct failures, the manifest that
+records only the key id, algorithm and wrap method, the damaged-wrapper archive
+that `restore` must refuse, the forced fence fallback, and the gate
+drain-timeout release).
 The Linux leg of the gate was reproduced on ext4 (`rust:1.89`, git 2.47,
 PostgreSQL 17) and passes; two facts outside this change are recorded rather
 than asserted. Clippy 1.89 reports `nonminimal_bool` for `!…is_some_and(…)` in
 `pulls.rs`, which this increment does not touch and newer clippy accepts, and
 the run is not the CI job itself: its `cargo llvm-cov` coverage threshold,
-`cargo deny` and the container image build were not re-run. Keeping the clone
-path evidenced on Linux still needs a btrfs (or other reflink-capable) CI job;
-until one exists, the clone path is evidenced on APFS, and the ext4 run
-evidences the probe decision, the skip and the fence fallback.
+`cargo deny` and the container image build were not re-run.
 
-The damaged-wrapper restore path is evidenced at the boundary `restore` uses —
-`secrets::startup` after `pg_restore`, tested with a damaged second wrapper —
-not end to end: `backup` now refuses to write an archive whose wrapper cannot
-be opened, so such an archive can only be produced by editing a dump by hand.
+Keeping the clone path evidenced on Linux now has a CI job:
+`.github/workflows/ci.yml` gains `online-backup-btrfs`, which builds a 6 GiB
+btrfs loopback, mounts it, sets `TMPDIR` to it and runs
+`--test online_backup -- --include-ignored` as the runner user. The same steps
+were reproduced here in a `rust:1.89-trixie` container (git 2.47.3,
+PostgreSQL 17.12 client and server, uid 501, 6 GiB btrfs loopback) and all
+eleven cases passed with no skip, so the clone, the probe and the fallback are
+evidenced on a reflink filesystem as well as on APFS. The workflow is
+`workflow_dispatch`-only and has not been dispatched for this change; that the
+GitHub job passes is not asserted here.
+
+The damaged-wrapper restore path is now evidenced end to end. `backup` refuses
+to write an archive whose wrapper cannot be opened, so such an archive can only
+come from an older binary or from editing a dump by hand; the case rebuilds one
+(a correct-length wrapper that cannot authenticate) inside a well-formed
+container and runs the real `restore` against it. The run fails at
+`secrets::startup` after `pg_restore`, names the unreadable wrapper, drops the
+partially restored database, and publishes no storage tree, configuration or
+host key. The boundary-only case with a damaged second wrapper remains as the
+unit-level check of the same call.

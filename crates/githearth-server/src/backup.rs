@@ -241,13 +241,23 @@ fn key_material(passphrase: &[u8]) -> Result<KeyMaterial, ArchiveError> {
         return Err(ArchiveError::MissingKey);
     }
     let mut salt = [0u8; 16];
-    let mut nonce = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    key_material_with_salt(passphrase, &salt)
+}
+
+/// The same archive key from a caller-chosen KDF salt. A rebuilt archive that
+/// keeps the salt keeps the same archive key id (and therefore the manifest's
+/// `encryption.key_id`); the GCM nonce is still drawn fresh.
+fn key_material_with_salt(passphrase: &[u8], salt: &[u8; 16]) -> Result<KeyMaterial, ArchiveError> {
+    if passphrase.is_empty() {
+        return Err(ArchiveError::MissingKey);
+    }
+    let mut nonce = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let key = derive_key(passphrase, &salt)?;
+    let key = derive_key(passphrase, salt)?;
     Ok(KeyMaterial {
         key,
-        salt,
+        salt: *salt,
         nonce,
         key_id: key_id(&key),
         key_check: key_check(&key),
@@ -479,6 +489,34 @@ pub fn decrypt_file(input: &Path, output: &Path, passphrase: &[u8]) -> Result<Ar
     }
     fs::rename(&temporary, output)?;
     Ok(header)
+}
+
+/// Encrypts `payload` into a new archive with `passphrase`: the inverse of
+/// [`decrypt_file`]. `backup` calls the same machinery; this entry point exists
+/// so a test (or an operator rebuilding an archive around a hand-made part) can
+/// produce a well-formed container without the archive-writing path.
+pub fn encrypt_file(payload: &Path, output: &Path, passphrase: &[u8]) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(ArchiveError::MissingKey.into());
+    }
+    let material = key_material(passphrase)?;
+    encrypt_with(payload, output, &material)
+}
+
+/// Like [`encrypt_file`], but with a caller-chosen KDF salt so a rebuilt
+/// archive keeps the archive key id (and the manifest's `encryption.key_id`)
+/// of the archive it replaces. The GCM nonce is still fresh.
+pub fn encrypt_file_with_salt(
+    payload: &Path,
+    output: &Path,
+    passphrase: &[u8],
+    salt: &[u8; 16],
+) -> Result<()> {
+    if passphrase.is_empty() {
+        return Err(ArchiveError::MissingKey.into());
+    }
+    let material = key_material_with_salt(passphrase, salt)?;
+    encrypt_with(payload, output, &material)
 }
 
 fn read_filled(reader: &mut dyn Read, buffer: &mut [u8]) -> std::io::Result<usize> {

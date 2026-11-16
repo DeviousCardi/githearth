@@ -76,6 +76,43 @@ jobs:
           name: coverage
           path: lcov.info
 
+  online-backup-btrfs:
+    # The copy-on-write snapshot path skips on the ext4 runner above, so the
+    # clone is otherwise evidenced only on APFS. A btrfs loopback gives the
+    # online cases a real reflink filesystem on Linux.
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_USER: githearth
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: githearth_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U githearth -d githearth_test"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    env:
+      GITHEARTH_TEST_DATABASE_URL: postgres://githearth:ci-only@127.0.0.1:5432/githearth_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: A btrfs loopback for the storage snapshot
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          sudo truncate -s 6G /btrfs.img
+          sudo mkfs.btrfs -q /btrfs.img
+          sudo mkdir -p /mnt/btrfs
+          sudo mount -o loop /btrfs.img /mnt/btrfs
+          sudo chown "$(id -u):$(id -g)" /mnt/btrfs
+      - name: Online backup suite with a real clone
+        env:
+          TMPDIR: /mnt/btrfs
+        run: cargo test -p githearth-server --test online_backup --locked -- --include-ignored
+
   image:
     runs-on: ubuntu-24.04
     steps:

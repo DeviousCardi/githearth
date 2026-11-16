@@ -10,6 +10,7 @@ use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use githearth_server::{
     AppState, MIGRATOR, audit_retention, backup, config::Config, connect, doctor, hash_password,
     router, secrets, ssh,
@@ -1175,6 +1176,134 @@ async fn a_damaged_second_wrapper_refuses_startup_and_is_not_rotation_complete()
         "{}",
         check.detail
     );
+    pool.close().await;
+}
+
+/// Wraps a 32-byte data key the way an older binary did: the same key material
+/// and key id, but a different `wrap_method`, which is part of the AAD. This is
+/// the row shape a descriptor-format rename leaves behind.
+fn wrap_with_recorded_method(
+    key: &[u8; 32],
+    kek_id: &str,
+    data_key_id: Uuid,
+    method: &str,
+    data_key: &[u8; 32],
+) -> Vec<u8> {
+    use aes_gcm::{
+        Aes256Gcm, Nonce,
+        aead::{Aead, KeyInit, Payload},
+    };
+    let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+    let nonce = [0x5au8; 12];
+    let mut aad = b"githearth-dek-wrap-v1\0".to_vec();
+    aad.extend_from_slice(kek_id.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(data_key_id.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(method.as_bytes());
+    let ciphertext = cipher
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: data_key,
+                aad: &aad,
+            },
+        )
+        .unwrap();
+    let mut wrapped = nonce.to_vec();
+    wrapped.extend_from_slice(&ciphertext);
+    wrapped
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn rotation_rewraps_a_current_key_row_whose_wrap_method_is_older() {
+    let installation = Installation::new("method-migration").await;
+    let pool = installation.pool().await;
+    let keys = installation.keys();
+    let data_key_id = Uuid::new_v4();
+    let data_key = [0x42u8; 32];
+    let encoded = installation.key_base64();
+    let key: [u8; 32] = BASE64.decode(encoded).unwrap().try_into().unwrap();
+    let legacy_method = "file-aes256gcm-v0";
+    assert_ne!(legacy_method, keys.current().method());
+    let wrapped = wrap_with_recorded_method(
+        &key,
+        keys.current().id(),
+        data_key_id,
+        legacy_method,
+        &data_key,
+    );
+    sqlx::query(
+        "INSERT INTO secret_data_keys (id, kek_id, algorithm, wrap_method, wrapped_key) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(data_key_id)
+    .bind(keys.current().id())
+    .bind(secrets::ALGORITHM)
+    .bind(legacy_method)
+    .bind(&wrapped)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Same key id, so the same key material wraps it, but start-up still
+    // refuses: the configured method and the recorded method disagree and only
+    // a rotation can settle which one the row will be read with.
+    let error = secrets::startup(&pool, Some(&keys), secrets::BACKFILL_BATCH)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("wrapped with method"),
+        "startup must refuse a row under an older wrap method: {error}"
+    );
+    let status = secrets::status(&pool, Some(&keys)).await.unwrap();
+    assert!(
+        !status.rotation_complete,
+        "a row under an older wrap method is not rotation complete"
+    );
+    assert_eq!(status.outdated_wrap_method, 1);
+    assert!(
+        status.unreadable_key_ids.is_empty(),
+        "the row opens with the method it records, so it is not a damaged wrapper"
+    );
+    let checks = doctor::report(&installation.config).await;
+    let check = checks
+        .iter()
+        .find(|check| check.name == "installation key")
+        .expect("doctor reports the installation key");
+    assert!(
+        matches!(check.status, doctor::Status::Warn),
+        "doctor must warn about the rotation, not call the wrapper damaged: {}",
+        check.detail
+    );
+
+    // Rotation selects on the key id *or* the method, opens the row with the
+    // method it records (the id already names the key material) and re-wraps it
+    // under the current method. Without the method term the row is left behind
+    // and this installation can never start.
+    let report = secrets::rotate(&pool, &keys, secrets::ROTATE_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(report.rewrapped, 1, "the older-method row is re-wrapped");
+    assert_eq!(report.remaining, 0, "nothing needs re-wrapping afterwards");
+
+    let (kek_id, method): (String, String) =
+        sqlx::query_as("SELECT kek_id, wrap_method FROM secret_data_keys WHERE id = $1")
+            .bind(data_key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kek_id, keys.current().id());
+    assert_eq!(method, keys.current().method());
+
+    secrets::startup(&pool, Some(&keys), secrets::BACKFILL_BATCH)
+        .await
+        .expect("a re-wrapped row opens at the next start-up");
+    let status = secrets::status(&pool, Some(&keys)).await.unwrap();
+    assert!(status.rotation_complete);
+    assert_eq!(status.outdated_wrap_method, 0);
     pool.close().await;
 }
 
