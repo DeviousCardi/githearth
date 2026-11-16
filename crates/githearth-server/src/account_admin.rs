@@ -73,7 +73,7 @@ fn not_found() -> ApiError {
 }
 
 /// Refuses a password outside the accepted range without repeating it.
-fn check_password(password: &str) -> ApiResult<()> {
+pub(crate) fn check_password(password: &str) -> ApiResult<()> {
     if !(PASSWORD_MIN_BYTES..=PASSWORD_MAX_BYTES).contains(&password.len())
         || crate::has_nul(password)
     {
@@ -163,7 +163,7 @@ impl Secret {
         Self(value.into())
     }
 
-    fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }
@@ -240,7 +240,7 @@ pub async fn create_account_inner(
 /// It takes an authentication slot so account creation and a password
 /// redemption cannot start unbounded hashing work around the same limiter the
 /// sign-in path uses.
-async fn hash_password_async(state: &AppState, password: Secret) -> ApiResult<String> {
+pub(crate) async fn hash_password_async(state: &AppState, password: Secret) -> ApiResult<String> {
     let permit = crate::acquire_auth_slot(state).await?;
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -754,10 +754,10 @@ pub async fn change_password(
 }
 
 /// How many credentials of each class a password change or reset revoked.
-struct Revoked {
-    sessions: u64,
-    access_tokens: u64,
-    ssh_keys: u64,
+pub(crate) struct Revoked {
+    pub(crate) sessions: u64,
+    pub(crate) access_tokens: u64,
+    pub(crate) ssh_keys: u64,
 }
 
 /// Revokes every live credential of the account except the session `keep`, all
@@ -804,7 +804,7 @@ async fn revoke_credentials(
 /// the caller's transaction. The counter is keyed by a hash of the username,
 /// which this reads inside the transaction so the cleared rows match
 /// [`login_throttle`].
-async fn replace_password(
+pub(crate) async fn replace_password(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
     hash: &str,
@@ -927,7 +927,7 @@ pub async fn redeem_password_reset_inner(
     let live: Option<Uuid> = sqlx::query_scalar(
         "SELECT t.id FROM password_reset_tokens t JOIN accounts a ON a.id = t.account_id \
          WHERE a.username = $1 AND t.token_hash = $2 AND t.used_at IS NULL \
-         AND t.expires_at > clock_timestamp()",
+         AND t.expires_at > clock_timestamp() AND t.purpose = 'administrator'",
     )
     .bind(username)
     .bind(&token_hash)
@@ -947,7 +947,8 @@ pub async fn redeem_password_reset_inner(
     let token_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT t.id FROM password_reset_tokens t JOIN accounts a ON a.id = t.account_id \
          WHERE a.username = $1 AND t.token_hash = $2 AND t.used_at IS NULL \
-         AND t.expires_at > clock_timestamp() FOR UPDATE OF t",
+         AND t.expires_at > clock_timestamp() AND t.purpose = 'administrator' \
+         FOR UPDATE OF t",
     )
     .bind(username)
     .bind(&token_hash)

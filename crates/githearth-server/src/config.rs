@@ -81,6 +81,16 @@ pub struct Config {
     /// password-hashing amplifier.
     #[serde(default = "default_anonymous_login_global")]
     pub anonymous_login_global: u64,
+    /// Anonymous security-mail requests (change of address and password
+    /// recovery) allowed per client address per hour. Charged before the
+    /// per-destination address budget, so one client cannot use distinct
+    /// addresses to grow that map without bound.
+    #[serde(default = "default_anonymous_security_per_address")]
+    pub anonymous_security_per_address: u64,
+    /// The installation-wide anonymous security-mail budget, so a client that
+    /// changes address cannot exhaust the public mail capacity.
+    #[serde(default = "default_anonymous_security_global")]
+    pub anonymous_security_global: u64,
     /// Organizations one account may create per 24 hours.
     #[serde(default = "default_organization_creation_per_account")]
     pub organization_creation_per_account: u64,
@@ -378,6 +388,8 @@ impl Default for Config {
             anonymous_fetch_global: default_anonymous_fetch_global(),
             anonymous_login_per_address: default_anonymous_login_per_address(),
             anonymous_login_global: default_anonymous_login_global(),
+            anonymous_security_per_address: default_anonymous_security_per_address(),
+            anonymous_security_global: default_anonymous_security_global(),
             organization_creation_per_account: default_organization_creation_per_account(),
             organization_creation_per_installation: default_organization_creation_per_installation(
             ),
@@ -509,6 +521,12 @@ fn default_anonymous_login_per_address() -> u64 {
     20
 }
 fn default_anonymous_login_global() -> u64 {
+    300
+}
+fn default_anonymous_security_per_address() -> u64 {
+    20
+}
+fn default_anonymous_security_global() -> u64 {
     300
 }
 fn default_organization_creation_per_account() -> u64 {
@@ -757,6 +775,14 @@ impl Config {
             "GITHEARTH_ANONYMOUS_LOGIN_PER_ADDRESS"
         );
         env!(anonymous_login_global, "GITHEARTH_ANONYMOUS_LOGIN_GLOBAL");
+        env!(
+            anonymous_security_per_address,
+            "GITHEARTH_ANONYMOUS_SECURITY_PER_ADDRESS"
+        );
+        env!(
+            anonymous_security_global,
+            "GITHEARTH_ANONYMOUS_SECURITY_GLOBAL"
+        );
         env!(
             organization_creation_per_account,
             "GITHEARTH_ORGANIZATION_CREATION_PER_ACCOUNT"
@@ -1048,6 +1074,8 @@ impl Config {
             || !(1..=10_000_000).contains(&self.anonymous_fetch_global)
             || !(1..=1_000_000).contains(&self.anonymous_login_per_address)
             || !(1..=10_000_000).contains(&self.anonymous_login_global)
+            || !(1..=1_000_000).contains(&self.anonymous_security_per_address)
+            || !(1..=10_000_000).contains(&self.anonymous_security_global)
             || !(1..=1_000_000).contains(&self.organization_creation_per_account)
             || !(1..=1_000_000).contains(&self.organization_creation_per_installation)
             || !(1..=64).contains(&self.job_organization_share)
