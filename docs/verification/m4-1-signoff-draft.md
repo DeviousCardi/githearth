@@ -1,14 +1,18 @@
 # M4.1 sign-off — draft
 
-Date: 2026-11-16. State: **draft; not signed.** This is the evidence index for
-the two signatures. It is deliberately named `-draft.md`: the signed document
-must be `docs/verification/m4-1-signoff.md`, created only when both reviewers
-have signed below and the pre-signature corrections are resolved.
+Date: 2026-11-16. State: **draft; not signed; awaiting two signatures.** This is
+the evidence index for the two signatures. It is deliberately named
+`-draft.md`: the signed document must be
+`docs/verification/m4-1-signoff.md`, created only when both reviewers have signed
+below and the pre-signature corrections are resolved.
 
 Scope: every M4.1 acceptance case in
 [08-two-person-roadmap.md](../plan/08-two-person-roadmap.md#m41-acceptance-cases),
-U01–U23c, and the 6.4 acceptance row. Evidence is a document plus the executable
-suite it names; a case is not closed on a test name alone.
+U01–U23c, and the 6.4 acceptance row. Every row cites a path that exists on
+`main`: an executable test that asserts the clause, or a recorded document. A
+case is not closed on a test name alone, and a clause that was not exercised is
+recorded as not met, not as passed. A bare `tests/...` path resolves under
+`crates/githearth-server/`.
 
 ## Evidence by case
 
@@ -32,10 +36,10 @@ suite it names; a case is not closed on a test name alone.
 | U16 | met | `tests/membership.rs` (team memberships and direct grants revoked with removal, one role authority, demotion takes effect); PR #171 |
 | U17 | met | `tests/account_admin.rs` (single-use reset token, forced change, audit, no reusable password); PR #173 |
 | U18 | met | [m4-1-evidence-fresh.md](m4-1-evidence-fresh.md) §U18 (5/account/15 min, 20/address/15 min, exponential delay, token and key exemption); `tests/account_admin.rs`; PRs #189, #191 |
-| U19 | three clauses met; expiry addressed by migration 0058 | [m4-1-evidence-u19.md](m4-1-evidence-u19.md) (upgrade from before the pin migrations, no `upload-pack` advertisement, owning-organization charge); `crates/githearth-server/migrations/0058_pin_backfill_retention.sql` and `tests/pin_backfill_retention.rs` repair the 30-day backfill and prove the 90-day window, but no live-clock expiry was observed because the shortest configurable retention is one day; PRs #191, this close-out PR |
-| U20 | evidence present; earlier record says open | [offhost-backup.md](offhost-backup.md) records `verify-offhost-backup.py` at 5/5 scenarios including backup/restore, fence and four refusals on macOS; [m4-qualification.md](m4-qualification.md) records `verify-m4.py` at 13/13; runbooks in `docs/operations/` (install, upgrade, backup-restore, housekeeping, accounts, quota, metrics); PRs #187, #190, #191. The 2026-11-15 remaining-scope note said the off-host assertions had never executed, so a reviewer must confirm which record stands before signing this row. |
+| U19 | **not met — three of four clauses met; expiry not demonstrated** | [m4-1-evidence-u19.md](m4-1-evidence-u19.md) records the upgrade from before the pin migrations, the `upload-pack` non-advertisement and the owning-organization charge as pass, and records expiry on the stated retention as **not demonstrated** because the shortest configurable window is one day and no live-clock expiry was observed. `crates/githearth-server/migrations/0058_pin_backfill_retention.sql` and `tests/pin_backfill_retention.rs` (merged as #203) repair the 30-day backfill and assert the configured window through `retain_until` timestamps, not through an observed expiry. On `main` #203 landed as a second migration numbered `0058`, alongside `0058_identity_schema_and_recovery.sql`; the renumbering required by the cross-review is outstanding. PRs #191, #203. |
+| U20 | met | [offhost-backup.md](offhost-backup.md) 2026-11-16 records `scripts/verify-offhost-backup.py` at 5/5 scenarios with every clause exercised, including backup/restore, both fences and four refusals, on macOS; [backup-restore.md](../operations/backup-restore.md) states "U20's clause — both harnesses use `backup`/`restore` and pass — is met"; [m4-qualification.md](m4-qualification.md) records `scripts/verify-m4.py` at 13/13 scenarios and lists off-host backup under verified scope; runbooks in `docs/operations/` (install, upgrade, backup-restore, housekeeping, accounts, quota, metrics); PRs #187, #190, #191. The 2026-11-15 attempt stopped at `backup host sshd not reachable within 30 s` — harness plumbing (Darwin port publishing), not an unexecuted assertion — and the 2026-11-16 run supersedes it. |
 | U21 | met | `tests/two_account_e2e.rs` (invite → join → clone → branch → push → pull request → review → merge, both transports, no SQL); PR #186 |
-| U22 | met | `tests/fresh_auth.rs` (stale sensitive action refused, re-authentication, machine-readable reason, Git exception and HTTP/SSH agreement); browser prompt on site-administration paths; PRs #184, #188 |
+| U22 | met | `tests/fresh_auth.rs` (stale sensitive action refused, re-authentication, machine-readable reason, Git exception and HTTP/SSH agreement); browser prompt on site-administration paths; [0002-authorization.md](../decisions/0002-authorization.md) and [0003-git-push-and-repository-lifecycle.md](../decisions/0003-git-push-and-repository-lifecycle.md) state the 2026-11-15 Git token/SSH freshness decision; PRs #184, #188 |
 | U23 | met | [m3-signoff.md](m3-signoff.md) 2026-11-15 correction and candidate-binding gap; [lab-m4/round-4/05-regression.md](lab-m4/round-4/05-regression.md) O1 outcome; [lab-m4/README.md](lab-m4/README.md) one-occurrence note; PR #185 |
 | U23a | met | `tests/email_verification.rs` and `tests/notifications.rs` (single use, expired/reused refusal, duplicate address, no mail to unverified address); PR #180 |
 | U23b | met | [m4-1-evidence-fresh.md](m4-1-evidence-fresh.md) §U23b (only administrator locked out, host `reset-admin`, single-use credential, old sessions revoked, audit); PRs #189, #191 |
@@ -60,12 +64,17 @@ suite it names; a case is not closed on a test name alone.
    paragraphs below the 2026-11-15 correction that says the candidate-binding
    gap is real. The note's author must append a superseding note (or this
    sign-off must record the supersession) before either signature is added.
-2. **U19's expiry clause.** Migration 0058 repairs the historical backfill
-   window; it does not make the one-day minimum waitable. The case can be
-   signed on the migration's own test and the recorded `retain_until` values,
-   or held open for a live expiry observation — the reviewers must say which.
-3. **U20's record.** The off-host drill document and the remaining-scope note
-   disagree. The reviewers must state which record governs before signing.
+2. **U19's expiry clause is not met.** No live-clock expiry was observed: the
+   shortest configurable retention is one day, so the evidence records
+   `retain_until` values rather than an expiry. The row says so. The reviewers
+   may sign with that limitation stated, or hold U19 open; neither signature may
+   record the clause as passed.
+3. **U19's migration number is ambiguous on `main`.** #203 landed as
+   `0058_pin_backfill_retention.sql` while #201 already owns
+   `0058_identity_schema_and_recovery.sql`, so two migrations share version
+   0058. The renumbering the cross-review required is outstanding and must land,
+   with the pin test re-run, before the backfill and retention evidence can be
+   relied on.
 
 ## Sign-off
 
