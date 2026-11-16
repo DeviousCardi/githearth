@@ -838,7 +838,7 @@ fn host_key(path: &Path) -> Result<Outcome> {
 
 async fn migrate_with(config: &Config) -> Result<Outcome> {
     let pool = connect(config).await?;
-    let outcome = migrate(&pool).await;
+    let outcome = migrate(&pool, config.housekeeping_pin_retention_days).await;
     pool.close().await;
     outcome
 }
@@ -850,7 +850,7 @@ async fn bootstrap_with(config: &Config, source: &mut dyn PasswordSource) -> Res
     outcome
 }
 
-async fn migrate(pool: &sqlx::PgPool) -> Result<Outcome> {
+async fn migrate(pool: &sqlx::PgPool, pin_retention_days: u64) -> Result<Outcome> {
     let before: Option<i64> =
         sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
             .fetch_one(pool)
@@ -860,6 +860,7 @@ async fn migrate(pool: &sqlx::PgPool) -> Result<Outcome> {
     MIGRATOR.run(pool).await.map_err(|_| {
         anyhow::anyhow!("migration failed; inspect database availability and migration history")
     })?;
+    crate::pins::extend_backfilled_pins(pool, pin_retention_days).await?;
     let latest: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
         .fetch_one(pool)
         .await
