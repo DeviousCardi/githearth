@@ -1027,9 +1027,12 @@ impl Config {
                 && self.repository_quota_bytes > self.organization_quota_bytes)
             || !(1..=1_000_000).contains(&self.api_requests_per_organization)
             || !(1..=1_000_000).contains(&self.api_requests_per_account)
+            || !(1..=1_000_000).contains(&self.git_requests_per_organization)
+            || !(1..=1_000_000).contains(&self.git_requests_per_account)
             || !(1..=1_000_000).contains(&self.anonymous_fetch_per_address)
             || !(1..=10_000_000).contains(&self.anonymous_fetch_global)
             || !(1..=1_000_000).contains(&self.anonymous_login_per_address)
+            || !(1..=10_000_000).contains(&self.anonymous_login_global)
             || !(1..=1_000_000).contains(&self.organization_creation_per_account)
             || !(1..=1_000_000).contains(&self.organization_creation_per_installation)
             || !(1..=64).contains(&self.job_organization_share)
@@ -1067,7 +1070,7 @@ impl Config {
             || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git organization floor 1..=git concurrency and ceiling >= floor (clamped to capacity at run time), git wait 1..60000ms, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB (not above an organization quota), organization quota bytes 0 or 1MiB..1TiB, API rates 1..1000000/min, anonymous fetch 1..1000000 per address and 1..10000000 globally per minute, anonymous login 1..1000000/min, organization creation 1..1000000 per account/installation, job organization share 1..64 (clamped to the worker count), email 1..1000000/h, signup velocity 1..1000000 per 1..86400s, DKIM selector non-whitespace and at most 255 bytes, object upload deadline 60..2592000s, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, login throttle delay base 1..60000ms and max 1..600000ms (max >= base), backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git organization floor 1..=git concurrency and ceiling >= floor (clamped to capacity at run time), git wait 1..60000ms, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB (not above an organization quota), organization quota bytes 0 or 1MiB..1TiB, API rates 1..1000000/min, Git rates 1..1000000/min, anonymous fetch 1..1000000 per address and 1..10000000 globally per minute, anonymous login 1..1000000 per address and 1..10000000 globally per minute, organization creation 1..1000000 per account/installation, job organization share 1..64 (clamped to the worker count), email 1..1000000/h, signup velocity 1..1000000 per 1..86400s, DKIM selector non-whitespace and at most 255 bytes, object upload deadline 60..2592000s, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, login throttle delay base 1..60000ms and max 1..600000ms (max >= base), backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -1423,6 +1426,47 @@ mod tests {
         c.login_throttle_delay_base_ms = 100;
         c.login_throttle_delay_max_ms = 100;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn fairness_rate_limits_are_bounded() {
+        let mut c = Config {
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        };
+        assert!(c.validate().is_ok(), "the defaults fit every bound");
+        for bad in [0, 1_000_001] {
+            c.git_requests_per_organization = bad;
+            assert!(
+                c.validate().is_err(),
+                "git organization rate {bad} must be refused"
+            );
+        }
+        c.git_requests_per_organization = 600;
+        for bad in [0, 1_000_001] {
+            c.git_requests_per_account = bad;
+            assert!(
+                c.validate().is_err(),
+                "git account rate {bad} must be refused"
+            );
+        }
+        c.git_requests_per_account = 120;
+        for bad in [0, 10_000_001] {
+            c.anonymous_login_global = bad;
+            assert!(
+                c.validate().is_err(),
+                "anonymous login global rate {bad} must be refused"
+            );
+        }
+        c.anonymous_login_global = 300;
+        assert!(c.validate().is_ok(), "the largest valid rates are accepted");
+        c.git_requests_per_account = 0;
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("Git rates 1..1000000/min"), "{error}");
+        assert!(
+            error.contains("anonymous login 1..1000000 per address and 1..10000000 globally"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -53,6 +53,7 @@ auth_concurrency = 2
 # job_concurrency = 4
 # job_timeout_seconds = 60
 # job_poll_interval_ms = 500
+# outbox_poll_interval_ms = 500          # outbox fan-out poll when no event is waiting
 # job_retention_days = 7
 # housekeeping_enabled = true            # scheduled repack + prune (ADR 0013)
 # housekeeping_interval_seconds = 86400  # how often each repository is due

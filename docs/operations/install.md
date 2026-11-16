@@ -25,12 +25,16 @@ Prerequisites: a Linux host, **Git ≥ 2.40**, `curl`, `openssl`, Python 3,
    an existing file must be a regular file owned by the current user that group
    or others cannot read, otherwise the run stops and prints the mode it
    actually read;
-2. creates the storage root and the host key's directory (mode `0700`), refusing
+2. generates the installation key (mode `0600`, default
+   `<config dir>/installation.key`) when it is absent; every stored secret is
+   wrapped by it, and it is kept outside `storage_root` so a storage backup
+   never carries it;
+3. creates the storage root and the host key's directory (mode `0700`), refusing
    a path that is group- or world-writable or owned by another user;
-3. generates the SSH host key (Ed25519, mode `0600`) when it is absent;
-4. runs migrations;
-5. creates the first administrator, `admin`;
-6. runs the `doctor` checks and exits non-zero if any fails.
+4. generates the SSH host key (Ed25519, mode `0600`) when it is absent;
+5. runs migrations;
+6. creates the first administrator, `admin`;
+7. runs the `doctor` checks and exits non-zero if any fails.
 
 ```bash
 # The database URL is never a command argument. Put it in the environment
@@ -96,11 +100,14 @@ back, so a loopback-only development install that browses the UI over
 `http://127.0.0.1:8080` must set `secure_cookies = false` in the file after
 `setup` (as Compose does) or terminate TLS at a proxy ([tls.md](tls.md)).
 
-The secrets the server needs are the SSH host key, which `setup` generates, and
-the per-deployment rows it creates on first use in PostgreSQL (session tokens,
-personal access tokens, and the audit IP-retention keys), which never appear in
-configuration. The database password belongs to PostgreSQL: create the role and
-its database first, as in the manual path below.
+The secrets the server needs are two files `setup` generates: the SSH host key,
+and the installation key that wraps every stored secret (both mode `0600`; the
+installation key is kept outside `storage_root` and out of backups). The
+per-deployment rows it creates on first use in PostgreSQL (session tokens,
+personal access tokens, and the audit IP-retention keys) never appear in
+configuration; the keys protecting those rows are themselves wrapped by the
+installation key. The database password belongs to PostgreSQL: create the role
+and its database first, as in the manual path below.
 
 #### Manual steps (what `setup` automates)
 
@@ -175,7 +182,9 @@ This runs fourteen read-only checks:
 A fifteenth **base backfill** check appears only when a pull request's base could
 not be reconstructed because its target branch was deleted before the upgrade;
 it is a warning naming the affected requests. A clean install therefore prints
-`14 checks`, and an installation with recorded skips prints `15 checks`.
+`14 checks`, and an installation with a recorded base backfill prints
+`15 checks` (one warning). Skips replace checks rather than adding one: an
+unreachable database still prints fourteen lines.
 
 When the database cannot be reached the `schema`, `tokens`, `installation key`,
 `lifecycle`, `jobs`, `outbox` and `housekeeping` checks are skipped
