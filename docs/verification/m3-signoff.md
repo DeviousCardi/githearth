@@ -145,3 +145,10 @@ Two reviewers each confirm the tables above.
 - Date: 2026-11-13
 - Verdict: approve
 - Notes and problems found: The M3 exit suite (`tests/m3_exit.rs`, 9 tests) passes against the real server, Git storage and PostgreSQL; the intent/revalidation contract is additionally covered by `tests/merge_execute.rs` and `tests/merge_queue.rs`. No gap found.
+
+### Reviewer 2 — superseding note (2026-11-16)
+
+- Name: Aarav (`DeviousCardi`)
+- Date: 2026-11-16
+- Supersedes: Reviewer 2's 2026-11-13 note above ("No gap found").
+- Notes and problems found: My 2026-11-13 note is **superseded** by the 2026-11-15 correction above and must not be read as a clean finding. It was written against the exit suite and the intent/revalidation tests as they stood then, and it did not examine which revision the merge **decision** is bound to. The 2026-11-15 correction established that the approvals/checks digest is taken at the source head, never over the merged tree, and that a queued entry is re-targeted and revalidated rather than tested as a candidate. A check that passes on the source and fails only on the merged tree can therefore authorize the merge. That is a real gap against the promise, so "No gap found" was wrong in the sense in which it is now read. The 2026-11-13 note remains above, unedited, as the audit record.
