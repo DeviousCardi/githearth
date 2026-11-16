@@ -17,9 +17,9 @@ absolute latency.
 | API requests | 300/min per organization, 60/min per account | `api_requests_per_organization`, `api_requests_per_account` | one `/api/v1` middleware, every route |
 | Authenticated Git requests | 600/min per organization, 120/min per account | `git_requests_per_organization`, `git_requests_per_account` | Git HTTP (all three endpoints) and SSH, after admission |
 | Anonymous clone/fetch | 120/min per address, 2,000/min installation | `anonymous_fetch_per_address`, `anonymous_fetch_global` | `info/refs` and `upload-pack` for a request with no credential, after the repository is known to exist |
-| Anonymous login/search | 20/min per address, 300/min installation | `anonymous_login_per_address`, `anonymous_login_global` | every sign-in path before hashing |
+| Anonymous login | 20/min per address, 300/min installation | `anonymous_login_per_address`, `anonymous_login_global` | every sign-in path before hashing |
 | Organization creation | 3 per account per 24 h, 50 per installation per day | `organization_creation_per_account`, `organization_creation_per_installation` | `POST /api/v1/organizations` |
-| Repository storage | 5 GiB per repository, 50 GiB per organization | `repository_quota_bytes`, `organization_quota_bytes` | push hook and object store |
+| Repository storage | 5 GiB per repository; 50 GiB per organization for each of Git storage and the object store | `repository_quota_bytes`, `organization_quota_bytes` | the push hook, a server-side merge, and the object store |
 | Job worker share | 2 of 4 workers per organization | `job_organization_share` | the claim query |
 | Email | 200/hour per organization, 5/hour per address for security mail | `email_per_organization`, `email_security_per_address` | the notification and verification consumers |
 | Sign-up velocity | 3 per address per hour (M11a endpoint) | `signup_velocity_per_address`, `signup_velocity_window_seconds` | the M11a sign-up endpoint |
@@ -34,9 +34,30 @@ and `upload-pack`), which is why the Git budget is twice the API budget.
 
 Storage quota counts objects, merge-created objects, fork copies and stored
 large objects; `0` disables a quota, and the repository quota may not exceed
-the organization quota. `repository_quota_bytes` defaults to 5 GiB since
-M4.2; an installation that upgraded and has larger repositories can set it to
-`0` to restore the previous unlimited behaviour.
+the organization quota. The organization figure covers Git repository storage:
+every push is measured against the sum of every active repository's `objects/`
+in the organization plus the incoming quarantine, and a server-side merge is
+measured after the candidate is written and before the ref moves, so the merge
+commit, a squash's tree and a cross-repository fork fetch are all charged. The
+same configured number bounds the object store's ledger separately (ADR 0014
+§1): it is 50 GiB of Git repository storage and 50 GiB of object-store bytes,
+not 50 GiB of their sum, because the two ledgers are kept apart so a delete or
+a reconcile in one cannot erase the other's accounting. The
+walk happens on the blocking pool while the push or merge holds the
+repository lock, once per write, so a tenant with many repositories or many
+loose objects pays a delay proportional to its object count before
+`receive-pack` starts or the merge lands; a cached counter was rejected because
+it drifts after a crash, a restore or a hand-run `gc`, and the quota is a
+refusal rather than an estimate. `repository_quota_bytes` defaults to 5 GiB
+since M4.2; an installation that upgraded and has larger repositories can set
+it to `0` to restore the previous unlimited behaviour.
+
+**Search is not served by this build.** The row used to read
+"login/search"; M9 owns search, and no search endpoint exists here, so there is
+nothing to charge. When M9 adds one it must call the same
+anonymous per-address and per-installation budget before it can be published;
+the row above was narrowed to what a request can reach today rather than
+promising a limit for a surface that does not exist.
 
 ## Window semantics
 
@@ -137,6 +158,13 @@ The defaults revised from this measurement (ADR 0014 open item 6):
   installation budgets after the repository is known to exist; authenticated
   Git HTTP and SSH charge the organization and account Git budgets after
   admission; both transports use the share scheduler, as do the web reads.
+  A push also measures the organization's total repository bytes and refuses
+  before `receive-pack` when the tenant quota would be crossed.
+- **Merge** — after building the candidate and before moving the ref, a merge
+  measures the repository and the organization and refuses with the same two
+  messages a push uses; the candidate's objects stay unreachable until
+  housekeeping reclaims them. This is what makes "merge-created objects" in
+  the storage paragraph true.
 - **Sign-in** — every login path (JSON, browser, Git basic) charges the
   anonymous per-address and per-installation login budget before hashing.
 - **Jobs** — the claim query refuses to run more than `job_organization_share`

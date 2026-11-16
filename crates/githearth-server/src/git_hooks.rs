@@ -23,6 +23,8 @@ const HOOK_ACTOR: &str = "GITHEARTH_ACTOR";
 const HOOK_MERGE: &str = "GITHEARTH_MERGE";
 const HOOK_SUGGESTION: &str = "GITHEARTH_SUGGESTION";
 const HOOK_QUOTA_BYTES: &str = "GITHEARTH_QUOTA_BYTES";
+const HOOK_ORGANIZATION_QUOTA_BYTES: &str = "GITHEARTH_ORGANIZATION_QUOTA_BYTES";
+const HOOK_ORGANIZATION_OTHER_BYTES: &str = "GITHEARTH_ORGANIZATION_OTHER_BYTES";
 const REFUSE: &str = "ref updates must go through GitHearth";
 const RESPONSE_LIMIT: u64 = 4096;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -135,14 +137,30 @@ fn pre_receive(env: &HashMap<String, String>, stdin: &mut dyn Read, stderr: &mut
 }
 
 /// Refuses a push that brings new objects into a repository whose `objects/`
-/// plus the incoming quarantine exceed `GITHEARTH_QUOTA_BYTES` (0 or unset = unlimited).
-// shortcut: merge-created objects are not counted; upgrade with per-organization quotas.
+/// plus the incoming quarantine exceed `GITHEARTH_QUOTA_BYTES`, or whose
+/// repository bytes plus the rest of its organization exceed
+/// `GITHEARTH_ORGANIZATION_QUOTA_BYTES` (0 or unset = unlimited for each).
+///
+/// The organization figure is measured by the server (it needs PostgreSQL and
+/// the organization's other repository directories) and passed as
+/// `GITHEARTH_ORGANIZATION_OTHER_BYTES`; the hook only adds it to what it can
+/// see on disk. Merge-created objects are not pushed through this hook: the
+/// merge path measures the same two figures after building the candidate and
+/// refuses the merge before the ref moves (see `merge::execute_intent`), so
+/// every object the server creates is charged to the same quotas.
 fn check_quota(env: &HashMap<String, String>) -> Result<(), String> {
     let quota: u64 = env
         .get(HOOK_QUOTA_BYTES)
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let Some(quarantine) = env.get("GIT_QUARANTINE_PATH").filter(|_| quota > 0) else {
+    let organization_quota: u64 = env
+        .get(HOOK_ORGANIZATION_QUOTA_BYTES)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if quota == 0 && organization_quota == 0 {
+        return Ok(());
+    }
+    let Some(quarantine) = env.get("GIT_QUARANTINE_PATH") else {
         return Ok(());
     };
     let measured = |e: std::io::Error| format!("cannot measure repository size: {e}");
@@ -162,10 +180,22 @@ fn check_quota(env: &HashMap<String, String>) -> Result<(), String> {
         .map_err(measured)?;
     let used =
         githearth_git::layout::dir_size(&objects, Some(&quarantine)).map_err(measured)? + incoming;
-    if used > quota {
+    if quota > 0 && used > quota {
         return Err(format!(
             "repository storage quota exceeded: {used} of {quota} bytes"
         ));
+    }
+    if organization_quota > 0 {
+        let other: u64 = env
+            .get(HOOK_ORGANIZATION_OTHER_BYTES)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let organization = used + other;
+        if organization > organization_quota {
+            return Err(format!(
+                "organization storage quota exceeded: {organization} of {organization_quota} bytes"
+            ));
+        }
     }
     Ok(())
 }
@@ -901,6 +931,56 @@ mod tests {
                 None => {
                     server.join().unwrap();
                     assert_eq!(code, 0, "{objects}/{incoming}: {err}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+    }
+
+    #[test]
+    fn organization_quota_decisions() {
+        let mib = 1_048_576usize;
+        // (objects, incoming, other repositories, expected refusal substring)
+        let cases = [
+            // 600k in this repository + 300k incoming + 200k elsewhere = 1.1 MiB.
+            (
+                600_000,
+                300_000,
+                200_000,
+                Some("organization storage quota exceeded: 1100000 of 1048576 bytes"),
+            ),
+            (600_000, 300_000, 50_000, None),
+            // Nothing incoming: allowed even when the tenant is already over.
+            (2 * mib, 0, 5 * mib, None),
+        ];
+        for (objects, incoming, other, refused) in cases {
+            let (repo, quarantine) = quota_repo(objects, incoming);
+            let (path, server) = mock_server("OK\n");
+            let git_dir = format!("{}/.", repo.display());
+            let other = other.to_string();
+            let pairs = vec![
+                ("GITHEARTH_HOOK_SOCKET", path.as_str()),
+                ("GIT_QUARANTINE_PATH", quarantine.to_str().unwrap()),
+                (HOOK_QUOTA_BYTES, "0"),
+                (HOOK_ORGANIZATION_QUOTA_BYTES, "1048576"),
+                (HOOK_ORGANIZATION_OTHER_BYTES, other.as_str()),
+                ("GIT_DIR", git_dir.as_str()),
+            ];
+            let (code, err) = run_with(
+                "pre-receive",
+                &[],
+                &env_with(&pairs),
+                &format!("{ZERO} {SHA} refs/heads/main\n"),
+            );
+            match refused {
+                Some(message) => {
+                    assert_eq!(code, 1, "{objects}/{incoming}/{other}: {err}");
+                    assert!(err.contains(message), "{objects}/{incoming}/{other}: {err}");
+                    drop(server);
+                }
+                None => {
+                    server.join().unwrap();
+                    assert_eq!(code, 0, "{objects}/{incoming}/{other}: {err}");
                 }
             }
             let _ = std::fs::remove_dir_all(&repo);

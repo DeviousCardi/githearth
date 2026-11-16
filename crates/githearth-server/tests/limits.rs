@@ -341,6 +341,30 @@ async fn sign_in_is_refused_over_the_anonymous_login_budget() {
     db.drop_db().await;
 }
 
+/// The published anonymous row is the whole promise: no search endpoint is
+/// served in this build (search is M9's), so the row must say login and the
+/// numbers in it must be the ones sign-in charges. A row that advertises a
+/// search budget would be a promise nothing can enforce.
+#[test]
+fn the_published_anonymous_row_promises_only_what_sign_in_enforces() {
+    const LIMITS: &str = include_str!("../../../docs/operations/limits.md");
+    let row = LIMITS
+        .lines()
+        .find(|line| line.starts_with("| Anonymous login"))
+        .expect("limits.md publishes an anonymous login row");
+    assert!(
+        !row.to_lowercase().contains("search"),
+        "this build serves no search endpoint, so it must not publish a search budget: {row}"
+    );
+    assert!(row.contains("20/min per address"), "{row}");
+    assert!(row.contains("300/min installation"), "{row}");
+    assert!(row.contains("every sign-in path before hashing"), "{row}");
+
+    let defaults = Config::default();
+    assert_eq!(defaults.anonymous_login_per_address, 20);
+    assert_eq!(defaults.anonymous_login_global, 300);
+}
+
 /// The organization budget is charged only to a member. Otherwise a stranger
 /// who knows an organization's slug could exhaust that tenant's 300/min with
 /// requests the handler refuses anyway.

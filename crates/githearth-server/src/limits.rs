@@ -210,11 +210,12 @@ impl Limits {
         self.anonymous_fetch_global.allow_at("installation", now)
     }
 
-    /// Anonymous login and search: per client address and across the
-    /// installation. Sign-in has a separate failure throttle; this is the
-    /// request-rate ceiling that keeps a public login form from being used as
-    /// a password-hashing amplifier. The installation budget is what a second
-    /// address cannot escape.
+    /// Anonymous login: per client address and across the installation. Sign-in
+    /// has a separate failure throttle; this is the request-rate ceiling that
+    /// keeps a public login form from being used as a password-hashing
+    /// amplifier. The installation budget is what a second address cannot
+    /// escape. No search endpoint exists in this build (M9 owns it); a search
+    /// surface added later must charge this same counter.
     pub fn allow_anonymous_login(&self, address: Option<IpAddr>) -> bool {
         self.allow_anonymous_login_at(address, Instant::now())
     }

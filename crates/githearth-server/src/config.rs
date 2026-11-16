@@ -42,10 +42,12 @@ pub struct Config {
     pub git_request_limit_bytes: usize,
     pub git_push_limit_bytes: usize,
     pub repository_quota_bytes: u64,
-    /// Per-organization byte limit across the object store. `0` disables it,
-    /// matching `repository_quota_bytes`. Objects are charged to the
-    /// organization that owns their tenant prefix, and the bytes of an open
-    /// multipart upload count until the upload is completed or swept.
+    /// Per-organization byte limit for Git repository storage and the object
+    /// store. `0` disables it, matching `repository_quota_bytes`. The Git half
+    /// is the sum of every active repository's `objects/` tree, checked on each
+    /// push and merge; the object-store half charges the organization that owns
+    /// a tenant prefix, and an open multipart upload's bytes count until the
+    /// upload is completed or swept. The two ledgers do not overlap.
     #[serde(default)]
     pub organization_quota_bytes: u64,
     /// Authenticated API requests allowed per organization per minute.
@@ -72,8 +74,9 @@ pub struct Config {
     /// minute, so one address cannot exhaust the public capacity.
     #[serde(default = "default_anonymous_fetch_global")]
     pub anonymous_fetch_global: u64,
-    /// Anonymous login and search requests allowed per client address per
-    /// minute.
+    /// Anonymous login requests allowed per client address per minute. No
+    /// search endpoint ships in M4.2; M9's search surface must charge this same
+    /// budget before it can be published.
     #[serde(default = "default_anonymous_login_per_address")]
     pub anonymous_login_per_address: u64,
     /// Anonymous login requests allowed across the installation per minute,
