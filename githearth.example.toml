@@ -104,12 +104,14 @@ auth_concurrency = 2
 #                                                     # never a TOML value, never logged.
 #                                                     # "-" reads one line from stdin.
 # public_url = "https://githearth.example"  # base of links in mail; no trailing slash needed
-# Backup and restore (docs/operations/backup-restore.md). `backup` refuses
-# unless the server is stopped (its listeners refuse connections) or this
-# process is in maintenance mode and has drained. The archive is encrypted;
-# the key is read from a file or stdin, never from an argument or this file.
+# Backup and restore (docs/operations/backup-restore.md). On a filesystem with
+# copy-on-write cloning `backup` snapshots online and needs no maintenance
+# window; the fence fallback refuses unless the server is stopped or drained in
+# maintenance. The archive is encrypted; the key is read from a file or stdin,
+# never from an argument or this file.
 # backup_directory = "backups"          # --output overrides the file name
 # backup_key_file = "/etc/githearth/backup.key"  # mode 0600; --key-file overrides
+# backup_snapshot_mode = "auto"         # auto | fence; auto probes copy-on-write
 # maintenance_drain_timeout_seconds = 300  # how long `maintenance start` waits
 # Secrets at rest (ADR 0014 §3, docs/operations/secrets-at-rest.md). Every
 # stored secret is wrapped by this operator key. Mode 0600, outside

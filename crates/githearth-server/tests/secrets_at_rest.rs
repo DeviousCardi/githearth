@@ -1020,6 +1020,26 @@ async fn backup_refuses_while_a_rotation_is_incomplete() {
             .unwrap();
     assert_eq!(remaining_id, locked);
 
+    // The interrupted batch loses no secret: the row still under the retired
+    // key opens with the retired key, and with both keys configured, to the
+    // same value it had before the rotation.
+    let audit_key_id: Uuid = sqlx::query_scalar(
+        "SELECT a.id FROM audit_ip_keys a JOIN stored_secrets s ON s.id = a.secret_id \
+         WHERE s.data_key_id = $1",
+    )
+    .bind(remaining_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let with_old = secrets::load_audit_ip_key(&pool, audit_key_id, &old_keys)
+        .await
+        .unwrap();
+    let with_both = secrets::load_audit_ip_key(&pool, audit_key_id, &new_keys)
+        .await
+        .unwrap();
+    assert_eq!(with_old, with_both);
+    assert_eq!(with_old.len(), 32);
+
     let mut config = installation.config.clone();
     config.installation_key_file = new_key_path;
     config.installation_key_previous_file = installation.key_path.clone();
@@ -1070,6 +1090,88 @@ async fn status_and_doctor_report_a_corrupt_wrapper() {
         .expect("doctor reports the installation key");
     assert!(
         check.detail.contains("cannot be unwrapped"),
+        "{}",
+        check.detail
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_damaged_second_wrapper_refuses_startup_and_is_not_rotation_complete() {
+    let installation = Installation::new("second-wrapper").await;
+    let pool = installation.pool().await;
+    let state = installation.state().await;
+    let app = router(state.clone());
+    installation.login_with_ip(&app, &pool).await;
+    let keys = installation.keys();
+    // A second data key under the same key id. Each sealed secret gets its own
+    // data key, so this is the ordinary shape of an installation with more than
+    // one secret.
+    audit_retention::rotate_ip_key(&pool, &keys, false)
+        .await
+        .unwrap();
+    let wrapped: Vec<(Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT id, wrapped_key FROM secret_data_keys ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(wrapped.len(), 2, "two data keys under one key id");
+
+    // Damage only the second wrapper. Sampling one row per key id still sees a
+    // readable wrapper, which is exactly the secret-loss path this closes.
+    let (damaged, _) = wrapped[1].clone();
+    sqlx::query(
+        "UPDATE secret_data_keys \
+         SET wrapped_key = set_byte(wrapped_key, 0, (get_byte(wrapped_key, 0) + 1) % 256) \
+         WHERE id = $1",
+    )
+    .bind(damaged)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let after: Vec<(Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT id, wrapped_key FROM secret_data_keys ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        wrapped[0].1, after[0].1,
+        "the first wrapper is untouched, so a one-row sample would pass"
+    );
+    assert_ne!(wrapped[1].1, after[1].1, "the second wrapper is damaged");
+
+    let status = secrets::status(&pool, Some(&keys)).await.unwrap();
+    assert!(
+        !status.rotation_complete,
+        "a damaged non-sampled wrapper must not be reported as rotation complete"
+    );
+    assert_eq!(
+        status.unreadable_key_ids,
+        vec![keys.current().id().to_owned()]
+    );
+
+    let error = secrets::startup(&pool, Some(&keys), secrets::BACKFILL_BATCH)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot be opened"),
+        "startup must refuse the damaged wrapper: {error}"
+    );
+    assert!(
+        error.contains("1 of 2"),
+        "the refusal counts every wrapper: {error}"
+    );
+    assert!(!error.contains(&installation.key_base64()), "{error}");
+
+    let checks = doctor::report(&installation.config).await;
+    let check = checks
+        .iter()
+        .find(|check| check.name == "installation key")
+        .expect("doctor reports the installation key");
+    assert!(
+        matches!(check.status, doctor::Status::Fail),
         "{}",
         check.detail
     );

@@ -914,6 +914,7 @@ async fn run_backup(
         report.fence.kind(),
         report.fence.detail()
     );
+    println!("storage snapshot: {}", report.snapshot);
     Ok(())
 }
 

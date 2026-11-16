@@ -93,11 +93,14 @@ unrecoverable.
 ## Restore
 
 `restore` verifies the archive's installation key id against the destination
-key and, after restoring the database, opens every wrapped data key before it
-publishes the storage tree or configuration. A wrong or missing key fails and
-drops the partially restored database. Put the key where the archived
-configuration names it, or set `GITHEARTH_INSTALLATION_KEY_FILE` (the restore
-rewrites `installation_key_file` to that path).
+key and, after restoring the database, opens every wrapped data key — every row,
+not one sample per key id — before it publishes the storage tree or
+configuration. A missing key file, a key file
+whose mode lets group or others read it, a wrong key and a key id that does not
+match the archive each fail with a distinct message and drop the partially
+restored database. Put the key where the archived configuration names it, or
+set `GITHEARTH_INSTALLATION_KEY_FILE` (the restore rewrites
+`installation_key_file` to that path).
 
 ## What is not encrypted
 

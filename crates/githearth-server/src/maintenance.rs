@@ -397,6 +397,10 @@ pub enum Fence {
     /// The server reported that it is fenced and that no admitted write is
     /// still in flight.
     Maintenance { detail: String },
+    /// The online path briefly and automatically fenced the running server for
+    /// the metadata position and the copy-on-write snapshot, then released it
+    /// before the dump and archive. It is not an operator maintenance window.
+    OnlineSnapshot { detail: String },
 }
 
 impl Fence {
@@ -404,12 +408,15 @@ impl Fence {
         match self {
             Fence::NotRunning { .. } => "not-running",
             Fence::Maintenance { .. } => "maintenance",
+            Fence::OnlineSnapshot { .. } => "online-snapshot",
         }
     }
 
     pub fn detail(&self) -> &str {
         match self {
-            Fence::NotRunning { detail } | Fence::Maintenance { detail } => detail,
+            Fence::NotRunning { detail }
+            | Fence::Maintenance { detail }
+            | Fence::OnlineSnapshot { detail } => detail,
         }
     }
 }
@@ -513,6 +520,207 @@ pub async fn prove(config: &crate::config::Config) -> anyhow::Result<Fence> {
             "cannot prove the server at {} is stopped: {reason}",
             config.bind
         ),
+    }
+}
+
+/// A brief automatic gate used only by the online backup path. It reuses the
+/// proved maintenance fence so a write that starts while the snapshot is taken
+/// is refused before acknowledgement, but it drains before the metadata
+/// position and is released before the dump, tar and encryption, so the
+/// operator never enters maintenance mode.
+pub struct OnlineGate {
+    address: SocketAddr,
+    token: String,
+    started_here: bool,
+}
+
+impl OnlineGate {
+    /// Releases the gate. Idempotent from the caller's side: a gate the
+    /// operator had already entered is left alone.
+    pub async fn release(mut self) -> anyhow::Result<()> {
+        if self.started_here {
+            request_stop(self.address, &self.token).await?;
+            // The stop was acknowledged; `Drop` must not send it again.
+            self.started_here = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OnlineGate {
+    /// The last chance to release a gate this process started. Error paths
+    /// release explicitly and a normal exit never drops an unreleased gate;
+    /// this covers a panic, an unwound error and a caller that forgot. The
+    /// request is synchronous and bounded by the same timeouts the control
+    /// endpoint uses, so unwinding cannot hang.
+    fn drop(&mut self) {
+        if self.started_here {
+            let _ = request_blocking(self.address, &self.token, "POST", STOP_PATH);
+            self.started_here = false;
+        }
+    }
+}
+
+/// Starts the online snapshot gate, or proves the server is already stopped.
+/// The returned gate is `None` when no server is listening. Unlike [`prove`],
+/// a running server is fenced automatically here; that is the point of the
+/// online path, and it is not an operator maintenance window.
+pub async fn begin_online(
+    config: &crate::config::Config,
+) -> anyhow::Result<(Fence, Option<OnlineGate>)> {
+    let http = probe(config.bind);
+    let ssh = if config.ssh_enabled {
+        Some((config.ssh_bind, probe(config.ssh_bind)))
+    } else {
+        None
+    };
+    match http {
+        Listener::Refused => {
+            if let Some((address, Listener::Open)) = ssh {
+                anyhow::bail!(
+                    "the HTTP listener on {} refuses connections, but the SSH listener on {} \
+                     still accepts them and the online snapshot gate cannot reach the server; \
+                     stop the whole server, or use backup_snapshot_mode = \"fence\" with \
+                     maintenance mode",
+                    config.bind,
+                    address
+                );
+            }
+            if let Some((address, Listener::Unknown(reason))) = ssh {
+                anyhow::bail!("cannot prove the SSH listener on {address} is stopped: {reason}");
+            }
+            Ok((
+                Fence::NotRunning {
+                    detail: match config.ssh_enabled {
+                        true => format!(
+                            "HTTP {} and SSH {} both refused connections; no writers to gate",
+                            config.bind, config.ssh_bind
+                        ),
+                        false => format!(
+                            "HTTP {} refused connections; no writers to gate",
+                            config.bind
+                        ),
+                    },
+                },
+                None,
+            ))
+        }
+        Listener::Open => {
+            let token = control_token(config)?;
+            let status = request_status(config.bind, &token).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "the server at {} is running, but the online snapshot gate could not read \
+                     its maintenance state ({error}); stop it or use the fence path",
+                    config.bind
+                )
+            })?;
+            let started_here = match status.phase {
+                Phase::Active => {
+                    let started = match request_start(config.bind, &token).await {
+                        Ok(started) => started,
+                        Err(error) => {
+                            // It may have started before the response was lost.
+                            return Err(release_failed_gate(config, &token, error)
+                                .await
+                                .context("the online snapshot gate could not be started"));
+                        }
+                    };
+                    if started.phase == Phase::Active {
+                        return Err(release_failed_gate(
+                            config,
+                            &token,
+                            anyhow::anyhow!(
+                                "the server at {} did not enter the snapshot gate",
+                                config.bind
+                            ),
+                        )
+                        .await);
+                    }
+                    true
+                }
+                Phase::Draining | Phase::Drained => false,
+            };
+            match wait_gate_drained(config, &token).await {
+                Ok(()) => Ok((
+                    Fence::OnlineSnapshot {
+                        detail: format!(
+                            "server at {} drained with 0 writes in flight and was gated only for \
+                             the recorded position and the copy-on-write snapshot (HTTP control \
+                             endpoint)",
+                            config.bind
+                        ),
+                    },
+                    Some(OnlineGate {
+                        address: reachable_address(config.bind),
+                        token,
+                        started_here,
+                    }),
+                )),
+                Err(error) => {
+                    if !started_here {
+                        // The operator's own maintenance window is not ours to end.
+                        return Err(error);
+                    }
+                    Err(release_failed_gate(config, &token, error).await)
+                }
+            }
+        }
+        Listener::Unknown(reason) => anyhow::bail!(
+            "cannot prove the server at {} is stopped or gate it: {reason}",
+            config.bind
+        ),
+    }
+}
+
+/// Stops a gate this command started after it could not be used, and reports
+/// whether it was actually released. A failure here is stated as a failure,
+/// with the command that recovers it: the server must never be left fenced
+/// because a backup failed, and an operator must not be told it was released
+/// when it was not.
+async fn release_failed_gate(
+    config: &crate::config::Config,
+    token: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match request_stop(config.bind, token).await {
+        Ok(_) => error.context(format!(
+            "the online snapshot gate was released; the server at {} accepts writes again",
+            config.bind
+        )),
+        Err(stop) => anyhow::anyhow!(
+            "{error:#}\n\nthe online snapshot gate could not be released ({stop}); the server at \
+             {} may still be refusing writes. Run `githearth-server maintenance stop`",
+            config.bind
+        ),
+    }
+}
+
+/// Waits for the gate started by [`begin_online`] to report `drained`, bounded
+/// by `maintenance_drain_timeout_seconds`.
+async fn wait_gate_drained(config: &crate::config::Config, token: &str) -> anyhow::Result<()> {
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(config.maintenance_drain_timeout_seconds);
+    loop {
+        let status = request_status(config.bind, token).await?;
+        match status.phase {
+            Phase::Drained => return Ok(()),
+            Phase::Draining => {}
+            Phase::Active => anyhow::bail!(
+                "the server at {} left the snapshot gate before draining; refusing to take an \
+                 online snapshot",
+                config.bind
+            ),
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the online snapshot gate did not drain within {}s: {} write(s) still in flight at \
+                 {}; increase maintenance_drain_timeout_seconds or stop the server",
+                config.maintenance_drain_timeout_seconds,
+                status.in_flight,
+                config.bind
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

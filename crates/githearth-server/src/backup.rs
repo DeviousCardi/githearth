@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{ConnectOptions, PgPool, postgres::PgPoolOptions};
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     net::SocketAddr,
@@ -71,23 +72,49 @@ pub struct RepositoryPosition {
     pub object_format: String,
     pub journal_position: u64,
     pub journal_applied: u64,
+    /// SHA-256 of the whole client-visible ref set (`ref\0oid`, sorted) read
+    /// from the live repository at the recorded position, before the storage
+    /// snapshot was taken. It is the expected ref set of the snapshot, the
+    /// published archive and the restore, including refs that predate the live
+    /// journal or were never journaled (an import or a fork). `None` in an
+    /// archive written before this field existed; those are verified against
+    /// the journal only.
+    #[serde(default)]
+    pub refs_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PostgresPosition {
     pub database: String,
     pub server_version: String,
-    /// Advisory only: `pg_current_wal_lsn()` read beside the dump. It is not
-    /// the dump transaction's snapshot position and `restore` never compares
-    /// it; database-to-storage consistency is proved by the per-repository
-    /// journal positions in `repositories`.
+    /// `pg_current_wal_lsn()` read inside the exported repeatable-read
+    /// transaction. It is informational: the identity of the dump's position is
+    /// `exported_snapshot`, and `restore` does not compare the LSN.
+    /// Database-to-storage consistency is proved by the per-repository journal
+    /// positions in `repositories`.
     pub dump_lsn: String,
+    /// The exported repeatable-read snapshot `pg_dump --snapshot` used. It is
+    /// the recorded position the repository journal positions were read at.
+    #[serde(default)]
+    pub exported_snapshot: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FenceRecord {
     pub kind: String,
     pub detail: String,
+}
+
+/// How the storage part was captured. `mode` is `copy-on-write` for the online
+/// path and `maintenance-fence` for the M4.1 fallback; `mechanism` names the
+/// filesystem operation or `whole-root-tar`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRecord {
+    pub mode: String,
+    pub mechanism: String,
+    /// The journal position is taken for every repository; this records
+    /// whether the snapshot was verified against it.
+    pub refs_verified: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +142,10 @@ pub struct Manifest {
     pub format_version: u32,
     pub created_unix_seconds: u64,
     pub fence: FenceRecord,
+    /// How the storage tree was captured. Absent in archives written before
+    /// the online path existed; those were all whole-root tars under the fence.
+    #[serde(default)]
+    pub snapshot: Option<SnapshotRecord>,
     pub postgres: PostgresPosition,
     pub repositories: Vec<RepositoryPosition>,
     /// Every stored object's key, checksum and size (ADR 0014 §1). Empty for
@@ -695,6 +726,372 @@ fn extract_tar(archive: &Path, destination: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Copy-on-write storage snapshot (online path)
+// ---------------------------------------------------------------------------
+
+const SNAPSHOT_PREFIX: &str = ".githearth-backup-snapshot-";
+
+fn copy_on_write_mechanism() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "clonefile"
+    } else {
+        "reflink"
+    }
+}
+
+fn clone_command() -> Command {
+    let mut command = Command::new("cp");
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("LC_ALL", "C");
+    if cfg!(target_os = "macos") {
+        command.arg("-c");
+    } else {
+        command.arg("--reflink=always");
+    }
+    command.arg("-R");
+    command
+}
+
+fn clone_path(source: &Path, destination: &Path) -> Result<()> {
+    let output = clone_command()
+        .arg(source)
+        .arg(destination)
+        .output()
+        .context("cannot run the copy-on-write clone command")?;
+    if !output.status.success() {
+        bail!(
+            "copy-on-write clone failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Probes the storage filesystem by cloning a small file. A filesystem without
+/// copy-on-write support makes the clone fail (or copy rather than share
+/// blocks); only a successful clone selects the online path. Any probe failure
+/// — including one creating or writing the probe itself — is "unsupported", so
+/// `auto` falls back to the proved fence instead of aborting the backup.
+pub fn copy_on_write_supported(storage_root: &Path) -> Result<bool> {
+    match probe_copy_on_write(storage_root) {
+        Ok(supported) => Ok(supported),
+        Err(error) => {
+            eprintln!(
+                "storage snapshot: the copy-on-write probe could not run ({error:#}); using the \
+                 maintenance fence"
+            );
+            Ok(false)
+        }
+    }
+}
+
+fn probe_copy_on_write(storage_root: &Path) -> Result<bool> {
+    let probe = storage_root.join(format!(
+        "{SNAPSHOT_PREFIX}probe-{}",
+        Uuid::new_v4().simple()
+    ));
+    fs::create_dir(&probe).with_context(|| {
+        format!(
+            "cannot create the copy-on-write probe directory under {}",
+            storage_root.display()
+        )
+    })?;
+    let outcome = (|| -> Result<bool> {
+        let source = probe.join("source");
+        fs::write(&source, b"githearth copy-on-write probe")?;
+        Ok(clone_path(&source, &probe.join("clone")).is_ok())
+    })();
+    let _ = fs::remove_dir_all(&probe);
+    outcome
+}
+
+/// Removes snapshot trees left behind by a backup that crashed or was killed.
+/// Only entries older than a day are swept: a live backup may be cloning for a
+/// long time, and deleting its clone would corrupt the archive it is writing.
+fn sweep_stale_snapshots(storage_root: &Path) {
+    let Ok(entries) = fs::read_dir(storage_root) else {
+        return;
+    };
+    let cutoff = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SNAPSHOT_PREFIX)
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// A clone of the storage root on the same filesystem, removed on drop. It is
+/// a direct child of the storage root so a clone never crosses a mount, and
+/// its name is excluded from the clone and from the fallback tar.
+struct SnapshotTree {
+    path: PathBuf,
+}
+
+impl SnapshotTree {
+    fn create(storage_root: &Path) -> Result<Self> {
+        let path = storage_root.join(format!("{SNAPSHOT_PREFIX}{}", Uuid::new_v4().simple()));
+        fs::create_dir(&path).with_context(|| {
+            format!(
+                "cannot create the storage snapshot directory under {}",
+                storage_root.display()
+            )
+        })?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SnapshotTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Clone the parts of the storage root that the archive carries. Sockets and
+/// scratch trees under `run/`, `tmp/`, `hooks/` and the object store's own
+/// locks/tmp/usage/uploads are skipped exactly as the fallback tar skips them.
+fn copy_on_write_snapshot(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(name.as_ref(), "run" | "tmp" | "hooks" | "locks")
+            || name.starts_with(SNAPSHOT_PREFIX)
+        {
+            continue;
+        }
+        if name == "objects" {
+            let objects = destination.join("objects");
+            fs::create_dir(&objects)?;
+            for entry in fs::read_dir(entry.path())? {
+                let entry = entry?;
+                let child = entry.file_name();
+                let child = child.to_string_lossy();
+                if matches!(child.as_ref(), "tmp" | "locks" | "usage" | "uploads") {
+                    continue;
+                }
+                clone_path(&entry.path(), &objects.join(entry.file_name()))?;
+            }
+        } else {
+            clone_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The canonical digest of a client-visible ref set: SHA-256 over sorted
+/// `ref\0oid\0` entries. It is the expected ref set of the snapshot, so a ref
+/// that disappears between the recorded position and the clone changes it,
+/// whether or not a journal record named that ref.
+fn refs_digest(refs: &HashMap<String, githearth_core::ObjectId>) -> String {
+    let mut entries: Vec<(&str, String)> = refs
+        .iter()
+        .map(|(name, oid)| (name.as_str(), oid.to_string()))
+        .collect();
+    entries.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"githearth-refs-v1");
+    for (name, oid) in entries {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(oid.as_bytes());
+        digest.update([0]);
+    }
+    format!("sha256:{}", hex::encode(digest.finalize()))
+}
+
+/// Records the ref digest of every repository from a live storage root. It is
+/// called under the fence or the online gate, before anything is cloned, so it
+/// is the expected ref set of the snapshot that follows.
+fn record_ref_digests(storage_root: &Path, positions: &mut [RepositoryPosition]) -> Result<()> {
+    let storage = Storage::open_existing(storage_root)?;
+    for position in positions.iter_mut() {
+        let path = storage.repository_path(position.id);
+        let refs = if path.is_dir() {
+            githearth_git::layout::read_refs(&path).map_err(|error| {
+                anyhow::anyhow!(
+                    "repository {} refs cannot be read at the recorded position: {error}",
+                    position.id
+                )
+            })?
+        } else {
+            HashMap::new()
+        };
+        position.refs_digest = Some(refs_digest(&refs));
+    }
+    Ok(())
+}
+
+/// Proves that every client-visible ref at the recorded position is present in
+/// the storage snapshot with the value it had. Two independent checks: the ref
+/// digest recorded from the live root before the snapshot, and — for a
+/// repository with a journal — every journaled update replayed to the recorded
+/// position. The digest is what covers a ref with no journal record (a pre-0005
+/// ref, an import or a fork); the replay names the offending journal entry.
+fn verify_snapshot_refs(storage_root: &Path, positions: &[RepositoryPosition]) -> Result<()> {
+    let storage = Storage::open_existing(storage_root)?;
+    for position in positions {
+        let path = storage.repository_path(position.id);
+        if !path.is_dir() {
+            if position.status == "active" {
+                bail!(
+                    "repository {} is active but the storage snapshot has no directory",
+                    position.id
+                );
+            }
+            continue;
+        }
+        let actual_position = journal::verify(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "repository {} journal in the snapshot does not verify: {error}",
+                position.id
+            )
+        })?;
+        if actual_position != position.journal_position {
+            bail!(
+                "repository {} journal is at {} in the storage snapshot, but the recorded \
+                 position is {}",
+                position.id,
+                actual_position,
+                position.journal_position
+            );
+        }
+        let refs_now = githearth_git::layout::read_refs(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "repository {} refs in the snapshot cannot be read: {error}",
+                position.id
+            )
+        })?;
+        if position.journal_position > 0 {
+            verify_journaled_refs(position, &path, &refs_now)?;
+        }
+        if let Some(expected) = &position.refs_digest {
+            let actual = refs_digest(&refs_now);
+            if &actual != expected {
+                bail!(
+                    "repository {} client-visible refs in the storage snapshot are {actual}, but \
+                     the backup recorded {expected} at journal position {}; a ref that existed \
+                     when the position was taken is missing or moved (the snapshot holds {} ref(s))",
+                    position.id,
+                    position.journal_position,
+                    refs_now.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replays one repository's journal up to its recorded position and requires
+/// every committed update, including deletion, to be the value in `refs_now`.
+fn verify_journaled_refs(
+    position: &RepositoryPosition,
+    path: &Path,
+    refs_now: &HashMap<String, githearth_core::ObjectId>,
+) -> Result<()> {
+    let journal = githearth_git::journal::Journal::open(path).map_err(|error| {
+        anyhow::anyhow!(
+            "repository {} journal in the snapshot cannot be read: {error}",
+            position.id
+        )
+    })?;
+    let records: Vec<githearth_git::journal::Record> = journal
+        .records_after(0)
+        .filter(|record| record.sequence <= position.journal_position)
+        .cloned()
+        .collect();
+    let mut expected: HashMap<String, githearth_core::ObjectId> = HashMap::new();
+    let mut deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < records.len() {
+        let prepared = &records[index];
+        if prepared.kind != githearth_git::journal::Kind::Prepared {
+            index += 1;
+            continue;
+        }
+        let marker = match records.get(index + 1) {
+            Some(next)
+                if next.kind != githearth_git::journal::Kind::Prepared
+                    && next.operation == prepared.operation =>
+            {
+                Some(next.kind)
+            }
+            _ => None,
+        };
+        match githearth_git::journal::classify(prepared, marker, refs_now) {
+            githearth_git::journal::Outcome::Committed
+            | githearth_git::journal::Outcome::CommittedMarkerLost => {
+                for update in &prepared.updates {
+                    if update.new.bytes().all(|byte| byte == b'0') {
+                        expected.remove(&update.reference);
+                        deleted.insert(update.reference.clone());
+                    } else {
+                        let oid = update.new.parse().map_err(|_| {
+                            anyhow::anyhow!(
+                                "repository {} journal names an invalid object id {} for {}",
+                                position.id,
+                                update.new,
+                                update.reference
+                            )
+                        })?;
+                        deleted.remove(&update.reference);
+                        expected.insert(update.reference.clone(), oid);
+                    }
+                }
+            }
+            githearth_git::journal::Outcome::Aborted
+            | githearth_git::journal::Outcome::AbortedMarkerLost => {}
+            githearth_git::journal::Outcome::Diverged => bail!(
+                "repository {} journal diverged at sequence {}; the snapshot cannot be verified",
+                position.id,
+                prepared.sequence
+            ),
+        }
+        index += if marker.is_some() { 2 } else { 1 };
+    }
+    for (reference, oid) in &expected {
+        if refs_now.get(reference) != Some(oid) {
+            bail!(
+                "repository {} ref {reference} is at {} in the storage snapshot, but the journal \
+                 at position {} committed {oid}",
+                position.id,
+                refs_now
+                    .get(reference)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "(absent)".to_owned()),
+                position.journal_position
+            );
+        }
+    }
+    for reference in &deleted {
+        if refs_now.contains_key(reference) {
+            bail!(
+                "repository {} ref {reference} was deleted by journal position {}, but it is still \
+                 present in the storage snapshot",
+                position.id,
+                position.journal_position
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // PostgreSQL helpers
 // ---------------------------------------------------------------------------
 
@@ -850,12 +1247,17 @@ fn run_pg(command: &mut Command, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn dump_database(url: &str, path: &Path) -> Result<()> {
+fn dump_database(url: &str, path: &Path, exported_snapshot: Option<&str>) -> Result<()> {
     let url = parse_pg_url(url)?;
     let mut command = pg_command(&url, "pg_dump");
     command
         .args(["--format=custom", "--no-owner", "--no-acl", "--file"])
         .arg(path);
+    if let Some(snapshot) = exported_snapshot {
+        // `pg_export_snapshot()`'s id includes spaces and commas; pg_dump
+        // accepts it as one `--snapshot=<id>` argument.
+        command.arg(format!("--snapshot={snapshot}"));
+    }
     run_pg(&mut command, "pg_dump")
 }
 
@@ -869,23 +1271,6 @@ fn restore_database(url: &str, path: &Path) -> Result<()> {
         .arg(&url.database)
         .arg(path);
     run_pg(&mut command, "pg_restore")
-}
-
-/// The advisory PostgreSQL position. It is read beside the dump, not inside
-/// the dump's transaction, so it is recorded for an operator and never read by
-/// `restore`. See [`PostgresPosition::dump_lsn`].
-async fn position(pool: &PgPool) -> Result<PostgresPosition> {
-    let (database, version, lsn): (String, String, String) = sqlx::query_as(
-        "SELECT current_database(), current_setting('server_version'), \
-         pg_current_wal_lsn()::text",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(PostgresPosition {
-        database,
-        server_version: version,
-        dump_lsn: lsn,
-    })
 }
 
 /// Whether the named destination database exists. Shared with export import,
@@ -1082,6 +1467,7 @@ pub fn verify_parts(directory: &Path, manifest: &Manifest) -> Result<()> {
 
 pub struct BackupReport {
     pub fence: crate::maintenance::Fence,
+    pub snapshot: String,
     pub output: PathBuf,
     pub bytes: u64,
     pub repositories: usize,
@@ -1099,45 +1485,9 @@ pub async fn run_backup(
     if passphrase.is_empty() {
         return Err(ArchiveError::MissingKey.into());
     }
-    let fence = crate::maintenance::prove(config).await?;
-    println!("fence: {} ({})", fence.kind(), fence.detail());
 
     let pool = crate::connect(config).await?;
-    // Advisory only (see `PostgresPosition::dump_lsn`): read beside the dump,
-    // never compared by `restore`.
-    let postgres = position(&pool).await?;
 
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staging = Staging::new(parent, ".githearth-backup")?;
-    let result = build_backup(
-        config,
-        config_source,
-        passphrase,
-        output,
-        &staging.path,
-        &pool,
-        postgres,
-        fence,
-    )
-    .await;
-    pool.close().await;
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_backup(
-    config: &Config,
-    config_source: Option<&Path>,
-    passphrase: &[u8],
-    output: &Path,
-    staging: &Path,
-    pool: &PgPool,
-    postgres: PostgresPosition,
-    fence: crate::maintenance::Fence,
-) -> Result<BackupReport> {
     // A backup publishes a database dump. Encrypt any plaintext audit IP key
     // first, and refuse when the configured installation key cannot unwrap the
     // existing set: a dump taken outside the envelope is exactly what U28
@@ -1145,7 +1495,7 @@ async fn build_backup(
     // than no archive.
     let installation_keys = crate::secrets::InstallationKeySet::from_config(config)?;
     let startup = crate::secrets::startup(
-        pool,
+        &pool,
         installation_keys.as_ref(),
         crate::secrets::BACKFILL_BATCH,
     )
@@ -1157,6 +1507,7 @@ async fn build_backup(
     // id would still need both key files at restore, so failing closed is the
     // simpler contract.
     if !startup.retired_key_ids.is_empty() {
+        pool.close().await;
         bail!(
             "installation key rotation is incomplete: data keys remain under {}; run \
              `githearth-server secrets rotate` and retry the backup so the archive can be \
@@ -1164,41 +1515,179 @@ async fn build_backup(
             startup.retired_key_ids.join(", ")
         );
     }
+
+    // How the storage part is captured is decided once, before anything is
+    // written: `auto` probes the storage filesystem for copy-on-write cloning,
+    // and a failed probe (or an explicit `fence`) keeps M4.1's maintenance
+    // window. The probe happens before the gate so a filesystem that cannot
+    // clone never enters the online path.
+    let online = match config.backup_snapshot_mode.as_str() {
+        "fence" => false,
+        _ => copy_on_write_supported(&config.storage_root)?,
+    };
+    sweep_stale_snapshots(&config.storage_root);
+
+    // Everything that can fail without the gate is done before the gate
+    // starts, so a failure here cannot leave the server fenced.
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staging = Staging::new(parent, ".githearth-backup")?;
+
+    let (fence, mut gate) = if online {
+        crate::maintenance::begin_online(config).await?
+    } else {
+        (crate::maintenance::prove(config).await?, None)
+    };
+    println!("fence: {} ({})", fence.kind(), fence.detail());
+    if online {
+        println!("snapshot: copy-on-write (probed on the storage filesystem)");
+    } else {
+        println!("snapshot: maintenance fence (copy-on-write probe failed or disabled)");
+    }
+
+    // Drop the future before touching the gate again: it borrows `gate`
+    // mutably, and an operator interrupt must release the gate, not leave the
+    // server fenced until someone runs `maintenance stop`.
+    let result = {
+        let build = build_backup(
+            config,
+            config_source,
+            passphrase,
+            output,
+            &staging.path,
+            &pool,
+            installation_keys.as_ref(),
+            fence,
+            online,
+            &mut gate,
+        );
+        tokio::pin!(build);
+        tokio::select! {
+            result = &mut build => Some(result),
+            _ = interrupted() => None,
+        }
+    };
+    let result = match result {
+        Some(result) => result,
+        None => {
+            if let Some(gate) = gate.take() {
+                let _ = gate.release().await;
+            }
+            pool.close().await;
+            bail!(
+                "backup was interrupted; the online snapshot gate was released and no archive was \
+                 published"
+            );
+        }
+    };
+    // If the build failed before releasing the gate, release it here so the
+    // server never stays fenced because a backup failed.
+    if let Some(gate) = gate.take()
+        && let Err(error) = gate.release().await
+    {
+        pool.close().await;
+        return Err(error.context("the online snapshot gate could not be released"));
+    }
+    pool.close().await;
+    result
+}
+
+/// Resolves when the operator interrupts the backup, so an interrupted run
+/// releases the online snapshot gate instead of leaving the server refusing
+/// writes until someone runs `maintenance stop`.
+async fn interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut terminate), Ok(mut interrupt)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_backup(
+    config: &Config,
+    config_source: Option<&Path>,
+    passphrase: &[u8],
+    output: &Path,
+    staging: &Path,
+    pool: &PgPool,
+    installation_keys: Option<&crate::secrets::InstallationKeySet>,
+    fence: crate::maintenance::Fence,
+    online: bool,
+    gate: &mut Option<crate::maintenance::OnlineGate>,
+) -> Result<BackupReport> {
     config.check_private_paths_outside_storage()?;
 
-    // Dump the database first, so the storage snapshot that follows includes
-    // every journal record that references a row in the dump.
-    dump_database(&config.database_url, &staging.join("database.dump"))?;
-    // A test holds here to lift the fence between the dump and the snapshot.
-    crate::testseam::hold("BACKUP_AFTER_DUMP").await;
+    // The metadata position and the storage snapshot are taken together: a
+    // repeatable-read transaction exports a snapshot for `pg_dump`, records
+    // the WAL position, and reads every repository's journal position. The
+    // transaction stays open while the dump runs, so the dump is exactly that
+    // position even though writers resume before it starts.
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *conn)
+        .await
+        .context("cannot start the metadata snapshot transaction")?;
+    let (database, version, lsn, exported): (String, String, String, String) = sqlx::query_as(
+        "SELECT current_database(), current_setting('server_version'), \
+                pg_current_wal_lsn()::text, pg_export_snapshot()",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("cannot record the PostgreSQL position and export its snapshot")?;
+    let postgres = PostgresPosition {
+        database,
+        server_version: version,
+        dump_lsn: lsn,
+        exported_snapshot: Some(exported.clone()),
+    };
 
-    // Re-prove immediately before the storage snapshot. If the operator
-    // stopped the server's maintenance mode while the dump was running, this
-    // refuses instead of taking a snapshot that could race a new write.
-    let _ = crate::maintenance::prove(config).await?;
+    let before_snapshot = repository_positions(config, &mut conn).await?;
+    // The ref digest is read from the live root now, while the gate (or the
+    // fence) still holds writers, so it is the expected ref set of everything
+    // that follows: the clone, the archive and the restore. It covers a ref
+    // that has no journal record, which the journal replay cannot see.
+    let mut recorded = before_snapshot.clone();
+    record_ref_digests(&config.storage_root, &mut recorded)?;
+    let objects_before = object_positions(&config.storage_root)?;
 
-    // Sample the repository state *before* the snapshot. A journal-moving
-    // writer during the tar would otherwise produce an archive whose
-    // `storage.tar` and manifest disagree, discovered only at restore.
-    let before_snapshot = repository_positions(config, pool).await?;
-    let objects_before = object_positions(config)?;
-    create_tar(
-        &staging.join("storage.tar"),
-        &config.storage_root,
-        &[
-            "./run",
-            "./tmp",
-            "./hooks",
-            "./objects/tmp",
-            "./objects/locks",
-            // Derived or ephemeral: rebuilt after a restore, and an upload is
-            // not part of a published object set.
-            "./objects/usage",
-            "./objects/uploads",
-        ],
-    )?;
-    let after_snapshot = repository_positions(config, pool).await?;
-    let objects_after = object_positions(config)?;
+    // Take the storage snapshot. The online path clones the included subtrees
+    // with copy-on-write while the brief gate holds writers at the recorded
+    // position; the fence path tars the live root later, where no writer can
+    // acknowledge a commit.
+    let snapshot_tree = if online {
+        // A test holds here to attempt a write while the short gate is held,
+        // after the recorded position and before the snapshot.
+        crate::testseam::hold("BACKUP_ONLINE_GATE").await;
+        Some(SnapshotTree::create(&config.storage_root)?)
+    } else {
+        None
+    };
+    let snapshot_root = snapshot_tree
+        .as_ref()
+        .map(|tree| tree.path.clone())
+        .unwrap_or_else(|| config.storage_root.clone());
+    if online {
+        copy_on_write_snapshot(&config.storage_root, &snapshot_root)?;
+        // A test holds here to attempt a write after the clone and before the
+        // ref check; the gate is still held, so it must be refused.
+        crate::testseam::hold("BACKUP_AFTER_SNAPSHOT").await;
+    }
+
+    let after_snapshot = repository_positions(config, &mut conn).await?;
+    let objects_after = object_positions(&snapshot_root)?;
     if before_snapshot != after_snapshot {
         let changed = before_snapshot
             .iter()
@@ -1207,18 +1696,87 @@ async fn build_backup(
             .map(|(before, _after)| format!("repository {}", before.id))
             .unwrap_or_else(|| "the repository set".to_owned());
         bail!(
-            "repository state changed during the storage snapshot ({changed}); refusing to \
-             publish an inconsistent backup"
+            "repository state changed while the storage snapshot was taken ({changed}); \
+             refusing to publish an inconsistent backup"
         );
     }
     if objects_before != objects_after {
         bail!(
-            "object store inventory changed during the storage snapshot; refusing to publish an \
-             inconsistent backup"
+            "object store inventory changed while the storage snapshot was taken; refusing to \
+             publish an inconsistent backup"
         );
     }
-    let repositories = after_snapshot;
+
+    // The snapshot must carry every repository's client-visible refs at the
+    // recorded journal position, not just a set of files that happen to exist.
+    verify_snapshot_refs(&snapshot_root, &recorded)?;
+    let refs_verified = recorded
+        .iter()
+        .all(|position| position.refs_digest.is_some());
+    let repositories = recorded;
     let objects = objects_after;
+
+    // Release the brief gate now. The dump and everything after it run with
+    // writers active; they are after the recorded position by construction.
+    if let Some(gate) = gate.take() {
+        gate.release()
+            .await
+            .context("the online snapshot gate could not be released after the snapshot")?;
+    }
+
+    // A test holds here to make a write land after the gate release and before
+    // the dump: the dump is pinned to the exported snapshot, so the write is
+    // absent from the archive even though it was acknowledged.
+    crate::testseam::hold("BACKUP_BEFORE_DUMP").await;
+
+    // Writers are active again. A mixed-version writer (an older binary that
+    // ignores the gate) could have added a plaintext audit key since the check
+    // at the start of the command; the dump must never carry one. Re-running
+    // the full start-up check also re-proves that every wrapper still opens.
+    crate::secrets::startup(pool, installation_keys, crate::secrets::BACKFILL_BATCH)
+        .await
+        .context(
+            "cannot prove every stored secret is encrypted immediately before the dump; refusing \
+             to publish a dump that may carry a plaintext secret",
+        )?;
+
+    dump_database(
+        &config.database_url,
+        &staging.join("database.dump"),
+        Some(&exported),
+    )?;
+    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+    drop(conn);
+
+    // A test holds here to lift the fence between the dump and the snapshot.
+    crate::testseam::hold("BACKUP_AFTER_DUMP").await;
+
+    if online {
+        create_tar(&staging.join("storage.tar"), &snapshot_root, &[])?;
+    } else {
+        // The fence path keeps the operator's maintenance window (or the
+        // stopped server) for the whole backup. Re-prove immediately before
+        // the storage tar: if maintenance was lifted during the dump, refuse
+        // instead of tarring a tree a new writer could be moving.
+        let _ = crate::maintenance::prove(config).await?;
+        create_tar(
+            &staging.join("storage.tar"),
+            &config.storage_root,
+            &[
+                "./run",
+                "./tmp",
+                "./hooks",
+                "./objects/tmp",
+                "./objects/locks",
+                // Derived or ephemeral: rebuilt after a restore, and an upload
+                // is not part of a published object set.
+                "./objects/usage",
+                "./objects/uploads",
+                "./.githearth-backup-snapshot-*",
+            ],
+        )?;
+    }
+    drop(snapshot_tree);
 
     // The effective configuration is the one this backup was taken under.
     let config_text = toml::to_string(config)?;
@@ -1270,6 +1828,20 @@ async fn build_backup(
         parts.push(part.clone());
     }
 
+    let snapshot = Some(SnapshotRecord {
+        mode: if online {
+            "copy-on-write".into()
+        } else {
+            "maintenance-fence".into()
+        },
+        mechanism: if online {
+            copy_on_write_mechanism().into()
+        } else {
+            "whole-root-tar".into()
+        },
+        refs_verified,
+    });
+
     let material = key_material(passphrase)?;
     let manifest = Manifest {
         format_version: FORMAT_VERSION,
@@ -1278,12 +1850,13 @@ async fn build_backup(
             kind: fence.kind().into(),
             detail: fence.detail().into(),
         },
+        snapshot,
         postgres,
         repositories,
         objects,
         config: config_part,
         ssh_host_key: host_key_part,
-        installation: installation_keys.as_ref().map(|keys| keys.record()),
+        installation: installation_keys.map(|keys| keys.record()),
         parts,
         encryption: EncryptionRecord {
             key_id: material.key_id.clone(),
@@ -1305,9 +1878,12 @@ async fn build_backup(
              SHA-256. It does not cover itself (the outer AES-256-GCM tag authenticates it) and \
              it deliberately does not contain the encryption key."
                 .into(),
-            "The PostgreSQL position is advisory: `dump_lsn` is pg_current_wal_lsn() read beside \
-             the dump, not the dump's snapshot position, and restore does not compare it. \
-             Database-to-storage consistency is proved by the per-repository journal positions."
+            "The PostgreSQL position is the exported repeatable-read snapshot that pg_dump used; \
+             the dump is exactly that position. Database-to-storage consistency is additionally \
+             proved by the per-repository journal positions, and every repository's \
+             client-visible refs at those positions were verified inside the storage snapshot \
+             against a SHA-256 digest of the live ref set recorded before the snapshot and against \
+             the journal replay."
                 .into(),
             "The manifest records the installation key id, algorithm and wrap method only. The \
              installation key itself is never written to the database or the archive; without it \
@@ -1345,8 +1921,14 @@ async fn build_backup(
     }
 
     let bytes = fs::metadata(output)?.len();
+    let snapshot = manifest
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.mode.clone())
+        .unwrap_or_else(|| "legacy-whole-root-tar".into());
     Ok(BackupReport {
         fence,
+        snapshot,
         output: output.to_path_buf(),
         bytes,
         repositories: manifest.repositories.len(),
@@ -1378,6 +1960,7 @@ fn verify_written_archive(archive: &Path, passphrase: &[u8], staging: &Path) -> 
     extract_tar(&root.join("storage.tar"), &storage_dir)?;
     let storage = Storage::open_existing(&storage_dir)?;
     verify_objects(&storage_dir, &manifest.objects)?;
+    verify_snapshot_refs(&storage_dir, &manifest.repositories)?;
     let (_, problems) = storage.check()?;
     if let Some(first) = problems.first() {
         bail!(
@@ -1390,11 +1973,17 @@ fn verify_written_archive(archive: &Path, passphrase: &[u8], staging: &Path) -> 
     Ok(())
 }
 
-async fn repository_positions(config: &Config, pool: &PgPool) -> Result<Vec<RepositoryPosition>> {
-    let rows: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
-        "SELECT id, status, object_format, journal_applied FROM repositories ORDER BY id",
+async fn repository_positions(
+    config: &Config,
+    conn: &mut sqlx::PgConnection,
+) -> Result<Vec<RepositoryPosition>> {
+    let rows: Vec<(Uuid, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT r.id, r.status, r.object_format, r.journal_applied, \
+                COALESCE((SELECT max(p.journal_sequence) FROM repository_pushes p \
+                          WHERE p.repository_id = r.id), 0) \
+         FROM repositories r ORDER BY r.id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     let storage = Storage::open_existing(&config.storage_root)?;
     let scanned = storage.scan()?;
@@ -1406,7 +1995,7 @@ async fn repository_positions(config: &Config, pool: &PgPool) -> Result<Vec<Repo
         );
     }
     let mut positions = Vec::with_capacity(rows.len());
-    for (id, status, object_format, journal_applied) in rows {
+    for (id, status, object_format, journal_applied, max_push) in rows {
         let path = storage.repository_path(id);
         let journal_position = if path.is_dir() {
             journal::verify(&path).map_err(|error| {
@@ -1420,12 +2009,20 @@ async fn repository_positions(config: &Config, pool: &PgPool) -> Result<Vec<Repo
         } else {
             0
         };
+        if max_push as u64 > journal_position {
+            bail!(
+                "repository {id} has metadata at journal sequence {max_push}, past the storage \
+                 journal position {journal_position}; refusing to back up an inconsistent \
+                 installation"
+            );
+        }
         positions.push(RepositoryPosition {
             id,
             status,
             object_format,
             journal_position,
             journal_applied: journal_applied.max(0) as u64,
+            refs_digest: None,
         });
     }
     Ok(positions)
@@ -1433,8 +2030,8 @@ async fn repository_positions(config: &Config, pool: &PgPool) -> Result<Vec<Repo
 
 /// Every object the installation stores, or an empty list when the object
 /// store has never been opened (a fresh install before M4.2's first write).
-fn object_positions(config: &Config) -> Result<Vec<ObjectRecord>> {
-    let root = config.storage_root.join("objects");
+fn object_positions(storage_root: &Path) -> Result<Vec<ObjectRecord>> {
+    let root = storage_root.join("objects");
     if !root.is_dir() {
         return Ok(Vec::new());
     }
@@ -1673,7 +2270,10 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
                 // key the destination holds. This runs before the storage tree
                 // or configuration is published; a failure drops the database
                 // below, so the restore never leaves unreadable secrets.
-                if manifest.installation.is_some() || installation_keys.is_some() {
+                // A pre-format-3 archive has no installation record and no
+                // envelope, so it is restored as plaintext even when the
+                // operator supplied a destination key.
+                if manifest.installation.is_some() {
                     crate::secrets::startup(
                         &pool,
                         installation_keys.as_ref(),
@@ -1693,6 +2293,7 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
         // Every object's recorded checksum, and the manifest's inventory,
         // before the storage tree is published to the destination.
         verify_objects(&staged_storage, &manifest.objects)?;
+        verify_snapshot_refs(&staged_storage, &manifest.repositories)?;
 
         publish_storage(&staged_storage, &destination_storage)?;
         storage_published = true;
@@ -2013,10 +2614,12 @@ mod tests {
                 kind: "not-running".into(),
                 detail: "test".into(),
             },
+            snapshot: None,
             postgres: PostgresPosition {
                 database: "d".into(),
                 server_version: "16".into(),
                 dump_lsn: "0/0".into(),
+                exported_snapshot: None,
             },
             repositories: Vec::new(),
             objects: Vec::new(),
@@ -2052,6 +2655,15 @@ mod tests {
         let archive = directory.join("archive.ghbackup");
         encrypt_with(&payload, &archive, &material).unwrap();
         archive
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_falls_back_to_the_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("no-such-storage-root");
+        // The probe directory cannot be created, so `auto` must choose the
+        // fence path rather than abort the backup.
+        assert!(!copy_on_write_supported(&missing).unwrap());
     }
 
     #[test]
