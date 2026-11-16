@@ -3,9 +3,9 @@
 Date: 2026-11-15.
 
 Status: **decision accepted for M4.2; the object-store half is implemented in
-increment 7A and the secrets-at-rest half in increment 7C, and their detailed
-designs are recorded below.** The token, fairness and export halves remain open
-decisions.
+increment 7A, and the secrets-at-rest and single-node online-backup halves in
+increment 7C, and their detailed designs are recorded below.** The token,
+fairness and export halves remain open decisions.
 
 ## Context
 
@@ -217,17 +217,23 @@ reach are unchanged.
     finish and reports drained.
   It records which check it used, and refuses otherwise.
 - **Single-node online backup** uses a filesystem snapshot or copy-on-write
-  clone of the storage root. It takes a metadata transaction at a recorded
-  PostgreSQL position, records one journal position per repository, starts the
-  snapshot, and verifies that every repository's client-visible refs at the
-  recorded position are present in the snapshot. A write that starts before
-  the snapshot and commits during it is either in the restore or was refused
-  before acknowledgement. Filesystems without snapshots keep the
-  maintenance-window path; the command reports which mode it used.
+  clone of the storage root. It opens a repeatable-read metadata transaction,
+  exports its snapshot for `pg_dump`, records the PostgreSQL position, records
+  one journal position per repository, and clones the storage root while
+  writers continue. A brief automatic gate, not an operator maintenance window,
+  drains the writers that were already committing and refuses a new ref write
+  with `503`, so a write racing the snapshot is in the restore or was refused
+  before acknowledgement. After the snapshot it verifies that every
+  repository's client-visible refs at the recorded journal position are present
+  in the clone, then releases the gate and runs the dump, tar and encryption
+  while writers continue. Filesystems without copy-on-write keep the
+  maintenance-window path; the command probes the filesystem and reports which
+  mode it used in `manifest.snapshot`.
 - Restore verifies the manifest, the key id, the database-to-storage
-  consistency, and every repository's journal position. A wrong key or a
-  missing key fails before the server is started, with a message naming the
-  key id.
+  consistency, every repository's journal position and its refs, and every
+  object checksum. A wrong key, a missing key, an unreadable key or a key id
+  that does not match the archive fails before the server is started, with a
+  message naming the key id.
 - The cluster backup is M5's; this ADR fixes only the single-node form it must
   extend.
 
@@ -454,10 +460,9 @@ returned.
    passphrase-derived key parameters, below.
 4. **Resolved in M4.2 increment 7C** — re-wrap batch size and the operator
    signal that rotation is complete, below.
-5. **Resolved in M4.2 increment 7A** — object-verification depth for backup
-   and restore, below. The filesystem snapshot mechanism itself remains the
-   operator's choice; the single-node path uses the proved write fence and a
-   whole-root tar, so no filesystem-specific snapshot API is required here.
+5. **Resolved in M4.2 increments 7A and 7C** — object-verification depth for
+   backup and restore in 7A, and the filesystem snapshot mechanism, the racing
+   write and the ref-verification depth in 7C, below.
 6. **Resolved in M4.2 increment 7D** — the measured fairness bound on the
    reference machine and the defaults revised from it, below.
 7. **Resolved in M4.2 increment 7A** — export format versioning, the metadata
@@ -985,6 +990,26 @@ is atomic per row, so no request can see a new key id with an old blob or the
 reverse. Both the new and retired keys must be configured for the whole
 rotation; the server does not pick a key by guessing.
 
+A row is selected for re-wrapping when its `kek_id` is not the current key
+**or** its `wrap_method` is not the current method. The second term covers a
+row whose key material is unchanged but whose method label differs from the one
+the same material is configured with now — a descriptor-format rename, or a row
+written by a release that spelled the method differently. The key id still
+names the key material, so `rotate` opens the row with the method the row
+records and writes it back under the current method. Start-up and restore keep
+the strict method check and refuse such a row until it has been re-wrapped; the
+invariant they need is that every row opens the way it will be used, and
+rotation is the one command that can restore it without decrypting a secret.
+`secrets status` counts those rows in `outdated_wrap_method` and does not call
+the set complete until they are re-wrapped.
+
+The condition's example — moving the same material from a raw key file to a
+passphrase descriptor — cannot produce this shape: a passphrase descriptor
+derives its own 32 bytes, and therefore its own key id, from the passphrase. It
+is a different key, handled by an ordinary rotation under the old key id, not a
+method mismatch. The method term closes the general same-id/different-label
+case; it is not what makes that migration work.
+
 ### Re-wrap batch size and the completion signal (open item 4)
 
 One rotation transaction re-wraps at most **256 data keys** (`ROTATE_BATCH`),
@@ -998,8 +1023,8 @@ that is the heavier transaction.
 The operator signal is `githearth-server secrets status`: it prints the current
 key id and, per key id, the number of data keys and secrets, then
 `rotation complete` and exits zero only when every data key is under the current
-key, every key id is configured, **one sample wrapper per key id actually
-unwraps**, and no plaintext row remains. Otherwise it prints what is left and
+key, every key id is configured, **every wrapper actually unwraps** (all rows,
+not one sample per key id), and no plaintext row remains. Otherwise it prints what is left and
 exits non-zero. `secrets rotate` prints `rotation complete` when its own
 remaining count reaches zero. `doctor` reports the same state as a check named
 `installation key`, including a damaged wrapper under a configured key id, and
@@ -1032,6 +1057,151 @@ that every wrapped data key opens. A wrong key, a missing key or an unreadable
 row fails before the storage tree or configuration is published and drops the
 partially restored database. Switching the destination installation key is a
 separate rotation, not part of restore.
+that every wrapped data key opens — every row of `secret_data_keys`, not one
+sample per key id. The start-up check (`serve`, `migrate`, `backup` and
+`restore`) unwraps the same complete set and refuses with the number of failures
+and the first unreadable data key id, because a damaged non-sampled wrapper
+would otherwise start the server and fail only when that secret is used.
+Archives written before format 3 have no installation record and no envelope;
+they restore as plaintext even when the operator supplies a destination key.
+
+A missing key file, a key file whose mode is too loose, a wrong key and a key
+id that does not match the archive each fail with a distinct message before the
+storage tree or configuration is published, and the partially restored database
+is dropped. Switching the destination
+installation key is a separate rotation, not part of restore.
+
+### Single-node online backup: snapshot mechanism and verification depth (open item 5)
+
+The online path is chosen by a probe, not by configuration guesswork. Before
+anything is written, `backup` creates a small file under `storage_root`, clones
+it with `cp -c` on macOS (APFS `clonefile`) or `cp --reflink=always` on Linux
+(btrfs/XFS reflink), and removes the probe. Only a successful clone selects the
+online path. `backup_snapshot_mode = "auto"` (the default) runs the probe;
+`"fence"` skips it and keeps the M4.1 maintenance window, for a filesystem that
+cannot clone and for the deterministic fallback test. A probe that fails for
+any reason, including creating or writing its own probe file, is "no
+copy-on-write" and falls back to the fence with the reason printed; it never
+aborts the backup. A running server is then refused until the operator stops it
+or enters maintenance, exactly as before.
+
+The clone is a hidden direct child of `storage_root`, so it is necessarily on
+the same filesystem and cannot cross a mount. It clones `repositories/`,
+`trash/`, `orphans/` and `objects/data` plus `objects/meta`, skipping `run/`,
+`tmp/`, `hooks/`, `locks/` and the object store's `tmp/`, `locks/`, `usage/`
+and `uploads/` exactly as the fallback tar skips them. The clone directory is
+removed when the storage tar has been written.
+
+The position is taken first: a `REPEATABLE READ` transaction calls
+`pg_export_snapshot()` and `pg_current_wal_lsn()`, reads every repository row
+and its journal position inside that transaction, and stays open while
+`pg_dump --snapshot=<id>` runs after the gate is released. The dump is therefore
+exactly the recorded position even though writers resume before it starts. A
+metadata push sequence past the storage journal position refuses the backup.
+
+The write guarantee is explicit. The online path reuses the proved fence as a
+**brief automatic gate**, not an operator window: it drains writes already in
+flight before recording the position and refuses a new ref write with `503`
+while the clone runs. A push that started before the gate is in the restore; a
+push that starts during it was refused before acknowledgement. The gate is
+released immediately after the clone and ref verification, so the database
+dump, storage tar, encryption and archive verification all run with writers
+active. `manifest.fence.kind` is `online-snapshot` and `manifest.snapshot`
+records `mode = "copy-on-write"`, the mechanism (`clonefile` or `reflink`) and
+`refs_verified = true`; the fallback records `maintenance`/`not-running` and
+`mode = "maintenance-fence"`. With the server stopped the online path also
+records `fence.kind = not-running`: there were no writers to gate, and
+`manifest.snapshot.mode` (still `copy-on-write`) is what says how the storage
+part was captured. The two fields answer different questions, so `not-running`
+alone does not mean the fence path.
+
+The gate is released on every failure path, not only on success. A staging
+directory that cannot be created is made before the gate starts; a gate that
+cannot drain, a control request that fails, a server that does not enter the
+gate, a panic while the gate is held and a `SIGINT`/`SIGTERM` during the backup
+all stop the gate before the command exits (or, for a signal, before it reports
+the interruption). The server is therefore never left refusing writes because
+a backup failed; an operator who still finds it fenced is told to run
+`maintenance stop`.
+
+Ref verification is a digest of the whole client-visible ref set. Before the
+storage snapshot, under the gate or the fence, the command reads every
+repository's refs from the live root and records `sha256` over the sorted
+`ref\0oid` entries in `manifest.repositories[].refs_digest`. The clone, the
+archive the command writes and the staged tree before `restore` publishes it
+must all produce that digest; a ref that disappears or moves between the
+recorded position and the clone changes it, whether or not a journal record
+named that ref. That is what covers a ref with no journal record — a pre-0005
+ref, an import or a fork — which the journal replay alone cannot see. On top of
+the digest, each repository's live journal is replayed to its recorded position
+and every committed update, including deletion, must be the value in the
+snapshot; the replay is what names the offending journal entry. An archive
+written before `refs_digest` existed has `None` and is verified against the
+journal only, as before.
+
+Verification runs on the clone before the gate is released, again on the
+archive the command just wrote, and again on the staged tree before `restore`
+publishes it. The depth is complete, not sampled: every repository's journal
+position, every client-visible ref, every object's whole-object and chunk
+checksums, and the existing `git fsck --full`/journal check. A large repository
+therefore costs one full verification pass at backup and one at restore; that
+is the same depth M4.1 already paid, and it is the price of "a backup is
+consistent or it does not happen".
+
+Two further checks close the dump's own windows. `backup` re-runs the same
+start-up secret check immediately before `pg_dump`, so a plaintext audit key
+that a mixed-version writer inserted after the check at the start of the
+command cannot enter the dump. And the dump is pinned to the exported snapshot,
+so a write acknowledged after the gate is released is absent from both the
+storage snapshot and the database dump: it is not in the restore, and nothing
+suggested it would be. The case evidence asserts exactly that with a real push
+between the gate release and the dump.
+
+The write guarantee U29 states is therefore bounded by the recorded position.
+A write that **starts before** the recorded position is in the restore or was
+refused before acknowledgement; a write acknowledged **after** the recorded
+position is outside that guarantee and is absent from both parts by
+point-in-time design. This ADR does not claim the literal "any write during the
+command" reading: the two racing cases are named for the boundary they cover
+(`a_write_that_starts_before_the_recorded_position_is_restored_or_refused` and
+`a_write_after_the_recorded_position_is_acknowledged_and_absent_by_design`).
+
+Test evidence and its limits. The online cases probe the storage filesystem and
+report a skip, with the reason, when it cannot clone, so on the project's ext4
+runner six of the eleven cases report `skipping ...: does not support
+copy-on-write cloning` and return; the five that need no clone still run there
+(the key failure modes with their six distinct failures, the manifest that
+records only the key id, algorithm and wrap method, the damaged-wrapper archive
+that `restore` must refuse, the forced fence fallback, and the gate
+drain-timeout release).
+The Linux leg of the gate was reproduced on ext4 (`rust:1.89`, git 2.47,
+PostgreSQL 17) and passes; two facts outside this change are recorded rather
+than asserted. Clippy 1.89 reports `nonminimal_bool` for `!…is_some_and(…)` in
+`pulls.rs`, which this increment does not touch and newer clippy accepts, and
+the run is not the CI job itself: its `cargo llvm-cov` coverage threshold,
+`cargo deny` and the container image build were not re-run.
+
+Keeping the clone path evidenced on Linux now has a CI job:
+`.github/workflows/ci.yml` gains `online-backup-btrfs`, which builds a 6 GiB
+btrfs loopback, mounts it, sets `TMPDIR` to it and runs
+`--test online_backup -- --include-ignored` as the runner user. The same steps
+were reproduced here in a `rust:1.89-trixie` container (git 2.47.3,
+PostgreSQL 17.12 client and server, uid 501, 6 GiB btrfs loopback) and all
+eleven cases passed with no skip, so the clone, the probe and the fallback are
+evidenced on a reflink filesystem as well as on APFS. The workflow is
+`workflow_dispatch`-only and has not been dispatched for this change; that the
+GitHub job passes is not asserted here.
+
+The damaged-wrapper restore path is now evidenced end to end. `backup` refuses
+to write an archive whose wrapper cannot be opened, so such an archive can only
+come from an older binary or from editing a dump by hand; the case rebuilds one
+(a correct-length wrapper that cannot authenticate) inside a well-formed
+container and runs the real `restore` against it. The run fails at
+`secrets::startup` after `pg_restore`, names the unreadable wrapper, drops the
+partially restored database, and publishes no storage tree, configuration or
+host key. The boundary-only case with a damaged second wrapper remains as the
+unit-level check of the same call.
+
 ## Resolutions recorded by M4.2 increment 7D
 
 ### Open item 6: the measured fairness bound and revised defaults

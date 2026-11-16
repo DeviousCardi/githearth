@@ -172,12 +172,38 @@ impl InstallationKey {
     ) -> Result<[u8; DATA_KEY_BYTES]> {
         if method != self.method {
             bail!(
-                "data key {} was wrapped with method {method}, but installation key {} uses {}",
+                "data key {} was wrapped with method {method}, but installation key {} uses {}; \
+                 run `secrets rotate` to re-wrap it under the current method",
                 data_key_id,
                 self.id,
                 self.method
             );
         }
+        self.open(data_key_id, method, wrapped)
+    }
+
+    /// Opens a data key with the method recorded on its row, without requiring
+    /// that method to match how this key is configured now. The row's `kek_id`
+    /// already names the key material, so the method is only the AAD suffix:
+    /// a row written before a descriptor-format rename can still be opened and
+    /// re-wrapped. Only rotation uses this; startup and restore keep the
+    /// strict check above, because a mismatch there must be healed by
+    /// `secrets rotate`, not silently accepted forever.
+    fn unwrap_recorded(
+        &self,
+        data_key_id: Uuid,
+        method: &str,
+        wrapped: &[u8],
+    ) -> Result<[u8; DATA_KEY_BYTES]> {
+        self.open(data_key_id, method, wrapped)
+    }
+
+    fn open(
+        &self,
+        data_key_id: Uuid,
+        method: &str,
+        wrapped: &[u8],
+    ) -> Result<[u8; DATA_KEY_BYTES]> {
         if wrapped.len() != NONCE_BYTES + DATA_KEY_BYTES + 16 {
             bail!("wrapped data key {} has an invalid length", data_key_id);
         }
@@ -192,7 +218,7 @@ impl InstallationKey {
                 &Nonce::from(nonce),
                 Payload {
                     msg: ciphertext,
-                    aad: &wrap_aad(&self.id, &data_key_id, &self.method),
+                    aad: &wrap_aad(&self.id, &data_key_id, method),
                 },
             )
             .map_err(|_| {
@@ -353,8 +379,16 @@ fn passphrase_method(memory_kib: u32, iterations: u32, parallelism: u32) -> Stri
 /// another user owns. The check is made on both the key file and a passphrase
 /// file; the error names the path and the reason, never the contents.
 pub fn check_private_file(path: &Path, label: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("cannot inspect {label} {}", path.display()))?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{label} {} is missing", path.display())
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect {label} {}", path.display()));
+        }
+    };
     if metadata.file_type().is_symlink() {
         bail!(
             "{label} {} is a symbolic link; use a regular file",
@@ -781,9 +815,10 @@ pub struct StartupReport {
 }
 
 /// The start-up/migration check: encrypts any plaintext `audit_ip_keys.key`
-/// rows, then proves the configured key set can unwrap every key id present.
-/// A missing or wrong key is an error naming the key id, never a warning that
-/// lets the server start with unreadable secrets.
+/// rows, then proves the configured key set can unwrap **every** wrapped data
+/// key. A missing or wrong key is an error naming the key id, never a warning
+/// that lets the server start with unreadable secrets; one damaged wrapper is
+/// one secret that would fail at use, so a sample per key id is not enough.
 pub async fn startup(
     pool: &PgPool,
     keys: Option<&InstallationKeySet>,
@@ -874,7 +909,7 @@ pub async fn startup(
             "stored secrets need the installation key, but installation_key_file is not set; \
              refusing to start with unreadable secrets",
         )?;
-        for (kek_id, count) in &rows {
+        for (kek_id, _count) in &rows {
             if keys.get(kek_id).is_none() {
                 bail!(
                     "stored secrets were wrapped by installation key {kek_id}, which is not \
@@ -882,25 +917,36 @@ pub async fn startup(
                      correct installation_key_file"
                 );
             }
-            let sample: WrappedDataKey = sqlx::query_as(
-                "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys \
-                 WHERE kek_id = $1 ORDER BY id LIMIT 1",
-            )
-            .bind(kek_id)
-            .fetch_one(pool)
-            .await
-            .context("cannot read a wrapped data key")?;
-            let key = keys.get(kek_id).expect("checked above");
-            key.unwrap(sample.id, &sample.wrap_method, &sample.wrapped_key)
-                .with_context(|| {
-                    format!(
-                        "the configured installation key {kek_id} does not match {count} wrapped \
-                         data key(s); check installation_key_file"
-                    )
-                })?;
             if kek_id != keys.current.id() {
                 retired.push(kek_id.clone());
             }
+        }
+        // Every wrapper, not one sample per key id: a damaged second wrapper
+        // would otherwise start the server and fail only when that secret is
+        // used, which is exactly what "never starts with unreadable secrets"
+        // forbids. Unwrapping is ~48 bytes of AES-GCM per row.
+        let wrapped: Vec<WrappedDataKey> = sqlx::query_as(
+            "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .context("cannot read the wrapped data keys")?;
+        let mut failures = Vec::new();
+        for row in &wrapped {
+            let key = keys
+                .get(&row.kek_id)
+                .expect("every key id was checked above");
+            if let Err(error) = key.unwrap(row.id, &row.wrap_method, &row.wrapped_key) {
+                failures.push((row.id, row.kek_id.clone(), format!("{error:#}")));
+            }
+        }
+        if let Some((id, kek_id, error)) = failures.first() {
+            bail!(
+                "{} of {} wrapped data key(s) cannot be opened with the configured installation \
+                 key(s); first: data key {id} under {kek_id}: {error}",
+                failures.len(),
+                wrapped.len()
+            );
         }
     }
 
@@ -980,9 +1026,11 @@ pub async fn rotate(
         let mut tx = pool.begin().await?;
         let rows: Vec<WrappedDataKey> = sqlx::query_as(
             "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys \
-             WHERE kek_id <> $1 ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED",
+             WHERE kek_id <> $1 OR wrap_method <> $2 ORDER BY id LIMIT $3 \
+             FOR UPDATE SKIP LOCKED",
         )
         .bind(keys.current.id())
+        .bind(keys.current.method())
         .bind(batch as i64)
         .fetch_all(&mut *tx)
         .await
@@ -999,7 +1047,7 @@ pub async fn rotate(
                     row.id, row.kek_id
                 )
             })?;
-            let data_key = source.unwrap(row.id, &row.wrap_method, &row.wrapped_key)?;
+            let data_key = source.unwrap_recorded(row.id, &row.wrap_method, &row.wrapped_key)?;
             let wrapped = keys.current.wrap(row.id, &data_key)?;
             sqlx::query(
                 "UPDATE secret_data_keys SET kek_id = $1, wrap_method = $2, wrapped_key = $3 \
@@ -1017,12 +1065,14 @@ pub async fn rotate(
         rewrapped += rows.len() as u64;
         tracing::info!(rows = rows.len(), rewrapped, "re-wrapped data keys");
     }
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM secret_data_keys WHERE kek_id <> $1")
-            .bind(keys.current.id())
-            .fetch_one(pool)
-            .await
-            .context("cannot count data keys still under a retired key")?;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM secret_data_keys WHERE kek_id <> $1 OR wrap_method <> $2",
+    )
+    .bind(keys.current.id())
+    .bind(keys.current.method())
+    .fetch_one(pool)
+    .await
+    .context("cannot count data keys still under a retired key or older wrap method")?;
     Ok(RotationReport {
         rewrapped,
         remaining,
@@ -1042,10 +1092,15 @@ pub struct StatusReport {
     pub keys: Vec<KeyStatus>,
     pub legacy_plaintext: i64,
     pub unknown_key_ids: Vec<String>,
-    /// Key ids whose wrapped data key one sample cannot be opened, usually a
-    /// damaged wrapper or a wrong key with the same id (impossible in practice,
-    /// so this is damage). `status`/`doctor` must not call these "complete".
+    /// Key ids whose wrapped data keys cannot all be opened, usually a damaged
+    /// wrapper or a wrong key with the same id (impossible in practice, so this
+    /// is damage). `status`/`doctor` must not call these "complete".
     pub unreadable_key_ids: Vec<String>,
+    /// Data keys under a configured key id whose `wrap_method` is not the
+    /// method that key is configured with now. They still open (the id names
+    /// the key material), but rotation must re-wrap them before the set is
+    /// complete.
+    pub outdated_wrap_method: i64,
     pub rotation_complete: bool,
 }
 
@@ -1068,8 +1123,15 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
     .await
     .context("cannot count wrapped data keys")?;
     let current = keys.map(|keys| keys.current.id().to_owned());
+    let wrapped: Vec<WrappedDataKey> = sqlx::query_as(
+        "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("cannot read the wrapped data keys for status")?;
     let mut unknown = Vec::new();
     let mut unreadable = Vec::new();
+    let mut outdated_wrap_method = 0i64;
     let mut complete = legacy_plaintext == 0;
     let mut out = Vec::new();
     for (key_id, data_keys, secrets) in rows {
@@ -1079,24 +1141,26 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
             complete = false;
         }
         if let Some(key) = configured {
-            // A wrapper can be unreadable while its `kek_id` is configured: a
-            // damaged tag or an installation key that is not the one that
-            // wrapped it. `startup` unwraps a sample and refuses to start; the
-            // operator's status check must report the same thing rather than
-            // "rotation complete".
-            let sample: Option<WrappedDataKey> = sqlx::query_as(
-                "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys \
-                 WHERE kek_id = $1 ORDER BY id LIMIT 1",
-            )
-            .bind(&key_id)
-            .fetch_optional(pool)
-            .await
-            .context("cannot read a wrapped data key for status")?;
-            if let Some(sample) = sample
-                && key
-                    .unwrap(sample.id, &sample.wrap_method, &sample.wrapped_key)
-                    .is_err()
-            {
+            let outdated = wrapped
+                .iter()
+                .filter(|row| row.kek_id == key_id && row.wrap_method != key.method())
+                .count() as i64;
+            if outdated > 0 {
+                outdated_wrap_method += outdated;
+                complete = false;
+            }
+            // Every wrapper is checked, not a sample: a damaged second wrapper
+            // is an unreadable secret and must not be reported as "rotation
+            // complete". `startup` unwraps the same set and refuses to start.
+            let broken = wrapped
+                .iter()
+                .filter(|row| row.kek_id == key_id)
+                .filter(|row| {
+                    key.unwrap_recorded(row.id, &row.wrap_method, &row.wrapped_key)
+                        .is_err()
+                })
+                .count();
+            if broken > 0 {
                 unreadable.push(key_id.clone());
                 complete = false;
             }
@@ -1119,6 +1183,7 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
         legacy_plaintext,
         unknown_key_ids: unknown,
         unreadable_key_ids: unreadable,
+        outdated_wrap_method,
         rotation_complete: complete,
     })
 }

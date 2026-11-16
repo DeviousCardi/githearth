@@ -275,6 +275,13 @@ pub struct Config {
     /// file's contents are the key: the path is configuration, the key is not.
     #[serde(default)]
     pub backup_key_file: PathBuf,
+    /// How `backup` takes the storage snapshot: `auto` probes the filesystem
+    /// for copy-on-write cloning and uses the online path when it works;
+    /// `fence` skips the probe and keeps the M4.1 maintenance-window fence.
+    /// A failed probe also falls back to the fence, so `fence` exists for an
+    /// operator who knows the filesystem and for the fallback test.
+    #[serde(default = "default_backup_snapshot_mode")]
+    pub backup_snapshot_mode: String,
     /// The operator-owned key that wraps every stored secret (ADR 0014 §3).
     /// The file, not its path, is the key: it must be mode 0600, outside the
     /// storage root, and is never written to PostgreSQL or a backup. Empty
@@ -419,6 +426,7 @@ impl Default for Config {
             public_url: default_public_url(),
             backup_directory: default_backup_directory(),
             backup_key_file: PathBuf::new(),
+            backup_snapshot_mode: default_backup_snapshot_mode(),
             installation_key_file: PathBuf::new(),
             installation_key_previous_file: PathBuf::new(),
             installation_key_method: default_installation_key_method(),
@@ -436,6 +444,9 @@ fn default_public_url() -> String {
 }
 fn default_backup_directory() -> PathBuf {
     PathBuf::from("backups")
+}
+fn default_backup_snapshot_mode() -> String {
+    "auto".to_string()
 }
 fn default_installation_key_method() -> String {
     "file".to_string()
@@ -884,6 +895,9 @@ impl Config {
         {
             env!(backup_key_file, "GITHEARTH_BACKUP_KEY_FILE");
         }
+        if let Ok(value) = std::env::var("GITHEARTH_BACKUP_SNAPSHOT_MODE") {
+            c.backup_snapshot_mode = value;
+        }
         if let Ok(value) = std::env::var("GITHEARTH_INSTALLATION_KEY_FILE") {
             c.installation_key_file = if value.is_empty() {
                 PathBuf::new()
@@ -1061,6 +1075,9 @@ impl Config {
         }
         if !matches!(self.installation_key_method.as_str(), "file" | "kms") {
             bail!("installation_key_method must be \"file\" or \"kms\"");
+        }
+        if !matches!(self.backup_snapshot_mode.as_str(), "auto" | "fence") {
+            bail!("backup_snapshot_mode must be \"auto\" or \"fence\"");
         }
         if !self.installation_key_previous_file.as_os_str().is_empty()
             && self.installation_key_file.as_os_str().is_empty()
