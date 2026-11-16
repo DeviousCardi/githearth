@@ -340,6 +340,45 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// C1/M1: the operator docs state the custody-copy limit, not its negation.
+// A security disclosure is part of the mechanism here: the old sentence
+// promised that a shred stays a shred even when an older custody copy is
+// restored, which the test below proves false. This guard makes a reverted
+// sentence fail the suite rather than silently promising a property the
+// design does not have.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_docs_state_the_custody_copy_limit_honestly() {
+    const SECRETS: &str = include_str!("../../../docs/operations/secrets-at-rest.md");
+    const BACKUP: &str = include_str!("../../../docs/operations/backup-restore.md");
+    const ADR: &str = include_str!("../../../docs/decisions/0015-identity-slice.md");
+
+    for doc in [SECRETS, BACKUP] {
+        assert!(
+            doc.contains("A shred is only as strong as the custody copies you discard"),
+            "the operator docs must say what bounds a shred against an older archive"
+        );
+        assert!(
+            doc.contains("never restore a custody copy that predates a deletion"),
+            "the operator docs must forbid the copy that un-shreds the archive"
+        );
+        assert!(
+            !doc.contains("with it, a shredded key stays destroyed"),
+            "the docs must not claim a retained custody copy cannot un-shred an archive"
+        );
+    }
+    assert!(
+        ADR.contains("Retention of `data_key_directory` copies, not the tombstone, bounds a shred"),
+        "ADR 0015's Consequences must record the custody-copy bound"
+    );
+    assert!(
+        ADR.contains("a custody copy taken before a deletion still holds"),
+        "ADR 0015 must say why a custody copy breaks the shred"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // U36: an account's secret is unreadable in an older backup after the shred,
 // while the pseudonymous row and its profile columns remain.
 // ---------------------------------------------------------------------------
