@@ -107,14 +107,23 @@ ALTER TABLE access_tokens ADD CONSTRAINT access_tokens_resource_set_check CHECK 
 -- A legacy token is an account token with no resource set and only the two
 -- historical scopes. Every other token must carry a resource set and a finite
 -- expiry.
+--
+-- Scope to the current schema: a shared test database may hold several
+-- migrated schemas, each with its own `access_tokens` table and a scopes
+-- constraint. Without the namespace filter the query would find another
+-- schema's constraint and `DROP CONSTRAINT` would fail with 42704.
 DO $$ DECLARE
     cn text;
 BEGIN
     SELECT con.conname INTO cn
     FROM pg_constraint con
     JOIN pg_class rel ON rel.oid = con.conrelid
-    WHERE rel.relname = 'access_tokens' AND con.contype = 'c'
-      AND pg_get_constraintdef(con.oid) LIKE '%scopes%';
+    JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+    WHERE ns.nspname = current_schema()
+      AND rel.relname = 'access_tokens' AND con.contype = 'c'
+      AND pg_get_constraintdef(con.oid) LIKE '%scopes%'
+    ORDER BY con.conname
+    LIMIT 1;
     IF cn IS NOT NULL THEN
         EXECUTE format('ALTER TABLE access_tokens DROP CONSTRAINT %I', cn);
     END IF;

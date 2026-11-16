@@ -7,6 +7,7 @@
 
 use std::{
     io::{Read, Write},
+    // outbound-exempt: the DNS resolver owns its UDP/TCP queries; it never speaks HTTP
     net::{IpAddr, SocketAddr, TcpStream, UdpSocket},
     time::Duration,
 };
@@ -83,6 +84,7 @@ fn build_query(name: &str) -> Result<Vec<u8>, String> {
 fn query_udp(server: SocketAddr, name: &str) -> Result<(Vec<String>, bool), String> {
     let query = build_query(name)?;
     let socket =
+        // outbound-exempt: the DNS resolver owns its UDP/TCP queries; it never speaks HTTP
         UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("cannot open a DNS socket: {e}"))?;
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -102,6 +104,7 @@ fn query_udp(server: SocketAddr, name: &str) -> Result<(Vec<String>, bool), Stri
 
 fn query_tcp(server: SocketAddr, name: &str) -> Result<Vec<String>, String> {
     let query = build_query(name)?;
+    // outbound-exempt: the DNS resolver owns its UDP/TCP queries; it never speaks HTTP
     let mut stream = TcpStream::connect_timeout(&server, Duration::from_secs(2))
         .map_err(|e| format!("cannot reach DNS server {server}: {e}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();

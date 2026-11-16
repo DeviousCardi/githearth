@@ -258,10 +258,17 @@ fn repo_path(org: &str, repo: &str) -> String {
 async fn migration_preserves_existing_tokens_and_the_audit_chain() {
     let url = fresh_database("mig").await;
     let pool = PgPool::connect(&url).await.unwrap();
-    // Everything before 0055: the schema M4.1 left behind.
-    let migrations = MIGRATOR.iter().cloned().collect::<Vec<_>>();
+    // Everything before 0055: the schema M4.1 left behind. Filter by version,
+    // not "all but the newest": 0056 arrived after this test was written, so
+    // `len - 1` included 0055 and stopped meaning "before 0055".
     let previous = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(migrations[..migrations.len() - 1].to_vec()),
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version < 55)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
         ..MIGRATOR
     };
     previous.run(&pool).await.unwrap();
@@ -382,12 +389,25 @@ async fn migration_preserves_existing_tokens_and_the_audit_chain() {
 async fn migration_rehashes_in_seq_order_without_permuting_seq_or_outbox() {
     let url = fresh_database("mig_order").await;
     let pool = PgPool::connect(&url).await.unwrap();
-    let migrations = MIGRATOR.iter().cloned().collect::<Vec<_>>();
+    // Everything before 0055, by version: the rehash under test is 0055.
     let previous = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(migrations[..migrations.len() - 1].to_vec()),
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version < 55)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
         ..MIGRATOR
     };
     previous.run(&pool).await.unwrap();
+    // Prove the fixture really stops before 0055, so applying MIGRATOR below is
+    // what rehashes the V3 chain into V4 rather than a no-op.
+    let applied: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(applied, 54, "the fixture must stop before 0055");
 
     let account = Uuid::new_v4();
     let org = Uuid::new_v4();
@@ -479,6 +499,11 @@ async fn migration_rehashes_in_seq_order_without_permuting_seq_or_outbox() {
             .await
             .unwrap();
     assert_eq!(seq_before, vec![(first, 1), (second, 2)]);
+    let hashes_before: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT hash FROM audit_events ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
 
     MIGRATOR.run(&pool).await.unwrap();
 
@@ -501,6 +526,15 @@ async fn migration_rehashes_in_seq_order_without_permuting_seq_or_outbox() {
             .await
             .unwrap();
     assert_eq!(seq_after, seq_before, "the migration must not permute seq");
+    let hashes_after: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT hash FROM audit_events ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_ne!(
+        hashes_after, hashes_before,
+        "0055 must rehash the V3 chain into the V4 encoding"
+    );
     let outbox_after: Vec<(Uuid, Uuid, i64)> =
         sqlx::query_as("SELECT id, chain, seq FROM outbox_events ORDER BY id")
             .fetch_all(&pool)
