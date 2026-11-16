@@ -76,7 +76,7 @@ async fn load_repo_ui(
     headers: &HeaderMap,
     slug: &str,
     name: &str,
-) -> Result<(Option<String>, bool, Uuid), ui::UiError> {
+) -> Result<(Option<String>, bool, Uuid, Uuid), ui::UiError> {
     match ui::browser_auth(state, headers).await {
         Ok((account, auth_age)) => {
             let loaded =
@@ -101,7 +101,12 @@ async fn load_repo_ui(
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(ui::not_found_page(Some(&account.username)));
             }
-            Ok((Some(account.username), account.is_admin, loaded.repo.id))
+            Ok((
+                Some(account.username),
+                account.is_admin,
+                loaded.repo.id,
+                loaded.org_id,
+            ))
         }
         Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {
             // An anonymous visitor sees the same `410` a signed-in one does for
@@ -111,7 +116,7 @@ async fn load_repo_ui(
                 return Err(ui::moved_away_page(None));
             }
             match repository_api::load_public_anonymous(state, slug, name).await {
-                Some(repo) => Ok((None, false, repo.id)),
+                Some(repo) => Ok((None, false, repo.id, repo.organization_id)),
                 None => {
                     // Only a public deleted row justifies `410` for an
                     // anonymous visitor; a private one (or a private live
@@ -130,6 +135,7 @@ async fn load_repo_ui(
 
 async fn git_work_ui<T>(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     username: Option<&str>,
     work: impl FnOnce(&FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
@@ -137,10 +143,8 @@ async fn git_work_ui<T>(
 where
     T: Send + 'static,
 {
-    let permit = state
-        .git_slots
-        .clone()
-        .try_acquire_owned()
+    let permit = crate::browse::acquire_permit(state, organization)
+        .await
         .map_err(|_| ui::unavailable_page(username))?;
     let storage = state.storage.clone();
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
@@ -169,6 +173,7 @@ fn map_work_error(repo_id: Uuid, username: Option<&str>, error: StorageError) ->
 /// the worker returns) for Git commands that must write objects off-repository.
 async fn git_compare_ui<T>(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     username: Option<&str>,
     work: impl FnOnce(&FsPath, &FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
@@ -176,10 +181,8 @@ async fn git_compare_ui<T>(
 where
     T: Send + 'static,
 {
-    let permit = state
-        .git_slots
-        .clone()
-        .try_acquire_owned()
+    let permit = crate::browse::acquire_permit(state, organization)
+        .await
         .map_err(|_| ui::unavailable_page(username))?;
     let storage = state.storage.clone();
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
@@ -196,14 +199,19 @@ where
 
 async fn resolve_ui(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     username: Option<&str>,
     rev: &str,
 ) -> Result<String, ui::UiError> {
     let rev = rev.to_owned();
-    git_work_ui(state, repo_id, username, move |path, timeout| {
-        browse::resolve(path, &rev, timeout)
-    })
+    git_work_ui(
+        state,
+        organization,
+        repo_id,
+        username,
+        move |path, timeout| browse::resolve(path, &rev, timeout),
+    )
     .await?
     .ok_or_else(|| ui::not_found_page(username))
 }
@@ -232,7 +240,8 @@ async fn render_tree(
     rev: &str,
     path: Option<&str>,
 ) -> Result<Response, ui::UiError> {
-    let (username, is_admin, repo_id) = load_repo_ui(state, headers, slug, name).await?;
+    let (username, is_admin, repo_id, organization) =
+        load_repo_ui(state, headers, slug, name).await?;
     let username = username.as_deref();
     let path = path.filter(|p| !p.is_empty());
     if !browse::valid_rev(rev) {
@@ -244,11 +253,15 @@ async fn render_tree(
         return Err(ui::not_found_page(username));
     }
 
-    let id = resolve_ui(state, repo_id, username, rev).await?;
+    let id = resolve_ui(state, organization, repo_id, username, rev).await?;
     let path_owned = path.map(str::to_owned);
-    let entries = git_work_ui(state, repo_id, username, move |fs_path, timeout| {
-        browse::tree(fs_path, &id, path_owned.as_deref(), timeout)
-    })
+    let entries = git_work_ui(
+        state,
+        organization,
+        repo_id,
+        username,
+        move |fs_path, timeout| browse::tree(fs_path, &id, path_owned.as_deref(), timeout),
+    )
     .await?
     .ok_or_else(|| ui::not_found_page(username))?;
 
@@ -345,17 +358,24 @@ async fn blob_page(
     headers: HeaderMap,
     Path((slug, name, rev, path)): Path<(String, String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id, organization) =
+        load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     if !browse::valid_rev(&rev) || !browse::valid_path(&path) {
         return Err(ui::not_found_page(username));
     }
 
-    let id = resolve_ui(&state, repo_id, username, &rev).await?;
+    let id = resolve_ui(&state, organization, repo_id, username, &rev).await?;
     let path_for_git = path.clone();
-    let blob = git_work_ui(&state, repo_id, username, move |fs_path, timeout| {
-        browse::blob(fs_path, &id, &path_for_git, browse::MAX_BLOB_BYTES, timeout)
-    })
+    let blob = git_work_ui(
+        &state,
+        organization,
+        repo_id,
+        username,
+        move |fs_path, timeout| {
+            browse::blob(fs_path, &id, &path_for_git, browse::MAX_BLOB_BYTES, timeout)
+        },
+    )
     .await?
     .ok_or_else(|| ui::not_found_page(username))?;
 
@@ -404,24 +424,31 @@ async fn commits_page(
     headers: HeaderMap,
     Path((slug, name, rev)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id, organization) =
+        load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     if !browse::valid_rev(&rev) {
         return Err(ui::not_found_page(username));
     }
 
-    let id = resolve_ui(&state, repo_id, username, &rev).await?;
+    let id = resolve_ui(&state, organization, repo_id, username, &rev).await?;
     let id_for_git = id.clone();
-    let commits = git_work_ui(&state, repo_id, username, move |fs_path, timeout| {
-        browse::log(
-            fs_path,
-            &id_for_git,
-            None,
-            Some(0),
-            browse::MAX_LOG_LIMIT,
-            timeout,
-        )
-    })
+    let commits = git_work_ui(
+        &state,
+        organization,
+        repo_id,
+        username,
+        move |fs_path, timeout| {
+            browse::log(
+                fs_path,
+                &id_for_git,
+                None,
+                Some(0),
+                browse::MAX_LOG_LIMIT,
+                timeout,
+            )
+        },
+    )
     .await?;
 
     let repo_href = format!(
@@ -504,15 +531,20 @@ async fn commit_page(
     headers: HeaderMap,
     Path((slug, name, id)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id, organization) =
+        load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     if !crate::browse::is_commit_id(&id) {
         return Err(ui::not_found_page(username));
     }
 
-    let detail = git_work_ui(&state, repo_id, username, move |fs_path, timeout| {
-        browse::commit(fs_path, &id, timeout)
-    })
+    let detail = git_work_ui(
+        &state,
+        organization,
+        repo_id,
+        username,
+        move |fs_path, timeout| browse::commit(fs_path, &id, timeout),
+    )
     .await?
     .ok_or_else(|| ui::not_found_page(username))?;
 
@@ -566,7 +598,8 @@ async fn compare_form(
     Path((slug, name)): Path<(String, String)>,
     Query(query): Query<CompareQuery>,
 ) -> Result<Response, ui::UiError> {
-    let (username, _is_admin, _repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, _is_admin, _repo_id, _organization) =
+        load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     let spec = format!("{}...{}", query.base, query.head);
     let Some((base, head)) = crate::browse::split_spec(&spec) else {
@@ -587,7 +620,8 @@ async fn compare_page(
     headers: HeaderMap,
     Path((slug, name, spec)): Path<(String, String, String)>,
 ) -> Result<Response, ui::UiError> {
-    let (username, is_admin, repo_id) = load_repo_ui(&state, &headers, &slug, &name).await?;
+    let (username, is_admin, repo_id, organization) =
+        load_repo_ui(&state, &headers, &slug, &name).await?;
     let username = username.as_deref();
     let Some((base, head)) = crate::browse::split_spec(&spec) else {
         return Err(ui::not_found_page(username));
@@ -595,6 +629,7 @@ async fn compare_page(
     let (base_owned, head_owned) = (base.to_owned(), head.to_owned());
     let comparison = git_compare_ui(
         &state,
+        organization,
         repo_id,
         username,
         move |fs_path, scratch, timeout| {

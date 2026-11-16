@@ -1707,3 +1707,54 @@ async fn git_concurrency_exhausted_503_with_retry_after() {
     cleanup(&storage_root);
     pool.close().await;
 }
+
+/// The anonymous clone budget is a real HTTP rate, not only a counter: the
+/// second anonymous `info/refs` from one address is refused with 429 and
+/// `Retry-After`, after the repository is known to exist (U30).
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn anonymous_fetch_is_limited_per_address_with_retry_after() {
+    let (_app, pool, storage_root, _owner, _username, org_slug, repo_name, repo_id, _head) =
+        setup_with_repo_on_disk().await;
+    sqlx::query("UPDATE repositories SET visibility='public' WHERE id=$1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = Config {
+        database_url: std::env::var("GITHEARTH_TEST_DATABASE_URL").unwrap(),
+        database_max_connections: 4,
+        database_timeout_seconds: 3,
+        storage_root: storage_root.clone(),
+        anonymous_fetch_per_address: 1,
+        anonymous_fetch_global: 100,
+        git_concurrency: 4,
+        ..Config::default()
+    };
+    let state = AppState::new(pool.clone(), config).await.unwrap();
+    let app = router(state);
+    let path = format!("/{org_slug}/{repo_name}.git/info/refs?service=git-upload-pack");
+
+    let (status, _headers, body) = raw_request(&app, "GET", &path, &[], vec![]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the first anonymous advertisement succeeds: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, headers, _body) = raw_request(&app, "GET", &path, &[], vec![]).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the second anonymous request is over the per-address budget"
+    );
+    assert_eq!(
+        headers.get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("60")
+    );
+
+    cleanup(&storage_root);
+    pool.close().await;
+}

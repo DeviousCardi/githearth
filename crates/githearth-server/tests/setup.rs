@@ -611,7 +611,7 @@ fn clean_host_reaches_a_doctor_clean_running_installation() {
     );
     let out = stdout(&output);
     assert!(out.contains("created      "), "{out}");
-    assert!(out.contains("12 checks, 0 failed"), "{out}");
+    assert!(out.contains("14 checks, 0 failed"), "{out}");
     assert!(out.contains("setup complete"), "{out}");
     assert_no_secrets(&output, &database.url);
 
@@ -840,7 +840,7 @@ fn a_resumed_run_uses_the_recorded_url_and_reads_no_stdin() {
     );
     assert!(out.contains("existing settings used"), "{out}");
     assert!(out.contains("administrator exists"), "{out}");
-    assert!(out.contains("12 checks, 0 failed"), "{out}");
+    assert!(out.contains("14 checks, 0 failed"), "{out}");
     assert_eq!(
         before,
         snapshot(&installation.path),
@@ -936,7 +936,7 @@ fn second_run_changes_nothing_and_asks_for_nothing() {
     assert!(out.contains("administrator exists"), "{out}");
     assert!(out.contains("up to date"), "{out}");
     assert!(out.contains("existing key kept"), "{out}");
-    assert!(out.contains("12 checks, 0 failed"), "{out}");
+    assert!(out.contains("14 checks, 0 failed"), "{out}");
     assert_no_secrets(&second, &database.url);
 
     let after = snapshot(&installation.path);

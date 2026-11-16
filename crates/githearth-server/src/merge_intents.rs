@@ -409,7 +409,13 @@ pub(crate) async fn may_merge(
     let dismiss = protection
         .as_ref()
         .is_none_or(|p| p.dismiss_stale_approvals);
-    let head = pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
+    let head = pulls::branch_tip(
+        state,
+        loaded.org_id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await?;
     let target_ref = format!("refs/heads/{}", pull.target_branch);
     let required_checks = crate::protection::required_status_checks(&rules, &target_ref);
     // A deleted source branch has no head; create_intent would refuse this
@@ -417,9 +423,10 @@ pub(crate) async fn may_merge(
     let Some(head) = head.as_deref() else {
         return Ok(false);
     };
-    let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
+    let base = pulls::branch_tip(state, loaded.org_id, loaded.repo.id, &pull.target_branch).await?;
     pulls::fetch_cross_repo_head(
         state,
+        loaded.org_id,
         loaded.repo.id,
         pull.source_repository_id,
         &pull.source_branch,
@@ -538,9 +545,15 @@ pub(crate) async fn create_intent(
                 crate::protection::load_rules_with_generation(&mut conn, loaded.repo.id).await?;
             drop(conn);
 
-            let head =
-                pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
-            let base = pulls::branch_tip(state, loaded.repo.id, &pull.target_branch).await?;
+            let head = pulls::branch_tip(
+                state,
+                loaded.org_id,
+                pull.source_repository_id,
+                &pull.source_branch,
+            )
+            .await?;
+            let base = pulls::branch_tip(state, loaded.org_id, loaded.repo.id, &pull.target_branch)
+                .await?;
             let (Some(head), Some(base)) = (head, base) else {
                 return Err(branch_missing());
             };
@@ -552,6 +565,7 @@ pub(crate) async fn create_intent(
             // checks below can resolve the head there (ADR 0008).
             pulls::fetch_cross_repo_head(
                 state,
+                loaded.org_id,
                 loaded.repo.id,
                 pull.source_repository_id,
                 &pull.source_branch,
@@ -622,6 +636,7 @@ pub(crate) async fn create_intent(
             if input.method == "ff_only"
                 && !crate::mergeability::is_fast_forwardable(
                     state,
+                    loaded.org_id,
                     loaded.repo.id,
                     base.clone(),
                     head.clone(),
@@ -642,6 +657,7 @@ pub(crate) async fn create_intent(
             } {
                 let check = crate::mergeability::check_method(
                     state,
+                    loaded.org_id,
                     loaded.repo.id,
                     method,
                     &input.method,

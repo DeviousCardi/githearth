@@ -1597,7 +1597,7 @@ async fn repository(
         let storage = state.storage.clone();
         let repo_id = repo.id;
         let timeout = Duration::from_secs(state.config.git_timeout_seconds);
-        let refs = match state.git_slots.clone().try_acquire_owned() {
+        let refs = match crate::browse::acquire_permit(&state, repo.organization_id).await {
             Ok(permit) => tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let path = storage.read_path(repo_id)?;

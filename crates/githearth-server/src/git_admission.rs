@@ -231,18 +231,36 @@ async fn admit_actor(
 
 /// Admit a fetch. A request without an Authorization header may read a public
 /// repository anonymously; anything else must authenticate.
+/// A fetch admission: the repository, plus the account when the request was
+/// authenticated. The transport charges the organization and account Git
+/// budgets from it (ADR 0014 §5's "separate budgets for the API and for Git
+/// operations"); an anonymous fetch has no account and uses the per-address
+/// and installation budgets instead.
+pub struct FetchAdmission {
+    pub repository: RepositoryRow,
+    pub account: Option<Uuid>,
+}
+
 pub async fn admit_fetch(
     state: &AppState,
     headers: &HeaderMap,
     org_slug: &str,
     repo_name: &str,
-) -> Result<RepositoryRow, AuthError> {
+) -> Result<FetchAdmission, AuthError> {
     if headers.contains_key("authorization") {
         admit(state, headers, org_slug, repo_name, Want::Fetch)
             .await
-            .map(|a| a.repository)
+            .map(|a| FetchAdmission {
+                repository: a.repository,
+                account: Some(a.account),
+            })
     } else {
-        admit_anonymous(state, org_slug, repo_name).await
+        admit_anonymous(state, org_slug, repo_name)
+            .await
+            .map(|repository| FetchAdmission {
+                repository,
+                account: None,
+            })
     }
 }
 
@@ -881,11 +899,15 @@ mod tests {
             database_url: "postgres://localhost/unused".into(),
             ..crate::config::Config::default()
         };
+        let git_slots = Arc::new(tokio::sync::Semaphore::new(10));
+        let limits = Arc::new(crate::limits::Limits::from_config(&config));
         AppState {
             pool,
             config,
             auth_slots: Arc::new(tokio::sync::Semaphore::new(10)),
-            git_slots: Arc::new(tokio::sync::Semaphore::new(10)),
+            git_scheduler: crate::fairness::GitScheduler::new(git_slots.clone(), 10, 1, 6),
+            git_slots,
+            limits,
             housekeeping_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(engine),

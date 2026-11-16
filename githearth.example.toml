@@ -20,11 +20,31 @@ auth_concurrency = 2
 # merge_worker_interval_seconds = 2
 # trash_retention_seconds = 604800
 # git_concurrency = 8
+# git_organization_floor = 1    # a queued tenant always gets this many slots first
+# git_organization_ceiling = 4  # half the global slots; clamped to concurrency - 1
+# git_wait_millis = 1000        # then 503/Retry-After (HTTP) or unavailable (SSH)
 # git_timeout_seconds = 600
 # git_request_limit_bytes = 10485760
 # git_push_limit_bytes = 1073741824  # upload size and receive.maxInputSize
-# repository_quota_bytes = 1073741824  # total on-disk objects; 0 = unlimited
-# organization_quota_bytes = 53687091200  # object-store bytes per organization; 0 = unlimited
+# repository_quota_bytes = 5368709120  # 5 GiB total on-disk objects; 0 = unlimited
+# organization_quota_bytes = 53687091200  # 50 GiB object-store bytes per organization; 0 = unlimited
+# Per-organization and per-account limits (docs/operations/limits.md).
+# api_requests_per_organization = 300  # per minute
+# api_requests_per_account = 60        # per minute
+# Git transport requests are charged separately from the API (a clone is two requests).
+# git_requests_per_organization = 600  # per minute
+# git_requests_per_account = 120       # per minute
+# anonymous_fetch_per_address = 120    # clone/fetch per minute
+# anonymous_fetch_global = 2000        # clone/fetch per installation per minute
+# anonymous_login_per_address = 20     # login/search per minute
+# anonymous_login_global = 300          # login per installation per minute
+# organization_creation_per_account = 3
+# organization_creation_per_installation = 50   # per day
+# job_organization_share = 2           # of job_concurrency workers
+# email_per_organization = 200         # notification mail per hour
+# email_security_per_address = 5       # verification/recovery mail per hour
+# signup_velocity_per_address = 3      # M11a endpoint; window below
+# signup_velocity_window_seconds = 3600
 # object_upload_deadline_seconds = 86400  # abandoned multipart uploads are swept after this
 # hook_program = "/path/to/githearth-server"  # default: the running executable
 # ssh_enabled = false
@@ -99,6 +119,10 @@ auth_concurrency = 2
 # smtp_port = 587
 # smtp_tls = "starttls"            # starttls | implicit | none (none is refused with smtp_username)
 # smtp_from = "githearth@example.com"
+# smtp_bounce_address = "bounces@example.com"  # MAIL FROM; falls back to smtp_from
+# smtp_dkim_selector = "default"                # doctor checks <selector>._domainkey.<domain>
+# abuse_contact = "abuse@example.com"           # published before sign-up
+# email_dns_check_enabled = true                # SPF/DKIM/DMARC lookup in `doctor`
 # smtp_username = "githearth"
 # smtp_password_file = "/etc/githearth/smtp-password"  # read once at start-up;
 #                                                     # never a TOML value, never logged.

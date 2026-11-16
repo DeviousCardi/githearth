@@ -122,43 +122,49 @@ fn status_for(candidate: Candidate) -> (String, Vec<String>) {
 /// candidate commit is never referenced, only its outcome matters.
 async fn compute(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     method: Method,
     target: String,
     head: String,
 ) -> Result<(String, Vec<String>), ApiError> {
-    browse::git_compare(state, repo_id, move |path, scratch, timeout| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let identity = Identity {
-            name: "GitHearth".into(),
-            email: "noreply@githearth.invalid".into(),
-            time: now,
-            offset: "+0000".into(),
-        };
-        let message = String::new();
-        let request = Request {
-            method,
-            target: &target,
-            source: &head,
-            message: &message,
-            author: &identity,
-            committer: &identity,
-        };
-        // Rebase replays every commit, so a very large branch would blow the
-        // request timeout before the check finishes. Bound it: beyond the limit
-        // the check reports `unchecked` and the merge worker (which has no
-        // request deadline) re-runs the full rebase and reports conflicts
-        // asynchronously.
-        if method == Method::Rebase
-            && merge::rebase_commit_count(path, &request, timeout)? > REBASE_DRY_RUN_LIMIT
-        {
-            return Ok(("unchecked".to_owned(), vec![]));
-        }
-        merge::build_candidate(path, Some(scratch), &request, timeout).map(status_for)
-    })
+    browse::git_compare(
+        state,
+        organization,
+        repo_id,
+        move |path, scratch, timeout| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let identity = Identity {
+                name: "GitHearth".into(),
+                email: "noreply@githearth.invalid".into(),
+                time: now,
+                offset: "+0000".into(),
+            };
+            let message = String::new();
+            let request = Request {
+                method,
+                target: &target,
+                source: &head,
+                message: &message,
+                author: &identity,
+                committer: &identity,
+            };
+            // Rebase replays every commit, so a very large branch would blow the
+            // request timeout before the check finishes. Bound it: beyond the limit
+            // the check reports `unchecked` and the merge worker (which has no
+            // request deadline) re-runs the full rebase and reports conflicts
+            // asynchronously.
+            if method == Method::Rebase
+                && merge::rebase_commit_count(path, &request, timeout)? > REBASE_DRY_RUN_LIMIT
+            {
+                return Ok(("unchecked".to_owned(), vec![]));
+            }
+            merge::build_candidate(path, Some(scratch), &request, timeout).map(status_for)
+        },
+    )
     .await
 }
 
@@ -168,44 +174,51 @@ async fn compute(
 /// mergeability row, and the result is not cached.
 pub(crate) async fn is_fast_forwardable(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     target: String,
     head: String,
 ) -> Result<bool, ApiError> {
-    browse::git_compare(state, repo_id, move |path, scratch, timeout| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let identity = Identity {
-            name: "GitHearth".into(),
-            email: "noreply@githearth.invalid".into(),
-            time: now,
-            offset: "+0000".into(),
-        };
-        let message = String::new();
-        let request = Request {
-            method: Method::FastForward,
-            target: &target,
-            source: &head,
-            message: &message,
-            author: &identity,
-            committer: &identity,
-        };
-        match merge::build_candidate(path, Some(scratch), &request, timeout)? {
-            Candidate::NotFastForward | Candidate::Unrelated => Ok(false),
-            Candidate::Ready { .. } | Candidate::UpToDate => Ok(true),
-            // A fast-forward build cannot produce conflicts or a rebase-refusal;
-            // treat anything else defensively as not fast-forwardable.
-            Candidate::Conflicts(_) | Candidate::RebaseMergeCommit => Ok(false),
-        }
-    })
+    browse::git_compare(
+        state,
+        organization,
+        repo_id,
+        move |path, scratch, timeout| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let identity = Identity {
+                name: "GitHearth".into(),
+                email: "noreply@githearth.invalid".into(),
+                time: now,
+                offset: "+0000".into(),
+            };
+            let message = String::new();
+            let request = Request {
+                method: Method::FastForward,
+                target: &target,
+                source: &head,
+                message: &message,
+                author: &identity,
+                committer: &identity,
+            };
+            match merge::build_candidate(path, Some(scratch), &request, timeout)? {
+                Candidate::NotFastForward | Candidate::Unrelated => Ok(false),
+                Candidate::Ready { .. } | Candidate::UpToDate => Ok(true),
+                // A fast-forward build cannot produce conflicts or a rebase-refusal;
+                // treat anything else defensively as not fast-forwardable.
+                Candidate::Conflicts(_) | Candidate::RebaseMergeCommit => Ok(false),
+            }
+        },
+    )
     .await
 }
 
 /// Compute (or fetch from the cache) the mergeability of one method.
 pub(crate) async fn check_method(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     method: Method,
     method_name: &str,
@@ -219,8 +232,15 @@ pub(crate) async fn check_method(
             conflicts: row.conflicts,
         });
     }
-    let (status, conflicts) =
-        compute(state, repo_id, method, target.to_owned(), head.to_owned()).await?;
+    let (status, conflicts) = compute(
+        state,
+        organization,
+        repo_id,
+        method,
+        target.to_owned(),
+        head.to_owned(),
+    )
+    .await?;
     // `unchecked` is not a merge outcome and is not cached: it depends on the
     // branch size alone and is cheap to recompute (a single `rev-list --count`),
     // so storing it would only risk serving a stale answer.
@@ -247,13 +267,14 @@ pub(crate) async fn check_method(
 /// head and target tips.
 pub(crate) async fn for_pull(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     head: &str,
     target: &str,
 ) -> Result<Vec<Check>, ApiError> {
     let mut checks = Vec::with_capacity(ENABLED.len());
     for (name, method) in ENABLED {
-        checks.push(check_method(state, repo_id, method, name, target, head).await?);
+        checks.push(check_method(state, organization, repo_id, method, name, target, head).await?);
     }
     Ok(checks)
 }

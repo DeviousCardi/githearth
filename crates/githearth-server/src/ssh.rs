@@ -307,8 +307,22 @@ impl russh::server::Handler for SshHandler {
             }
         };
 
-        let permit = match state.git_slots.clone().try_acquire_owned() {
-            Ok(p) => p,
+        // Authenticated Git has its own organization and account budgets,
+        // separate from the API's (ADR 0014 §5). SSH is always authenticated.
+        if !state
+            .limits
+            .allow_git(admitted.organization, Some(admitted.account))
+        {
+            return refuse(session, channel, b"githearth: rate limit exceeded\n");
+        }
+
+        let permit = match tokio::time::timeout(
+            std::time::Duration::from_millis(state.config.git_wait_millis),
+            state.git_scheduler.acquire(admitted.organization),
+        )
+        .await
+        {
+            Ok(permit) => permit,
             Err(_) => {
                 return refuse(
                     session,

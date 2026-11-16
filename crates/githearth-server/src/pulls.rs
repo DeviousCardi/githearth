@@ -518,6 +518,7 @@ pub(crate) async fn may_close(
 /// The commit `branch` points at, or None when the branch does not exist.
 pub(crate) async fn branch_tip(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     branch: &str,
 ) -> Result<Option<String>, ApiError> {
@@ -526,11 +527,13 @@ pub(crate) async fn branch_tip(
     // reads as "no branch" rather than a storage error, so a closed
     // cross-repository pull request stays readable after its source fork is
     // deleted.
-    Ok(browse::git_read_opt(state, repo_id, move |path, timeout| {
-        git_browse::resolve(path, &rev, timeout)
-    })
-    .await?
-    .flatten())
+    Ok(
+        browse::git_read_opt(state, organization, repo_id, move |path, timeout| {
+            git_browse::resolve(path, &rev, timeout)
+        })
+        .await?
+        .flatten(),
+    )
 }
 
 /// For a cross-repository pull request, brings the fork's head-branch objects
@@ -555,6 +558,7 @@ pub(crate) async fn branch_tip(
 /// with it) for the duration of the Git work only.
 pub(crate) async fn fetch_cross_repo_head(
     state: &AppState,
+    organization: Uuid,
     repository_id: Uuid,
     source_repository_id: Uuid,
     source_branch: &str,
@@ -567,7 +571,7 @@ pub(crate) async fn fetch_cross_repo_head(
     // ([ADR 0008](../../decisions/0008-forks.md)), so the target also has a
     // `refs/heads/<branch>` of its own at fork time; that ref says nothing
     // about whether the fork's newer head was copied since.
-    let head = branch_tip(state, source_repository_id, source_branch).await?;
+    let head = branch_tip(state, organization, source_repository_id, source_branch).await?;
     let Some(head) = head else {
         return Ok(());
     };
@@ -721,10 +725,21 @@ pub(crate) async fn resolve_cross_repo_head(
     }
 }
 
-async fn tips(state: &AppState, repo_id: Uuid, pull: &PullJson) -> Result<Tips, ApiError> {
+async fn tips(
+    state: &AppState,
+    organization: Uuid,
+    repo_id: Uuid,
+    pull: &PullJson,
+) -> Result<Tips, ApiError> {
     Ok((
-        branch_tip(state, pull.source_repository_id, &pull.source_branch).await?,
-        branch_tip(state, repo_id, &pull.target_branch).await?,
+        branch_tip(
+            state,
+            organization,
+            pull.source_repository_id,
+            &pull.source_branch,
+        )
+        .await?,
+        branch_tip(state, organization, repo_id, &pull.target_branch).await?,
     ))
 }
 
@@ -1017,8 +1032,8 @@ pub(crate) async fn create_pull(
                 Some(spec) => resolve_source_repository(state, actor_id, auth_age, &loaded, spec)
                     .await?,
             };
-            let head = branch_tip(state, source_repository_id, &input.source_branch).await?;
-            let base = branch_tip(state, loaded.repo.id, &input.target_branch).await?;
+            let head = branch_tip(state, loaded.org_id, source_repository_id, &input.source_branch).await?;
+            let base = branch_tip(state, loaded.org_id, loaded.repo.id, &input.target_branch).await?;
             let (Some(head), Some(base)) = (head, base) else {
                 return Err(branch_missing());
             };
@@ -1031,13 +1046,14 @@ pub(crate) async fn create_pull(
             let cross_repository = source_repository_id != target_row.id;
             fetch_cross_repo_head(
                 state,
+                loaded.org_id,
                 loaded.repo.id,
                 source_repository_id,
                 &input.source_branch,
             )
             .await?;
             let codeowners =
-                crate::codeowners::load(state, loaded.repo.id, &base, &head).await?;
+                crate::codeowners::load(state, loaded.org_id, loaded.repo.id, &base, &head).await?;
 
             let mut tx = state.pool.begin().await?;
             if !repositories::lock_active(&mut tx, loaded.repo.id, false).await? {
@@ -1358,8 +1374,12 @@ pub(crate) async fn read_pull(
     let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
-    let (tips, pinned) =
-        tips_with_pin(state, &pull, tips(state, loaded.repo.id, &pull).await?).await?;
+    let (tips, pinned) = tips_with_pin(
+        state,
+        &pull,
+        tips(state, loaded.org_id, loaded.repo.id, &pull).await?,
+    )
+    .await?;
     let tips = base_with_pin(state, loaded.repo.id, &pull, tips).await?;
     let mergeability = match &tips {
         // A pinned head is unreachable by design and may live only in a fork;
@@ -1370,7 +1390,8 @@ pub(crate) async fn read_pull(
             // pinned object; if that is impossible, say so instead of a 404.
             match resolve_cross_repo_head(state, loaded.repo.id, &pull, head).await? {
                 HeadInTarget::Present => {
-                    crate::mergeability::for_pull(state, loaded.repo.id, head, base).await?
+                    crate::mergeability::for_pull(state, loaded.org_id, loaded.repo.id, head, base)
+                        .await?
                 }
                 HeadInTarget::Missing => Vec::new(),
             }
@@ -1459,8 +1480,12 @@ async fn update(
             if loaded.repo.status != RepositoryStatus::Active {
                 return Err(not_active());
             }
-            let (tips, pinned) =
-                tips_with_pin(state, &pull, tips(state, loaded.repo.id, &pull).await?).await?;
+            let (tips, pinned) = tips_with_pin(
+                state,
+                &pull,
+                tips(state, loaded.org_id, loaded.repo.id, &pull).await?,
+            )
+            .await?;
             let tips = base_with_pin(state, loaded.repo.id, &pull, tips).await?;
             let codeowners = match (&tips.0, &tips.1) {
                 (Some(head), Some(base))
@@ -1472,7 +1497,8 @@ async fn update(
                 {
                     Some((
                         head.clone(),
-                        crate::codeowners::load(state, loaded.repo.id, base, head).await?,
+                        crate::codeowners::load(state, loaded.org_id, loaded.repo.id, base, head)
+                            .await?,
                     ))
                 }
                 _ => None,
@@ -1502,9 +1528,14 @@ async fn update(
                 let source_active =
                     source.is_some_and(|row| row.status == RepositoryStatus::Active);
                 if !source_active
-                    || branch_tip(state, locked.source_repository_id, &locked.source_branch)
-                        .await?
-                        .is_none()
+                    || branch_tip(
+                        state,
+                        loaded.org_id,
+                        locked.source_repository_id,
+                        &locked.source_branch,
+                    )
+                    .await?
+                    .is_none()
                 {
                     return Err(cannot_reopen());
                 }
@@ -1688,7 +1719,7 @@ pub(crate) async fn set_draft(
             if pull.state != "open" {
                 return Err(not_open());
             }
-            let tips = tips(state, loaded.repo.id, &pull).await?;
+            let tips = tips(state, loaded.org_id, loaded.repo.id, &pull).await?;
 
             // Serialize against `execute_intent`, which holds this repository's
             // storage lock across its draft re-read and target ref compare-and-
@@ -1884,7 +1915,7 @@ pub(crate) async fn create_pull_comment(
                 return Err(not_active());
             }
             if let Some(commit) = input.commit_id.clone() {
-                if branch_tip(state, pull.source_repository_id, &pull.source_branch)
+                if branch_tip(state, loaded.org_id, pull.source_repository_id, &pull.source_branch)
                     .await?
                     .as_ref()
                     != Some(&commit)
@@ -1898,7 +1929,7 @@ pub(crate) async fn create_pull_comment(
                 let path = input.path.clone().unwrap();
                 let line = input.line.unwrap();
                 let commit_for_git = commit.clone();
-                let blob = browse::git_read(state, loaded.repo.id, move |fs_path, timeout| {
+                let blob = browse::git_read(state, loaded.org_id, loaded.repo.id, move |fs_path, timeout| {
                     git_browse::blob(
                         fs_path,
                         &commit_for_git,
@@ -2033,7 +2064,7 @@ async fn seq_page_start(
     repo_name: &str,
     number: i32,
     query: &SeqQuery,
-) -> Result<(PullJson, Uuid, i64), ApiError> {
+) -> Result<(PullJson, Uuid, Uuid, i64), ApiError> {
     let limit = query.limit.unwrap_or(30);
     if !(1..=100).contains(&limit) || query.after.is_some_and(|a| a < 1) {
         return Err(invalid());
@@ -2041,7 +2072,7 @@ async fn seq_page_start(
     let loaded = repository_api::load_repo(state, actor_id, auth_age, org_slug, repo_name).await?;
     require_readable_repo(&loaded)?;
     let pull = load_pull(state, &loaded, number, Action::PullRequestRead).await?;
-    Ok((pull, loaded.repo.id, limit))
+    Ok((pull, loaded.repo.id, loaded.org_id, limit))
 }
 
 fn page<T>(mut rows: Vec<T>, limit: i64, seq: impl Fn(&T) -> i64) -> Page<T> {
@@ -2077,13 +2108,19 @@ pub(crate) async fn list_pull_comments(
     number: i32,
     query: SeqQuery,
 ) -> Result<Page<CommentJson>, ApiError> {
-    let (pull, _repo_id, limit) = seq_page_start(
+    let (pull, _repo_id, organization, limit) = seq_page_start(
         state, actor_id, auth_age, org_slug, repo_name, number, &query,
     )
     .await?;
     // The head branch lives in the pull's source repository (the fork for a
     // cross-repository pull), so comment staleness is judged against its tip.
-    let head = branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
+    let head = branch_tip(
+        state,
+        organization,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await?;
     let head = head.as_deref();
     let mut conn = state.pool.acquire().await?;
     let rows = sqlx::query_as::<_, CommentRow>(&format!(
@@ -2120,7 +2157,7 @@ pub(crate) async fn comment_seqs(
     if ids.is_empty() {
         return Ok(seqs);
     }
-    let (pull, _repo_id, _limit) = seq_page_start(
+    let (pull, _repo_id, _organization, _limit) = seq_page_start(
         state,
         actor_id,
         auth_age,
@@ -2230,9 +2267,14 @@ pub(crate) async fn create_pull_review(
             }
             // A push racing this check leaves a review bound to the commit the
             // reviewer saw, which simply stops counting.
-            if branch_tip(state, pull.source_repository_id, &pull.source_branch)
-                .await?
-                .as_ref()
+            if branch_tip(
+                state,
+                loaded.org_id,
+                pull.source_repository_id,
+                &pull.source_branch,
+            )
+            .await?
+            .as_ref()
                 != Some(&input.commit_id)
             {
                 return Err(head_moved());
@@ -2335,7 +2377,7 @@ pub(crate) async fn list_pull_reviews(
     number: i32,
     query: SeqQuery,
 ) -> Result<Page<ReviewJson>, ApiError> {
-    let (pull, _repo_id, limit) = seq_page_start(
+    let (pull, _repo_id, _organization, limit) = seq_page_start(
         state, actor_id, auth_age, org_slug, repo_name, number, &query,
     )
     .await?;
@@ -2714,7 +2756,13 @@ pub(crate) async fn set_thread_resolved(
     if pull.state != "open" {
         return Err(not_open());
     }
-    let head = branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
+    let head = branch_tip(
+        state,
+        loaded.org_id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await?;
     let head = head.as_deref();
 
     let mut tx = state.pool.begin().await?;
@@ -3033,7 +3081,7 @@ pub(crate) async fn apply_pull_suggestion(
 
     // The expected old oid is the current head; the compare-and-swap refuses
     // the update if it moves between this read and the ref update.
-    let head = branch_tip(state, loaded.repo.id, &pull.source_branch)
+    let head = branch_tip(state, loaded.org_id, loaded.repo.id, &pull.source_branch)
         .await?
         .ok_or_else(branch_missing)?;
     // A suggestion applies to the exact commit it commented; once the head has

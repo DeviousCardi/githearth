@@ -237,6 +237,7 @@ pub(crate) async fn deliver(state: &AppState, notification_id: Uuid) -> JobOutco
 
     let context: Result<Option<Context>, sqlx::Error> = sqlx::query_as(
         "SELECT i.kind, pr.number, r.name AS repository, o.slug AS organization, \
+                r.organization_id AS organization_id, \
                 a.email, a.email_verified_at IS NOT NULL AS verified \
          FROM email_intents i \
          JOIN notifications n ON n.id = i.notification_id \
@@ -272,6 +273,19 @@ pub(crate) async fn deliver(state: &AppState, notification_id: Uuid) -> JobOutco
         return JobOutcome::Done;
     };
 
+    // Per-organization email share: one tenant's notification backlog cannot
+    // spend every send in the hour. The durable intent stays queued, so a
+    // refusal delays it instead of dropping it.
+    if !state
+        .limits
+        .allow_email(Some(context.organization_id), &to, false)
+    {
+        let _ = release(&state.pool, intent_id).await;
+        return JobOutcome::Retry {
+            after: std::time::Duration::from_secs(60),
+            reason: "organization email rate limit".into(),
+        };
+    }
     let (subject, body) = template(
         &context.kind,
         context.number,
@@ -312,6 +326,7 @@ struct Context {
     number: i32,
     repository: String,
     organization: String,
+    organization_id: Uuid,
     email: Option<String>,
     verified: bool,
 }

@@ -10,10 +10,12 @@ mod browse_ui;
 pub mod client_ip;
 pub mod codeowners;
 pub mod config;
+pub mod dns;
 pub mod doctor;
 pub mod email_verification;
 pub mod export;
 pub mod facts;
+pub mod fairness;
 pub mod forks;
 pub mod git_admission;
 pub mod git_hooks;
@@ -25,6 +27,7 @@ mod invitations_ui;
 pub mod issues;
 mod issues_ui;
 pub mod jobs;
+pub mod limits;
 mod login_throttle;
 pub mod mail;
 pub mod maintenance;
@@ -131,7 +134,14 @@ pub struct AppState {
     // pub so the password-reset saturation test can hold the only permit.
     pub auth_slots: Arc<Semaphore>,
     // pub so the concurrency-exhaustion integration test can hold a permit.
+    // The share scheduler takes its permits from this same semaphore, so the
+    // gauge and an externally held permit keep their meaning.
     pub git_slots: Arc<Semaphore>,
+    /// The per-organization Git share scheduler (ADR 0014 §5). Every Git
+    /// transport acquires through it; `git_slots` is its global capacity.
+    pub git_scheduler: Arc<fairness::GitScheduler>,
+    /// The live request, creation, email and sign-up budgets.
+    pub limits: Arc<limits::Limits>,
     /// Bounds simultaneous housekeeping runs (`housekeeping_concurrency`),
     /// including direct enqueues that bypass the scheduler's allowance.
     pub(crate) housekeeping_slots: Arc<Semaphore>,
@@ -309,10 +319,20 @@ impl AppState {
                 .join(maintenance::STATE_FILE),
         );
         let installation_keys = secrets::InstallationKeySet::from_config(&config)?.map(Arc::new);
+        let git_slots = Arc::new(Semaphore::new(config.git_concurrency));
+        let git_scheduler = fairness::GitScheduler::new(
+            git_slots.clone(),
+            config.git_concurrency,
+            config.git_organization_floor,
+            config.git_organization_ceiling,
+        );
+        let request_limits = Arc::new(limits::Limits::from_config(&config));
         let state = Self {
             pool,
             auth_slots: Arc::new(Semaphore::new(config.auth_concurrency)),
-            git_slots: Arc::new(Semaphore::new(config.git_concurrency)),
+            git_slots,
+            git_scheduler,
+            limits: request_limits,
             housekeeping_slots: Arc::new(Semaphore::new(config.housekeeping_concurrency)),
             config,
             dummy_hash: Arc::new(dummy_hash),
@@ -574,37 +594,111 @@ async fn enforce_read_only_boundary(
     next: axum::middleware::Next,
 ) -> Response {
     let method = request.method().clone();
+    let is_api = request.uri().path().starts_with("/api/v1");
+
+    // Resolve the credential on the API (for the published org/account budget)
+    // and on every non-GET/HEAD request (for the read-only boundary). An
+    // access token is a `gth_` bearer; everything else either authenticates
+    // or falls through to the handler as before.
+    let mut admitted = None;
+    if is_api || (method != Method::GET && method != Method::HEAD) {
+        match bearer_credential(request.headers()) {
+            Ok(Credential::AccessToken { token_hash }) => {
+                match authenticate_credential(
+                    &state.pool,
+                    Credential::AccessToken {
+                        token_hash: token_hash.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok((account, age)) => admitted = Some((token_hash, account, age)),
+                    // An invalid or expired token: the handler refuses it the
+                    // same way.
+                    Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => {}
+                    // Any other lookup failure (pool timeout, dropped
+                    // database) must fail closed: never run the handler, or a
+                    // transient error would let a read-only token's write
+                    // through.
+                    Err(e) => return e.into_response(),
+                }
+            }
+            Ok(credential @ Credential::Session { .. }) => {
+                if let Ok((account, age)) = authenticate_credential(&state.pool, credential).await {
+                    admitted = Some((Vec::new(), account, age));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    if is_api {
+        // The middleware is the single place that charges the published
+        // organization and account budgets, so a new route cannot forget them.
+        let account = admitted.as_ref().map(|(_, account, _)| account.id);
+        let organization = organization_in_path(&state, request.uri().path(), account).await;
+        if !state.limits.allow_api(organization, account) {
+            return rate_limited().into_response();
+        }
+    }
+
     if method == Method::GET || method == Method::HEAD {
         return next.run(request).await;
     }
-    // Only a valid `gth_` access token is intercepted; anything else (no
-    // credential, a session token, or a malformed token) falls through to the
-    // handler, which authenticates as it always has.
-    let token_hash = match bearer_credential(request.headers()) {
-        Ok(Credential::AccessToken { token_hash }) => token_hash,
-        _ => return next.run(request).await,
-    };
-    match authenticate_credential(
-        &state.pool,
-        Credential::AccessToken {
-            token_hash: token_hash.clone(),
-        },
-    )
-    .await
-    {
-        Ok((account, _)) if account.is_read_only() => read_only_denied().into_response(),
-        Ok((account, age)) => {
+    match admitted {
+        Some((_, account, _)) if account.is_read_only() => read_only_denied().into_response(),
+        Some((token_hash, account, age)) => {
             ADMITTED_TOKEN
                 .scope((token_hash, account, age), next.run(request))
                 .await
         }
-        // An invalid or expired token: the handler refuses it the same way.
-        Err(e) if e.status_code() == StatusCode::UNAUTHORIZED => next.run(request).await,
-        // Any other lookup failure (pool timeout, dropped database, a failed
-        // `last_used_at` refresh) must fail closed: never run the handler,
-        // or a transient error would let a read-only token's write through.
-        Err(e) => e.into_response(),
+        None => next.run(request).await,
     }
+}
+
+/// The organization named by `/api/v1/organizations/{slug}/...`, when the
+/// path has one, it exists, and the caller is a member. The membership join
+/// matters: a stranger must not be able to spend a victim organization's
+/// budget by spraying requests at its paths. A missing organization or a
+/// non-member is not charged to that organization — the handler answers
+/// `403`/`404`, and the caller still spends its own account budget.
+async fn organization_in_path(
+    state: &AppState,
+    path: &str,
+    account: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    let account = account?;
+    let rest = path.strip_prefix("/api/v1/organizations/")?;
+    let slug = rest.split('/').next()?;
+    if slug.is_empty() {
+        return None;
+    }
+    let by_id = slug.parse::<uuid::Uuid>().ok();
+    let found = match by_id {
+        Some(id) => {
+            sqlx::query_scalar(
+                "SELECT o.id FROM organizations o \
+                 JOIN memberships m ON m.organization_id = o.id AND m.account_id = $2 \
+                 WHERE o.id = $1",
+            )
+            .bind(id)
+            .bind(account)
+            .fetch_optional(&state.pool)
+            .await
+        }
+        None => {
+            sqlx::query_scalar(
+                "SELECT o.id FROM organizations o \
+                 JOIN memberships m ON m.organization_id = o.id AND m.account_id = $2 \
+                 WHERE o.slug = $1",
+            )
+            .bind(slug)
+            .bind(account)
+            .fetch_optional(&state.pool)
+            .await
+        }
+    };
+    found.ok().flatten()
 }
 
 async fn client_ip_middleware(
@@ -796,6 +890,11 @@ pub(crate) fn reauthentication_required() -> ApiError {
 }
 pub(crate) fn invalid() -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "invalid input")
+}
+/// A request over its published per-organization or per-account share. The
+/// message is fixed; callers do not reveal which budget was exhausted.
+pub(crate) fn rate_limited() -> ApiError {
+    ApiError(StatusCode::TOO_MANY_REQUESTS, "request rate limit exceeded")
 }
 
 /// PostgreSQL text columns cannot store U+0000. Reject it as invalid input
@@ -1094,6 +1193,12 @@ pub(crate) async fn sign_in(
     password: &str,
     request: login_throttle::Request,
 ) -> ApiResult<Option<Uuid>> {
+    // The anonymous login/search ceiling (ADR 0014 §5): before the failure
+    // throttle and before Argon2. It is per client address, so a public login
+    // form cannot be used to saturate the hashing pool.
+    if !state.limits.allow_anonymous_login(request.client_ip()) {
+        return Err(too_many_attempts());
+    }
     // A saturated authentication queue is refused without reading PostgreSQL.
     let mut permit = Some(acquire_auth_slot(state).await?);
     // The same throttle decision as the browser form and Git HTTP basic. The
@@ -1615,6 +1720,13 @@ pub(crate) async fn create_organization(
         return Err(invalid());
     }
     let (account, _) = authenticate(&state.pool, &headers).await?;
+    // The per-account API budget is charged by the `/api/v1` middleware. The
+    // organization-creation cap stays here because every new organization
+    // earns a fresh Git, job and email share; without it a single account
+    // could multiply its share.
+    if !state.limits.allow_organization_creation(account.id) {
+        return Err(rate_limited());
+    }
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
     sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,$3)")

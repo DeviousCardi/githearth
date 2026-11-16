@@ -3,7 +3,8 @@
 //! Authorization matches every other repository read: an authenticated bearer
 //! token, the repository loaded by name, and a `repository.read` decision.
 //! Non-active repositories are unreadable (404 with no detail). Each Git
-//! invocation set takes a `git_slots` permit and runs on the blocking pool.
+//! invocation set takes the organization's slot from the Git share scheduler
+//! (never the raw `git_slots` semaphore) and runs on the blocking pool.
 
 use axum::{
     Json, Router,
@@ -75,25 +76,34 @@ async fn load_readable(
     Ok(loaded)
 }
 
-async fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+/// Take the organization's Git slot through the share scheduler. Every web
+/// path that runs Git uses this, so a browser loop is charged to the same
+/// organization as a clone and cannot hold every global slot (U30, M1).
+pub(crate) async fn acquire_permit(
+    state: &AppState,
+    organization: Uuid,
+) -> Result<crate::fairness::GitPermit, ApiError> {
     state
-        .git_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "git requests busy"))
+        .git_scheduler
+        .try_acquire(organization)
+        .ok_or(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "git requests busy",
+        ))
 }
 
 /// Run one Git invocation set on the blocking pool, holding the permit for the
 /// whole call so a cancelled request cannot release it while Git still runs.
 pub(crate) async fn git_read<T>(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     work: impl FnOnce(&FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
 {
-    let permit = acquire_permit(state).await?;
+    let permit = acquire_permit(state, organization).await?;
     let storage = state.storage.clone();
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
     tokio::task::spawn_blocking(move || {
@@ -117,6 +127,7 @@ where
 /// branch".
 pub(crate) async fn git_read_opt<T>(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     work: impl FnOnce(&FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
 ) -> Result<Option<T>, ApiError>
@@ -126,20 +137,21 @@ where
     if !state.storage.has_repository(repo_id) {
         return Ok(None);
     }
-    git_read(state, repo_id, work).await.map(Some)
+    git_read(state, organization, repo_id, work).await.map(Some)
 }
 
 /// Like [`git_read`], but also creates a scratch directory (removed when the
 /// worker returns) for Git commands that must write objects off-repository.
 pub(crate) async fn git_compare<T>(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     work: impl FnOnce(&FsPath, &FsPath, Duration) -> Result<T, StorageError> + Send + 'static,
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
 {
-    let permit = acquire_permit(state).await?;
+    let permit = acquire_permit(state, organization).await?;
     let storage = state.storage.clone();
     let timeout = Duration::from_secs(state.config.git_timeout_seconds);
     tokio::task::spawn_blocking(move || {
@@ -185,8 +197,13 @@ fn map_storage_error(repo_id: Uuid, error: StorageError) -> ApiError {
     }
 }
 
-async fn resolve(state: &AppState, repo_id: Uuid, rev: String) -> Result<String, ApiError> {
-    git_read(state, repo_id, move |path, timeout| {
+async fn resolve(
+    state: &AppState,
+    organization: Uuid,
+    repo_id: Uuid,
+    rev: String,
+) -> Result<String, ApiError> {
+    git_read(state, organization, repo_id, move |path, timeout| {
         browse::resolve(path, &rev, timeout)
     })
     .await?
@@ -217,7 +234,7 @@ async fn refs(
 ) -> Result<Json<RefsJson>, ApiError> {
     let loaded = load_readable(&state, &headers, &org, &repo).await?;
     let repo_id = loaded.repo.id;
-    let result = git_read(&state, repo_id, browse::refs).await?;
+    let result = git_read(&state, loaded.org_id, repo_id, browse::refs).await?;
     Ok(Json(RefsJson {
         default_branch: result.default_branch,
         branches: result
@@ -276,10 +293,10 @@ async fn tree(
         return Err(invalid());
     }
     let repo_id = loaded.repo.id;
-    let id = resolve(&state, repo_id, rev.clone()).await?;
+    let id = resolve(&state, loaded.org_id, repo_id, rev.clone()).await?;
     let path = query.path.clone();
     let id_for_git = id.clone();
-    let entries = git_read(&state, repo_id, move |fs_path, timeout| {
+    let entries = git_read(&state, loaded.org_id, repo_id, move |fs_path, timeout| {
         browse::tree(fs_path, &id_for_git, path.as_deref(), timeout)
     })
     .await?
@@ -337,8 +354,8 @@ async fn blob(
         return Err(invalid());
     }
     let repo_id = loaded.repo.id;
-    let id = resolve(&state, repo_id, rev.clone()).await?;
-    let blob = git_read(&state, repo_id, move |fs_path, timeout| {
+    let id = resolve(&state, loaded.org_id, repo_id, rev.clone()).await?;
+    let blob = git_read(&state, loaded.org_id, repo_id, move |fs_path, timeout| {
         browse::blob(fs_path, &id, &path, browse::MAX_BLOB_BYTES, timeout)
     })
     .await?
@@ -428,11 +445,11 @@ async fn log(
     }
 
     let repo_id = loaded.repo.id;
-    let id = resolve(&state, repo_id, rev.clone()).await?;
+    let id = resolve(&state, loaded.org_id, repo_id, rev.clone()).await?;
     let path = query.path.clone();
     let limit = limit as usize;
     let id_for_git = id.clone();
-    let summaries = git_read(&state, repo_id, move |fs_path, timeout| {
+    let summaries = git_read(&state, loaded.org_id, repo_id, move |fs_path, timeout| {
         browse::log(
             fs_path,
             &id_for_git,
@@ -506,7 +523,7 @@ async fn commit(
         return Err(invalid());
     }
     let repo_id = loaded.repo.id;
-    let detail = git_read(&state, repo_id, move |fs_path, timeout| {
+    let detail = git_read(&state, loaded.org_id, repo_id, move |fs_path, timeout| {
         browse::commit(fs_path, &id, timeout)
     })
     .await?
@@ -573,9 +590,12 @@ async fn compare(
     };
     let (base, head) = (base.to_owned(), head.to_owned());
     let repo_id = loaded.repo.id;
-    let comparison = git_compare(&state, repo_id, move |fs_path, scratch, timeout| {
-        browse::compare(fs_path, scratch, &base, &head, timeout)
-    })
+    let comparison = git_compare(
+        &state,
+        loaded.org_id,
+        repo_id,
+        move |fs_path, scratch, timeout| browse::compare(fs_path, scratch, &base, &head, timeout),
+    )
     .await?
     .ok_or_else(revision_not_found)?;
 
@@ -679,9 +699,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn worker_panic_maps_to_500() {
-        let root = std::env::temp_dir().join(format!("browse-panic-{}", Uuid::new_v4()));
+    /// A state with a lazy pool (these tests never touch the database) and a
+    /// scheduler whose capacity matches `git_slots`.
+    fn test_state(prefix: &str, git_concurrency: usize) -> (AppState, Uuid) {
+        let root = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
         let storage = Storage::open(&root).unwrap();
         let repo_id = Uuid::new_v4();
         storage
@@ -690,6 +711,7 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
+        let git_slots = Arc::new(Semaphore::new(git_concurrency));
         let state = AppState {
             pool,
             config: crate::config::Config {
@@ -698,7 +720,11 @@ mod tests {
                 ..crate::config::Config::default()
             },
             auth_slots: Arc::new(Semaphore::new(2)),
-            git_slots: Arc::new(Semaphore::new(2)),
+            git_slots: git_slots.clone(),
+            git_scheduler: crate::fairness::GitScheduler::new(git_slots, git_concurrency, 1, 4),
+            limits: Arc::new(crate::limits::Limits::from_config(
+                &crate::config::Config::default(),
+            )),
             housekeeping_slots: Arc::new(Semaphore::new(2)),
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(Engine::new().unwrap()),
@@ -722,9 +748,53 @@ mod tests {
             maintenance_token: Arc::from("test-token"),
             installation_keys: None,
         };
-        let error = git_read(&state, repo_id, |_, _| -> Result<Vec<u8>, StorageError> {
-            panic!("worker panic")
-        })
+        (state, repo_id)
+    }
+
+    /// M1: the browser read paths take the organization's slot through the
+    /// scheduler, not the raw `git_slots` semaphore. With capacity four and
+    /// the ceiling clamped to three, one organization gets three and the
+    /// fourth slot stays free for a peer.
+    #[tokio::test]
+    async fn the_browse_path_charges_the_organizations_git_share() {
+        let (state, _repo_id) = test_state("browse-share", 4);
+        let first = Uuid::new_v4();
+        let mut held = Vec::new();
+        for slot in 1..=3 {
+            held.push(
+                acquire_permit(&state, first)
+                    .await
+                    .unwrap_or_else(|_| panic!("slot {slot} is within the ceiling")),
+            );
+        }
+        let refused = acquire_permit(&state, first).await;
+        assert!(
+            refused.is_err(),
+            "a browser loop cannot take the fourth global slot for one organization"
+        );
+        // The fourth slot is still there for another organization.
+        let peer = acquire_permit(&state, Uuid::new_v4())
+            .await
+            .expect("a peer gets the slot the capped organization may not hold");
+        drop(peer);
+        drop(held);
+        assert_eq!(
+            state.git_slots.available_permits(),
+            4,
+            "every permit returned"
+        );
+        let _ = std::fs::remove_dir_all(&state.config.storage_root);
+    }
+
+    #[tokio::test]
+    async fn worker_panic_maps_to_500() {
+        let (state, repo_id) = test_state("browse-panic", 2);
+        let error = git_read(
+            &state,
+            Uuid::new_v4(),
+            repo_id,
+            |_, _| -> Result<Vec<u8>, StorageError> { panic!("worker panic") },
+        )
         .await
         .unwrap_err();
         assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);

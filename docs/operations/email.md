@@ -11,7 +11,11 @@ produced the event.
 | `smtp_host` | `GITHEARTH_SMTP_HOST` | empty | SMTP server; empty disables delivery |
 | `smtp_port` | `GITHEARTH_SMTP_PORT` | `587` | SMTP port |
 | `smtp_tls` | `GITHEARTH_SMTP_TLS` | `starttls` | `starttls`, `implicit` (port 465) or `none` (no TLS; refused with `smtp_username`) |
-| `smtp_from` | `GITHEARTH_SMTP_FROM` | empty | Envelope sender and `From:` address; required when `smtp_host` is set |
+| `smtp_from` | `GITHEARTH_SMTP_FROM` | empty | `From:` address; required when `smtp_host` is set |
+| `smtp_bounce_address` | `GITHEARTH_SMTP_BOUNCE_ADDRESS` | empty | Envelope sender (`MAIL FROM`) for bounces; falls back to `smtp_from` |
+| `smtp_dkim_selector` | `GITHEARTH_SMTP_DKIM_SELECTOR` | `default` | Selector `doctor` checks at `<selector>._domainkey.<domain>` |
+| `abuse_contact` | `GITHEARTH_ABUSE_CONTACT` | empty | Published abuse address; required before sign-up |
+| `email_dns_check_enabled` | `GITHEARTH_EMAIL_DNS_CHECK_ENABLED` | `true` | Whether `doctor` resolves SPF, DKIM and DMARC |
 | `smtp_username` | `GITHEARTH_SMTP_USERNAME` | unset | AUTH username; requires a credential file |
 | `smtp_password_file` | `GITHEARTH_SMTP_PASSWORD_FILE` | unset | File containing the SMTP credential, or `-` for one line on stdin |
 | `public_url` | `GITHEARTH_PUBLIC_URL` | `http://127.0.0.1:8080` | Base of links in mail |
@@ -55,6 +59,49 @@ SMTP resolves its host once and checks every answer with the outbound client's
 address policy: a cloud-metadata endpoint is always refused, and a loopback,
 link-local or private answer needs `outbound_allow_private = true`. A loopback
 development relay therefore needs that option as well as `smtp_host`.
+
+## SPF, DKIM, DMARC and bounces
+
+A public host that enables sign-up must publish all three records for the
+sending domain and accept bounces. This is the M4.2 abuse baseline; M11a's
+sign-up and recovery depend on it.
+
+- **SPF** — a TXT record at the domain apex beginning `v=spf1`, naming the
+  relay that sends the mail (for example `v=spf1 include:mail.example
+  ~all`). Do not use `+all`.
+- **DKIM** — a TXT record at `<selector>._domainkey.<domain>` beginning
+  `v=DKIM1`, with the public key. Set `smtp_dkim_selector` to the same
+  selector the relay signs with. The built-in transport does not sign; the
+  relay must, or an operator can front it with a signing relay.
+- **DMARC** — a TXT record at `_dmarc.<domain>` beginning `v=DMARC1`, with a
+  policy of at least `p=quarantine` (prefer `p=reject`) and an `rua=` address
+  the operator reads.
+- **Bounce address** — set `smtp_bounce_address` to a mailbox that accepts
+  bounces. It is used as `MAIL FROM`; `From:` stays `smtp_from`. A bounce is a
+  delivery failure the operator must be able to see, not a message that
+  disappears into the sending mailbox.
+
+`doctor` has an **email DNS** check: with SMTP configured it looks up those
+three TXT records and requires `smtp_bounce_address` and `abuse_contact`. A
+resolved domain missing a record fails the check; a resolver outage warns. The
+check is read-only and sends no mail. It can be disabled with
+`email_dns_check_enabled = false` for an offline preflight, but that does not
+waive the requirement before sign-up.
+
+## Rate limits
+
+Email is bounded so one tenant or one address cannot use the installation as a
+bulk sender:
+
+| Budget | Default | Where enforced |
+| --- | --- | --- |
+| Notification mail per organization | 200/hour | `notification_email::deliver` |
+| Security mail per destination address | 5/hour | `email_verification::send_requested` |
+
+A send over its budget returns the durable job to `pending` with a delay; the
+intent is not dropped. The counters are in-process and reset with the server,
+which is the same lifetime as the in-memory request budgets (see
+[limits](limits.md)).
 
 ## What is sent
 

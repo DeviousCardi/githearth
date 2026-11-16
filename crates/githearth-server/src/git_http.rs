@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -58,6 +58,7 @@ async fn info_refs(
     Path((org, repo)): Path<(String, String)>,
     Query(query): Query<InfoRefsQuery>,
     headers: HeaderMap,
+    client: crate::client_ip::ResolvedIp,
 ) -> Result<Response, GitHttpError> {
     let repo_name = strip_dot_git(&repo).ok_or(GitHttpError::NotFound)?;
 
@@ -80,26 +81,39 @@ async fn info_refs(
         }
     };
 
-    let repo_id = match want {
-        git_admission::Want::Fetch => git_admission::admit_fetch(&state, &headers, &org, repo_name)
-            .await
-            .inspect(|_| record_admission(&state, Ok(())))
-            .map(|r| r.id)
-            .map_err(|e| {
-                record_admission(&state, Err(e.1));
-                GitHttpError::Auth(e.0, e.1)
-            })?,
-        git_admission::Want::Push => git_admission::admit(&state, &headers, &org, repo_name, want)
-            .await
-            .inspect(|_| record_admission(&state, Ok(())))
-            .map(|a| a.repository.id)
-            .map_err(|e| {
-                record_admission(&state, Err(e.1));
-                GitHttpError::Auth(e.0, e.1)
-            })?,
+    let (repo_id, organization, account) = match want {
+        git_admission::Want::Fetch => {
+            let admission = git_admission::admit_fetch(&state, &headers, &org, repo_name)
+                .await
+                .inspect(|_| record_admission(&state, Ok(())))
+                .map_err(|e| {
+                    record_admission(&state, Err(e.1));
+                    GitHttpError::Auth(e.0, e.1)
+                })?;
+            (
+                admission.repository.id,
+                admission.repository.organization_id,
+                admission.account,
+            )
+        }
+        git_admission::Want::Push => {
+            let admitted = git_admission::admit(&state, &headers, &org, repo_name, want)
+                .await
+                .inspect(|_| record_admission(&state, Ok(())))
+                .map_err(|e| {
+                    record_admission(&state, Err(e.1));
+                    GitHttpError::Auth(e.0, e.1)
+                })?;
+            (
+                admitted.repository.id,
+                admitted.organization,
+                Some(admitted.account),
+            )
+        }
     };
+    charge_git_request(&state, organization, account, &client)?;
 
-    let permit = acquire_git_permit(&state).await?;
+    let permit = acquire_git_permit(&state, organization).await?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(state.config.git_timeout_seconds);
 
@@ -188,20 +202,23 @@ async fn upload_pack(
     State(state): State<AppState>,
     Path((org, repo)): Path<(String, String)>,
     headers: HeaderMap,
+    client: crate::client_ip::ResolvedIp,
     body: axum::body::Body,
 ) -> Result<Response, GitHttpError> {
     let repo_name = strip_dot_git(&repo).ok_or(GitHttpError::NotFound)?;
 
-    let repo_row = git_admission::admit_fetch(&state, &headers, &org, repo_name)
+    let admission = git_admission::admit_fetch(&state, &headers, &org, repo_name)
         .await
         .inspect(|_| record_admission(&state, Ok(())))
         .map_err(|e| {
             record_admission(&state, Err(e.1));
             GitHttpError::Auth(e.0, e.1)
         })?;
-    let repo_id = repo_row.id;
+    let repo_id = admission.repository.id;
+    let organization = admission.repository.organization_id;
+    charge_git_request(&state, organization, admission.account, &client)?;
 
-    let permit = acquire_git_permit(&state).await?;
+    let permit = acquire_git_permit(&state, organization).await?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(state.config.git_timeout_seconds);
     let limit = state.config.git_request_limit_bytes;
@@ -375,7 +392,18 @@ async fn receive_pack(
                 GitHttpError::Auth(e.0, e.1)
             })?;
 
-    let permit = acquire_git_permit(&state).await?;
+    // Authenticated Git has its own organization and account budgets,
+    // separate from the API's (ADR 0014 §5). The charge is after admission so
+    // a scanner cannot spend it with requests for a repository that does not
+    // exist.
+    if !state
+        .limits
+        .allow_git(admitted.organization, Some(admitted.account))
+    {
+        return Err(GitHttpError::RateLimited);
+    }
+
+    let permit = acquire_git_permit(&state, admitted.organization).await?;
     // Per-repository lock BEFORE any pool connection (see reconcile.rs lock
     // ordering).  Held until the response stream finishes so the journal
     // records of one ref transaction stay adjacent.
@@ -1054,12 +1082,47 @@ async fn registered_keys(
 // Concurrency permit
 // ---------------------------------------------------------------------------
 
-async fn acquire_git_permit(state: &AppState) -> Result<OwnedSemaphorePermit, GitHttpError> {
-    state
-        .git_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| GitHttpError::ConcurrencyExhausted)
+/// Charge one Git transport request. An authenticated caller spends the
+/// organization and account Git budgets; an anonymous fetch spends the
+/// per-address and installation budgets. Charged only after admission, when
+/// the repository (and so the organization) is known to exist.
+fn charge_git_request(
+    state: &AppState,
+    organization: Uuid,
+    account: Option<Uuid>,
+    client: &crate::client_ip::ResolvedIp,
+) -> Result<(), GitHttpError> {
+    let allowed = match account {
+        Some(account) => state.limits.allow_git(organization, Some(account)),
+        None => state
+            .limits
+            .allow_anonymous_fetch(client.0.map(|c| c.addr())),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(GitHttpError::RateLimited)
+    }
+}
+
+async fn acquire_git_permit(
+    state: &AppState,
+    organization: Uuid,
+) -> Result<crate::fairness::GitPermit, GitHttpError> {
+    // Wait up to `git_wait_millis` for this organization's share. A release
+    // serves an organization below its floor first, so a busy tenant cannot
+    // make a newcomer's requests wait behind its whole queue. The bounded wait
+    // keeps the transport's existing `Retry-After` refusal for a genuinely
+    // saturated installation.
+    match tokio::time::timeout(
+        Duration::from_millis(state.config.git_wait_millis),
+        state.git_scheduler.acquire(organization),
+    )
+    .await
+    {
+        Ok(permit) => Ok(permit),
+        Err(_) => Err(GitHttpError::ConcurrencyExhausted),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,7 +1286,7 @@ fn stream_git_output(
     prefix: Vec<u8>,
     repo_id: Uuid,
     deadline: tokio::time::Instant,
-    permit: OwnedSemaphorePermit,
+    permit: crate::fairness::GitPermit,
     kill_rx: Option<oneshot::Receiver<()>>,
     feeder_handle: Option<tokio::task::JoinHandle<()>>,
     token: CancellationToken,
@@ -1433,6 +1496,7 @@ enum GitHttpError {
     BadRequest(&'static str),
     Auth(StatusCode, &'static str),
     ConcurrencyExhausted,
+    RateLimited,
     PayloadTooLarge,
     ServerError,
     UnsupportedContentEncoding,
@@ -1451,6 +1515,14 @@ impl IntoResponse for GitHttpError {
                 response
                     .headers_mut()
                     .insert("Retry-After", "5".parse().unwrap());
+                response
+            }
+            Self::RateLimited => {
+                let mut response =
+                    (StatusCode::TOO_MANY_REQUESTS, "request rate limit exceeded").into_response();
+                response
+                    .headers_mut()
+                    .insert("Retry-After", "60".parse().unwrap());
                 response
             }
             Self::PayloadTooLarge => {

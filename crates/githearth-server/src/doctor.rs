@@ -112,6 +112,10 @@ pub async fn report(config: &Config) -> Vec<Check> {
 
     check_email(config, &mut checks);
 
+    check_email_dns(config, &crate::dns::SystemResolver, &mut checks);
+
+    check_limits(config, &mut checks);
+
     match db_connect(config).await {
         Ok(pool) => {
             checks.push(Check::ok("database", "connected"));
@@ -140,9 +144,9 @@ pub async fn report(config: &Config) -> Vec<Check> {
             checks.push(outbox_check(&pool).await);
             checks.push(housekeeping_check(&pool, config).await);
             // Only reported when it has something to report: a clean install
-            // has no skipped request. So `doctor` runs eleven checks there and
-            // twelve on an install whose base backfill warned, which is what
-            // `docs/operations/install.md` documents.
+            // has no skipped request. So `doctor` runs fourteen checks there
+            // and fifteen on an install whose base backfill warned, which is
+            // what `docs/operations/install.md` documents.
             if let Some(check) = base_backfill_check(&pool).await {
                 checks.push(check);
             }
@@ -458,6 +462,150 @@ fn check_email(config: &Config, checks: &mut Vec<Check>) {
     } else {
         checks.push(Check::ok("email", summary));
     }
+}
+
+fn has_record(records: &[String], prefix: &str) -> bool {
+    records
+        .iter()
+        .any(|record| record.trim().to_ascii_lowercase().starts_with(prefix))
+}
+
+/// The public-host baseline (ADR 0014 §5, case U30b): a configured relay must
+/// name a bounce address, and the sending domain must publish SPF, DKIM and
+/// DMARC. It is one check so the documented doctor count stays stable; a
+/// resolver outage is a warning, but a resolved answer without the record is a
+/// failure, because that is a policy decision an operator can fix before
+/// enabling sign-up.
+fn check_email_dns(
+    config: &Config,
+    resolver: &dyn crate::dns::TxtResolver,
+    checks: &mut Vec<Check>,
+) {
+    const NAME: &str = "email DNS";
+    if config.smtp_host.is_empty() {
+        checks.push(Check::ok(
+            NAME,
+            "not configured; no SPF, DKIM or DMARC record is required until SMTP is enabled",
+        ));
+        return;
+    }
+    if !config.email_dns_check_enabled {
+        checks.push(Check::ok(
+            NAME,
+            "disabled by configuration; enable email_dns_check_enabled before sign-up",
+        ));
+        return;
+    }
+    let domain = config
+        .smtp_from
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim().to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty());
+    let Some(domain) = domain else {
+        checks.push(Check::fail(
+            NAME,
+            "smtp_from has no domain, so SPF, DKIM and DMARC cannot be checked",
+        ));
+        return;
+    };
+
+    let mut problems = Vec::new();
+    let mut unresolved = Vec::new();
+    let spf_name = domain.clone();
+    match resolver.txt(&spf_name) {
+        Ok(records) if has_record(&records, "v=spf1") => {}
+        Ok(_) => problems.push(format!("{spf_name} has no SPF (v=spf1) TXT record")),
+        Err(error) => unresolved.push(format!("SPF {spf_name}: {error}")),
+    }
+    let dmarc_name = format!("_dmarc.{domain}");
+    match resolver.txt(&dmarc_name) {
+        Ok(records) if has_record(&records, "v=dmarc1") => {}
+        Ok(_) => problems.push(format!("{dmarc_name} has no DMARC (v=DMARC1) TXT record")),
+        Err(error) => unresolved.push(format!("DMARC {dmarc_name}: {error}")),
+    }
+    let dkim_name = format!("{}._domainkey.{domain}", config.smtp_dkim_selector);
+    match resolver.txt(&dkim_name) {
+        Ok(records) if has_record(&records, "v=dkim1") => {}
+        Ok(_) => problems.push(format!("{dkim_name} has no DKIM (v=DKIM1) TXT record")),
+        Err(error) => unresolved.push(format!("DKIM {dkim_name}: {error}")),
+    }
+    if config.smtp_bounce_address.trim().is_empty() {
+        problems.push("smtp_bounce_address is empty; bounces fall back to smtp_from".to_owned());
+    }
+    if config.abuse_contact.trim().is_empty() {
+        problems.push("abuse_contact is empty; publish one before sign-up".to_owned());
+    }
+
+    if !problems.is_empty() {
+        checks.push(Check::fail(NAME, problems.join("; ")));
+    } else if !unresolved.is_empty() {
+        checks.push(Check::warn(
+            NAME,
+            format!(
+                "cannot resolve the sending domain from this host; check again from the mail host: {}",
+                unresolved.join("; ")
+            ),
+        ));
+    } else {
+        checks.push(Check::ok(
+            NAME,
+            format!(
+                "SPF, DKIM ({}) and DMARC present for {domain}; bounce address set",
+                config.smtp_dkim_selector
+            ),
+        ));
+    }
+}
+
+/// The trusted-proxy prerequisite for the per-address budgets (ADR 0014 §5).
+/// Limits are always on, so the real question is whether this installation
+/// sits behind a reverse proxy: a loopback `public_url` is the documented
+/// local profile and reads the connection peer directly, while any other
+/// public URL is expected to be TLS-terminated by a proxy. With no trusted
+/// proxy the budgets silently collapse to the proxy's one address.
+fn check_limits(config: &Config, checks: &mut Vec<Check>) {
+    const NAME: &str = "limits";
+    if !config.trusted_proxies.is_empty() {
+        checks.push(Check::ok(
+            NAME,
+            format_args!(
+                "per-address budgets trust {} proxy address(es) for client address resolution",
+                config.trusted_proxies.len()
+            ),
+        ));
+        return;
+    }
+    if public_url_is_loopback(&config.public_url) {
+        checks.push(Check::ok(
+            NAME,
+            "per-address budgets use the connection peer; no reverse proxy is configured",
+        ));
+    } else {
+        checks.push(Check::warn(
+            NAME,
+            "trusted_proxies is empty while public_url is not loopback: behind a reverse \
+             proxy every per-address budget shares the proxy's address",
+        ));
+    }
+}
+
+/// Whether `public_url` names a loopback host (`localhost`, `127.0.0.0/8`,
+/// `::1`). A parse failure is not loopback, so it warns rather than assuming
+/// the safer direct-connection shape.
+fn public_url_is_loopback(public_url: &str) -> bool {
+    let Some((_, rest)) = public_url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(unbracketed) = authority.strip_prefix('[') {
+        unbracketed.split(']').next().unwrap_or(unbracketed)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 async fn db_connect(config: &Config) -> anyhow::Result<PgPool> {
@@ -848,6 +996,156 @@ mod tests {
         );
         assert!(checks[0].detail.contains("port 465"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FakeResolver {
+        records: std::collections::HashMap<String, Vec<String>>,
+    }
+
+    impl crate::dns::TxtResolver for FakeResolver {
+        fn txt(&self, name: &str) -> Result<Vec<String>, String> {
+            Ok(self.records.get(name).cloned().unwrap_or_default())
+        }
+    }
+
+    fn dns_config(storage: &std::path::Path) -> Config {
+        Config {
+            smtp_host: "smtp.example.com".into(),
+            smtp_from: "githearth@example.com".into(),
+            smtp_bounce_address: "bounces@example.com".into(),
+            abuse_contact: "abuse@example.com".into(),
+            storage_root: storage.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    fn records() -> FakeResolver {
+        FakeResolver {
+            records: std::collections::HashMap::from([
+                ("example.com".to_owned(), vec!["v=spf1 -all".to_owned()]),
+                (
+                    "_dmarc.example.com".to_owned(),
+                    vec!["v=DMARC1; p=reject".to_owned()],
+                ),
+                (
+                    "default._domainkey.example.com".to_owned(),
+                    vec!["v=DKIM1; k=rsa; p=abc".to_owned()],
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn email_dns_reports_a_missing_record_and_bounce_setting() {
+        let dir = temp_dir("doctor-dns");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = dns_config(&dir);
+        let mut checks = Vec::new();
+        check_email_dns(&config, &records(), &mut checks);
+        assert!(
+            matches!(checks[0].status, Status::Ok),
+            "{}",
+            checks[0].detail
+        );
+
+        config.smtp_bounce_address.clear();
+        let mut checks = Vec::new();
+        check_email_dns(&config, &records(), &mut checks);
+        assert!(matches!(checks[0].status, Status::Fail));
+        assert!(checks[0].detail.contains("smtp_bounce_address"));
+
+        config.smtp_bounce_address = "bounces@example.com".into();
+        let missing = FakeResolver {
+            records: std::collections::HashMap::from([(
+                "example.com".to_owned(),
+                vec!["v=spf1 -all".to_owned()],
+            )]),
+        };
+        let mut checks = Vec::new();
+        check_email_dns(&config, &missing, &mut checks);
+        assert!(matches!(checks[0].status, Status::Fail));
+        assert!(checks[0].detail.contains("DMARC"));
+        assert!(checks[0].detail.contains("DKIM"));
+
+        // A resolver failure is a warning, not a false "missing record".
+        struct Down;
+        impl crate::dns::TxtResolver for Down {
+            fn txt(&self, _name: &str) -> Result<Vec<String>, String> {
+                Err("no nameserver answered".into())
+            }
+        }
+        let mut checks = Vec::new();
+        check_email_dns(&config, &Down, &mut checks);
+        assert!(matches!(checks[0].status, Status::Warn));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The common failure: a typo in `smtp_from`'s domain resolves to
+    /// NXDOMAIN. `parse_response` turns that into an empty answer, so the
+    /// missing-record branch fails `doctor` rather than warning about an
+    /// outage. The resolver double returns `Ok(vec![])`, which is exactly what
+    /// the NXDOMAIN path produces.
+    #[test]
+    fn nxdomain_is_a_missing_record_not_an_outage() {
+        let dir = temp_dir("doctor-nxdomain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dns_config(&dir);
+        struct Nxdomain;
+        impl crate::dns::TxtResolver for Nxdomain {
+            fn txt(&self, _name: &str) -> Result<Vec<String>, String> {
+                Ok(Vec::new())
+            }
+        }
+        let mut checks = Vec::new();
+        check_email_dns(&config, &Nxdomain, &mut checks);
+        assert!(
+            matches!(checks[0].status, Status::Fail),
+            "a nonexistent sending domain is a missing record, not a warning: {}",
+            checks[0].detail
+        );
+        assert!(checks[0].detail.contains("SPF"));
+        assert!(checks[0].detail.contains("DMARC"));
+        assert!(checks[0].detail.contains("DKIM"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn limits_check_warns_when_a_public_host_trusts_no_proxy() {
+        let dir = temp_dir("doctor-limits");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_config(&dir);
+        // The clean local profile: loopback public URL, no proxy.
+        let mut checks = Vec::new();
+        check_limits(&config, &mut checks);
+        assert!(
+            matches!(checks[0].status, Status::Ok),
+            "{}",
+            checks[0].detail
+        );
+
+        // A public URL is the documented reverse-proxy deployment; without a
+        // trusted proxy the per-address budgets collapse.
+        config.public_url = "https://forge.example.com".into();
+        let mut checks = Vec::new();
+        check_limits(&config, &mut checks);
+        assert!(matches!(checks[0].status, Status::Warn));
+        assert!(checks[0].detail.contains("trusted_proxies"));
+
+        config.trusted_proxies = vec!["127.0.0.1".into()];
+        let mut checks = Vec::new();
+        check_limits(&config, &mut checks);
+        assert!(matches!(checks[0].status, Status::Ok));
+        assert!(checks[0].detail.contains("1 proxy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_public_urls_are_recognised() {
+        assert!(public_url_is_loopback("http://127.0.0.1:8080"));
+        assert!(public_url_is_loopback("http://localhost:8080/"));
+        assert!(public_url_is_loopback("http://[::1]:8080"));
+        assert!(!public_url_is_loopback("https://forge.example.com"));
+        assert!(!public_url_is_loopback("http://10.0.0.5:8080"));
     }
 
     // ---- storage tests ----

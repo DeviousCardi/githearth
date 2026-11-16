@@ -335,10 +335,20 @@ async fn claim_one(
             return None;
         }
     };
+    // Per-organization worker share (ADR 0014 §5): an organization with a
+    // backlog can run at most its configured share at once, so it never
+    // occupies every worker and another tenant's job is claimable. Jobs with
+    // no organization (installation maintenance, outbox fan-out) are not
+    // charged to a tenant.
     let selected = sqlx::query(
-        "SELECT id, kind FROM jobs WHERE state = 'pending' AND not_before <= now() \
-         ORDER BY not_before FOR UPDATE SKIP LOCKED LIMIT 1",
+        "SELECT j.id, j.kind FROM jobs j \
+         WHERE j.state = 'pending' AND j.not_before <= now() \
+           AND (j.organization_id IS NULL OR \
+                (SELECT count(*) FROM jobs r \
+                  WHERE r.state = 'running' AND r.organization_id = j.organization_id) < $1) \
+         ORDER BY j.not_before FOR UPDATE SKIP LOCKED LIMIT 1",
     )
+    .bind(state.config.job_organization_share as i64)
     .fetch_optional(&mut *tx)
     .await;
     let (id, kind): (Uuid, String) = match selected {
@@ -640,6 +650,10 @@ pub fn spawn(
             while tasks.try_join_next().is_some() {}
             if last_retention.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
                 retention_sweep(&state, state.config.job_retention_days).await;
+                // The fixed-window limit maps are pruned on the same hourly
+                // tick (M4.2). Without it, every address ever seen would stay
+                // in memory for the process lifetime.
+                state.limits.sweep();
                 last_retention = Some(Instant::now());
             }
             if !claimed {
