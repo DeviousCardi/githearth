@@ -82,7 +82,9 @@ U28 covers `pg_dump` and this binary's archives, not physical base backups.
    transaction without decrypting any secret; in-flight requests keep working
    because each row names the key that wrapped it.
 4. `githearth-server secrets status` prints `rotation complete` and exits zero
-   only when no data key is left under the old key. Until then, keep both keys,
+   only when no data key is left under the old key or an older wrap method (a
+   renamed key descriptor can leave rows whose key id is current but whose
+   method is not; `rotate` re-wraps those too). Until then, keep both keys,
    and `backup` refuses rather than write an archive that restores only with a
    key the operator was not told to keep.
 5. Remove `installation_key_previous_file`, restart, and destroy the old key.
@@ -93,11 +95,14 @@ unrecoverable.
 ## Restore
 
 `restore` verifies the archive's installation key id against the destination
-key and, after restoring the database, opens every wrapped data key before it
-publishes the storage tree or configuration. A wrong or missing key fails and
-drops the partially restored database. Put the key where the archived
-configuration names it, or set `GITHEARTH_INSTALLATION_KEY_FILE` (the restore
-rewrites `installation_key_file` to that path).
+key and, after restoring the database, opens every wrapped data key — every row,
+not one sample per key id — before it publishes the storage tree or
+configuration. A missing key file, a key file
+whose mode lets group or others read it, a wrong key and a key id that does not
+match the archive each fail with a distinct message and drop the partially
+restored database. Put the key where the archived configuration names it, or
+set `GITHEARTH_INSTALLATION_KEY_FILE` (the restore rewrites
+`installation_key_file` to that path).
 
 ## What is not encrypted
 

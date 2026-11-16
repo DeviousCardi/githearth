@@ -657,13 +657,20 @@ async fn run(args: Args) -> Result<()> {
                          unwrapped (damaged wrapper or wrong key)"
                     );
                 }
+                if report.outdated_wrap_method > 0 {
+                    println!(
+                        "{} data key(s) use an older wrap method under a configured key; \
+                         `secrets rotate` re-wraps them",
+                        report.outdated_wrap_method
+                    );
+                }
                 if report.rotation_complete {
                     println!("rotation complete");
                 } else {
                     bail!(
-                        "rotation is not complete: data keys remain under a retired key or \
-                         plaintext secrets remain; keep installation_key_previous_file configured \
-                         and run `secrets rotate`"
+                        "rotation is not complete: data keys remain under a retired key or an \
+                         older wrap method, or plaintext secrets remain; keep \
+                         installation_key_previous_file configured and run `secrets rotate`"
                     );
                 }
             }
@@ -914,6 +921,7 @@ async fn run_backup(
         report.fence.kind(),
         report.fence.detail()
     );
+    println!("storage snapshot: {}", report.snapshot);
     Ok(())
 }
 

@@ -808,6 +808,9 @@ fn restore_command(
 fn backup_refuses_while_serve_accepts_writes_and_proceeds_under_both_fences() {
     let mut installation = Installation::new("fences");
     installation.setup();
+    // This case is the M4.1 fence itself, so it keeps the fallback path; the
+    // online path and its automatic short gate are proved in online_backup.rs.
+    installation.append_config("backup_snapshot_mode = \"fence\"");
     installation.start();
     installation.create_org_and_repo();
     let work = installation.path.join("work");
@@ -1743,6 +1746,8 @@ fn a_housekeeping_run_is_counted_and_keeps_the_fence_draining() {
 fn a_fence_lifted_between_the_dump_and_the_snapshot_aborts_the_backup() {
     let mut installation = Installation::new("latefence");
     installation.setup();
+    // The fence path still proves the fence again before its storage tar.
+    installation.append_config("backup_snapshot_mode = \"fence\"");
     installation.start();
     installation.create_org_and_repo();
     let work = installation.path.join("work");

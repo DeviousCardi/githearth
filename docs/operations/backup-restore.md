@@ -6,22 +6,53 @@ only proven by restoring it. The M4 manual dump/tar procedure did not stop
 writes and is replaced by these commands (see the correction in
 [m4-qualification.md](../verification/m4-qualification.md)).
 
-## What `backup` proves first
+## Which path `backup` takes
 
-`backup` refuses to run unless it has proved that **no writer can acknowledge a
-commit**. It names the fence in its output and records it in
-`manifest.fence`:
+`backup` probes the storage filesystem for copy-on-write cloning before it
+writes anything. On a filesystem that supports it, the **online** path is used:
+the command briefly gates the running server, drains the writers already in
+flight, records a PostgreSQL snapshot position and one journal position per
+repository, clones the storage root, verifies every journaled client-visible
+ref, and releases the gate. The database dump, storage tar, encryption and
+archive verification then run while writers continue. There is no operator
+maintenance window.
 
+On a filesystem without copy-on-write (or with `backup_snapshot_mode =
+"fence"`), `backup` falls back to the M4.1 fence. It refuses to run unless it
+has proved that **no writer can acknowledge a commit**. It names the path it
+used in its output and records it in `manifest.fence` and `manifest.snapshot`:
+
+- `online-snapshot` — the filesystem probe succeeded; the running server was
+  briefly gated for the position and clone and released;
 - `not-running` — both the HTTP bind and, when SSH is enabled, the SSH bind
   refuse a connection; or
 - `maintenance` — the running server reports `drained` with zero writes in
   flight over the authenticated, loopback-only maintenance control endpoint.
 
-Anything else is refused: a running server that accepts writes, a drain still
-in progress, a listener whose state cannot be probed, or HTTP stopped while SSH
-still accepts pushes. `backup` proves the fence again after the database dump,
-immediately before the storage snapshot, so stopping maintenance mode during
-the dump cannot produce a racing snapshot.
+A running server is refused on the fallback path unless it is drained. The
+fence path proves the fence again after the database dump, immediately before
+the storage snapshot, so stopping maintenance mode during the dump cannot
+produce a racing snapshot.
+
+On the online path, a write that started before the brief gate is in the
+restore; a write that starts while the clone is taken is refused with `503`
+before acknowledgement. Writers continue during the long dump, tar and
+encryption steps, which are after the recorded position by construction: a
+write acknowledged after the gate is released is in neither the storage
+snapshot nor the database dump (the dump is pinned to the exported snapshot),
+so it is not in the restore and nothing claimed it would be.
+
+`backup` releases the gate on every failure path — a staging directory that
+cannot be created is made before the gate starts; a drain timeout, a control
+request failure, a panic and an interrupt all stop the gate before the command
+exits. A failed `backup` never leaves the server refusing writes. If an
+interrupted or killed run did leave it fenced, `githearth-server maintenance
+stop` releases it.
+
+Immediately before `pg_dump`, `backup` re-runs the same start-up secret check
+the command ran first (every wrapped data key opens, no plaintext audit IP key
+remains), so a mixed-version writer that admits a plaintext audit key during
+the dump window cannot put it in the archive.
 
 The fence covers every path that can acknowledge a write:
 
@@ -55,13 +86,26 @@ One archive contains:
   holds credentials, which is why the archive is encrypted;
 - `ssh_host_key` — the private host key when SSH is enabled;
 - `manifest.json` — a SHA-256 checksum for each part, one journal position per
-  repository, the PostgreSQL position, the fence kind and detail, the excluded
-  paths, and the encryption record.
+  repository, the PostgreSQL position and exported snapshot id, the fence kind
+  and detail, the snapshot mode and mechanism, the excluded paths, and the
+  encryption record.
 
-`manifest.postgres.dump_lsn` is `pg_current_wal_lsn()` read beside the dump. It
-is **advisory only**: it is not the dump transaction's snapshot position and
-`restore` does not compare it. Database-to-storage consistency is proved by the
+`manifest.postgres.dump_lsn` is the WAL position read inside the exported
+repeatable-read transaction, and `manifest.postgres.exported_snapshot` names
+the snapshot `pg_dump --snapshot` used, so the dump is exactly the recorded
+position. Database-to-storage consistency is additionally proved by the
 per-repository journal positions in the manifest.
+
+`manifest.snapshot` records `mode` (`copy-on-write` or `maintenance-fence`),
+the mechanism (`clonefile`, `reflink` or `whole-root-tar`) and
+`refs_verified`. `manifest.repositories[].refs_digest` is a SHA-256 digest of
+the whole client-visible ref set read from the live repository at the recorded
+position, before the snapshot. `backup` requires the clone, the archive it just
+wrote and the staged tree before `restore` publishes it to reproduce that
+digest, and separately replays each journal to its recorded position. A ref
+that disappears from the snapshot therefore refuses the backup even when no
+journal record names it (a pre-0005 ref, an import or a fork). An archive
+written before `refs_digest` existed is verified against the journal only.
 
 The archive is encrypted with AES-256-GCM under an Argon2id-derived key
 (64 MiB of memory, 3 iterations, a fresh salt and nonce per archive). The
@@ -76,13 +120,34 @@ restored is not left behind.
 
 ## Take a backup
 
+With a copy-on-write filesystem, no maintenance step is needed:
+
 ```sh
-# Stop accepting writes and wait until in-flight pushes, API writes and
-# background work (merge, reconcile and housekeeping) finish.
+# Encrypted backup. The key is read from a file or stdin, never an argument.
+githearth-server --config /etc/githearth/config.toml backup \
+  --output /srv/backups/githearth-20261115.ghbackup \
+  --key-file /etc/githearth/backup.key
+```
+
+The command prints:
+
+```
+fence: online-snapshot (server at 127.0.0.1:8080 drained with 0 writes in flight and was gated only for the recorded position and the copy-on-write snapshot)
+snapshot: copy-on-write (probed on the storage filesystem)
+backup written: /srv/backups/githearth-20261115.ghbackup (… bytes, N repositories, advisory dump LSN …, key sha256:…)
+manifest: key id sha256:…, AES-256-GCM, Argon2id wrap; the key is not in the archive
+fence used: online-snapshot (…)
+storage snapshot: copy-on-write
+```
+
+On a filesystem without copy-on-write, stop accepting writes and wait until
+in-flight pushes, API writes and background work (merge, reconcile and
+housekeeping) finish:
+
+```sh
 githearth-server --config /etc/githearth/config.toml maintenance start
 githearth-server --config /etc/githearth/config.toml maintenance status
 
-# Encrypted backup. The key is read from a file or stdin, never an argument.
 githearth-server --config /etc/githearth/config.toml backup \
   --output /srv/backups/githearth-20261115.ghbackup \
   --key-file /etc/githearth/backup.key
@@ -90,17 +155,9 @@ githearth-server --config /etc/githearth/config.toml backup \
 githearth-server --config /etc/githearth/config.toml maintenance stop
 ```
 
-The command prints:
-
-```
-fence: maintenance (server at 127.0.0.1:8080 reported drained with 0 writes in flight (HTTP control endpoint))
-backup written: /srv/backups/githearth-20261115.ghbackup (… bytes, N repositories, advisory dump LSN …, key sha256:…)
-manifest: key id sha256:…, AES-256-GCM, Argon2id wrap; the key is not in the archive
-fence used: maintenance (server at …)
-```
-
-With the server stopped the same command prints `fence: not-running` and
-`fence used: not-running` and names both refused listeners.
+The fallback prints `fence: maintenance`, `snapshot: maintenance fence`,
+`fence used: maintenance` and `storage snapshot: maintenance-fence`. With the
+server stopped it prints `fence: not-running` and names both refused listeners.
 
 `--key-file` reads a file; `--key-stdin` reads the piped key (stdin must not be
 a terminal, so a key is never echoed). Without either flag, `backup_key_file`
@@ -112,7 +169,8 @@ Configuration keys:
 | --- | --- | --- | --- |
 | `backup_directory` | `GITHEARTH_BACKUP_DIRECTORY` | `backups` | Directory used when `--output` is omitted |
 | `backup_key_file` | `GITHEARTH_BACKUP_KEY_FILE` | empty | Key read when neither `--key-file` nor `--key-stdin` is given |
-| `maintenance_drain_timeout_seconds` | `GITHEARTH_MAINTENANCE_DRAIN_TIMEOUT_SECONDS` | `300` | How long `maintenance start` waits for in-flight writes |
+| `backup_snapshot_mode` | `GITHEARTH_BACKUP_SNAPSHOT_MODE` | `auto` | `auto` probes for copy-on-write; `fence` keeps the maintenance-window path |
+| `maintenance_drain_timeout_seconds` | `GITHEARTH_MAINTENANCE_DRAIN_TIMEOUT_SECONDS` | `300` | How long `maintenance start` (and the online gate) waits for in-flight writes |
 
 ## Restore on a fresh host
 
@@ -143,13 +201,14 @@ Before publishing anything, `restore`:
    archive header;
 2. restores the database into the new name;
 3. extracts and checks the storage snapshot;
-4. verifies every repository's journal position and that the metadata does not
-   run past it, and that the database and storage agree.
+4. verifies every repository's journal position and its client-visible refs,
+   and that the metadata does not run past it, and that the database and
+   storage agree.
 
 A failure removes whatever the command created (storage, configuration, host
 key and database) and leaves the destination as it found it.
 
-The four refusals are distinct:
+The four archive-key refusals are distinct:
 
 | Condition | Message starts |
 | --- | --- |
@@ -157,6 +216,21 @@ The four refusals are distinct:
 | missing key | `no backup key supplied; pass --key-file or --key-stdin` |
 | corrupted archive | `backup archive is corrupt: …` |
 | incomplete archive | `backup archive is incomplete: expected … bytes, found …` |
+
+The installation key is separate from the archive key and each failure mode is
+also distinct:
+
+| Condition | Message contains |
+| --- | --- |
+| installation key file absent | `installation key file … is missing` |
+| key file readable by group/others | `group or others could read it` |
+| wrong key | `wrong installation key: the archive records key id …, but the supplied key is …` |
+| key id not in the archive | the same `wrong installation key` refusal |
+| a wrapped data key cannot be opened | `the restored database's secrets do not match the installation key` |
+
+None of these publishes storage or configuration, and none leaves a database
+behind. `restore` never starts a server; `serve` repeats the same check at
+start-up and refuses to listen with unreadable secrets.
 
 After a restore, start `serve` with the published configuration and do a
 representative clone. The reconciler replays any journal records newer than the
