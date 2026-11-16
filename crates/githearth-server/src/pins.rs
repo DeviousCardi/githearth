@@ -41,6 +41,34 @@ pub const REASON_REVIEW: &str = "review_commit";
 /// A commit status's commit.
 pub const REASON_STATUS: &str = "commit_status";
 
+/// Raises every still-live pin written by the 0045 head backfill to at least
+/// `retention_days` from the pin's creation, returning how many rows changed.
+///
+/// Migration 0058 repairs the hard-coded 30-day window with the documented
+/// default (90 days), but a SQL migration cannot see this installation's
+/// `housekeeping_pin_retention_days`. `migrate` and `setup` call this with the
+/// loaded configuration so an operator who chose a longer window gets it. It
+/// only moves a live pin forward: a pin already expired stays expired (a prune
+/// may already have released its objects), and a shorter configured window
+/// never shortens a pin that the migration repaired.
+pub async fn extend_backfilled_pins(
+    pool: &sqlx::PgPool,
+    retention_days: u64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE pinned_commits \
+         SET retain_until = created_at + make_interval(days => $1) \
+         WHERE reason = $2 AND pull_request_id IS NOT NULL \
+           AND retain_until IS NOT NULL AND retain_until > now() \
+           AND retain_until < created_at + make_interval(days => $1)",
+    )
+    .bind(days(retention_days))
+    .bind(REASON_BACKFILL)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Creates or extends the pin for `commit_oid`. Idempotent: the retention
 /// timestamp only moves forward, so re-pinning a head never shortens it.
 pub async fn pin_head(
