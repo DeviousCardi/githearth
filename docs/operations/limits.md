@@ -52,12 +52,16 @@ refusal rather than an estimate. `repository_quota_bytes` defaults to 5 GiB
 since M4.2; an installation that upgraded and has larger repositories can set
 it to `0` to restore the previous unlimited behaviour.
 
-**Search is not served by this build.** The row used to read
-"login/search"; M9 owns search, and no search endpoint exists here, so there is
-nothing to charge. When M9 adds one it must call the same
-anonymous per-address and per-installation budget before it can be published;
-the row above was narrowed to what a request can reach today rather than
-promising a limit for a surface that does not exist.
+**Search is not routed by this build, but its budget is real.** The row used to
+read "login/search". M9 owns search and no search endpoint exists here, so the
+table publishes only the surface a request can reach today: sign-in.
+`Limits::allow_anonymous_search` already spends the same
+`anonymous_login_per_address` and `anonymous_login_global` counters, and
+`tests/limits.rs::the_anonymous_search_limiter_refuses_above_the_published_budget`
+exercises both refusals (the 21st search from one address, the 301st request
+installation-wide). M9's route calls that limiter, so "20/minute for login and
+search" will be true by construction rather than a second number to keep in
+step.
 
 ## Window semantics
 

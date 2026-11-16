@@ -803,6 +803,100 @@ fn relative_paths_are_recorded_absolute_and_work_from_another_directory() {
 
 #[test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+fn the_doctor_count_is_fourteen_clean_and_fifteen_with_a_base_backfill_warning() {
+    let installation = Installation::new();
+    let database = Database::new();
+    let output = setup_with_password(&installation, &database.url);
+    assert!(output.status.success(), "{}", both(&output));
+    assert!(
+        stdout(&output).contains("14 checks, 0 failed"),
+        "a clean install is fourteen checks: {}",
+        stdout(&output)
+    );
+
+    // The state an upgrade leaves behind: a closed request whose target branch
+    // was deleted before its base was pinned. The repository has a completed
+    // housekeeping run, so the base backfill is the only warning.
+    let url = database.url.clone();
+    runtime().block_on(async move {
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let admin: Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let organization = Uuid::new_v4();
+        let repository = Uuid::new_v4();
+        let pull = Uuid::new_v4();
+        sqlx::query("INSERT INTO organizations (id,slug,name) VALUES ($1,$2,$3)")
+            .bind(organization)
+            .bind(format!("backfill-{}", organization.simple()))
+            .bind("base backfill")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO repositories (id,organization_id,name,created_by,operation_id,status,visibility) \
+             VALUES ($1,$2,'repo',$3,$4,'active','private')",
+        )
+        .bind(repository)
+        .bind(organization)
+        .bind(admin)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO repository_housekeeping (repository_id,last_run_at,last_outcome) \
+             VALUES ($1, now(), 'completed')",
+        )
+        .bind(repository)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pull_requests (id,repository_id,number,title,body,author_id,source_branch,target_branch,source_repository_id,state) \
+             VALUES ($1,$2,1,'gone','',$3,'side','main',$2,'closed')",
+        )
+        .bind(pull)
+        .bind(repository)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pull_request_base_backfill_skips \
+                 (pull_request_id,repository_id,state,target_branch,reason) \
+             VALUES ($1,$2,'closed','main','target_branch_missing')",
+        )
+        .bind(pull)
+        .bind(repository)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    });
+
+    let mut command = server();
+    command.args([
+        "--config",
+        installation.config().to_str().unwrap(),
+        "doctor",
+    ]);
+    let doctor = run(command);
+    let text = both(&doctor);
+    assert!(
+        text.contains("15 checks, 0 failed, 1 warnings"),
+        "the base-backfill warning is the fifteenth check: {text}"
+    );
+    assert!(text.contains("warn base backfill:"), "{text}");
+    assert!(
+        text.contains("#PR-1"),
+        "the warning names the request: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 fn a_resumed_run_uses_the_recorded_url_and_reads_no_stdin() {
     let installation = Installation::new();
     let database = Database::new();

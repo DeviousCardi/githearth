@@ -74,9 +74,11 @@ pub struct Config {
     /// minute, so one address cannot exhaust the public capacity.
     #[serde(default = "default_anonymous_fetch_global")]
     pub anonymous_fetch_global: u64,
-    /// Anonymous login requests allowed per client address per minute. No
-    /// search endpoint ships in M4.2; M9's search surface must charge this same
-    /// budget before it can be published.
+    /// Anonymous login and search requests allowed per client address per
+    /// minute. One budget covers both: [`crate::limits::Limits::allow_anonymous_search`]
+    /// spends the same counters, so a search route inherits this number
+    /// instead of adding a second one. No search route ships in M4.2 (M9 owns
+    /// it), so `docs/operations/limits.md` publishes the row as sign-in only.
     #[serde(default = "default_anonymous_login_per_address")]
     pub anonymous_login_per_address: u64,
     /// Anonymous login requests allowed across the installation per minute,

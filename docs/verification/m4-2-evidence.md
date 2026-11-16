@@ -2,9 +2,10 @@
 
 Date: 2026-11-16. Collected on branch `m42/exit-evidence` at `a4541b5`
 (`main`), clean working tree. A completion pass on branch `m42/complete`
-fixed the three published claims below that the code did not enforce; the
-fixes, their files and their revert proofs are in "The three published claims,
-fixed" at the end of this document. This document records case-by-case acceptance
+fixed two of the three published claims below in the code and withdrew the
+third from publication; the fixes, their files and their proofs are in "The
+three published claims — two fixed in code, one withdrawn from publication" at
+the end of this document. This document records case-by-case acceptance
 evidence for the M4.2 platform slice. It is not a code summary and not a
 sign-off: `m4-2-signoff.md` is deliberately not written, and the two signature
 lines are not mine to add.
@@ -13,8 +14,9 @@ No file under `docs/plan/` was changed and no code was modified in the evidence
 tree. Revert proofs were run in a detached scratch worktree at the same commit
 (`/tmp/ght/revert`) with a shared cargo target directory; the evidence tree
 stayed clean throughout. The completion pass named in the header did modify
-code, in its own worktree (`m42/complete`); its revert proofs and gate counts
-are recorded in "The three published claims, fixed" below.
+code, in its own worktree (`m42/complete`); its proofs and gate counts
+are recorded in "The three published claims — two fixed in code, one withdrawn
+from publication" below.
 
 ## Under test
 
@@ -731,7 +733,7 @@ ok   housekeeping: repositories are up to date
 | --- | --- | --- | --- |
 | binary (`doctor::report`) | 14 | 15 (one warning) | — |
 | `docs/operations/install.md` | fourteen, example `14 checks` | fifteenth `base backfill`, `15 checks` | yes |
-| `tests/setup.rs` | asserts `14 checks, 0 failed` at lines 614, 843, 939 | — | yes |
+| `tests/setup.rs` | `clean_host_reaches_a_doctor_clean_running_installation` asserts `14 checks, 0 failed` (lines 614, 843, 939) | `the_doctor_count_is_fourteen_clean_and_fifteen_with_a_base_backfill_warning` inserts the skip row, reruns the binary, and asserts `15 checks, 0 failed, 1 warnings` and the `warn base backfill:` line naming `#PR-1` | yes |
 | `tests/housekeeping.rs` | — | asserts `checks.len() == 15` in `a_request_whose_target_branch_is_gone_is_reported_by_the_base_backfill` | yes |
 
 The base-backfill case was run:
@@ -754,46 +756,85 @@ Git HTTP and SSH, anonymous clone/login, organization creation, job claim,
 email sends, and the sign-up limiter.
 
 The exit verification found three rows where the published claim was not what
-the code did. They were fixed in the completion pass rather than left in
-`limits.md`:
+the code did. Two were fixed in the completion pass and the third was withdrawn
+from publication rather than left in `limits.md`:
 
 | Row / claim | Was | Now |
 | --- | --- | --- |
-| **Anonymous login/search**: 20/min per address, 300/min installation | Only sign-in was charged. There is no search route in this build, so the "search" half of the row promised a budget nothing could spend. | The row is **Anonymous login**. Search is M9's; when it ships it must charge the same `anonymous_login_per_address`/`_global` counters before a search limit is published. `tests/limits.rs::the_published_anonymous_row_promises_only_what_sign_in_enforces` pins the row to sign-in and to the config defaults. |
+| **Anonymous login/search**: 20/min per address, 300/min installation | Only sign-in was charged. There is no search route in this build, so the "search" half of the row promised a budget nothing could spend. | The operator row is **Anonymous login**, because it names the surface this build routes. The budget in code is one: `Limits::allow_anonymous_search` spends the same per-address and installation counters as sign-in, and `tests/limits.rs::the_anonymous_search_limiter_refuses_above_the_published_budget` exercises both refusals. Search is M9's route; it calls that limiter. |
 | **Repository storage**: 5 GiB per repository, **50 GiB per organization**, charged at "push hook and object store" | The push hook checked only `repository_quota_bytes`; `organization_quota_bytes` was consulted only by the object store. Git repository bytes were never summed per organization. | `storage_quota::measure` sums every non-deleted repository's `objects/` tree in the organization; `git_http.rs` and `ssh.rs` pass the tenant figure to `pre-receive`, which refuses with "organization storage quota exceeded". The page and row now name the merge path too, and say plainly that the configured number bounds the Git ledger and the object-store ledger separately (ADR 0014 §1) rather than their sum. |
 | "Storage quota counts objects, **merge-created objects**, fork copies and stored large objects" | `git_hooks.rs` carried `// shortcut: merge-created objects are not counted`, because a server-side merge bypasses `pre-receive`. | `merge::execute_intent` measures the repository and the organization after writing the candidate and before moving the ref, so a merge commit, a squash's tree and a fetched fork head are charged. The shortcut comment is gone. |
 
 The remaining rows are what the code enforces.
 
-### The three published claims, fixed — and the revert proof for each
+### The three published claims — two fixed in code, one withdrawn from publication
 
-Each proof was run in this worktree by deleting the mechanism, running the
-named test, and restoring the file. The failing output is quoted.
+Two of the three were fixed end to end in the code: the Git half of the
+organization quota, and the merge charge. The third, the anonymous **search**
+budget, had no route to fix — no search surface ships in M4.2 (search is M9's).
+The number is now a real limiter arm that M9's route will call, and the
+operator documentation stopped publishing a limit for a route that is not
+served. That is a withdrawal from publication, not a code fix, and it is
+recorded here as such.
 
-**1. Anonymous search budget — removed, because no search surface is served.**
-The published "login/search" row was narrowed to login (`docs/operations/limits.md`,
-row "Anonymous login"; ADR 0014 §5 and the config/limiter comments say the same).
-Search arrives in M9; publishing a limit for a route that does not exist is a
-promise the code cannot keep. The remaining row is enforced by
-`lib.rs:1202` (`state.limits.allow_anonymous_login(request.client_ip())`)
-before hashing. Reverting that call to `if false && …`:
+**1. Anonymous search budget — the number is enforced, the publication is
+withdrawn.** The operator table names **Anonymous login**, because that is the
+only anonymous surface this build routes; `githearth.example.toml` and the
+M4.2 roadmap line say the same. The budget itself is one mechanism:
+`Limits::allow_anonymous_search` spends the same `anonymous_login_per_address`
+and `anonymous_login_global` counters as sign-in, so "20/minute for login and
+search" will be one number when M9's route lands, not two. The refusal was
+exercised at the limiter above both published budgets —
+`tests/limits.rs::the_anonymous_search_limiter_refuses_above_the_published_budget`:
 
 ```text
-thread 'sign_in_is_refused_over_the_anonymous_login_budget' panicked at
-crates/githearth-server/tests/limits.rs:335:5:
-assertion `left == right` failed: the third attempt is refused by the per-address login budget
-  left: 401
- right: 429
-test result: FAILED. 0 passed; 1 failed; ... finished in 1.28s
+running 1 test
+test the_anonymous_search_limiter_refuses_above_the_published_budget ... ok
 ```
+
+Twenty searches from `192.0.2.9` are admitted and the twenty-first is refused;
+nineteen sign-ins plus one search fill the same twenty; fifteen addresses at
+twenty each spend exactly 300 installation-wide and the 301st request is
+refused. Making the search arm ignore the window (`allow_anonymous_search_at`
+returning `true`) fails the test:
+
+```text
+thread 'the_anonymous_search_limiter_refuses_above_the_published_budget' panicked at
+crates/githearth-server/tests/limits.rs:385:5:
+the 21st search in the same minute is refused
+test result: FAILED. 0 passed; 1 failed; ... filtered out; finished in 0.00s
+```
+
+The routed sign-in half is still enforced by `lib.rs` (`state.limits.
+allow_anonymous_login(request.client_ip())`) before hashing; reverting that call
+to `if false && …` fails `sign_in_is_refused_over_the_anonymous_login_budget`
+with `429` expected and `401` returned.
 
 **2. Organization quota covers Git repository storage.** The push path measures
 the tenant in `git_http.rs` and `ssh.rs` (`storage_quota::measure`) and passes
 `GITHEARTH_ORGANIZATION_QUOTA_BYTES` / `GITHEARTH_ORGANIZATION_OTHER_BYTES` to
 the hook; `git_hooks.rs:188` refuses the push. The cost is one blocking walk of
 the organization's `objects/` set per push while the repository lock is held,
-documented in `docs/operations/quota.md`. Reverting the hook's organization
-branch to `if false && organization_quota > 0`:
+documented in `docs/operations/quota.md`.
+
+The published 50 GiB boundary was exercised through the shipped hook with
+sparse `objects/` trees at the default (`organization_quota_bytes =
+53687091200`): one repository carrying 9 GiB, a 1 GiB quarantine, and 40 GiB in
+another repository of the same organization.
+
+```text
+--- exactly 50 GiB total (9 own + 1 quarantine + 40 other)
+cannot reach the push service: No such file or directory (os error 2)
+--- own grows by 1 byte => 50 GiB + 1
+organization storage quota exceeded: 53687091201 of 53687091200 bytes
+```
+
+Exactly 50 GiB passes the quota check and fails later on the deliberately
+absent socket; one byte more is refused with the published message. The
+two-repository push over the tenant total also passes:
+`tests/git_push.rs::organization_quota_refuses_a_push_across_the_tenants_repositories`
+(`... ok`, 4.47 s). Reverting the hook's organization branch to
+`if false && organization_quota > 0`:
 
 ```text
 thread 'organization_quota_refuses_a_push_across_the_tenants_repositories' panicked at
@@ -806,7 +847,12 @@ test result: FAILED. 0 passed; 1 failed; ... finished in 6.24s
 quotas after the candidate exists and before the compare-and-swap, returning
 `MergeOutcome::Failed { reason: "organization storage quota exceeded: …" }` and
 leaving the ref untouched. The cost is the same tenant walk, once per merge.
-Reverting the organization branch to `if false && …`:
+The exercise leaves 8 bytes under the limit before the merge, so only the
+objects the merge itself creates can take the repository over; the refused
+merge is confirmed to leave the target ref where it was
+(`tests/merge_execute.rs::a_merge_that_crosses_the_tenant_total_is_refused_and_the_ref_stays`,
+`... ok`, 1.65 s, asserting `main_tip` is unchanged). Reverting the organization
+branch to `if false && …`:
 
 ```text
 thread 'a_merge_that_crosses_the_tenant_total_is_refused_and_the_ref_stays' panicked at
@@ -876,5 +922,6 @@ The five below are accepted for this milestone and repeated in ADR 0014
    with "no KMS adapter is built into this binary". A deployment that wants key
    custody from a KMS must supply an adapter out of tree; no adapter ships.
 
-The search claim is no longer a limitation: it was removed from the published
-limits rather than left unenforced (see "The three published claims, fixed").
+The search claim is no longer a limitation: the operator limits publish only
+sign-in, and the shared limiter already refuses above the 20/300 budget M9's
+route will inherit (see "The three published claims").

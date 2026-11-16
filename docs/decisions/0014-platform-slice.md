@@ -248,10 +248,11 @@ Limits are configuration with published safe defaults. The shape:
 - **Authenticated request rate:** per organization and per account, separate
   budgets for the API and for Git operations.
 - **Anonymous traffic:** per client address and globally, because public clone
-  and login are unauthenticated. The M4.2 exit promised a search budget too,
-  but no search surface ships in this build (search is M9's); the published row
-  now names only login, and M9 must charge the same per-address and
-  installation counters before it can publish a search limit.
+  and login are unauthenticated. The M4.2 build serves no search route (search
+  is M9's), so the published row names only login. The budget is still one:
+  `Limits::allow_anonymous_search` spends the same per-address and installation
+  counters as sign-in and is exercised at that interface, so M9's route calls
+  it instead of publishing a second number.
   `trusted_proxies` must be configured
   for the address to be the client's; the documentation says so and `doctor`
   warns when limits are on and no proxy is trusted.
@@ -1252,10 +1253,12 @@ installation budget with 404s.
 ## Limitations recorded at the M4.2 exit
 
 The exit verification added on 2026-11-16 found three published claims the code
-did not enforce and five limits on what the evidence proves. The three are
-fixed in the code (`docs/verification/m4-2-evidence.md` records the revert
-proof for each); the five below are accepted for this milestone and are not
-silently claimed as done.
+did not enforce and five limits on what the evidence proves. Two of the three
+are fixed in the code; the third (an anonymous search budget) is withdrawn
+from publication, because no search route ships in M4.2 and publishing a limit
+for a surface that does not exist would be a doc ahead of the binary. The
+evidence doc records the exercise and revert proof for each; the five below
+are accepted for this milestone and are not silently claimed as done.
 
 1. **No measured p95 for API or job capacity.** Only the Git share scheduler
    has a reproducible relative measurement (worst ratio 1.09 against a limit of

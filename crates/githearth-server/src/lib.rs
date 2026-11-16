@@ -1197,8 +1197,9 @@ pub(crate) async fn sign_in(
 ) -> ApiResult<Option<Uuid>> {
     // The anonymous login ceiling (ADR 0014 §5): before the failure throttle
     // and before Argon2. It is per client address, so a public login form
-    // cannot be used to saturate the hashing pool. No search endpoint exists in
-    // this build; the published row names only login.
+    // cannot be used to saturate the hashing pool. Sign-in is the only routed
+    // anonymous surface in this build; M9's search route calls
+    // `allow_anonymous_search`, which spends the same counters.
     if !state.limits.allow_anonymous_login(request.client_ip()) {
         return Err(too_many_attempts());
     }

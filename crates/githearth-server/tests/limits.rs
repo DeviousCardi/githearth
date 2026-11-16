@@ -10,12 +10,14 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use githearth_server::{MIGRATOR, config::Config, connect, router};
+use githearth_server::{MIGRATOR, config::Config, connect, limits::Limits, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::{ConnectOptions, Connection, PgPool, postgres::PgConnectOptions};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Instant;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -341,12 +343,11 @@ async fn sign_in_is_refused_over_the_anonymous_login_budget() {
     db.drop_db().await;
 }
 
-/// The published anonymous row is the whole promise: no search endpoint is
-/// served in this build (search is M9's), so the row must say login and the
-/// numbers in it must be the ones sign-in charges. A row that advertises a
-/// search budget would be a promise nothing can enforce.
+/// The published anonymous row names only what a request can reach: no search
+/// route is served in this build (search is M9's), so the row must say login
+/// even though the shared limiter below already enforces the number.
 #[test]
-fn the_published_anonymous_row_promises_only_what_sign_in_enforces() {
+fn the_published_anonymous_row_names_only_the_routed_surface() {
     const LIMITS: &str = include_str!("../../../docs/operations/limits.md");
     let row = LIMITS
         .lines()
@@ -363,6 +364,65 @@ fn the_published_anonymous_row_promises_only_what_sign_in_enforces() {
     let defaults = Config::default();
     assert_eq!(defaults.anonymous_login_per_address, 20);
     assert_eq!(defaults.anonymous_login_global, 300);
+}
+
+/// The anonymous half of the published "login/search" row is a mechanism, not
+/// a sentence. No search route ships in M4.2, but the limiter the route will
+/// call already refuses above both published numbers: 20/min per address and
+/// 300/min installation-wide, with login and search spending one budget.
+#[test]
+fn the_anonymous_search_limiter_refuses_above_the_published_budget() {
+    // Per address: twenty are admitted and the twenty-first is refused.
+    let limits = Limits::from_config(&Config::default());
+    let address: IpAddr = "192.0.2.9".parse().unwrap();
+    let start = Instant::now();
+    for attempt in 1..=20 {
+        assert!(
+            limits.allow_anonymous_search_at(Some(address), start),
+            "search {attempt} is inside the 20/min per-address budget"
+        );
+    }
+    assert!(
+        !limits.allow_anonymous_search_at(Some(address), start),
+        "the 21st search in the same minute is refused"
+    );
+    assert!(
+        limits.allow_anonymous_search_at(Some(address), start + std::time::Duration::from_secs(60)),
+        "the fixed window resets"
+    );
+
+    // One shared budget, not two: nineteen sign-ins and one search fill the
+    // twenty, so the next sign-in is refused too.
+    let limits = Limits::from_config(&Config::default());
+    let shared: IpAddr = "192.0.2.10".parse().unwrap();
+    for _ in 0..19 {
+        assert!(limits.allow_anonymous_login_at(Some(shared), start));
+    }
+    assert!(
+        limits.allow_anonymous_search_at(Some(shared), start),
+        "the twentieth request, a search, is inside the shared budget"
+    );
+    assert!(
+        !limits.allow_anonymous_login_at(Some(shared), start),
+        "login and search share the counter, so the 21st request of either kind is refused"
+    );
+
+    // Installation-wide: fifteen addresses at twenty each spend exactly the
+    // published 300, and a client that changes address cannot get one more.
+    let limits = Limits::from_config(&Config::default());
+    for last in 0..15u8 {
+        let ip: IpAddr = IpAddr::from([198, 51, 100, last]);
+        for _ in 0..20 {
+            assert!(
+                limits.allow_anonymous_search_at(Some(ip), start),
+                "address {ip} is inside the installation budget"
+            );
+        }
+    }
+    assert!(
+        !limits.allow_anonymous_search_at(Some("203.0.113.1".parse().unwrap()), start),
+        "the 301st anonymous request in the minute is refused installation-wide"
+    );
 }
 
 /// The organization budget is charged only to a member. Otherwise a stranger
