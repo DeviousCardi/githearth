@@ -263,6 +263,15 @@ pub(crate) async fn send_requested(state: &AppState, verification_id: Uuid) -> J
         return db_retry();
     }
 
+    // Security mail is bounded per destination address (ADR 0014 §5). A
+    // request over the budget stays queued; the next attempt is later, not
+    // dropped, and a fresh token is minted then.
+    if !state.limits.allow_email(None, &email, true) {
+        return JobOutcome::Retry {
+            after: std::time::Duration::from_secs(60),
+            reason: "security email rate limit".into(),
+        };
+    }
     let link = format!(
         "{}/verify-email/{token}",
         state.config.public_url.trim_end_matches('/')

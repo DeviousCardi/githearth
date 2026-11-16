@@ -1466,7 +1466,7 @@ async fn files_changed(
     let repo_id = loaded.repo.id;
     let base = base.to_owned();
     let head = head.to_owned();
-    let Ok(permit) = state.git_slots.clone().try_acquire_owned() else {
+    let Ok(permit) = crate::browse::acquire_permit(state, loaded.org_id).await else {
         return String::new();
     };
     let storage = state.storage.clone();

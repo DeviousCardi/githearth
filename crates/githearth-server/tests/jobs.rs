@@ -865,6 +865,92 @@ async fn on_delete_cascade() {
     pool.close().await;
 }
 
+/// One organization's backlog cannot occupy every worker: with four workers
+/// and a share of two, the other organization's jobs run while the first still
+/// has pending work.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn one_organization_cannot_take_every_job_worker() {
+    let database_url =
+        fresh_database(&format!("githearth_jobs_share_{}", Uuid::new_v4().simple())).await;
+    let storage = temp_storage_root();
+    let mut config = fast_config(&storage, &database_url);
+    config.job_concurrency = 4;
+    config.job_organization_share = 2;
+    config.job_timeout_seconds = 10;
+    let (state, pool) = setup(config).await;
+
+    let org_a = Uuid::new_v4();
+    let org_b = Uuid::new_v4();
+    for (id, slug) in [(org_a, "org-a"), (org_b, "org-b")] {
+        sqlx::query("INSERT INTO organizations (id, slug, name) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(format!("{slug}-{}", Uuid::new_v4().simple()))
+            .bind(slug)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let enqueue_for = |org: Uuid, kind: &'static str, key: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO jobs (id, organization_id, kind, payload, dedupe_key) \
+                 VALUES ($1, $2, $3, '{}'::jsonb, $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(org)
+            .bind(kind)
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    for i in 0..4 {
+        enqueue_for(org_a, "test.slow", format!("a-{i}")).await;
+    }
+    for i in 0..2 {
+        enqueue_for(org_b, "test.fast", format!("b-{i}")).await;
+    }
+
+    let mut reg = Registry::new();
+    reg.register(
+        "test.slow",
+        Arc::new(|_: AppState, _: Job| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                JobOutcome::Done
+            })
+        }),
+    );
+    reg.register(
+        "test.fast",
+        Arc::new(|_: AppState, _: Job| Box::pin(async { JobOutcome::Done })),
+    );
+    let shutdown = CancellationToken::new();
+    let h = jobs::spawn(state, reg, shutdown.clone());
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let (running_a, done_b): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE organization_id = $1 AND state = 'running'), \
+                count(*) FILTER (WHERE organization_id = $2 AND state = 'done') \
+         FROM jobs",
+    )
+    .bind(org_a)
+    .bind(org_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        running_a <= 2,
+        "organization A ran {running_a} jobs over its share"
+    );
+    assert_eq!(done_b, 2, "organization B's jobs were starved");
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(15), h).await;
+    pool.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
 async fn slow_job_does_not_hold_other_slots() {
@@ -906,4 +992,44 @@ async fn slow_job_does_not_hold_other_slots() {
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(15), h).await;
     pool.close().await;
+}
+
+/// m2: the runner's hourly retention tick also sweeps the fixed-window limit
+/// maps, so an address seen once is not retained for the process lifetime.
+/// The first loop iteration sweeps immediately, which makes this observable.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn the_runner_sweeps_expired_limit_keys() {
+    let storage_root = temp_storage_root();
+    let url = fresh_database("githearth_jobs_limit_sweep").await;
+    let (state, pool) = setup(fast_config(&storage_root, &url)).await;
+
+    let stale = std::time::Instant::now() - Duration::from_secs(120);
+    assert!(
+        state
+            .limits
+            .allow_api_organization_at(Uuid::new_v4(), stale)
+    );
+    assert!(
+        state
+            .limits
+            .allow_anonymous_login_at(Some("203.0.113.55".parse().unwrap()), stale)
+    );
+    assert!(state.limits.tracked_keys() >= 2);
+
+    let shutdown = CancellationToken::new();
+    let runner = jobs::spawn(state.clone(), Registry::new(), shutdown.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while state.limits.tracked_keys() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runner never swept the expired limit keys"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), runner).await;
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&storage_root);
 }

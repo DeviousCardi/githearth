@@ -262,10 +262,11 @@ Default values, recorded so the exit can be tested and later revised:
 | Limit | Default |
 | --- | --- |
 | Global Git concurrency | 8 slots |
-| Per-organization Git share | floor 1, ceiling 6, fair share of the rest |
+| Per-organization Git share | floor 1, ceiling 4, fair share of the rest (ceiling revised from 6 by open item 6) |
 | API requests | 300/min per organization, 60/min per account |
+| Authenticated Git requests | 600/min per organization, 120/min per account |
 | Anonymous clone/fetch | 120/min per address, 2,000/min installation |
-| Anonymous login/search | 20/min per address |
+| Anonymous login/search | 20/min per address, 300/min installation |
 | Organization creation | 3 per account per 24 h, 50 per installation per day |
 | Repository size | 5 GiB per repository, 50 GiB per organization |
 | Job worker share | 2 of 4 workers per organization |
@@ -457,8 +458,8 @@ returned.
    and restore, below. The filesystem snapshot mechanism itself remains the
    operator's choice; the single-node path uses the proved write fence and a
    whole-root tar, so no filesystem-specific snapshot API is required here.
-6. The measured fairness bound on the reference machine, and the defaults
-   above revised from it.
+6. **Resolved in M4.2 increment 7D** — the measured fairness bound on the
+   reference machine and the defaults revised from it, below.
 7. **Resolved in M4.2 increment 7A** — export format versioning, the metadata
    JSON Lines schema, the object manifest and its comparison tolerances, and
    the export/import harness, below.
@@ -1031,3 +1032,38 @@ that every wrapped data key opens. A wrong key, a missing key or an unreadable
 row fails before the storage tree or configuration is published and drops the
 partially restored database. Switching the destination installation key is a
 separate rotation, not part of restore.
+## Resolutions recorded by M4.2 increment 7D
+
+### Open item 6: the measured fairness bound and revised defaults
+
+The bound is measured by
+`fairness::tests::an_organization_at_its_share_stays_within_twice_the_single_organization_p95`.
+It drives the scheduler with a fixed simulated service time: the measured
+organization sends 48 requests with four in flight alone, then repeats the
+same 48-at-four while a second organization offers 480 requests with 32 in
+flight at its own share. The harness is repeated with the per-organization cap
+removed (`floor = ceiling = global`); that negative control must breach the
+bound, so the test cannot pass if the mechanism is deleted.
+
+On the reference machine, over three consecutive runs, the single-organization
+p95 was **273–275 ms** and the shared p95 **290–295 ms**, a ratio of
+**1.06–1.07** (worst 1.07); the no-cap control was **4.55–4.64×**. The runs and
+the revert proofs are recorded in
+`/Users/suniljadav/Aarav/Github/githearth-m41-reports/m42b5-fix-report.md`.
+
+The measurement revised `git_organization_ceiling` from 6 to **4**. At 6 the
+first organization into an idle installation filled 6 of 8 slots; a peer
+arriving at its share had two of its four requests refused after the 1 s wait
+while the incumbent was above its re-derived share. At 4 the first mover can
+never hold more than half, and two tenants at their measured share fill the
+installation without queueing. The floor stays 1, because that is what serves
+a queued newcomer ahead of an incumbent's next request. The ceiling is also
+clamped to `git_concurrency - 1`, so lowering concurrency below the default
+ceiling can never let one organization take every slot.
+
+The same increment made the published API row a real rate (one `/api/v1`
+middleware on every route, not only the two creation endpoints), added the
+authenticated Git rows above (ADR §5 asks for separate API and Git budgets),
+and added the installation-wide login budget. Anonymous clone and fetch are
+charged after the repository is known to exist, so a scanner cannot spend the
+installation budget with 404s.

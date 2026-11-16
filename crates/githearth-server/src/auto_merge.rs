@@ -118,9 +118,14 @@ pub(crate) async fn may_enable(
 
     // A deleted source branch has no head; enabling auto-merge would refuse
     // with 422 "branch not found", so the form must not offer it.
-    if pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch)
-        .await?
-        .is_none()
+    if pulls::branch_tip(
+        state,
+        loaded.org_id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await?
+    .is_none()
     {
         return Ok(false);
     }
@@ -249,8 +254,13 @@ pub(crate) async fn enable_auto_merge(
             let protection = crate::protection::matching(&rules, &target_ref);
             require_enable_permission(state, &loaded, &pull, protection)?;
 
-            let head =
-                pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
+            let head = pulls::branch_tip(
+                state,
+                loaded.org_id,
+                pull.source_repository_id,
+                &pull.source_branch,
+            )
+            .await?;
             let Some(head) = head else {
                 return Err(branch_missing());
             };
@@ -519,7 +529,13 @@ pub(crate) async fn maybe_auto_merge(
     // a push by someone other than the enabler) cancels the auto-merge. The
     // enabler's own push re-targets the row in `on_push`, so it never lands
     // here as a mismatch.
-    let head = pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await?;
+    let head = pulls::branch_tip(
+        state,
+        repo.organization_id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await?;
     if head.as_deref() != Some(source_oid.as_str()) {
         let mut tx = state.pool.begin().await?;
         cancel_in_tx(

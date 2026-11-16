@@ -168,11 +168,17 @@ pub fn transport_from_config(config: &Config) -> anyhow::Result<Arc<dyn MailTran
             Some(trim_credential(&value))
         }
     };
+    let envelope_from = if config.smtp_bounce_address.trim().is_empty() {
+        config.smtp_from.clone()
+    } else {
+        config.smtp_bounce_address.clone()
+    };
     Ok(Arc::new(SmtpTransport {
         host: config.smtp_host.clone(),
         port: config.smtp_port,
         tls: config.smtp_tls,
         from: config.smtp_from.clone(),
+        envelope_from,
         username: config.smtp_username.clone(),
         password,
         allow_private: config.outbound_allow_private,
@@ -190,6 +196,8 @@ pub struct SmtpTransport {
     port: u16,
     tls: SmtpTls,
     from: String,
+    /// The envelope sender (`MAIL FROM`) bounces go to. Defaults to `from`.
+    envelope_from: String,
     username: Option<String>,
     password: Option<String>,
     /// The installation-wide private-range opt-in. The connect uses the same
@@ -205,6 +213,7 @@ impl std::fmt::Debug for SmtpTransport {
             .field("port", &self.port)
             .field("tls", &self.tls)
             .field("from", &self.from)
+            .field("envelope_from", &self.envelope_from)
             .field("username", &self.username.as_deref().map(|_| "[redacted]"))
             .field("password", &self.password.as_deref().map(|_| "[redacted]"))
             .finish()
@@ -220,6 +229,7 @@ impl MailTransport for SmtpTransport {
                 port: self.port,
                 tls: self.tls,
                 from: self.from.clone(),
+                envelope_from: self.envelope_from.clone(),
                 username: self.username.clone(),
                 password: self.password.clone(),
                 allow_private: self.allow_private,
@@ -237,6 +247,7 @@ struct Settings {
     port: u16,
     tls: SmtpTls,
     from: String,
+    envelope_from: String,
     username: Option<String>,
     password: Option<String>,
     allow_private: bool,
@@ -340,7 +351,11 @@ fn conversation<S: Read + Write>(
             return Err(MailError::Auth);
         }
     }
-    expect(stream, &format!("MAIL FROM:<{}>", settings.from), 250)?;
+    expect(
+        stream,
+        &format!("MAIL FROM:<{}>", settings.envelope_from),
+        250,
+    )?;
     // `expect` also accepts 251, which some relays answer for a forwarded
     // recipient.
     expect(stream, &format!("RCPT TO:<{}>", message.to), 250)?;
@@ -525,6 +540,7 @@ mod tests {
             port: 587,
             tls: SmtpTls::Starttls,
             from: "githearth@example.com".into(),
+            envelope_from: "bounces@example.com".into(),
             username: Some("githearth".into()),
             password: Some("smtp-credential-must-not-appear".into()),
             allow_private: false,
@@ -584,6 +600,7 @@ mod tests {
             port: 587,
             tls: SmtpTls::Starttls,
             from: "githearth@example.com".into(),
+            envelope_from: "bounce@example.com".into(),
             username: None,
             password: None,
             allow_private: false,

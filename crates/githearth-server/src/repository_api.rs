@@ -383,6 +383,9 @@ pub(crate) async fn create(
         .await?
         .ok_or_else(org_not_found)?;
 
+    // The per-organization API budget is charged by the `/api/v1` middleware,
+    // after resolving this path's organization, so every route is charged once.
+
     let Some(facts) = facts::load(&mut conn, actor.id, org_id).await? else {
         return Err(org_not_found());
     };

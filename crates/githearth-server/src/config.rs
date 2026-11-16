@@ -23,6 +23,21 @@ pub struct Config {
     pub merge_worker_interval_seconds: u64,
     pub trash_retention_seconds: u64,
     pub git_concurrency: usize,
+    /// Every organization may hold at least this many Git slots when queued.
+    #[serde(default = "default_git_organization_floor")]
+    pub git_organization_floor: usize,
+    /// No organization may hold more than this many Git slots, however idle
+    /// the rest of the installation is. The fair share of the remaining slots
+    /// is `git_concurrency / active organizations`, clamped to this and the
+    /// floor.
+    #[serde(default = "default_git_organization_ceiling")]
+    pub git_organization_ceiling: usize,
+    /// How long a Git request over its share waits for a slot before the
+    /// transport refuses it with `Retry-After`. The scheduler wakes a waiter
+    /// below its floor first, so waiting is bounded by running work, not by a
+    /// busier organization's queue.
+    #[serde(default = "default_git_wait_millis")]
+    pub git_wait_millis: u64,
     pub git_timeout_seconds: u64,
     pub git_request_limit_bytes: usize,
     pub git_push_limit_bytes: usize,
@@ -33,6 +48,78 @@ pub struct Config {
     /// multipart upload count until the upload is completed or swept.
     #[serde(default)]
     pub organization_quota_bytes: u64,
+    /// Authenticated API requests allowed per organization per minute.
+    #[serde(default = "default_api_requests_per_organization")]
+    pub api_requests_per_organization: u64,
+    /// Authenticated API requests allowed per account per minute.
+    #[serde(default = "default_api_requests_per_account")]
+    pub api_requests_per_account: u64,
+    /// Authenticated Git transport requests allowed per organization per
+    /// minute. A clone is at least two requests (`info/refs` and
+    /// `upload-pack`), so this is deliberately twice the API organization
+    /// budget.
+    #[serde(default = "default_git_requests_per_organization")]
+    pub git_requests_per_organization: u64,
+    /// Authenticated Git transport requests allowed per account per minute,
+    /// the second half of ADR 0014 §5's "separate budgets for the API and for
+    /// Git operations".
+    #[serde(default = "default_git_requests_per_account")]
+    pub git_requests_per_account: u64,
+    /// Anonymous clone/fetch requests allowed per client address per minute.
+    #[serde(default = "default_anonymous_fetch_per_address")]
+    pub anonymous_fetch_per_address: u64,
+    /// Anonymous clone/fetch requests allowed across the installation per
+    /// minute, so one address cannot exhaust the public capacity.
+    #[serde(default = "default_anonymous_fetch_global")]
+    pub anonymous_fetch_global: u64,
+    /// Anonymous login and search requests allowed per client address per
+    /// minute.
+    #[serde(default = "default_anonymous_login_per_address")]
+    pub anonymous_login_per_address: u64,
+    /// Anonymous login requests allowed across the installation per minute,
+    /// so a second address cannot make the login form an unbounded
+    /// password-hashing amplifier.
+    #[serde(default = "default_anonymous_login_global")]
+    pub anonymous_login_global: u64,
+    /// Organizations one account may create per 24 hours.
+    #[serde(default = "default_organization_creation_per_account")]
+    pub organization_creation_per_account: u64,
+    /// Organizations the installation may create per UTC day.
+    #[serde(default = "default_organization_creation_per_installation")]
+    pub organization_creation_per_installation: u64,
+    /// Jobs one organization may run at once, a share of `job_concurrency`.
+    #[serde(default = "default_job_organization_share")]
+    pub job_organization_share: usize,
+    /// Email sends allowed per organization per hour.
+    #[serde(default = "default_email_per_organization")]
+    pub email_per_organization: u64,
+    /// Security mail (verification and recovery) allowed per address per hour.
+    #[serde(default = "default_email_security_per_address")]
+    pub email_security_per_address: u64,
+    /// Sign-up attempts allowed per client address in the velocity window.
+    /// The endpoint arrives with M11a; this is the limiter it will call.
+    #[serde(default = "default_signup_velocity_per_address")]
+    pub signup_velocity_per_address: u64,
+    /// Length of the sign-up velocity window in seconds.
+    #[serde(default = "default_signup_velocity_window_seconds")]
+    pub signup_velocity_window_seconds: u64,
+    /// The published abuse contact. `doctor` warns when mail is configured and
+    /// this is empty; the takedown runbook is docs/operations/abuse.md.
+    #[serde(default)]
+    pub abuse_contact: String,
+    /// The envelope sender bounces go to (VERP/return path). Falls back to
+    /// `smtp_from` when empty; `doctor` reports a configured relay with no
+    /// bounce address.
+    #[serde(default)]
+    pub smtp_bounce_address: String,
+    /// The DKIM selector whose `<selector>._domainkey.<domain>` TXT record
+    /// `doctor` checks.
+    #[serde(default = "default_smtp_dkim_selector")]
+    pub smtp_dkim_selector: String,
+    /// Whether `doctor` resolves SPF, DKIM and DMARC TXT records. On by
+    /// default; a test or an offline host can turn it off.
+    #[serde(default = "default_email_dns_check_enabled")]
+    pub email_dns_check_enabled: bool,
     /// How long a multipart upload may sit without activity before the
     /// reconciler removes it, in seconds (ADR 0014 §1).
     #[serde(default = "default_object_upload_deadline_seconds")]
@@ -261,11 +348,34 @@ impl Default for Config {
             merge_worker_interval_seconds: 2,
             trash_retention_seconds: 604_800,
             git_concurrency: 8,
+            git_organization_floor: default_git_organization_floor(),
+            git_organization_ceiling: default_git_organization_ceiling(),
+            git_wait_millis: default_git_wait_millis(),
             git_timeout_seconds: 600,
             git_request_limit_bytes: 10_485_760,
             git_push_limit_bytes: 1_073_741_824,
-            repository_quota_bytes: 0,
-            organization_quota_bytes: 0,
+            repository_quota_bytes: default_repository_quota_bytes(),
+            organization_quota_bytes: default_organization_quota_bytes(),
+            api_requests_per_organization: default_api_requests_per_organization(),
+            api_requests_per_account: default_api_requests_per_account(),
+            git_requests_per_organization: default_git_requests_per_organization(),
+            git_requests_per_account: default_git_requests_per_account(),
+            anonymous_fetch_per_address: default_anonymous_fetch_per_address(),
+            anonymous_fetch_global: default_anonymous_fetch_global(),
+            anonymous_login_per_address: default_anonymous_login_per_address(),
+            anonymous_login_global: default_anonymous_login_global(),
+            organization_creation_per_account: default_organization_creation_per_account(),
+            organization_creation_per_installation: default_organization_creation_per_installation(
+            ),
+            job_organization_share: default_job_organization_share(),
+            email_per_organization: default_email_per_organization(),
+            email_security_per_address: default_email_security_per_address(),
+            signup_velocity_per_address: default_signup_velocity_per_address(),
+            signup_velocity_window_seconds: default_signup_velocity_window_seconds(),
+            abuse_contact: String::new(),
+            smtp_bounce_address: String::new(),
+            smtp_dkim_selector: default_smtp_dkim_selector(),
+            email_dns_check_enabled: default_email_dns_check_enabled(),
             object_upload_deadline_seconds: default_object_upload_deadline_seconds(),
             hook_program: PathBuf::new(),
             secure_cookies: true,
@@ -335,6 +445,79 @@ fn default_maintenance_drain_timeout_seconds() -> u64 {
 }
 fn default_object_upload_deadline_seconds() -> u64 {
     86_400
+}
+fn default_git_organization_floor() -> usize {
+    1
+}
+fn default_git_organization_ceiling() -> usize {
+    // Half the default concurrency of eight. Measurement revised this from
+    // six (ADR 0014 open item 6): with six, an incumbent could fill 6 of 8
+    // slots before a peer arrived and the peer's first requests waited behind
+    // it. At four the first mover can never hold more than half, and two
+    // tenants at their measured share fill the installation without queueing.
+    // `GitScheduler::new` also clamps any configured ceiling to `concurrency -
+    // 1`, so no organization may take every slot on a small installation.
+    4
+}
+fn default_git_wait_millis() -> u64 {
+    1_000
+}
+fn default_repository_quota_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
+}
+fn default_organization_quota_bytes() -> u64 {
+    50 * 1024 * 1024 * 1024
+}
+fn default_api_requests_per_organization() -> u64 {
+    300
+}
+fn default_api_requests_per_account() -> u64 {
+    60
+}
+fn default_git_requests_per_organization() -> u64 {
+    600
+}
+fn default_git_requests_per_account() -> u64 {
+    120
+}
+fn default_anonymous_fetch_per_address() -> u64 {
+    120
+}
+fn default_anonymous_fetch_global() -> u64 {
+    2_000
+}
+fn default_anonymous_login_per_address() -> u64 {
+    20
+}
+fn default_anonymous_login_global() -> u64 {
+    300
+}
+fn default_organization_creation_per_account() -> u64 {
+    3
+}
+fn default_organization_creation_per_installation() -> u64 {
+    50
+}
+fn default_job_organization_share() -> usize {
+    2
+}
+fn default_email_per_organization() -> u64 {
+    200
+}
+fn default_email_security_per_address() -> u64 {
+    5
+}
+fn default_signup_velocity_per_address() -> u64 {
+    3
+}
+fn default_signup_velocity_window_seconds() -> u64 {
+    3_600
+}
+fn default_smtp_dkim_selector() -> String {
+    "default".to_owned()
+}
+fn default_email_dns_check_enabled() -> bool {
+    true
 }
 fn default_legacy_token_deprecation_date() -> String {
     "2027-06-30".to_owned()
@@ -515,6 +698,12 @@ impl Config {
         env!(auth_concurrency, "GITHEARTH_AUTH_CONCURRENCY");
         env!(secure_cookies, "GITHEARTH_SECURE_COOKIES");
         env!(git_concurrency, "GITHEARTH_GIT_CONCURRENCY");
+        env!(git_organization_floor, "GITHEARTH_GIT_ORGANIZATION_FLOOR");
+        env!(
+            git_organization_ceiling,
+            "GITHEARTH_GIT_ORGANIZATION_CEILING"
+        );
+        env!(git_wait_millis, "GITHEARTH_GIT_WAIT_MILLIS");
         env!(git_timeout_seconds, "GITHEARTH_GIT_TIMEOUT_SECONDS");
         env!(git_request_limit_bytes, "GITHEARTH_GIT_REQUEST_LIMIT_BYTES");
         env!(git_push_limit_bytes, "GITHEARTH_GIT_PUSH_LIMIT_BYTES");
@@ -522,6 +711,54 @@ impl Config {
         env!(
             organization_quota_bytes,
             "GITHEARTH_ORGANIZATION_QUOTA_BYTES"
+        );
+        env!(
+            api_requests_per_organization,
+            "GITHEARTH_API_REQUESTS_PER_ORGANIZATION"
+        );
+        env!(
+            api_requests_per_account,
+            "GITHEARTH_API_REQUESTS_PER_ACCOUNT"
+        );
+        env!(
+            git_requests_per_organization,
+            "GITHEARTH_GIT_REQUESTS_PER_ORGANIZATION"
+        );
+        env!(
+            git_requests_per_account,
+            "GITHEARTH_GIT_REQUESTS_PER_ACCOUNT"
+        );
+        env!(
+            anonymous_fetch_per_address,
+            "GITHEARTH_ANONYMOUS_FETCH_PER_ADDRESS"
+        );
+        env!(anonymous_fetch_global, "GITHEARTH_ANONYMOUS_FETCH_GLOBAL");
+        env!(
+            anonymous_login_per_address,
+            "GITHEARTH_ANONYMOUS_LOGIN_PER_ADDRESS"
+        );
+        env!(anonymous_login_global, "GITHEARTH_ANONYMOUS_LOGIN_GLOBAL");
+        env!(
+            organization_creation_per_account,
+            "GITHEARTH_ORGANIZATION_CREATION_PER_ACCOUNT"
+        );
+        env!(
+            organization_creation_per_installation,
+            "GITHEARTH_ORGANIZATION_CREATION_PER_INSTALLATION"
+        );
+        env!(job_organization_share, "GITHEARTH_JOB_ORGANIZATION_SHARE");
+        env!(email_per_organization, "GITHEARTH_EMAIL_PER_ORGANIZATION");
+        env!(
+            email_security_per_address,
+            "GITHEARTH_EMAIL_SECURITY_PER_ADDRESS"
+        );
+        env!(
+            signup_velocity_per_address,
+            "GITHEARTH_SIGNUP_VELOCITY_PER_ADDRESS"
+        );
+        env!(
+            signup_velocity_window_seconds,
+            "GITHEARTH_SIGNUP_VELOCITY_WINDOW_SECONDS"
         );
         env!(
             object_upload_deadline_seconds,
@@ -622,6 +859,10 @@ impl Config {
         env!(smtp_port, "GITHEARTH_SMTP_PORT");
         env!(smtp_tls, "GITHEARTH_SMTP_TLS");
         env!(smtp_from, "GITHEARTH_SMTP_FROM");
+        env!(abuse_contact, "GITHEARTH_ABUSE_CONTACT");
+        env!(smtp_bounce_address, "GITHEARTH_SMTP_BOUNCE_ADDRESS");
+        env!(smtp_dkim_selector, "GITHEARTH_SMTP_DKIM_SELECTOR");
+        env!(email_dns_check_enabled, "GITHEARTH_EMAIL_DNS_CHECK_ENABLED");
         if let Ok(value) = std::env::var("GITHEARTH_SMTP_USERNAME") {
             c.smtp_username = (!value.is_empty()).then_some(value);
         }
@@ -756,6 +997,11 @@ impl Config {
             || !(1..=3600).contains(&self.merge_worker_interval_seconds)
             || !(3600..=31536000).contains(&self.trash_retention_seconds)
             || !(1..=256).contains(&self.git_concurrency)
+            || !(1..=256).contains(&self.git_organization_floor)
+            || !(1..=256).contains(&self.git_organization_ceiling)
+            || self.git_organization_floor > self.git_concurrency
+            || self.git_organization_ceiling < self.git_organization_floor
+            || !(1..=60_000).contains(&self.git_wait_millis)
             || !(10..=86400).contains(&self.git_timeout_seconds)
             || !(1024..=1073741824).contains(&self.git_request_limit_bytes)
             || !(1024..=10737418240).contains(&self.git_push_limit_bytes)
@@ -763,6 +1009,22 @@ impl Config {
                 && !(1_048_576..=1_099_511_627_776).contains(&self.repository_quota_bytes))
             || (self.organization_quota_bytes != 0
                 && !(1_048_576..=1_099_511_627_776).contains(&self.organization_quota_bytes))
+            || (self.organization_quota_bytes != 0
+                && self.repository_quota_bytes > self.organization_quota_bytes)
+            || !(1..=1_000_000).contains(&self.api_requests_per_organization)
+            || !(1..=1_000_000).contains(&self.api_requests_per_account)
+            || !(1..=1_000_000).contains(&self.anonymous_fetch_per_address)
+            || !(1..=10_000_000).contains(&self.anonymous_fetch_global)
+            || !(1..=1_000_000).contains(&self.anonymous_login_per_address)
+            || !(1..=1_000_000).contains(&self.organization_creation_per_account)
+            || !(1..=1_000_000).contains(&self.organization_creation_per_installation)
+            || !(1..=64).contains(&self.job_organization_share)
+            || !(1..=1_000_000).contains(&self.email_per_organization)
+            || !(1..=1_000_000).contains(&self.email_security_per_address)
+            || !(1..=1_000_000).contains(&self.signup_velocity_per_address)
+            || !(1..=86_400).contains(&self.signup_velocity_window_seconds)
+            || self.smtp_dkim_selector.len() > 255
+            || self.smtp_dkim_selector.contains(char::is_whitespace)
             || !(60..=2_592_000).contains(&self.object_upload_deadline_seconds)
             || !(1..=64).contains(&self.job_concurrency)
             || !(1..=3600).contains(&self.job_timeout_seconds)
@@ -791,7 +1053,7 @@ impl Config {
             || housekeeping_budget > MAX_JOB_BUDGET_SECONDS
         {
             bail!(
-                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB, organization quota bytes 0 or 1MiB..1TiB, object upload deadline 60..2592000s, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, login throttle delay base 1..60000ms and max 1..600000ms (max >= base), backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
+                "configuration bounds: pool 1..100, DB timeout 1..30s, request timeout 1..120s, token TTL 1..86400s, body 1024..1048576 bytes, auth concurrency 1..16, reconcile interval 5..3600s, reconcile grace 30..86400s, merge worker interval 1..3600s, trash retention 3600..31536000s, git concurrency 1..256, git organization floor 1..=git concurrency and ceiling >= floor (clamped to capacity at run time), git wait 1..60000ms, git timeout 10..86400s, git request limit 1024..1073741824 bytes, git push limit 1024..10737418240 bytes, repository quota bytes 0 or 1MiB..1TiB (not above an organization quota), organization quota bytes 0 or 1MiB..1TiB, API rates 1..1000000/min, anonymous fetch 1..1000000 per address and 1..10000000 globally per minute, anonymous login 1..1000000/min, organization creation 1..1000000 per account/installation, job organization share 1..64 (clamped to the worker count), email 1..1000000/h, signup velocity 1..1000000 per 1..86400s, DKIM selector non-whitespace and at most 255 bytes, object upload deadline 60..2592000s, job concurrency 1..64, job timeout 1..3600s, job poll 50..60000ms, job retention 1..365d, outbox poll 50..60000ms, login throttle 1..1000000 failed sign-ins per username and per client inside a 1..86400s window, login throttle delay base 1..60000ms and max 1..600000ms (max >= base), backup directory must not be empty, maintenance drain timeout 1..86400s, housekeeping interval 60..2592000s, housekeeping grace 0..31536000s, housekeeping concurrency 1..16, housekeeping timeout 10..86400s, housekeeping live-set cap 1MiB..1GiB, housekeeping pin retention 1..3650d, housekeeping fork fetch limit 1MiB..1GiB, housekeeping job budget (7*timeout+60s) <= 604860s"
             );
         }
         if self.storage_root.as_os_str().is_empty() {
@@ -873,6 +1135,16 @@ impl Config {
             }
             if !crate::invitations::valid_email(&self.smtp_from) {
                 bail!("smtp_from must be a valid email address when smtp_host is set");
+            }
+            if !self.smtp_bounce_address.trim().is_empty()
+                && !crate::invitations::valid_email(&self.smtp_bounce_address)
+            {
+                bail!("smtp_bounce_address must be a valid email address when set");
+            }
+            if !self.abuse_contact.trim().is_empty()
+                && !crate::invitations::valid_email(&self.abuse_contact)
+            {
+                bail!("abuse_contact must be a valid email address when set");
             }
             if self
                 .smtp_username
@@ -1063,16 +1335,18 @@ mod tests {
     }
 
     #[test]
-    fn object_store_limits_default_to_unlimited_and_a_day_and_are_bounded() {
+    fn object_store_limits_default_to_the_published_quotas_and_are_bounded() {
         let mut c = Config {
             database_url: "postgres://localhost/test".into(),
             ..Config::default()
         };
-        assert_eq!(c.organization_quota_bytes, 0, "unlimited by default");
+        assert_eq!(c.repository_quota_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(c.organization_quota_bytes, 50 * 1024 * 1024 * 1024);
         assert_eq!(c.object_upload_deadline_seconds, 86_400, "one day");
         assert!(c.validate().is_ok());
         c.organization_quota_bytes = 1;
         assert!(c.validate().is_err(), "a sub-1MiB quota is refused");
+        c.repository_quota_bytes = 0;
         c.organization_quota_bytes = 1_048_576;
         assert!(c.validate().is_ok());
         c.object_upload_deadline_seconds = 59;

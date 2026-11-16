@@ -133,9 +133,17 @@ async fn user(pool: &PgPool, prefix: &str) -> User {
 }
 
 async fn fixture(url: &str, mailer: Arc<dyn MailTransport>) -> Fixture {
+    fixture_with(url, mailer, |_| {}).await
+}
+
+async fn fixture_with(
+    url: &str,
+    mailer: Arc<dyn MailTransport>,
+    adjust: impl FnOnce(&mut Config),
+) -> Fixture {
     let storage_root = std::env::temp_dir().join(format!("githearth-email-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
-    let config = Config {
+    let mut config = Config {
         database_url: url.to_owned(),
         database_max_connections: 4,
         database_timeout_seconds: 3,
@@ -144,6 +152,7 @@ async fn fixture(url: &str, mailer: Arc<dyn MailTransport>) -> Fixture {
         public_url: "https://forge.example".into(),
         ..Config::default()
     };
+    adjust(&mut config);
     let pool = connect(&config).await.unwrap();
     MIGRATOR.run(&pool).await.unwrap();
     let state = AppState::new(pool.clone(), config)
@@ -822,4 +831,73 @@ async fn columns_containing(pool: &PgPool, needle: &str) -> Vec<String> {
         }
     }
     hits
+}
+
+/// U30b / condition 9: the configured security-mail budget is enforced by the
+/// sender, not only by the counter. One verification mail per address per hour
+/// is allowed; the second request is accepted by the API (it stays queued)
+/// but the consumer refuses to send it and records the reason.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_verification_mail_is_refused_over_the_per_address_budget() {
+    let db = Db::new().await;
+    let mail = Arc::new(MemoryTransport::new());
+    let f = fixture_with(&db.url, mail.clone(), |config| {
+        config.email_security_per_address = 1;
+    })
+    .await;
+    let u = user(&f.pool, "mail-budget").await;
+    let email = format!("{}@example.com", u.username);
+
+    // The first request spends the hour's one security mail for this address.
+    request_and_capture_link(&f, &u, &email, &mail).await;
+    assert_eq!(mail.delivered().len(), 1);
+
+    let (status, body, text) = request_link(&f.app, &u.token, &email).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body} {text}");
+
+    // Run the relay and the consumer until the job records the refusal. It
+    // stays queued with a retry delay, so the queue never drains here.
+    githearth_server::outbox::register_builtin(&f.state)
+        .await
+        .unwrap();
+    githearth_server::outbox::fan_out_batch(&f.state, 10_000)
+        .await
+        .unwrap();
+    let mut registry = githearth_server::jobs::Registry::new();
+    githearth_server::notifications::register(&mut registry);
+    registry.backoff_override = Some(Duration::from_millis(20));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let runner = githearth_server::jobs::spawn(f.state.clone(), registry, shutdown.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let reason: Option<String> = loop {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT last_error FROM jobs \
+             WHERE kind = 'notification.outbox' AND last_error LIKE '%security email rate limit%' \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        if row.is_some() {
+            break row;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the consumer never recorded the security-mail refusal");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), runner).await;
+
+    assert!(reason.is_some());
+    assert_eq!(
+        mail.delivered().len(),
+        1,
+        "a second mail for the same address inside the hour is not delivered"
+    );
+    assert_eq!(mail.attempts(), 1, "and no SMTP attempt is made");
+
+    finish(f).await;
+    db.drop_db().await;
 }

@@ -1900,12 +1900,12 @@ async fn a_request_whose_target_branch_is_gone_is_reported_by_the_base_backfill(
         backfill.status,
         githearth_server::doctor::Status::Warn
     ));
-    // Only reported when it has something to report: eleven checks on a clean
-    // install, twelve here (docs/operations/install.md).
+    // Only reported when it has something to report: fourteen checks on a
+    // clean install, fifteen here (docs/operations/install.md).
     assert_eq!(
         checks.len(),
-        12,
-        "the base-backfill warning is the twelfth check: {:?}",
+        15,
+        "the base-backfill warning is the fifteenth check: {:?}",
         checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
     );
     assert!(

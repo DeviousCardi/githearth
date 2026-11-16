@@ -155,12 +155,14 @@ before any check runs. One such error: `storage_root` must be short enough (at m
 107-byte Unix socket path limit. The checks below are only reached when the configuration
 is valid.
 
-This runs twelve read-only checks:
+This runs fourteen read-only checks:
 
 - **git** — verifies Git ≥ 2.40 is available
 - **storage** — checks the storage root exists, is a writable directory, is not a symlink, is not world-writable, and every subdirectory (`repositories/`, `tmp/`, `trash/`, `orphans/`) that already exists is a real writable directory
 - **disk** — reports free space on the filesystem holding the storage root; warns below 10% free or below twice `git_push_limit_bytes`. It does not see PostgreSQL's disk: monitor that separately, because a full database disk leaves `doctor` and `/health/ready` reporting ok while writes fail (see [db-disk-full](../verification/db-disk-full.md))
 - **email** — reports whether SMTP is configured. With no `smtp_host` it says delivery is disabled; with one it checks that `smtp_from` is a valid address, that the credential file is configured and readable (or names `-` on stdin, which `doctor` cannot verify without consuming it), and warns when `smtp_tls` does not match the port (`implicit` expects 465; `starttls` and `none` do not). It opens no socket and sends no mail
+- **email DNS** — with SMTP configured, looks up the sending domain's SPF (`v=spf1`), DMARC (`_dmarc.<domain>`) and DKIM (`<smtp_dkim_selector>._domainkey.<domain>`) TXT records and checks that `smtp_bounce_address` and `abuse_contact` are set. A resolved domain with a missing record (including NXDOMAIN, the common typo case) or an empty bounce/abuse setting fails; a resolver outage is a warning. With SMTP disabled it is `ok` and no lookup is made. Set `email_dns_check_enabled = false` only for an offline preflight; the sign-up prerequisite still applies (see [email](email.md) and [abuse](abuse.md))
+- **limits** — checks the trusted-proxy prerequisite for the per-address budgets. With `trusted_proxies` set it reports how many proxy addresses are trusted. With none set it is `ok` when `public_url` is loopback (the local profile reads the connection peer) and warns when `public_url` is public, because a reverse proxy would make every per-address budget share the proxy's address (see [limits](limits.md))
 - **database** — connects to PostgreSQL and verifies connectivity
 - **schema** — compares applied migrations against the binary; detects pending, failed, or tampered migrations
 - **tokens** — reports how many legacy `repo:read`/`repo:write` tokens remain and the enforced cutoff (the UTC midnight after `legacy_token_deprecation_date`, default 2027-06-30; see [tokens](tokens.md))
@@ -170,15 +172,15 @@ This runs twelve read-only checks:
 - **outbox** — warns when an outbox delivery is `dead` (names `jobs requeue`, see [outbox.md](outbox.md)); warns when a registered consumer has no handler; otherwise reports the pending, delivering and delivered counts
 - **housekeeping** — warns when an active repository has never run housekeeping or is more than two `housekeeping_interval_seconds` overdue (the scheduler has stopped), or when a repository's last run failed or was deferred; reports ok when housekeeping is disabled by configuration
 
-A thirteenth **base backfill** check appears only when a pull request's base could
+A fifteenth **base backfill** check appears only when a pull request's base could
 not be reconstructed because its target branch was deleted before the upgrade;
 it is a warning naming the affected requests. A clean install therefore prints
-`12 checks`, and an installation with recorded skips prints `13 checks`.
+`14 checks`, and an installation with recorded skips prints `15 checks`.
 
 When the database cannot be reached the `schema`, `tokens`, `installation key`,
 `lifecycle`, `jobs`, `outbox` and `housekeeping` checks are skipped
 (`skip <name>: database unavailable`) rather than counted
-as failures, so one outage counts as one failure, not five.
+as failures, so one outage counts as one failure, not eight.
 
 Exit code is 0 when all checks pass (warnings and skips are allowed), 1 otherwise.
 The last line prints a summary: `N checks, F failed, W warnings, S skipped`.
@@ -190,6 +192,8 @@ ok   git: 2.50
 ok   storage: /data/githearth/repositories writable
 ok   disk: 47.82 GiB free
 ok   email: not configured (smtp_host is empty); no mail is sent
+ok   email DNS: not configured; no SPF, DKIM or DMARC record is required until SMTP is enabled
+ok   limits: per-address budgets use the connection peer; no reverse proxy is configured
 ok   database: connected
 ok   schema: latest v56
 ok   tokens: no legacy tokens; legacy repo:read/repo:write tokens are refused from the day after 2027-06-30
@@ -198,5 +202,5 @@ ok   lifecycle: no stuck repositories
 ok   jobs: no dead, late or stuck jobs
 ok   outbox: 0 pending, 0 delivering, 0 delivered delivery(ies)
 ok   housekeeping: repositories are up to date
-12 checks, 0 failed, 0 warnings, 0 skipped
+14 checks, 0 failed, 0 warnings, 0 skipped
 ```

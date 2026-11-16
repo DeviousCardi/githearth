@@ -92,6 +92,8 @@ Start with the [master plan](docs/plan/00-master-plan.md).
 | [Decision gates](docs/plan/02-decision-gates.md) | Agreed requirements, unresolved decisions, and the implementation sequence |
 | [Deployment contract](docs/plan/03-deployment-contract.md) | Single-node/cluster behavior, failure semantics, expansion, and merge requirements |
 | [Accounts](docs/operations/accounts.md) | Creating, disabling and re-enabling accounts; password change and reset; failed sign-in bounds |
+| [Limits and fairness](docs/operations/limits.md) | Published per-organization and anonymous budgets, the Git share scheduler and storage quotas |
+| [Abuse and takedown](docs/operations/abuse.md) | Abuse contact, takedown runbook and the sign-up prerequisite |
 | [Backup and restore](docs/operations/backup-restore.md) | Concrete backup/restore procedure and storage verification |
 | [Repository housekeeping](docs/operations/housekeeping.md) | Scheduled repack and pruning: schedule, grace period, manual run, results |
 | [Outbox delivery](docs/operations/outbox.md) | Delivery states, retry budget, dead letters and `jobs requeue`, `doctor` output |

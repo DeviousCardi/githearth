@@ -364,24 +364,26 @@ pub(crate) struct CodeOwnersLoad {
 /// and `head`, in one blocking Git pass.
 pub(crate) async fn load(
     state: &AppState,
+    organization: Uuid,
     repo_id: Uuid,
     base: &str,
     head: &str,
 ) -> Result<CodeOwnersLoad, ApiError> {
     let base = base.to_owned();
     let head = head.to_owned();
-    let (content, paths) = crate::browse::git_read(state, repo_id, move |fs_path, timeout| {
-        let content = read_codeowners_blob(fs_path, &base, timeout)?;
-        let paths =
-            browse::changed_files(fs_path, &base, &head, timeout)?.map(|(files, truncated)| {
-                (
-                    files.into_iter().map(|f| f.new_path).collect::<Vec<_>>(),
-                    truncated,
-                )
-            });
-        Ok::<_, StorageError>((content, paths))
-    })
-    .await?;
+    let (content, paths) =
+        crate::browse::git_read(state, organization, repo_id, move |fs_path, timeout| {
+            let content = read_codeowners_blob(fs_path, &base, timeout)?;
+            let paths =
+                browse::changed_files(fs_path, &base, &head, timeout)?.map(|(files, truncated)| {
+                    (
+                        files.into_iter().map(|f| f.new_path).collect::<Vec<_>>(),
+                        truncated,
+                    )
+                });
+            Ok::<_, StorageError>((content, paths))
+        })
+        .await?;
 
     let (rules, errors, unreadable) = match content {
         CodeOwnersBlob::Missing => (Vec::new(), Vec::new(), false),
@@ -621,7 +623,7 @@ pub(crate) async fn review(
     head: &str,
     base: &str,
 ) -> Result<CodeOwnerReview, ApiError> {
-    let loaded = load(state, repo_id, base, head).await?;
+    let loaded = load(state, org_id, repo_id, base, head).await?;
     // Resolve the fail-closed cases before touching the pool: when base or head
     // does not resolve there is nothing to compute, and a flaky database must
     // not turn an unknown changed-file set into a 503.
@@ -712,13 +714,20 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         Err(_) => return retry(),
     };
 
-    let head = match pulls::branch_tip(state, pull.source_repository_id, &pull.source_branch).await
+    let head = match pulls::branch_tip(
+        state,
+        org_id,
+        pull.source_repository_id,
+        &pull.source_branch,
+    )
+    .await
     {
         Ok(Some(head)) => head,
         Ok(None) => return jobs::JobOutcome::Done,
         Err(_) => return retry(),
     };
-    let base = match pulls::branch_tip(state, pull.repository_id, &pull.target_branch).await {
+    let base = match pulls::branch_tip(state, org_id, pull.repository_id, &pull.target_branch).await
+    {
         Ok(Some(base)) => base,
         Ok(None) => return jobs::JobOutcome::Done,
         Err(_) => return retry(),
@@ -729,6 +738,7 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
     // (ADR 0008). Same-repository pulls already have the head.
     if pulls::fetch_cross_repo_head(
         state,
+        org_id,
         pull.repository_id,
         pull.source_repository_id,
         &pull.source_branch,
@@ -739,7 +749,7 @@ async fn request_reviews(state: &AppState, job: &jobs::Job) -> jobs::JobOutcome 
         return retry();
     }
 
-    let loaded = match load(state, pull.repository_id, &base, &head).await {
+    let loaded = match load(state, org_id, pull.repository_id, &base, &head).await {
         Ok(v) => v,
         Err(_) => return retry(),
     };
@@ -1124,6 +1134,10 @@ mod tests {
             },
             auth_slots: Arc::new(Semaphore::new(2)),
             git_slots: Arc::new(Semaphore::new(2)),
+            git_scheduler: crate::fairness::GitScheduler::new(Arc::new(Semaphore::new(2)), 2, 1, 2),
+            limits: Arc::new(crate::limits::Limits::from_config(
+                &crate::config::Config::default(),
+            )),
             housekeeping_slots: Arc::new(Semaphore::new(2)),
             dummy_hash: Arc::new(String::new()),
             authz: Arc::new(Engine::new().unwrap()),
