@@ -31,9 +31,9 @@ Actions are named `object.verb` and grouped. Templates name only groups, so a ne
 | `write` | `ref.push`, `ref.force_push`, `ref.delete`, `pull_request.approve`, `pull_request.merge` |
 | `maintain` | `repository.update` (branch and tag protection mutations) |
 | `admin` | `repository.manage_access`, `archive`, `unarchive`, `delete`, `transfer` |
-| `owner` | `organization.update`, `manage_members`, `delete`, `team.create`, `invitation.read`, `invitation.create`, `invitation.revoke`, `repository.restore` |
+| `owner` | `organization.update`, `manage_members`, `delete`, `team.create`, `team.update`, `team.delete`, `invitation.read`, `invitation.create`, `invitation.revoke`, `repository.restore` |
 | `site_admin` | `organization.suspend`, `organization.unsuspend`, `account.create`, `account.disable`, `account.enable`, `account.reset_password` |
-| `sensitive` | sudo mode: an action here also sits in its functional group above — `organization.update`, `manage_members`, `delete`, `organization.suspend`, `unsuspend`, `team.create`, `repository.manage_access`, `archive`, `unarchive`, `delete`, `transfer`, `repository.restore`, `ref.force_push`, `ref.delete`, `account.disable`, `account.enable`, `account.reset_password`, `invitation.create`, `invitation.revoke` |
+| `sensitive` | sudo mode: an action here also sits in its functional group above — `organization.update`, `manage_members`, `delete`, `organization.suspend`, `unsuspend`, `team.create`, `team.update`, `team.delete`, `repository.manage_access`, `archive`, `unarchive`, `delete`, `transfer`, `repository.restore`, `ref.force_push`, `ref.delete`, `account.disable`, `account.enable`, `account.reset_password`, `invitation.create`, `invitation.revoke` |
 
 `repository.restore` is deliberately narrower than `repository.delete`: it joins `owner` and `sensitive`, not `admin`, so a repository admin who can delete cannot restore. Restoring a deleted repository is an organization-owner decision (U23c); a site administrator holds it through one explicitly scoped permit rather than through the `site_admin` group, because that group's forbid is exclusive to site administrators and would exclude owners. `repository.transfer` joins `admin` and `sensitive` because moving a repository is the repository's own administration; the target side is the separate `repository.create` decision on the target organization.
 
@@ -81,7 +81,7 @@ Cedar answers "may X do Y to Z", not "which Z may X see". List, search and dashb
 
 ## Open items
 
-- **Revocation and caching.** Decisions currently load facts per request from PostgreSQL, so a committed revocation applies to the next admitted request. Any cache, or the M5 storage nodes authorizing pushes locally, needs a versioned change feed and a stated maximum staleness before it ships.
+- **Revocation and caching.** Decisions currently load one facts snapshot per decision from PostgreSQL — a read-only `REPEATABLE READ` transaction for ordinary requests, or the mutation transaction's own snapshot when the caller already holds a lock — so a committed revocation is seen by every decision whose snapshot begins after the commit. A decision already evaluating an earlier snapshot is not retroactively changed and can still complete; membership mutations re-read under the organization row lock so a concurrent demotion is seen before the change. Any cache, or the M5 storage nodes authorizing pushes locally, needs a versioned change feed and a stated maximum staleness before it ships.
 - **Performance.** Each decision clones the policy set and links one template per grant. Measure decision latency at the enterprise profile (large single organization, many teams and grants) before M4. If needed, cache linked sets per principal keyed by a grant version.
 - **Persistence.** Tables for teams, team membership, grants and protection rules land with M2 repositories and M3 reviews. Grant writes validate the scope against the role's assignability, and that the subject belongs to the scope's organization.
 
