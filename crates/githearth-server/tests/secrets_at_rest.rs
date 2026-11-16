@@ -793,6 +793,7 @@ async fn restore_without_the_installation_key_fails_before_publishing() {
         config_path: config_path.clone(),
         storage_root: Some(destination_root.clone()),
         ssh_host_key_path: Some(host_key_path.clone()),
+        accept_shredded: false,
     };
     let error = match backup::run_restore(&options).await {
         Ok(_) => panic!("restoring without the installation key must fail"),
@@ -1358,6 +1359,9 @@ async fn passphrase_key_round_trips_and_wrong_passphrase_fails() {
         kek_id: sealed.kek_id.clone(),
         wrap_method: sealed.wrap_method.clone(),
         wrapped_key: sealed.wrapped_key.clone(),
+        owner_key_id: None,
+        owner_kind: None,
+        owner_id: None,
     };
     assert_eq!(
         secrets::open(

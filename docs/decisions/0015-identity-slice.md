@@ -155,6 +155,75 @@ Off by default, in configuration and in the UI. When enabled:
   must be tested rather than assumed.
 - Sign-up turns a private installation into an Internet-facing registration
   endpoint; the prerequisites are therefore gates, not documentation.
+- Retention of `data_key_directory` copies, not the tombstone, bounds a shred
+  against an older archive: a custody copy taken before a deletion still holds
+  the key and un-shreds every archive it can open.
+
+## Resolutions recorded by M11a increment 8A (infrastructure)
+
+### Data-key granularity (open item 5)
+
+One data key per account and one per organization, generated on first use. The
+id is deterministic from the owner: SHA-256 over `domain || kind || 0x00 || 16
+raw UUID bytes` with the UUID version and variant bits set (`UUIDv5`-shaped,
+not SHA-1 UUIDv5; call `data_keys::id_for`, do not reimplement it). It is the
+reference the owner row carries: `accounts.data_key_id` and
+`organizations.data_key_id` (the identity-schema lane owns those columns; the
+infrastructure lane owns the key material and returns the id from
+`data_keys::ensure_account_data_key` / `ensure_organization_data_key`). The
+column is informational and is never the shred input. A
+shared repository does not get its own key in this slice: repository secrets
+are not in the schema yet, and when they arrive they can follow the
+organization owning the repository.
+
+A secret belonging to an owner is encrypted under a per-secret data key, which
+is wrapped by the owner key; the owner key is wrapped by the installation key.
+Installation-level secrets (the audit IP key) keep the M4.2 shape and are the
+pre-key rows a pre-key backup cannot shred.
+
+### Where owner keys live, and the divergence from ADR 0014's audit-key resolution
+
+ADR 0014's resolution for the audit IP key keeps it in PostgreSQL as an
+envelope, and that is right for row-level shredding of the live digest binding.
+It cannot make an **older backup** unreadable, because the backup carries the
+wrapped key and the installation key opens it. Crypto-shredding across backups
+therefore requires the key to be absent from the archive. Owner keys live in
+`data_key_directory` (default: `data-keys` beside `installation_key_file`;
+`GITHEARTH_DATA_KEY_DIRECTORY`), wrapped by the installation key. The directory
+is outside `storage_root`, is not in the database or an archive, and is the
+operator's custody problem exactly as the installation key already is — which
+is the risk this ADR's Consequences section records. This **extends** ADR 0014
+§3's wrapped set with a key store outside the database; the envelope, AAD and
+rotation construction are unchanged, and rotation re-wraps owner keys too.
+
+### Shredding and its exact scope
+
+Destroying an owner key writes a tombstone and removes the key file (tombstone
+first, so an interrupted shred is still a shred). Every secret and encrypted
+column under that key becomes unreadable in the live database and in every
+backup whose custody copy no longer holds the key. A retained custody copy that
+predates the deletion un-shreds the archives it can open, because it has
+neither the tombstone nor the removal; removing the key from every retained
+copy is what closes that. The pseudonymous account/organization row and
+its plaintext profile columns remain in a pre-deletion backup until that
+backup's retention expires. A backup predating the owner keys has nothing to
+shred: its secrets are wrapped directly by the installation key, so retention
+is the only control. An account with no owner key at deletion records
+`had_key = false` rather than pretending the older secret was shredded. These
+limits are written where the operator reads them
+(`docs/operations/secrets-at-rest.md` and `docs/operations/backup-restore.md`).
+
+### Backup and restore
+
+The manifest lists owner keys as `{key_id, owner_kind, owner_id, kek_id,
+algorithm, wrap_method, shredded, had_key}`; it never contains a key or a
+wrapped key, and `had_key = false` marks a pre-key tombstone. `restore` opens
+owner keys from the custody directory: a present key opens, an absent key
+without a tombstone fails before anything is published (a lost key cannot
+silently become an unreadable installation), and a tombstoned key is a
+completed shred that restore **refuses by default** and accepts only with
+`--accept-shredded`, naming the key ids either way. `secrets status` and
+`doctor` make the same distinction.
 
 ## Open items
 
@@ -166,5 +235,7 @@ Off by default, in configuration and in the UI. When enabled:
 4. The tombstone row's shape, what "cleared" means per column, and the
    retention of the pseudonymous row in the live database.
 5. Data-key granularity: per account, per organization, and how a shared
-   repository is keyed when ownership moves.
+   repository is keyed when ownership moves. (Resolved for accounts and
+   organizations by increment 8A above; repository secrets are not in this
+   slice.)
 6. The exact `doctor` checks for the sign-up prerequisites.

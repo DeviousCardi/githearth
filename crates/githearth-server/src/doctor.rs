@@ -175,7 +175,13 @@ async fn installation_key_check(config: &Config, pool: &PgPool) -> Check {
         Ok(keys) => keys,
         Err(error) => return Check::fail("installation key", format_args!("{error:#}")),
     };
-    let report = match crate::secrets::status(pool, keys.as_ref()).await {
+    let report = match crate::secrets::status_with_data_keys(
+        pool,
+        keys.as_ref(),
+        Some(&config.data_key_directory()),
+    )
+    .await
+    {
         Ok(report) => report,
         Err(error) => return Check::fail("installation key", format_args!("{error:#}")),
     };
@@ -207,12 +213,30 @@ async fn installation_key_check(config: &Config, pool: &PgPool) -> Check {
             ),
         );
     }
+    if !report.missing_owner_key_ids.is_empty() {
+        return Check::fail(
+            "installation key",
+            format_args!(
+                "owner data key(s) are missing from {} without a shred record: {}; restore them \
+                 or record the deletion (shredded keys are unreadable by design)",
+                config.data_key_directory().display(),
+                report
+                    .missing_owner_key_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
     match (&report.current_key_id, report.rotation_complete) {
         (Some(id), true) => Check::ok(
             "installation key",
             format_args!(
-                "{id}, {} secret(s), rotation complete",
+                "{id}, {} secret(s), {} shredded owner key(s), rotation complete",
                 report.keys.iter().map(|k| k.secrets).sum::<i64>()
+                    + report.owner_keys.iter().map(|k| k.secrets).sum::<i64>(),
+                report.shredded_owner_keys
             ),
         ),
         (Some(id), false) => Check::warn(

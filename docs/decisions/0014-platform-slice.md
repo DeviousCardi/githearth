@@ -198,6 +198,9 @@ reach are unchanged.
   plaintext profile column unreadable, and a backup predating the keys cannot
   be shredded at all. The identity slice's disposal promise is scoped to
   secrets and encrypted columns, with retention the control for the rest.
+  Because an archive carries any key it holds, the per-owner key itself lives
+  in operator custody outside the database and the archive (ADR 0015, M11a
+  8A); the envelope and rotation construction are otherwise unchanged.
 
 ### 4. Backups: encrypted, fenced, and online on one node
 
