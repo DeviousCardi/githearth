@@ -383,13 +383,32 @@ impl russh::server::Handler for SshHandler {
         } else {
             None
         };
+        // A push is measured against the tenant total here; the hook cannot
+        // read PostgreSQL. A failed measurement refuses the push instead of
+        // treating the missing bytes as free (fail closed).
+        let storage = if want == Want::Push {
+            match crate::storage_quota::other_repositories(&state, admitted.organization, repo_id)
+                .await
+            {
+                Ok(measured) => Some(measured),
+                Err(e) => {
+                    return refuse(
+                        session,
+                        channel,
+                        format!("githearth: cannot measure storage quota: {e}\n").as_bytes(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
         let token_guard = hook_token
             .clone()
             .map(|token| crate::git_http::HookTokenGuard::new(state.hook_tokens.clone(), token));
 
         let mut hook_cmd = tokio::process::Command::from(cmd);
-        if let (Some(token), Some(op_id)) = (&hook_token, operation) {
+        if let (Some(token), Some(op_id), Some(storage)) = (&hook_token, operation, storage) {
             hook_cmd
                 .env("GITHEARTH_HOOK_SOCKET", &state.hook_socket_path)
                 .env("GITHEARTH_HOOK_TOKEN", token)
@@ -398,7 +417,12 @@ impl russh::server::Handler for SshHandler {
                 .env(
                     "GITHEARTH_QUOTA_BYTES",
                     state.config.repository_quota_bytes.to_string(),
-                );
+                )
+                .env(
+                    "GITHEARTH_ORGANIZATION_QUOTA_BYTES",
+                    state.config.organization_quota_bytes.to_string(),
+                )
+                .env("GITHEARTH_ORGANIZATION_OTHER_BYTES", storage.to_string());
         }
         if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
             hook_cmd.env("LLVM_PROFILE_FILE", profile);

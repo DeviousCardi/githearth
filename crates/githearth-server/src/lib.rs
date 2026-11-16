@@ -60,6 +60,7 @@ pub mod setup;
 pub mod ssh;
 pub mod ssh_keys;
 pub mod statuses;
+pub mod storage_quota;
 pub mod tag_protection;
 mod tag_protection_ui;
 pub mod teams;
@@ -1196,9 +1197,11 @@ pub(crate) async fn sign_in(
     password: &str,
     request: login_throttle::Request,
 ) -> ApiResult<Option<Uuid>> {
-    // The anonymous login/search ceiling (ADR 0014 §5): before the failure
-    // throttle and before Argon2. It is per client address, so a public login
-    // form cannot be used to saturate the hashing pool.
+    // The anonymous login ceiling (ADR 0014 §5): before the failure throttle
+    // and before Argon2. It is per client address, so a public login form
+    // cannot be used to saturate the hashing pool. Sign-in is the only routed
+    // anonymous surface in this build; M9's search route calls
+    // `allow_anonymous_search`, which spends the same counters.
     if !state.limits.allow_anonymous_login(request.client_ip()) {
         return Err(too_many_attempts());
     }

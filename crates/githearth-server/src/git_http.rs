@@ -459,6 +459,21 @@ async fn receive_pack(
     let git_protocol = extract_git_protocol(&headers);
     let hooks_dir = state.config.storage_root.join("hooks");
 
+    // The organization total is measured here, once, and handed to the hook:
+    // the hook cannot read PostgreSQL, and the target repository's own
+    // `objects/` (with the incoming quarantine) is what it measures directly.
+    // Either figure failing to measure refuses the push (fail closed).
+    let storage = crate::storage_quota::other_repositories(&state, admitted.organization, repo_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                category = "git",
+                repository_id = %repo_id,
+                "storage accounting failed: {e}"
+            );
+            GitHttpError::ServerError
+        })?;
+
     let cmd = state
         .storage
         .receive_pack(
@@ -496,7 +511,12 @@ async fn receive_pack(
         .env(
             "GITHEARTH_QUOTA_BYTES",
             state.config.repository_quota_bytes.to_string(),
-        );
+        )
+        .env(
+            "GITHEARTH_ORGANIZATION_QUOTA_BYTES",
+            state.config.organization_quota_bytes.to_string(),
+        )
+        .env("GITHEARTH_ORGANIZATION_OTHER_BYTES", storage.to_string());
     // coverage: let the hook subprocess (the same instrumented binary) record
     // its own profile under the test harness.
     if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {

@@ -27,7 +27,7 @@ auth_concurrency = 2
 # git_request_limit_bytes = 10485760
 # git_push_limit_bytes = 1073741824  # upload size and receive.maxInputSize
 # repository_quota_bytes = 5368709120  # 5 GiB total on-disk objects; 0 = unlimited
-# organization_quota_bytes = 53687091200  # 50 GiB object-store bytes per organization; 0 = unlimited
+# organization_quota_bytes = 53687091200  # 50 GiB for Git storage + 50 GiB for the object store (separate ledgers); 0 = unlimited
 # Per-organization and per-account limits (docs/operations/limits.md).
 # api_requests_per_organization = 300  # per minute
 # api_requests_per_account = 60        # per minute
@@ -36,7 +36,7 @@ auth_concurrency = 2
 # git_requests_per_account = 120       # per minute
 # anonymous_fetch_per_address = 120    # clone/fetch per minute
 # anonymous_fetch_global = 2000        # clone/fetch per installation per minute
-# anonymous_login_per_address = 20     # login/search per minute
+# anonymous_login_per_address = 20     # sign-in per minute; M9's search route shares this budget
 # anonymous_login_global = 300          # login per installation per minute
 # organization_creation_per_account = 3
 # organization_creation_per_installation = 50   # per day

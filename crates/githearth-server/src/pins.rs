@@ -44,7 +44,7 @@ pub const REASON_STATUS: &str = "commit_status";
 /// Raises every still-live pin written by the 0045 head backfill to at least
 /// `retention_days` from the pin's creation, returning how many rows changed.
 ///
-/// Migration 0058 repairs the hard-coded 30-day window with the documented
+/// Migration 0059 repairs the hard-coded 30-day window with the documented
 /// default (90 days), but a SQL migration cannot see this installation's
 /// `housekeeping_pin_retention_days`. `migrate` and `setup` call this with the
 /// loaded configuration so an operator who chose a longer window gets it. It

@@ -209,6 +209,17 @@ fn merge_href(org: &str, repo: &str, number: i64) -> String {
 /// pull request `feature -> main`. With `conflict`, the two branches edit the
 /// same file so a merge candidate conflicts.
 async fn build_fixture(conflict: bool) -> Fixture {
+    build_fixture_with(conflict, 0, 0).await
+}
+
+/// The same fixture with the two storage quotas set explicitly (`0` disables
+/// one). The seeded pushes bypass the hooks, so the fixture itself never trips
+/// a quota; a test fills the headroom deliberately.
+async fn build_fixture_with(
+    conflict: bool,
+    repository_quota_bytes: u64,
+    organization_quota_bytes: u64,
+) -> Fixture {
     let storage_root = std::env::temp_dir().join(format!("githearth-merge-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
     let config = Config {
@@ -218,6 +229,8 @@ async fn build_fixture(conflict: bool) -> Fixture {
         database_timeout_seconds: 3,
         storage_root: storage_root.clone(),
         hook_program: PathBuf::from(env!("CARGO_BIN_EXE_githearth-server")),
+        repository_quota_bytes,
+        organization_quota_bytes,
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
@@ -1017,6 +1030,47 @@ async fn ff_only_on_diverged_branches_is_refused_up_front() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(main_tip(&f).await, before);
+
+    finish(f).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn a_merge_that_crosses_the_tenant_total_is_refused_and_the_ref_stays() {
+    // The per-repository quota is unlimited, so only the organization total can
+    // refuse. All but 8 bytes of the tenant budget is already on disk; the
+    // merge commit the candidate just wrote must take it over and refuse.
+    const ORG_QUOTA: u64 = 8 * 1024 * 1024;
+    let f = build_fixture_with(false, 0, ORG_QUOTA).await;
+
+    let objects = f.repo_path.join("objects");
+    let used = githearth_git::layout::dir_size(&objects, None).unwrap();
+    std::fs::create_dir_all(objects.join("pack")).unwrap();
+    std::fs::write(
+        objects.join("pack/ballast.pack"),
+        vec![0u8; (ORG_QUOTA - used - 8) as usize],
+    )
+    .unwrap();
+
+    let (status, intent) = create_merge_intent(&f, "merge", &f.feature_head).await;
+    assert_eq!(status, StatusCode::CREATED, "{intent}");
+    let op: Uuid = intent["operation_id"].as_str().unwrap().parse().unwrap();
+    set_intent_executing(&f.pool, op).await;
+
+    let before = main_tip(&f).await;
+    let outcome = execute_intent(&f.state, op).await.unwrap();
+    match outcome {
+        MergeOutcome::Failed { reason } => assert!(
+            reason.contains("organization storage quota exceeded"),
+            "the refusal must name the organization quota: {reason}"
+        ),
+        other => panic!("a merge over the tenant total must be refused, got {other:?}"),
+    }
+    assert_eq!(
+        main_tip(&f).await,
+        before,
+        "the target ref must not move when the merge is refused"
+    );
 
     finish(f).await;
 }

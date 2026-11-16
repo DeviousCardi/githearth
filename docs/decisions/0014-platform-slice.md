@@ -51,8 +51,9 @@ secrets and tokens, three incompatible limit schemes), or to defer them to M11
   organization (see "Quota: the organization owns the bytes"): it counts
   committed object bytes plus open-upload part bytes and releases them when an
   object is deleted or an upload is completed, aborted or swept. Repository
-  size stays on `repository_quota_bytes`, which counts a repository's own
-  `objects/` tree; the two ledgers do not overlap.
+  size stays on `repository_quota_bytes` (one repository's own `objects/`
+  tree) and `organization_quota_bytes` (the sum of those trees across an
+  organization, checked on push and merge); the two ledgers do not overlap.
 - `backup` includes the object store: a manifest of every object's key,
   checksum and size, and the bytes themselves, either in the archive or by a
   snapshot the restore can verify.
@@ -246,8 +247,13 @@ Limits are configuration with published safe defaults. The shape:
 
 - **Authenticated request rate:** per organization and per account, separate
   budgets for the API and for Git operations.
-- **Anonymous traffic:** per client address and globally, because public clone,
-  login and search are unauthenticated. `trusted_proxies` must be configured
+- **Anonymous traffic:** per client address and globally, because public clone
+  and login are unauthenticated. The M4.2 build serves no search route (search
+  is M9's), so the published row names only login. The budget is still one:
+  `Limits::allow_anonymous_search` spends the same per-address and installation
+  counters as sign-in and is exercised at that interface, so M9's route calls
+  it instead of publishing a second number.
+  `trusted_proxies` must be configured
   for the address to be the client's; the documentation says so and `doctor`
   warns when limits are on and no proxy is trusted.
 - **Git concurrency:** a share of the global slots per organization, with a
@@ -256,7 +262,10 @@ Limits are configuration with published safe defaults. The shape:
   starved.
 - **Storage:** per-organization quota on top of the per-repository one,
   counting objects, merge-created objects, fork copies and stored large
-  objects.
+  objects. The Git half is summed from every active repository's `objects/`
+  tree on each push and each merge (`storage_quota`); the object-store half
+  keeps its own ledger. The two ledgers do not overlap: the configured
+  organization number bounds each of them separately, not their sum.
 - **Organization creation:** a cap per account and per installation, because a
   new organization otherwise earns a fresh share.
 - **Background work:** per-organization shares of the job worker pool and of
@@ -275,9 +284,9 @@ Default values, recorded so the exit can be tested and later revised:
 | API requests | 300/min per organization, 60/min per account |
 | Authenticated Git requests | 600/min per organization, 120/min per account |
 | Anonymous clone/fetch | 120/min per address, 2,000/min installation |
-| Anonymous login/search | 20/min per address, 300/min installation |
+| Anonymous login | 20/min per address, 300/min installation |
 | Organization creation | 3 per account per 24 h, 50 per installation per day |
-| Repository size | 5 GiB per repository, 50 GiB per organization |
+| Repository size | 5 GiB per repository; 50 GiB per organization for each of Git storage and the object store |
 | Job worker share | 2 of 4 workers per organization |
 | Email | 200/h per organization, 5/h per address for security mail |
 
@@ -1240,3 +1249,41 @@ authenticated Git rows above (ADR §5 asks for separate API and Git budgets),
 and added the installation-wide login budget. Anonymous clone and fetch are
 charged after the repository is known to exist, so a scanner cannot spend the
 installation budget with 404s.
+
+## Limitations recorded at the M4.2 exit
+
+The exit verification added on 2026-11-16 found three published claims the code
+did not enforce and five limits on what the evidence proves. Two of the three
+are fixed in the code; the third (an anonymous search budget) is withdrawn
+from publication, because no search route ships in M4.2 and publishing a limit
+for a surface that does not exist would be a doc ahead of the binary. The
+evidence doc records the exercise and revert proof for each; the five below
+are accepted for this milestone and are not silently claimed as done.
+
+1. **No measured p95 for API or job capacity.** Only the Git share scheduler
+   has a reproducible relative measurement (worst ratio 1.09 against a limit of
+   2.0, with a no-cap control at 4.27–4.64×). API isolation is proven by
+   independent per-organization and per-account counters, and job isolation by
+   the 2-of-4 worker-share claim query; neither is a latency measurement under
+   load. The exit sentence says "requests past the stated bound"; for the API
+   and job legs the bound is the published budget, not a measured p95, and a
+   product-level API/job p95 remains open.
+2. **Abandoned-upload cleanup is tested at the store interface, not through
+   the reconciler.** `cleanup_abandoned` has a deadline case and a resume case
+   in `crates/githearth-git/tests/object_store.rs`. `reconcile.rs` calls it on
+   every pass, but no integration test drives that wiring; a reconciler that
+   stopped calling it would not fail the suite.
+3. **The U29 write guarantee is bounded by the recorded position.** A write
+   that starts before the backup's recorded PostgreSQL position is restored or
+   refused. A write acknowledged after that position is deliberately in
+   neither the dump nor the storage snapshot. The exit sentence ("a write
+   racing an online backup") does not state the boundary; this ADR and the
+   evidence doc do.
+4. **SMTP credentials remain an operator file, not an envelope column.**
+   `smtp_password_file` names a file the operator owns and the archive does not
+   carry. Only the audit IP key is a stored secret column in this schema, and it
+   is wrapped under the installation key. The build bullet's phrase "every
+   secret column … SMTP credentials" describes a column that does not exist.
+5. **KMS is an interface only; the shipped binary refuses `method = "kms"`**
+   with "no KMS adapter is built into this binary". A deployment that wants key
+   custody from a KMS must supply an adapter out of tree; no adapter ships.

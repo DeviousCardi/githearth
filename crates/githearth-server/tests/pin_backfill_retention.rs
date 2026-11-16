@@ -1,9 +1,9 @@
-//! Migration 0058: repair the 0045 pull-request head backfill window.
+//! Migration 0059: repair the 0045 pull-request head backfill window.
 //!
 //! The installation is built the way U19's was: start at the schema before the
 //! pin migrations (`0044`), populate pull requests and reviews through rows
 //! that 0045 reads, then upgrade with the current migrator. 0045 writes its
-//! fixed 30-day pins; 0058 must extend the live ones to the documented
+//! fixed 30-day pins; 0059 must extend the live ones to the documented
 //! retention and leave an already-expired pin expired.
 
 use githearth_server::{MIGRATOR, pins};
@@ -193,7 +193,7 @@ async fn upgraded_installation_keeps_backfilled_pins_for_the_documented_retentio
     .await
     .unwrap();
 
-    // 3. The current migrator applies 0058.
+    // 3. The current migrator applies 0059.
     MIGRATOR.run(&pool).await.unwrap();
 
     let repaired: i64 = sqlx::query_scalar(

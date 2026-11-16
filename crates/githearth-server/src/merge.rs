@@ -81,6 +81,9 @@ pub enum MergeError {
     Storage(githearth_git::StorageError),
     Replay(ReplayError),
     Join(tokio::task::JoinError),
+    /// Storage accounting could not measure the repository or organization, so
+    /// the quota cannot be checked and the merge is refused rather than allowed.
+    Accounting(String),
     /// A run stopped at an injected test point; never returned in production
     /// unless a test armed it with [`fail_after_candidate`].
     Injected(&'static str),
@@ -93,6 +96,7 @@ impl fmt::Display for MergeError {
             MergeError::Storage(e) => write!(f, "storage error: {e}"),
             MergeError::Replay(e) => write!(f, "journal replay error: {e}"),
             MergeError::Join(e) => write!(f, "blocking task failed: {e}"),
+            MergeError::Accounting(e) => write!(f, "storage accounting failed: {e}"),
             MergeError::Injected(point) => write!(f, "merge execution interrupted at {point}"),
         }
     }
@@ -105,6 +109,7 @@ impl std::error::Error for MergeError {
             MergeError::Storage(e) => Some(e),
             MergeError::Replay(e) => Some(e),
             MergeError::Join(e) => Some(e),
+            MergeError::Accounting(_) => None,
             MergeError::Injected(_) => None,
         }
     }
@@ -427,7 +432,7 @@ pub async fn execute_intent(
 
     // Actor authorization, re-evaluated under the lock. A merge is a routine
     // action, so session age does not apply.
-    let (actor_username, pr_author_username) = {
+    let (actor_username, pr_author_username, organization_id) = {
         let mut conn = state.pool.acquire().await?;
         let Some(repo) = crate::repositories::get(&mut conn, repository_id).await? else {
             return Ok(MergeOutcome::Stale {
@@ -490,7 +495,7 @@ pub async fn execute_intent(
                 .bind(pull.author_id)
                 .fetch_one(&mut *conn)
                 .await?;
-        (actor_username, pr_author_username)
+        (actor_username, pr_author_username, repo.organization_id)
     };
 
     // 6. Build (or reuse) the candidate.
@@ -610,6 +615,39 @@ pub async fn execute_intent(
     // point, so the candidate's objects survive a prune and a retry reuses the
     // same commit. The update is fenced on `executing`, so a cancelled intent
     // is not resurrected.
+    //
+    // First charge what the merge just wrote to the published quotas. The push
+    // hook cannot see this path, so without this check a server-side merge
+    // (and a cross-repository fork fetch, which copies objects in before the
+    // candidate) could take a repository or an organization past its limit
+    // with no refusal. Both figures are measured on disk after the candidate
+    // exists and before the ref moves; the cost is one walk of the tenant's
+    // `objects/` set per merge (see `storage_quota`).
+    let storage = crate::storage_quota::measure(state, organization_id, repository_id)
+        .await
+        .map_err(MergeError::Accounting)?;
+    if state.config.repository_quota_bytes > 0
+        && storage.repository > state.config.repository_quota_bytes
+    {
+        return Ok(MergeOutcome::Failed {
+            reason: format!(
+                "repository storage quota exceeded: {} of {} bytes",
+                storage.repository, state.config.repository_quota_bytes
+            ),
+        });
+    }
+    if state.config.organization_quota_bytes > 0
+        && storage.organization_total() > state.config.organization_quota_bytes
+    {
+        return Ok(MergeOutcome::Failed {
+            reason: format!(
+                "organization storage quota exceeded: {} of {} bytes",
+                storage.organization_total(),
+                state.config.organization_quota_bytes
+            ),
+        });
+    }
+
     let persisted = sqlx::query(
         "UPDATE merge_intents SET candidate_oid = $1, updated_at = now() \
          WHERE operation_id = $2 AND state = 'executing'",

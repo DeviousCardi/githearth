@@ -227,16 +227,35 @@ impl Limits {
         self.anonymous_fetch_global.allow_at("installation", now)
     }
 
-    /// Anonymous login and search: per client address and across the
-    /// installation. Sign-in has a separate failure throttle; this is the
-    /// request-rate ceiling that keeps a public login form from being used as
-    /// a password-hashing amplifier. The installation budget is what a second
-    /// address cannot escape.
+    /// Anonymous login: per client address and across the installation. Sign-in
+    /// has a separate failure throttle; this is the request-rate ceiling that
+    /// keeps a public login form from being used as a password-hashing
+    /// amplifier. The installation budget is what a second address cannot
+    /// escape.
     pub fn allow_anonymous_login(&self, address: Option<IpAddr>) -> bool {
         self.allow_anonymous_login_at(address, Instant::now())
     }
 
     pub fn allow_anonymous_login_at(&self, address: Option<IpAddr>, now: Instant) -> bool {
+        self.anonymous_budget_at(address, now)
+    }
+
+    /// Anonymous search: the half of the "login/search" row that has no route
+    /// in this build. It spends the *same* per-address and installation counters as sign-in,
+    /// so login plus search together are one 20/min budget and the 300/min
+    /// installation ceiling, not two. No search route ships in M4.2 (M9 owns
+    /// it); this is the mechanism the route calls, and
+    /// `tests/limits.rs::the_anonymous_search_limiter_refuses_above_the_published_budget`
+    /// exercises the refusal at this interface.
+    pub fn allow_anonymous_search(&self, address: Option<IpAddr>) -> bool {
+        self.allow_anonymous_search_at(address, Instant::now())
+    }
+
+    pub fn allow_anonymous_search_at(&self, address: Option<IpAddr>, now: Instant) -> bool {
+        self.anonymous_budget_at(address, now)
+    }
+
+    fn anonymous_budget_at(&self, address: Option<IpAddr>, now: Instant) -> bool {
         let key = address
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "unresolved".to_owned());

@@ -3084,6 +3084,10 @@ async fn push_and_merge_serialize_on_the_repository_lock() {
 }
 
 async fn setup_with_quota(repository_quota_bytes: u64) -> Fixture {
+    setup_with_quotas(repository_quota_bytes, 50 * 1024 * 1024 * 1024).await
+}
+
+async fn setup_with_quotas(repository_quota_bytes: u64, organization_quota_bytes: u64) -> Fixture {
     let storage_root = std::env::temp_dir().join(format!("githearth-push-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&storage_root).unwrap();
     let config = Config {
@@ -3096,6 +3100,7 @@ async fn setup_with_quota(repository_quota_bytes: u64) -> Fixture {
         git_push_limit_bytes: 1 << 30,
         git_concurrency: 8,
         repository_quota_bytes,
+        organization_quota_bytes,
         ..Config::default()
     };
     let pool = connect(&config).await.unwrap();
@@ -3334,6 +3339,96 @@ async fn quota_zero_allows_large_push() {
 
     wait_for_journal_applied(&fx.pool, fx.repo_id, 1).await;
     assert_push_metadata(&fx.pool, fx.repo_id, 1).await;
+
+    let _ = std::fs::remove_dir_all(&clone);
+    cleanup(&fx.storage_root);
+    fx.pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL database via GITHEARTH_TEST_DATABASE_URL; see docs/foundation.md"]
+async fn organization_quota_refuses_a_push_across_the_tenants_repositories() {
+    // The per-repository quota is unlimited, so only the organization total can
+    // refuse. A second repository in the same organization consumes all but 64
+    // bytes of the tenant budget; a 2 MiB push must be refused.
+    const ORG_QUOTA: u64 = 8 * 1024 * 1024;
+    let fx = setup_with_quotas(0, ORG_QUOTA).await;
+
+    let (org_id, owner): (Uuid, Uuid) =
+        sqlx::query_as("SELECT organization_id, created_by FROM repositories WHERE id = $1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    let ballast_id = create_active_repo(&fx.pool, org_id, &tag("ballast"), owner).await;
+    let ballast_path = fx
+        .state
+        .storage
+        .create(ballast_id, Uuid::new_v4(), ObjectFormat::Sha1)
+        .unwrap();
+    let target_used = githearth_git::layout::dir_size(&fx.repo_path.join("objects"), None).unwrap();
+    let ballast = ORG_QUOTA - target_used - 64;
+    std::fs::write(
+        ballast_path.join("objects/ballast.pack"),
+        vec![0u8; ballast as usize],
+    )
+    .unwrap();
+
+    let clone = std::env::temp_dir().join(format!("git-push-orgquota-{}", Uuid::new_v4()));
+    let cd = clone.to_str().unwrap();
+    git_ok(git_cmd(&["clone", "--", &fx.url(), cd])).await;
+
+    let mut blob = vec![0u8; 2 * 1024 * 1024];
+    let mut urandom = std::fs::File::open("/dev/urandom").unwrap();
+    std::io::Read::read_exact(&mut urandom, &mut blob).unwrap();
+    std::fs::write(clone.join("big.bin"), &blob).unwrap();
+    git_ok(git_cmd(&["-C", cd, "add", "big.bin"])).await;
+    git_ok(git_cmd(&[
+        "-C",
+        cd,
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "big",
+    ]))
+    .await;
+    let out = git_run(git_cmd(&["-C", cd, "push", "origin", "main"])).await;
+    assert!(
+        !out.status.success(),
+        "push over the tenant total must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("organization storage quota exceeded"),
+        "rejection reason: {stderr}"
+    );
+
+    // No journal record, no push metadata, and the ref is unchanged.
+    let records = journal_records(&fx.repo_path);
+    assert!(
+        !records.iter().any(|r| r.kind == Kind::Prepared),
+        "no prepared records should be written"
+    );
+    assert_eq!(
+        git_output(git_cmd(&[
+            "--git-dir",
+            fx.repo_path_str(),
+            "rev-parse",
+            "main"
+        ]))
+        .await,
+        fx.base_commit
+    );
+    let pushes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_pushes WHERE repository_id=$1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(pushes, 0, "no push metadata should be recorded");
 
     let _ = std::fs::remove_dir_all(&clone);
     cleanup(&fx.storage_root);
