@@ -301,6 +301,13 @@ pub struct Config {
     /// `method = "passphrase"`.
     #[serde(default)]
     pub installation_key_passphrase_file: Option<PathBuf>,
+    /// Operator custody for per-account and per-organization data keys
+    /// (M11a, crypto-shredding). Each key is wrapped by the installation key;
+    /// the directory is outside `storage_root` and is **not** in a backup, so
+    /// deleting a key makes its secrets unreadable in older backups. Empty
+    /// derives `data-keys` beside `installation_key_file`.
+    #[serde(default)]
+    pub data_key_directory: PathBuf,
     /// How long `maintenance start` waits for in-flight writes to drain.
     #[serde(default = "default_maintenance_drain_timeout_seconds")]
     pub maintenance_drain_timeout_seconds: u64,
@@ -431,6 +438,7 @@ impl Default for Config {
             installation_key_previous_file: PathBuf::new(),
             installation_key_method: default_installation_key_method(),
             installation_key_passphrase_file: None,
+            data_key_directory: PathBuf::new(),
             maintenance_drain_timeout_seconds: default_maintenance_drain_timeout_seconds(),
             legacy_token_deprecation_date: default_legacy_token_deprecation_date(),
         }
@@ -918,6 +926,13 @@ impl Config {
         if let Ok(value) = std::env::var("GITHEARTH_INSTALLATION_KEY_PASSPHRASE_FILE") {
             c.installation_key_passphrase_file = (!value.is_empty()).then(|| PathBuf::from(value));
         }
+        if let Ok(value) = std::env::var("GITHEARTH_DATA_KEY_DIRECTORY") {
+            c.data_key_directory = if value.is_empty() {
+                PathBuf::new()
+            } else {
+                PathBuf::from(value)
+            };
+        }
         env!(
             maintenance_drain_timeout_seconds,
             "GITHEARTH_MAINTENANCE_DRAIN_TIMEOUT_SECONDS"
@@ -1190,6 +1205,25 @@ impl Config {
         Ok(())
     }
 
+    /// The operator-custody directory for per-account and per-organization
+    /// data keys. An explicit `data_key_directory` wins; otherwise it is a
+    /// `data-keys` directory beside `installation_key_file`. It is never inside
+    /// the database or an archive, which is what makes deleting a key shred the
+    /// secrets it protected in older backups.
+    pub fn data_key_directory(&self) -> PathBuf {
+        if !self.data_key_directory.as_os_str().is_empty() {
+            return self.data_key_directory.clone();
+        }
+        if self.installation_key_file.as_os_str().is_empty() {
+            return PathBuf::new();
+        }
+        self.installation_key_file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("data-keys")
+    }
+
     /// The storage tar carries `storage_root` verbatim, so an installation key
     /// or another private operator file inside it would travel in every backup.
     /// This is part of `validate` (not only `backup`) so `serve`, `migrate` and
@@ -1221,6 +1255,10 @@ impl Config {
         }
         if let Some(path) = &self.installation_key_passphrase_file {
             paths.push(("installation key passphrase", path));
+        }
+        let data_key_directory = self.data_key_directory();
+        if !data_key_directory.as_os_str().is_empty() {
+            paths.push(("data key directory", &data_key_directory));
         }
         if let Some(path) = &self.smtp_password_file {
             paths.push(("SMTP credential", path));

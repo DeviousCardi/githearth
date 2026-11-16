@@ -137,6 +137,11 @@ enum Command {
         storage_root: Option<PathBuf>,
         #[arg(long)]
         ssh_host_key_path: Option<PathBuf>,
+        /// Restore even though the archive names a completed shred. The
+        /// affected secrets stay unreadable by design; without this flag the
+        /// restore refuses before publishing anything.
+        #[arg(long)]
+        accept_shredded: bool,
     },
 }
 
@@ -283,6 +288,7 @@ async fn run(args: Args) -> Result<()> {
         key_stdin,
         storage_root,
         ssh_host_key_path,
+        accept_shredded,
     } = args.command
     {
         return run_restore(
@@ -292,6 +298,7 @@ async fn run(args: Args) -> Result<()> {
             key_stdin,
             storage_root,
             ssh_host_key_path,
+            accept_shredded,
         )
         .await;
     }
@@ -367,9 +374,10 @@ async fn run(args: Args) -> Result<()> {
             // taken after `migrate` contains no plaintext secret. A missing or
             // wrong key names the key id and leaves every row readable.
             let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?;
-            let report = githearth_server::secrets::startup(
+            let report = githearth_server::secrets::startup_with_data_keys(
                 &pool,
                 keys.as_ref(),
+                Some(&config.data_key_directory()),
                 githearth_server::secrets::BACKFILL_BATCH,
             )
             .await?;
@@ -440,9 +448,10 @@ async fn run(args: Args) -> Result<()> {
             // secrets may start without a key; the first secret write then
             // fails rather than storing plaintext.
             let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?;
-            let secrets = githearth_server::secrets::startup(
+            let secrets = githearth_server::secrets::startup_with_data_keys(
                 &pool,
                 keys.as_ref(),
+                Some(&config.data_key_directory()),
                 githearth_server::secrets::BACKFILL_BATCH,
             )
             .await?;
@@ -631,7 +640,12 @@ async fn run(args: Args) -> Result<()> {
             SecretsCommand::Keygen { .. } => unreachable!("handled before configuration load"),
             SecretsCommand::Status => {
                 let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?;
-                let report = githearth_server::secrets::status(&pool, keys.as_ref()).await?;
+                let report = githearth_server::secrets::status_with_data_keys(
+                    &pool,
+                    keys.as_ref(),
+                    Some(&config.data_key_directory()),
+                )
+                .await?;
                 println!(
                     "current key id: {}",
                     report.current_key_id.as_deref().unwrap_or("(none)")
@@ -640,6 +654,32 @@ async fn run(args: Args) -> Result<()> {
                     println!(
                         "key id {}: {} data key(s), {} secret(s)",
                         key.key_id, key.data_keys, key.secrets
+                    );
+                }
+                for key in &report.owner_keys {
+                    if key.shredded {
+                        println!(
+                            "owner key {} ({} {}): {} secret(s) unreadable by design; the key was \
+                             shredded",
+                            key.key_id, key.owner_kind, key.owner_id, key.secrets
+                        );
+                    } else {
+                        println!(
+                            "owner key {} ({} {}): {} secret(s)",
+                            key.key_id, key.owner_kind, key.owner_id, key.secrets
+                        );
+                    }
+                }
+                if !report.missing_owner_key_ids.is_empty() {
+                    println!(
+                        "owner key(s) missing from the custody directory: {}; restore them, or \
+                         record the deletion so a shred is distinguishable from a lost key",
+                        report
+                            .missing_owner_key_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
                 if report.legacy_plaintext > 0 {
@@ -677,12 +717,24 @@ async fn run(args: Args) -> Result<()> {
             SecretsCommand::Rotate { batch } => {
                 let keys = githearth_server::secrets::InstallationKeySet::from_config(&config)?
                     .context("secrets rotate needs installation_key_file")?;
-                let report = githearth_server::secrets::rotate(&pool, &keys, batch).await?;
+                let report = githearth_server::secrets::rotate_with_data_keys(
+                    &pool,
+                    &keys,
+                    Some(&config.data_key_directory()),
+                    batch,
+                )
+                .await?;
                 println!(
                     "re-wrapped {} data key(s) under key id {}",
                     report.rewrapped,
                     keys.current().id()
                 );
+                if report.owner_keys_rewrapped > 0 {
+                    println!(
+                        "re-wrapped {} owner data key(s) in operator custody",
+                        report.owner_keys_rewrapped
+                    );
+                }
                 if report.remaining == 0 {
                     println!("rotation complete");
                 } else {
@@ -996,6 +1048,7 @@ async fn run_restore(
     key_stdin: bool,
     storage_root: Option<PathBuf>,
     ssh_host_key_path: Option<PathBuf>,
+    accept_shredded: bool,
 ) -> Result<()> {
     let passphrase = match key_file {
         Some(path) => githearth_server::backup::read_key_file(&path)?,
@@ -1019,6 +1072,7 @@ async fn run_restore(
         config_path,
         storage_root,
         ssh_host_key_path,
+        accept_shredded,
     };
     let report = githearth_server::backup::run_restore(&options).await?;
     println!(
@@ -1030,6 +1084,22 @@ async fn run_restore(
         report.key_id
     );
     println!("database-to-storage consistency verified; nothing was published before it passed");
+    if report.shredded_data_keys > 0 {
+        println!(
+            "{} per-account/organization data key(s) were shredded before this archive was taken; \
+             the secrets they protected are unreadable by design. The account and organization \
+             rows and their plaintext profile columns remain until this backup's retention \
+             expires.",
+            report.shredded_data_keys
+        );
+    }
+    if report.pre_key_archive {
+        println!(
+            "this archive predates the per-account/organization data keys (its data_keys list is \
+             empty); every secret is under the installation key, so the archive cannot be \
+             shredded at all and retention is its only control."
+        );
+    }
     Ok(())
 }
 

@@ -88,7 +88,10 @@ One archive contains:
 - `manifest.json` — a SHA-256 checksum for each part, one journal position per
   repository, the PostgreSQL position and exported snapshot id, the fence kind
   and detail, the snapshot mode and mechanism, the excluded paths, and the
-  encryption record.
+  encryption record. It also lists each per-account and per-organization data
+  key by id, owner, algorithm and wrap method (and whether it was shredded);
+  it never carries an owner key or a wrapped key. The key files themselves live
+  in operator custody outside the archive.
 
 `manifest.postgres.dump_lsn` is the WAL position read inside the exported
 repeatable-read transaction, and `manifest.postgres.exported_snapshot` names
@@ -227,6 +230,22 @@ also distinct:
 | wrong key | `wrong installation key: the archive records key id …, but the supplied key is …` |
 | key id not in the archive | the same `wrong installation key` refusal |
 | a wrapped data key cannot be opened | `the restored database's secrets do not match the installation key` |
+| a per-owner data key is missing without a tombstone | `is missing from …; restore the operator-custody key, or record the deletion` |
+| a per-owner data key was shredded | `owner data key(s) that were shredded: …`; restore refuses by default and names the keys |
+| the same archive with `--accept-shredded` | restore succeeds, prints the shredded-key count, and its secrets stay unreadable by design |
+
+A shredded key is a completed deletion, not a lost key, so `restore` will not
+silently publish a database whose secrets are unreadable. Naming the keys is the
+signal that the archive covers a period in which an account or organization was
+deleted; `--accept-shredded` is the operator saying that outcome is intended.
+
+A pre-key archive (one taken before per-account keys existed) has no
+`data_keys`; it restores as plaintext-shaped secrets under the installation key
+and **cannot be shredded at all**, because the key that would be destroyed did
+not exist when the backup was taken. Retention is the only control for that
+archive; the same is true of the plaintext profile columns in any older backup.
+Keep `data_key_directory` with the installation key off-host; a tombstone in
+that directory is what distinguishes a completed shred from a lost key.
 
 None of these publishes storage or configuration, and none leaves a database
 behind. `restore` never starts a server; `serve` repeats the same check at
@@ -256,7 +275,15 @@ plus, **separately**, its key:
 
 2. Keep the key on a different medium and a different access path. A stolen
    archive must not also yield its key. Do not store the key beside the
-   archive or in the same backup account.
+   archive or in the same backup account. Do the same for
+   `data_key_directory`: it holds the per-account and per-organization keys
+   that an archive deliberately omits. Without it, an archive's secrets cannot
+   be read. A shred is only as strong as the custody copies you discard: keep
+   only the current directory, or a copy that has had every shredded key
+   removed; never restore a custody copy that predates a deletion, because an
+   old copy has neither the tombstone nor the removal and would make the older
+   archive readable again. After a shred, remove the key from every retained
+   copy, and verify a restored archive against the **current** directory.
 
 3. Fetch the archive back to the new primary host, check its SHA-256 again, and
    run `restore` as above. A remote copy is not a backup until it has been

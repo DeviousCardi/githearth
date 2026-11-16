@@ -38,6 +38,11 @@ use std::{
 use uuid::Uuid;
 
 pub const ALGORITHM: &str = "AES-256-GCM";
+/// The wrap method recorded on a per-owner data-key row. The row's `kek_id` is
+/// the owner key's id and the data key was wrapped by the owner key, not the
+/// installation key; the constant makes the two kinds of row distinguishable
+/// without consulting the key store.
+pub const OWNER_WRAP_METHOD: &str = "owner-aes256gcm";
 pub const KEY_FILE_VERSION: u32 = 1;
 pub const RAW_WRAP_METHOD: &str = "file-aes256gcm";
 pub const KDF_MEMORY_KIB: u32 = 65_536;
@@ -144,24 +149,12 @@ impl InstallationKey {
         &self.method
     }
 
-    fn wrap(&self, data_key_id: Uuid, data_key: &[u8; DATA_KEY_BYTES]) -> Result<Vec<u8>> {
-        let mut nonce = [0u8; NONCE_BYTES];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid installation key length"))?;
-        let ciphertext = cipher
-            .encrypt(
-                &Nonce::from(nonce),
-                Payload {
-                    msg: data_key,
-                    aad: &wrap_aad(&self.id, &data_key_id, &self.method),
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("cannot wrap a data key"))?;
-        let mut wrapped = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
-        wrapped.extend_from_slice(&nonce);
-        wrapped.extend_from_slice(&ciphertext);
-        Ok(wrapped)
+    pub(crate) fn wrap(
+        &self,
+        data_key_id: Uuid,
+        data_key: &[u8; DATA_KEY_BYTES],
+    ) -> Result<Vec<u8>> {
+        wrap_with_key(&self.key, &self.id, data_key_id, &self.method, data_key)
     }
 
     fn unwrap(
@@ -189,7 +182,7 @@ impl InstallationKey {
     /// re-wrapped. Only rotation uses this; startup and restore keep the
     /// strict check above, because a mismatch there must be healed by
     /// `secrets rotate`, not silently accepted forever.
-    fn unwrap_recorded(
+    pub(crate) fn unwrap_recorded(
         &self,
         data_key_id: Uuid,
         method: &str,
@@ -204,34 +197,73 @@ impl InstallationKey {
         method: &str,
         wrapped: &[u8],
     ) -> Result<[u8; DATA_KEY_BYTES]> {
-        if wrapped.len() != NONCE_BYTES + DATA_KEY_BYTES + 16 {
-            bail!("wrapped data key {} has an invalid length", data_key_id);
-        }
-        let (nonce, ciphertext) = wrapped.split_at(NONCE_BYTES);
-        let nonce: [u8; NONCE_BYTES] = nonce
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid wrapped-key nonce"))?;
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid installation key length"))?;
-        let plaintext = cipher
-            .decrypt(
-                &Nonce::from(nonce),
-                Payload {
-                    msg: ciphertext,
-                    aad: &wrap_aad(&self.id, &data_key_id, method),
-                },
-            )
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "installation key {} cannot unwrap data key {}: wrong key or damaged data",
-                    self.id,
-                    data_key_id
-                )
-            })?;
-        plaintext
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("data key {} is not 32 bytes", data_key_id))
+        unwrap_with_key(&self.key, &self.id, data_key_id, method, wrapped)
     }
+}
+
+/// Wraps `data_key` under a 32-byte key-encryption key. The AAD binds the
+/// wrapping key's id, the wrapped key's id and the wrap method, exactly as the
+/// installation-key wrap does. Per-owner data keys use the same construction
+/// with the owner key's id, so a wrapped key moved between owners fails
+/// authentication instead of opening.
+pub(crate) fn wrap_with_key(
+    material: &[u8; DATA_KEY_BYTES],
+    key_id: &str,
+    data_key_id: Uuid,
+    method: &str,
+    data_key: &[u8; DATA_KEY_BYTES],
+) -> Result<Vec<u8>> {
+    let mut nonce = [0u8; NONCE_BYTES];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(material)
+        .map_err(|_| anyhow::anyhow!("invalid installation key length"))?;
+    let ciphertext = cipher
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: data_key,
+                aad: &wrap_aad(key_id, &data_key_id, method),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("cannot wrap a data key"))?;
+    let mut wrapped = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
+    wrapped.extend_from_slice(&nonce);
+    wrapped.extend_from_slice(&ciphertext);
+    Ok(wrapped)
+}
+
+pub(crate) fn unwrap_with_key(
+    material: &[u8; DATA_KEY_BYTES],
+    key_id: &str,
+    data_key_id: Uuid,
+    method: &str,
+    wrapped: &[u8],
+) -> Result<[u8; DATA_KEY_BYTES]> {
+    if wrapped.len() != NONCE_BYTES + DATA_KEY_BYTES + 16 {
+        bail!("wrapped data key {} has an invalid length", data_key_id);
+    }
+    let (nonce, ciphertext) = wrapped.split_at(NONCE_BYTES);
+    let nonce: [u8; NONCE_BYTES] = nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid wrapped-key nonce"))?;
+    let cipher = Aes256Gcm::new_from_slice(material)
+        .map_err(|_| anyhow::anyhow!("invalid installation key length"))?;
+    let plaintext = cipher
+        .decrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &wrap_aad(key_id, &data_key_id, method),
+            },
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "key {key_id} cannot unwrap data key {data_key_id}: wrong key or damaged data"
+            )
+        })?;
+    plaintext
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("data key {} is not 32 bytes", data_key_id))
 }
 
 /// The current key plus the decrypt-only predecessor used during rotation.
@@ -625,6 +657,15 @@ pub struct WrappedDataKey {
     pub kek_id: String,
     pub wrap_method: String,
     pub wrapped_key: Vec<u8>,
+    /// Set when the data key is wrapped by a per-owner data key rather than
+    /// directly by the installation key. The id is the owner's stable reference
+    /// (`data_keys::account_data_key_id`).
+    #[sqlx(default)]
+    pub owner_key_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub owner_kind: Option<String>,
+    #[sqlx(default)]
+    pub owner_id: Option<Uuid>,
 }
 
 /// A sealed secret: the wrapped data key plus the secret ciphertext.
@@ -637,6 +678,9 @@ pub struct SealedSecret {
     pub wrapped_key: Vec<u8>,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
+    pub owner_key_id: Option<Uuid>,
+    pub owner_kind: Option<String>,
+    pub owner_id: Option<Uuid>,
 }
 
 /// Encrypts `plaintext` under a fresh data key wrapped by the current
@@ -668,6 +712,72 @@ pub fn seal(keys: &InstallationKeySet, secret_id: Uuid, plaintext: &[u8]) -> Res
         wrapped_key,
         nonce: nonce.to_vec(),
         ciphertext,
+        owner_key_id: None,
+        owner_kind: None,
+        owner_id: None,
+    })
+}
+
+/// Encrypts `plaintext` under a fresh data key wrapped by the **owner's** data
+/// key (an account or organization). The owner key is created on first use and
+/// is kept in operator custody, so deleting it later makes this secret
+/// unreadable in the live database and in every older backup.
+pub fn seal_owned(
+    keys: &InstallationKeySet,
+    directory: &Path,
+    secret_id: Uuid,
+    plaintext: &[u8],
+    owner_kind: crate::data_keys::OwnerKind,
+    owner_id: Uuid,
+) -> Result<SealedSecret> {
+    let owner_key_id = crate::data_keys::ensure(keys, directory, owner_kind, owner_id)?;
+    let owner = match crate::data_keys::state(keys, directory, owner_key_id)? {
+        crate::data_keys::State::Present(key) => key,
+        crate::data_keys::State::Shredded => bail!(
+            "data key {owner_key_id} for {} {owner_id} was shredded; refusing to store a new \
+             secret under it",
+            owner_kind.as_str()
+        ),
+        crate::data_keys::State::Missing => bail!(
+            "data key {owner_key_id} for {} {owner_id} is missing; refusing to store a secret \
+             under a key the installation cannot read",
+            owner_kind.as_str()
+        ),
+    };
+    let mut data_key = [0u8; DATA_KEY_BYTES];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut data_key);
+    let data_key_id = Uuid::new_v4();
+    let wrapped_key = wrap_with_key(
+        &owner.key,
+        &owner_key_id.to_string(),
+        data_key_id,
+        OWNER_WRAP_METHOD,
+        &data_key,
+    )?;
+    let mut nonce = [0u8; NONCE_BYTES];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(&data_key)
+        .map_err(|_| anyhow::anyhow!("invalid data key length"))?;
+    let ciphertext = cipher
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: plaintext,
+                aad: &secret_aad(&secret_id, &data_key_id),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("cannot encrypt a secret"))?;
+    Ok(SealedSecret {
+        secret_id,
+        data_key_id,
+        kek_id: owner_key_id.to_string(),
+        wrap_method: OWNER_WRAP_METHOD.into(),
+        wrapped_key,
+        nonce: nonce.to_vec(),
+        ciphertext,
+        owner_key_id: Some(owner_key_id),
+        owner_kind: Some(owner_kind.as_str().into()),
+        owner_id: Some(owner_id),
     })
 }
 
@@ -682,11 +792,73 @@ pub fn open(
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
-    let key = keys.get(&data_key.kek_id).context(format!(
-        "no installation key with id {} is configured; the row was wrapped by a retired key",
-        data_key.kek_id
-    ))?;
-    let data_key_bytes = key.unwrap(data_key.id, &data_key.wrap_method, &data_key.wrapped_key)?;
+    open_with_data_keys(keys, None, secret_id, data_key, nonce, ciphertext)
+}
+
+/// Opens a secret whose data key may be wrapped by a per-owner data key. The
+/// custody directory is required for those rows; installation-level secrets do
+/// not need it. A missing key and a shredded key are different errors: the
+/// first is an operator mistake to repair, the second is a completed deletion.
+pub fn open_with_data_keys(
+    keys: &InstallationKeySet,
+    directory: Option<&Path>,
+    secret_id: Uuid,
+    data_key: &WrappedDataKey,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    let data_key_bytes = match data_key.owner_key_id {
+        None => {
+            let key = keys.get(&data_key.kek_id).context(format!(
+                "no installation key with id {} is configured; the row was wrapped by a retired key",
+                data_key.kek_id
+            ))?;
+            key.unwrap(data_key.id, &data_key.wrap_method, &data_key.wrapped_key)?
+        }
+        Some(owner_key_id) => {
+            if data_key.kek_id != owner_key_id.to_string() {
+                bail!(
+                    "data key {} names owner key {} but records wrapper {}; refusing to open it",
+                    data_key.id,
+                    owner_key_id,
+                    data_key.kek_id
+                );
+            }
+            let directory = directory.context(format!(
+                "data key {} is wrapped by owner data key {owner_key_id}, but no data-key \
+                 directory is configured; set data_key_directory",
+                data_key.id
+            ))?;
+            let owner = match crate::data_keys::state(keys, directory, owner_key_id)? {
+                crate::data_keys::State::Present(key) => key,
+                crate::data_keys::State::Shredded => bail!(
+                    "data key {owner_key_id} was shredded; secret {secret_id} is unreadable by design"
+                ),
+                crate::data_keys::State::Missing => bail!(
+                    "data key {owner_key_id} is missing from {}; secret {secret_id} cannot be \
+                     read until the key is restored",
+                    directory.display()
+                ),
+            };
+            if let (Some(kind), Some(owner_id)) = (&data_key.owner_kind, data_key.owner_id)
+                && (kind != owner.owner_kind.as_str() || owner_id != owner.owner_id)
+            {
+                bail!(
+                    "data key {} belongs to {:?} {}, but the secret row names {kind} {owner_id}",
+                    owner_key_id,
+                    owner.owner_kind,
+                    owner.owner_id
+                );
+            }
+            unwrap_with_key(
+                &owner.key,
+                &owner_key_id.to_string(),
+                data_key.id,
+                &data_key.wrap_method,
+                &data_key.wrapped_key,
+            )?
+        }
+    };
     if nonce.len() != NONCE_BYTES {
         bail!("secret {} has an invalid nonce", secret_id);
     }
@@ -725,6 +897,9 @@ pub struct StoredSecretRow {
     pub kek_id: String,
     pub wrap_method: String,
     pub wrapped_key: Vec<u8>,
+    pub owner_key_id: Option<Uuid>,
+    pub owner_kind: Option<String>,
+    pub owner_id: Option<Uuid>,
 }
 
 /// Inserts a sealed secret and its wrapped data key. The caller owns the
@@ -735,14 +910,18 @@ pub async fn insert_sealed(
     sealed: &SealedSecret,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO secret_data_keys (id, kek_id, algorithm, wrap_method, wrapped_key) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO secret_data_keys \
+             (id, kek_id, algorithm, wrap_method, wrapped_key, owner_kind, owner_id, owner_key_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(sealed.data_key_id)
     .bind(&sealed.kek_id)
     .bind(ALGORITHM)
     .bind(&sealed.wrap_method)
     .bind(&sealed.wrapped_key)
+    .bind(&sealed.owner_kind)
+    .bind(sealed.owner_id)
+    .bind(sealed.owner_key_id)
     .execute(&mut *conn)
     .await
     .context("insert wrapped data key")?;
@@ -768,9 +947,20 @@ pub async fn load_secret(
     secret_id: Uuid,
     keys: &InstallationKeySet,
 ) -> Result<Vec<u8>> {
+    load_secret_with_data_keys(pool, secret_id, keys, None).await
+}
+
+/// The same read for a row that may be wrapped by a per-owner data key.
+pub async fn load_secret_with_data_keys(
+    pool: &PgPool,
+    secret_id: Uuid,
+    keys: &InstallationKeySet,
+    directory: Option<&Path>,
+) -> Result<Vec<u8>> {
     let row: StoredSecretRow = sqlx::query_as(
         "SELECT s.id AS secret_id, s.data_key_id, s.nonce, s.ciphertext, \
-                d.kek_id, d.wrap_method, d.wrapped_key \
+                d.kek_id, d.wrap_method, d.wrapped_key, \
+                d.owner_key_id, d.owner_kind, d.owner_id \
          FROM stored_secrets s JOIN secret_data_keys d ON d.id = s.data_key_id \
          WHERE s.id = $1",
     )
@@ -783,8 +973,18 @@ pub async fn load_secret(
         kek_id: row.kek_id,
         wrap_method: row.wrap_method,
         wrapped_key: row.wrapped_key,
+        owner_key_id: row.owner_key_id,
+        owner_kind: row.owner_kind,
+        owner_id: row.owner_id,
     };
-    open(keys, row.secret_id, &data_key, &row.nonce, &row.ciphertext)
+    open_with_data_keys(
+        keys,
+        directory,
+        row.secret_id,
+        &data_key,
+        &row.nonce,
+        &row.ciphertext,
+    )
 }
 
 /// Decrypts an audit IP key by its `audit_ip_keys.id`. The migration and the
@@ -808,10 +1008,21 @@ pub async fn load_audit_ip_key(
 
 #[derive(Debug, Default)]
 pub struct StartupReport {
+    /// Rows wrapped directly by an installation key (the audit IP key and any
+    /// secret written before per-owner keys existed).
     pub data_keys: i64,
+    /// Rows wrapped by a per-account or per-organization data key.
+    pub owner_data_keys: i64,
     pub secrets: i64,
     pub backfilled: u64,
     pub retired_key_ids: Vec<String>,
+    /// Owner keys already shredded when this check ran. Their secrets are
+    /// unreadable by design and are not a start-up failure.
+    pub shredded_data_keys: u64,
+    /// The ids of those keys, so `restore` can name what its default refusal
+    /// would accept.
+    pub shredded_data_key_ids: Vec<Uuid>,
+    pub shredded_secrets: i64,
 }
 
 /// The start-up/migration check: encrypts any plaintext `audit_ip_keys.key`
@@ -822,6 +1033,20 @@ pub struct StartupReport {
 pub async fn startup(
     pool: &PgPool,
     keys: Option<&InstallationKeySet>,
+    batch: usize,
+) -> Result<StartupReport> {
+    startup_with_data_keys(pool, keys, None, batch).await
+}
+
+/// The same check with the operator's per-owner key custody directory. A
+/// referenced owner key that is absent **and not tombstoned** fails the check —
+/// that is a missing key, not a deletion. A tombstoned key is counted and
+/// skipped: the secrets it protected are unreadable by design, including in
+/// every backup taken before the shred.
+pub async fn startup_with_data_keys(
+    pool: &PgPool,
+    keys: Option<&InstallationKeySet>,
+    directory: Option<&Path>,
     batch: usize,
 ) -> Result<StartupReport> {
     let schema: Option<String> = sqlx::query_scalar("SELECT to_regclass('secret_data_keys')::text")
@@ -893,7 +1118,8 @@ pub async fn startup(
     }
 
     let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT kek_id, COUNT(*) FROM secret_data_keys GROUP BY kek_id ORDER BY kek_id",
+        "SELECT kek_id, COUNT(*) FROM secret_data_keys \
+         WHERE owner_key_id IS NULL GROUP BY kek_id ORDER BY kek_id",
     )
     .fetch_all(pool)
     .await
@@ -926,7 +1152,8 @@ pub async fn startup(
         // used, which is exactly what "never starts with unreadable secrets"
         // forbids. Unwrapping is ~48 bytes of AES-GCM per row.
         let wrapped: Vec<WrappedDataKey> = sqlx::query_as(
-            "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys ORDER BY id",
+            "SELECT id, kek_id, wrap_method, wrapped_key, owner_key_id, owner_kind, owner_id \
+             FROM secret_data_keys WHERE owner_key_id IS NULL ORDER BY id",
         )
         .fetch_all(pool)
         .await
@@ -950,11 +1177,106 @@ pub async fn startup(
         }
     }
 
+    let owner_groups: Vec<(Uuid, String, Uuid, i64)> = sqlx::query_as(
+        "SELECT d.owner_key_id, d.owner_kind, d.owner_id, COUNT(s.id) \
+         FROM secret_data_keys d LEFT JOIN stored_secrets s ON s.data_key_id = d.id \
+         WHERE d.owner_key_id IS NOT NULL \
+         GROUP BY d.owner_key_id, d.owner_kind, d.owner_id ORDER BY d.owner_key_id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("cannot count owner-wrapped data keys")?;
+    let owner_data_keys: i64 = owner_groups.iter().map(|(_, _, _, count)| *count).sum();
+    let mut shredded_data_keys = 0u64;
+    let mut shredded_data_key_ids = Vec::new();
+    let mut shredded_secrets = 0i64;
+    if !owner_groups.is_empty() {
+        let keys = keys.context(
+            "stored secrets need the installation key, but installation_key_file is not set; \
+             refusing to start with unreadable secrets",
+        )?;
+        let directory = directory.context(
+            "stored secrets are wrapped by per-account or per-organization data keys, but no \
+             data_key_directory is configured; set it outside storage_root before starting or \
+             restoring",
+        )?;
+        for (owner_key_id, kind, owner_id, count) in owner_groups {
+            match crate::data_keys::state(keys, directory, owner_key_id)? {
+                crate::data_keys::State::Shredded => {
+                    shredded_data_keys += 1;
+                    shredded_data_key_ids.push(owner_key_id);
+                    shredded_secrets += count;
+                }
+                crate::data_keys::State::Missing => bail!(
+                    "data key {owner_key_id} for {kind} {owner_id} is referenced by {count} stored \
+                     secret(s) but is missing from {}; restore the operator-custody key, or record \
+                     the deletion with `data_keys::shred` so the restore can tell a shred from a \
+                     lost key",
+                    directory.display()
+                ),
+                crate::data_keys::State::Present(owner) => {
+                    if owner.owner_kind.as_str() != kind || owner.owner_id != owner_id {
+                        bail!(
+                            "data key {owner_key_id} belongs to {:?} {}, but stored secrets name \
+                             {kind} {owner_id}",
+                            owner.owner_kind,
+                            owner.owner_id
+                        );
+                    }
+                    if owner.kek_id != keys.current.id() {
+                        retired.push(owner.kek_id.clone());
+                    }
+                    let wrapped: Vec<WrappedDataKey> = sqlx::query_as(
+                        "SELECT id, kek_id, wrap_method, wrapped_key, owner_key_id, owner_kind, \
+                                owner_id FROM secret_data_keys WHERE owner_key_id = $1 ORDER BY id",
+                    )
+                    .bind(owner_key_id)
+                    .fetch_all(pool)
+                    .await
+                    .context("cannot read owner-wrapped data keys")?;
+                    let mut failures = Vec::new();
+                    for row in &wrapped {
+                        if row.kek_id != owner_key_id.to_string() {
+                            failures.push((
+                                row.id,
+                                row.kek_id.clone(),
+                                "row names a different owner key".to_owned(),
+                            ));
+                            continue;
+                        }
+                        if let Err(error) = unwrap_with_key(
+                            &owner.key,
+                            &owner_key_id.to_string(),
+                            row.id,
+                            &row.wrap_method,
+                            &row.wrapped_key,
+                        ) {
+                            failures.push((row.id, row.kek_id.clone(), format!("{error:#}")));
+                        }
+                    }
+                    if let Some((id, kek_id, error)) = failures.first() {
+                        bail!(
+                            "{} data key(s) under owner key {owner_key_id} cannot be opened; \
+                             first: data key {id} under {kek_id}: {error}",
+                            failures.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    retired.sort();
+    retired.dedup();
+
     Ok(StartupReport {
         data_keys: rows.iter().map(|(_, count)| count).sum(),
+        owner_data_keys,
         secrets,
         backfilled,
         retired_key_ids: retired,
+        shredded_data_keys,
+        shredded_data_key_ids,
+        shredded_secrets,
     })
 }
 
@@ -1011,6 +1333,9 @@ async fn backfill_plaintext_audit_keys(
 pub struct RotationReport {
     pub rewrapped: u64,
     pub remaining: i64,
+    /// Operator-custody owner keys re-wrapped under the current installation
+    /// key. Their secrets are not touched.
+    pub owner_keys_rewrapped: u64,
 }
 
 /// Re-wraps every data key that is not under the current installation key.
@@ -1020,14 +1345,27 @@ pub async fn rotate(
     keys: &InstallationKeySet,
     batch: usize,
 ) -> Result<RotationReport> {
+    rotate_with_data_keys(pool, keys, None, batch).await
+}
+
+/// The same rotation with the operator's owner-key custody directory. Owner
+/// keys are wrapped by the installation key too, so they must move with it;
+/// their per-secret ciphertext does not change.
+pub async fn rotate_with_data_keys(
+    pool: &PgPool,
+    keys: &InstallationKeySet,
+    directory: Option<&Path>,
+    batch: usize,
+) -> Result<RotationReport> {
     let batch = batch.max(1);
     let mut rewrapped = 0u64;
     loop {
         let mut tx = pool.begin().await?;
         let rows: Vec<WrappedDataKey> = sqlx::query_as(
-            "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys \
-             WHERE kek_id <> $1 OR wrap_method <> $2 ORDER BY id LIMIT $3 \
-             FOR UPDATE SKIP LOCKED",
+            "SELECT id, kek_id, wrap_method, wrapped_key, owner_key_id, owner_kind, owner_id \
+             FROM secret_data_keys \
+             WHERE owner_key_id IS NULL AND (kek_id <> $1 OR wrap_method <> $2) \
+             ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED",
         )
         .bind(keys.current.id())
         .bind(keys.current.method())
@@ -1065,17 +1403,25 @@ pub async fn rotate(
         rewrapped += rows.len() as u64;
         tracing::info!(rows = rows.len(), rewrapped, "re-wrapped data keys");
     }
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM secret_data_keys WHERE kek_id <> $1 OR wrap_method <> $2",
+    let mut remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM secret_data_keys \
+         WHERE owner_key_id IS NULL AND (kek_id <> $1 OR wrap_method <> $2)",
     )
     .bind(keys.current.id())
     .bind(keys.current.method())
     .fetch_one(pool)
     .await
     .context("cannot count data keys still under a retired key or older wrap method")?;
+    let mut owner_keys_rewrapped = 0;
+    if let Some(directory) = directory {
+        let owner = crate::data_keys::rewrap(keys, directory)?;
+        owner_keys_rewrapped = owner.rewrapped;
+        remaining += owner.remaining as i64;
+    }
     Ok(RotationReport {
         rewrapped,
         remaining,
+        owner_keys_rewrapped,
     })
 }
 
@@ -1084,6 +1430,18 @@ pub struct KeyStatus {
     pub key_id: String,
     pub data_keys: i64,
     pub secrets: i64,
+}
+
+/// One per-account or per-organization key as `status`/`doctor` sees it.
+#[derive(Debug)]
+pub struct OwnerKeyStatus {
+    pub key_id: Uuid,
+    pub owner_kind: String,
+    pub owner_id: Uuid,
+    pub secrets: i64,
+    /// The key file is gone and a tombstone records the deletion. Its secrets
+    /// are unreadable by design and do not make rotation incomplete.
+    pub shredded: bool,
 }
 
 #[derive(Debug)]
@@ -1102,12 +1460,29 @@ pub struct StatusReport {
     /// complete.
     pub outdated_wrap_method: i64,
     pub rotation_complete: bool,
+    /// Present and shredded owner keys, metadata only.
+    pub owner_keys: Vec<OwnerKeyStatus>,
+    /// Referenced owner keys that are absent without a tombstone. This is a
+    /// lost key, not a deletion, and `doctor` fails on it.
+    pub missing_owner_key_ids: Vec<Uuid>,
+    pub shredded_owner_keys: u64,
 }
 
 /// The operator's rotation signal: every data key is under the current key,
 /// every key id is configured, and no plaintext audit key remains. It prints no
 /// key material, only ids and counts.
 pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<StatusReport> {
+    status_with_data_keys(pool, keys, None).await
+}
+
+/// The same report with the operator's owner-key custody directory. Shredded
+/// owner keys are reported as a completed deletion; missing ones are an error
+/// for `doctor`. Neither exposes key material.
+pub async fn status_with_data_keys(
+    pool: &PgPool,
+    keys: Option<&InstallationKeySet>,
+    directory: Option<&Path>,
+) -> Result<StatusReport> {
     let legacy_plaintext: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_ip_keys WHERE secret_id IS NULL AND key IS NOT NULL",
     )
@@ -1117,6 +1492,7 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
     let rows: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT d.kek_id, COUNT(DISTINCT d.id), COUNT(s.id) \
          FROM secret_data_keys d LEFT JOIN stored_secrets s ON s.data_key_id = d.id \
+         WHERE d.owner_key_id IS NULL \
          GROUP BY d.kek_id ORDER BY d.kek_id",
     )
     .fetch_all(pool)
@@ -1124,7 +1500,8 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
     .context("cannot count wrapped data keys")?;
     let current = keys.map(|keys| keys.current.id().to_owned());
     let wrapped: Vec<WrappedDataKey> = sqlx::query_as(
-        "SELECT id, kek_id, wrap_method, wrapped_key FROM secret_data_keys ORDER BY id",
+        "SELECT id, kek_id, wrap_method, wrapped_key, owner_key_id, owner_kind, owner_id \
+         FROM secret_data_keys WHERE owner_key_id IS NULL ORDER BY id",
     )
     .fetch_all(pool)
     .await
@@ -1177,6 +1554,88 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
     if out.is_empty() && current.is_none() {
         complete = true;
     }
+
+    let owner_groups: Vec<(Uuid, String, Uuid, i64)> = sqlx::query_as(
+        "SELECT d.owner_key_id, d.owner_kind, d.owner_id, COUNT(s.id) \
+         FROM secret_data_keys d LEFT JOIN stored_secrets s ON s.data_key_id = d.id \
+         WHERE d.owner_key_id IS NOT NULL \
+         GROUP BY d.owner_key_id, d.owner_kind, d.owner_id ORDER BY d.owner_key_id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("cannot count owner-wrapped data keys")?;
+    let mut owner_keys = Vec::new();
+    let mut missing_owner_key_ids = Vec::new();
+    let mut shredded_owner_keys = 0u64;
+    for (owner_key_id, owner_kind, owner_id, secrets) in owner_groups {
+        let state = match (keys, directory) {
+            (Some(keys), Some(directory)) => {
+                Some(crate::data_keys::state(keys, directory, owner_key_id)?)
+            }
+            _ => None,
+        };
+        match state {
+            Some(crate::data_keys::State::Shredded) => {
+                shredded_owner_keys += 1;
+                owner_keys.push(OwnerKeyStatus {
+                    key_id: owner_key_id,
+                    owner_kind,
+                    owner_id,
+                    secrets,
+                    shredded: true,
+                });
+            }
+            Some(crate::data_keys::State::Present(owner)) => {
+                if owner.kek_id != keys.map(|keys| keys.current.id()).unwrap_or_default() {
+                    complete = false;
+                }
+                let wrapped: Vec<WrappedDataKey> = sqlx::query_as(
+                    "SELECT id, kek_id, wrap_method, wrapped_key, owner_key_id, owner_kind, \
+                            owner_id FROM secret_data_keys WHERE owner_key_id = $1 ORDER BY id",
+                )
+                .bind(owner_key_id)
+                .fetch_all(pool)
+                .await
+                .context("cannot read owner-wrapped data keys")?;
+                let broken = wrapped
+                    .iter()
+                    .filter(|row| {
+                        row.kek_id != owner_key_id.to_string()
+                            || unwrap_with_key(
+                                &owner.key,
+                                &owner_key_id.to_string(),
+                                row.id,
+                                &row.wrap_method,
+                                &row.wrapped_key,
+                            )
+                            .is_err()
+                    })
+                    .count();
+                if broken > 0 {
+                    unreadable.push(owner_key_id.to_string());
+                    complete = false;
+                }
+                owner_keys.push(OwnerKeyStatus {
+                    key_id: owner_key_id,
+                    owner_kind,
+                    owner_id,
+                    secrets,
+                    shredded: false,
+                });
+            }
+            _ => {
+                missing_owner_key_ids.push(owner_key_id);
+                complete = false;
+                owner_keys.push(OwnerKeyStatus {
+                    key_id: owner_key_id,
+                    owner_kind,
+                    owner_id,
+                    secrets,
+                    shredded: false,
+                });
+            }
+        }
+    }
     Ok(StatusReport {
         current_key_id: current,
         keys: out,
@@ -1185,6 +1644,9 @@ pub async fn status(pool: &PgPool, keys: Option<&InstallationKeySet>) -> Result<
         unreadable_key_ids: unreadable,
         outdated_wrap_method,
         rotation_complete: complete,
+        owner_keys,
+        missing_owner_key_ids,
+        shredded_owner_keys,
     })
 }
 

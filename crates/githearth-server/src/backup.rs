@@ -159,6 +159,15 @@ pub struct Manifest {
     /// written before format 3.
     #[serde(default)]
     pub installation: Option<crate::secrets::InstallationRecord>,
+    /// Per-account and per-organization data keys this installation knows:
+    /// key id, owner, algorithm, wrap method, whether it was shredded and
+    /// whether a key existed; never key material. Absent in archives that
+    /// predate per-owner keys; a pre-key archive cannot be shredded. A
+    /// shredded key is still listed (with `shredded: true`) so an operator can
+    /// tell a deletion from a lost key, and `had_key = false` marks a deletion
+    /// before the owner ever had a key.
+    #[serde(default)]
+    pub data_keys: Vec<crate::data_keys::DataKeyRecord>,
     pub parts: Vec<Part>,
     pub encryption: EncryptionRecord,
     pub excluded: Vec<String>,
@@ -1532,9 +1541,10 @@ pub async fn run_backup(
     // forbids, and an archive whose secrets the operator cannot read is worse
     // than no archive.
     let installation_keys = crate::secrets::InstallationKeySet::from_config(config)?;
-    let startup = crate::secrets::startup(
+    let startup = crate::secrets::startup_with_data_keys(
         &pool,
         installation_keys.as_ref(),
+        Some(&config.data_key_directory()),
         crate::secrets::BACKFILL_BATCH,
     )
     .await
@@ -1771,12 +1781,17 @@ async fn build_backup(
     // ignores the gate) could have added a plaintext audit key since the check
     // at the start of the command; the dump must never carry one. Re-running
     // the full start-up check also re-proves that every wrapper still opens.
-    crate::secrets::startup(pool, installation_keys, crate::secrets::BACKFILL_BATCH)
-        .await
-        .context(
-            "cannot prove every stored secret is encrypted immediately before the dump; refusing \
-             to publish a dump that may carry a plaintext secret",
-        )?;
+    crate::secrets::startup_with_data_keys(
+        pool,
+        installation_keys,
+        Some(&config.data_key_directory()),
+        crate::secrets::BACKFILL_BATCH,
+    )
+    .await
+    .context(
+        "cannot prove every stored secret is encrypted immediately before the dump; refusing \
+         to publish a dump that may carry a plaintext secret",
+    )?;
 
     dump_database(
         &config.database_url,
@@ -1881,6 +1896,7 @@ async fn build_backup(
     });
 
     let material = key_material(passphrase)?;
+    let owner_data_keys = crate::data_keys::records(&config.data_key_directory())?;
     let manifest = Manifest {
         format_version: FORMAT_VERSION,
         created_unix_seconds: now_unix_seconds(),
@@ -1895,6 +1911,7 @@ async fn build_backup(
         config: config_part,
         ssh_host_key: host_key_part,
         installation: installation_keys.map(|keys| keys.record()),
+        data_keys: owner_data_keys,
         parts,
         encryption: EncryptionRecord {
             key_id: material.key_id.clone(),
@@ -1926,6 +1943,14 @@ async fn build_backup(
             "The manifest records the installation key id, algorithm and wrap method only. The \
              installation key itself is never written to the database or the archive; without it \
              the stored secret columns stay unreadable by design."
+                .into(),
+            "The manifest lists each per-account and per-organization data key by id, owner, \
+             algorithm and wrap method only, and marks a shredded key. The key files live in \
+             operator custody outside the archive, like the installation key; a backup taken \
+             before a key was shredded therefore cannot open the secrets that key protected, \
+             while the account or organization row and its plaintext profile columns remain \
+             until the backup's retention expires. A pre-key backup has no data_keys and cannot \
+             be shredded at all."
                 .into(),
         ],
     };
@@ -2152,6 +2177,14 @@ pub struct RestoreReport {
     pub config_path: PathBuf,
     pub repositories: usize,
     pub key_id: String,
+    /// Owner data keys that were already shredded when this archive was taken.
+    /// Their secrets are unreadable by design; the account/organization rows
+    /// and plaintext profile columns are still present.
+    pub shredded_data_keys: u64,
+    /// A format-3 archive with no owner keys at all: every secret is under the
+    /// installation key, so the archive cannot be shredded. Retention is its
+    /// only control.
+    pub pre_key_archive: bool,
 }
 
 pub struct RestoreOptions {
@@ -2161,6 +2194,10 @@ pub struct RestoreOptions {
     pub config_path: PathBuf,
     pub storage_root: Option<PathBuf>,
     pub ssh_host_key_path: Option<PathBuf>,
+    /// Accept an archive that names a completed shred. The default refuses,
+    /// because restoring one publishes a database whose secrets are
+    /// unreadable; the operator must say that is intended.
+    pub accept_shredded: bool,
 }
 
 /// The key set a restore should use: an environment override wins (the operator
@@ -2190,6 +2227,18 @@ fn restored_installation_keys(
         Some(previous.as_path()),
         passphrase.as_deref(),
     )
+}
+
+/// The owner-key custody directory a restore should use. An environment
+/// override wins (the operator restoring to a fresh host has not edited the
+/// archived configuration), then the archived path. The directory is not in
+/// the archive: like the installation key, it is carried by the operator.
+fn restored_data_key_directory(archived: &Config) -> PathBuf {
+    std::env::var("GITHEARTH_DATA_KEY_DIRECTORY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| archived.data_key_directory())
 }
 
 pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
@@ -2235,6 +2284,8 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
     )
     .map_err(|_| anyhow::anyhow!("the archived configuration is not valid TOML"))?;
     let installation_keys = restored_installation_keys(&archived)?;
+    let data_key_directory = restored_data_key_directory(&archived);
+    let pre_key_archive = manifest.format_version >= 3 && manifest.data_keys.is_empty();
     if let Some(record) = &manifest.installation {
         let keys = installation_keys.as_ref().context(format!(
             "the archive was written with installation key id {}; place that key where \
@@ -2285,6 +2336,7 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
     let mut storage_published = false;
     let mut config_written = false;
     let mut host_key_written = false;
+    let mut shredded_data_keys = 0u64;
     let result = async {
         let created = create_database(&options.database_url, &database).await?;
         if !created {
@@ -2305,24 +2357,44 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
         let verification = match verification {
             Ok(()) => {
                 // The restored database must be readable with the installation
-                // key the destination holds. This runs before the storage tree
-                // or configuration is published; a failure drops the database
-                // below, so the restore never leaves unreadable secrets.
+                // key and owner-key custody the destination holds. This runs
+                // before the storage tree or configuration is published; a
+                // failure drops the database below, so the restore never leaves
+                // unreadable secrets. An owner key that is tombstoned is a
+                // completed shred, not a failure: its ciphertext is in the
+                // archive by design and stays unreadable. An owner key that is
+                // absent without a tombstone is a missing key and fails here.
                 // A pre-format-3 archive has no installation record and no
                 // envelope, so it is restored as plaintext even when the
                 // operator supplied a destination key.
                 if manifest.installation.is_some() {
-                    crate::secrets::startup(
+                    let report = crate::secrets::startup_with_data_keys(
                         &pool,
                         installation_keys.as_ref(),
+                        Some(&data_key_directory),
                         crate::secrets::BACKFILL_BATCH,
                     )
                     .await
-                    .context("the restored database's secrets do not match the installation key")
-                    .map(|_| ())
-                } else {
-                    Ok(())
+                    .context("the restored database's secrets do not match the installation key")?;
+                    if report.shredded_data_keys > 0 && !options.accept_shredded {
+                        bail!(
+                            "the archive references {} owner data key(s) that were shredded: {}. \
+                             Their secrets are unreadable by design, and restoring would publish \
+                             a database with those secrets unreadable. Rerun with \
+                             --accept-shredded if that completed deletion is intended; nothing \
+                             has been published",
+                            report.shredded_data_keys,
+                            report
+                                .shredded_data_key_ids
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    shredded_data_keys = report.shredded_data_keys;
                 }
+                Ok(())
             }
             Err(error) => Err(error),
         };
@@ -2346,6 +2418,7 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .as_deref(),
+            Some(&data_key_directory),
         )?;
         write_private(&options.config_path, rewritten.as_bytes())?;
         config_written = true;
@@ -2387,6 +2460,8 @@ pub async fn run_restore(options: &RestoreOptions) -> Result<RestoreReport> {
         config_path: options.config_path.clone(),
         repositories: manifest.repositories.len(),
         key_id: manifest.encryption.key_id,
+        shredded_data_keys,
+        pre_key_archive,
     })
 }
 
@@ -2477,6 +2552,7 @@ fn rewrite_configuration(
     storage_root: &Path,
     ssh_host_key_path: &Path,
     installation_key_file: Option<&Path>,
+    data_key_directory: Option<&Path>,
 ) -> Result<String> {
     let text = fs::read_to_string(source)?;
     let mut value: toml::Value = toml::from_str(&text)
@@ -2499,6 +2575,12 @@ fn rewrite_configuration(
     if let Some(path) = installation_key_file {
         table.insert(
             "installation_key_file".into(),
+            toml::Value::String(path.display().to_string()),
+        );
+    }
+    if let Some(path) = data_key_directory.filter(|path| !path.as_os_str().is_empty()) {
+        table.insert(
+            "data_key_directory".into(),
             toml::Value::String(path.display().to_string()),
         );
     }
@@ -2669,6 +2751,7 @@ mod tests {
             },
             ssh_host_key: None,
             installation: None,
+            data_keys: Vec::new(),
             parts,
             encryption: EncryptionRecord {
                 key_id: material.key_id.clone(),

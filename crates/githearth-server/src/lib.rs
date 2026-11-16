@@ -10,6 +10,7 @@ mod browse_ui;
 pub mod client_ip;
 pub mod codeowners;
 pub mod config;
+pub mod data_keys;
 pub mod dns;
 pub mod doctor;
 pub mod email_verification;
@@ -2051,6 +2052,9 @@ fn open_current_ip_key(row: CurrentIpKey) -> Result<(Uuid, Vec<u8>), sqlx::Error
         kek_id,
         wrap_method,
         wrapped_key,
+        owner_key_id: None,
+        owner_kind: None,
+        owner_id: None,
     };
     let plaintext =
         secrets::open(&keys, secret_id, &data_key, &nonce, &ciphertext).map_err(|error| {

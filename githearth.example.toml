@@ -145,3 +145,9 @@ auth_concurrency = 2
 # installation_key_previous_file = "/etc/githearth/installation.previous.key"
 # installation_key_method = "file"       # file | kms (no built-in KMS adapter)
 # installation_key_passphrase_file = "/etc/githearth/installation.passphrase"
+# Per-account and per-organization data keys (crypto-shredding, ADR 0015).
+# Wrapped by the installation key and kept outside storage_root and outside
+# every backup; deleting a key makes the secrets it protected unreadable,
+# including in older archives. Defaults to `data-keys` beside
+# installation_key_file. Keep only copies that have had shredded keys removed.
+# data_key_directory = "/etc/githearth/data-keys"
