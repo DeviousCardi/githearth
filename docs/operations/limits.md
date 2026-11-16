@@ -18,6 +18,7 @@ absolute latency.
 | Authenticated Git requests | 600/min per organization, 120/min per account | `git_requests_per_organization`, `git_requests_per_account` | Git HTTP (all three endpoints) and SSH, after admission |
 | Anonymous clone/fetch | 120/min per address, 2,000/min installation | `anonymous_fetch_per_address`, `anonymous_fetch_global` | `info/refs` and `upload-pack` for a request with no credential, after the repository is known to exist |
 | Anonymous login | 20/min per address, 300/min installation | `anonymous_login_per_address`, `anonymous_login_global` | every sign-in path before hashing |
+| Anonymous security mail | 20/hour per client, 300/hour installation | `anonymous_security_per_address`, `anonymous_security_global` | change-of-address confirmation and password-recovery request/confirm, before the per-address mail budget |
 | Organization creation | 3 per account per 24 h, 50 per installation per day | `organization_creation_per_account`, `organization_creation_per_installation` | `POST /api/v1/organizations` |
 | Repository storage | 5 GiB per repository; 50 GiB per organization for each of Git storage and the object store | `repository_quota_bytes`, `organization_quota_bytes` | the push hook, a server-side merge, and the object store |
 | Job worker share | 2 of 4 workers per organization | `job_organization_share` | the claim query |
@@ -175,6 +176,11 @@ The defaults revised from this measurement (ADR 0014 open item 6):
   jobs for one organization at once, so its backlog cannot occupy every
   worker.
 - **Email** — notification and verification sends are charged before delivery;
-  an over-budget intent remains queued and retries.
+  an over-budget intent remains queued and retries. The anonymous security-mail
+  endpoints charge a per-client and installation budget **before** the
+  per-address budget, because the address is caller-supplied and one client
+  must not grow that map between hourly sweeps.
 - **Housekeeping** — the job runner's hourly retention tick also prunes the
-  fixed-window maps, so an address seen once is not remembered forever.
+  fixed-window maps, so an address seen once is not remembered forever. Each
+  window additionally refuses a new key once it holds 50,000, after first
+  reclaiming expired ones.

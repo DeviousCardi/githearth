@@ -369,6 +369,17 @@ async fn run(args: Args) -> Result<()> {
                     "migration failed; inspect database availability and migration history"
                 )
             })?;
+            // 0058 repairs 0045's fixed 30-day backfill with the documented
+            // default; this raises it further if the operator configured a
+            // longer retention. A SQL migration cannot read the config file.
+            let extended = githearth_server::pins::extend_backfilled_pins(
+                &pool,
+                config.housekeeping_pin_retention_days,
+            )
+            .await?;
+            if extended > 0 {
+                println!("extended {extended} backfilled pin(s) to the configured retention");
+            }
             // 0056 is schema-only. The plaintext audit IP key rows are
             // encrypted here, before this command reports success, so a dump
             // taken after `migrate` contains no plaintext secret. A missing or

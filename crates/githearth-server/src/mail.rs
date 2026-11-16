@@ -34,14 +34,17 @@ pub struct EmailMessage {
     /// intent's id, or the verification row's id. A retry of the same intent or
     /// request reuses it, so a receiving server that deduplicates on
     /// `Message-ID` sees one message; a new request gets a new row and so a new
-    /// id. It is not the timestamp: the `Date:` header is stamped per attempt.
+    /// id. Two messages about the same row that are *different facts* (a change
+    /// confirmation and the later notice) must use different ids. It is not the
+    /// timestamp: the `Date:` header is stamped per attempt.
     pub id: Uuid,
 }
 
 impl std::fmt::Debug for EmailMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The body never carries a credential, but a destination address is
-        // personal data; a debug line should not become a copy of it.
+        // The body can carry a one-time credential (a change or recovery
+        // link), so it must never be logged; a destination address is
+        // personal data too. Debug redacts both and shows only the length.
         f.debug_struct("EmailMessage")
             .field("to", &"[redacted]")
             .field("subject", &self.subject)

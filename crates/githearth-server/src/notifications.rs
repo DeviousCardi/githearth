@@ -69,6 +69,9 @@ pub const OUTBOX_EVENT_KINDS: &[&str] = &[
     "pull_request.changes_requested",
     "pull_request.review_requested",
     "account.email_verification_requested",
+    "account.email_change_requested",
+    "account.email_changed",
+    "account.password_recovery_requested",
 ];
 
 /// The consumer registered at start-up; migration `0050` inserts the same row
@@ -220,6 +223,24 @@ async fn from_outbox(state: &AppState, job: &Job) -> JobOutcome {
                 return JobOutcome::Done;
             };
             crate::email_verification::send_requested(state, verification_id).await
+        }
+        "account.email_change_requested" => {
+            let Some(change_id) = event_uuid("change_id") else {
+                return JobOutcome::Done;
+            };
+            crate::identity::send_change_requested(state, change_id).await
+        }
+        "account.email_changed" => {
+            let Some(change_id) = event_uuid("change_id") else {
+                return JobOutcome::Done;
+            };
+            crate::identity::send_change_notice(state, change_id).await
+        }
+        "account.password_recovery_requested" => {
+            let Some(token_id) = event_uuid("token_id") else {
+                return JobOutcome::Done;
+            };
+            crate::identity::send_recovery_requested(state, token_id).await
         }
         other => JobOutcome::Failed {
             reason: format!("no notification for event kind: {other}"),

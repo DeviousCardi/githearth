@@ -2,10 +2,11 @@
 
 Date: 2026-11-15.
 
-Status: **decision accepted for M11a; detailed design open.** Nothing here is
-implemented. This is the ADR the milestone rule requires before the identity
-slice starts; it depends on [ADR 0014](0014-platform-slice.md) for secrets,
-tokens and principals.
+Status: **decision accepted for M11a.** The application half of increment 8A is
+implemented (see "As built" below); the remaining open items are listed there.
+This is the ADR the milestone rule requires before the identity slice starts; it
+depends on [ADR 0014](0014-platform-slice.md) for secrets, tokens and
+principals.
 
 ## Context
 
@@ -224,6 +225,57 @@ silently become an unreadable installation), and a tombstoned key is a
 completed shred that restore **refuses by default** and accepts only with
 `--accept-shredded`, naming the key ids either way. `secrets status` and
 `doctor` make the same distinction.
+
+## As built — M11a 8A, the identity-schema (application) half
+
+This subsection records what the identity-schema lane built, so the open items
+it settles are not only in migration comments. The crypto-shredding lane owns
+the key material and edits the same file; whichever merges second reconciles
+the two "as built" notes into one.
+
+- **The data-key reference.** `accounts.data_key_id` and
+  `organizations.data_key_id` name the subject's key — the deterministic id the
+  crypto-shredding lane derives (the first 16 bytes of
+  `SHA-256("githearth-owner-data-key-v1\0" || kind || 0x00 || uuid16)`, with the
+  UUID version and variant bits set — `data_keys::id_for`). The database
+  computes the same value (`identity_account_data_key`,
+  `identity_organization_data_key`) and a CHECK refuses any other, so the
+  reference is not a free-form id. It is a plain `uuid` with **no foreign key**:
+  the owner key is an operator-custody file, not a `secret_data_keys` row, and
+  a shredded key leaves no row to point at. `identity::bind_account_data_key`
+  and `bind_organization_data_key` are the provisioning writers; 8B enrolment,
+  8C creation and import re-provisioning call them after the key lane has
+  created the file. The reference is one per subject (unique partial index).
+- **Shredding leaves the reference.** A shred tombstones and removes the
+  operator-custody key file. It has no database row to delete, so the subject
+  row, this reference and the ciphertext stay. `NULL` therefore means only
+  "pre-key", never "destroyed".
+- **Per-subject keys.** One owner key per account and one per organization,
+  kept in operator custody. A stored secret keeps its own random data key in
+  `secret_data_keys`, wrapped by the owner key; `secrets::seal_owned` writes
+  that row with `owner_kind`/`owner_id`/`owner_key_id`, and
+  `stored_secrets.data_key_id` names the per-secret row (not the owner key). A
+  TOTP seed is a `stored_secrets` row and `totp_secrets.secret_id` is the only
+  reference; constraint triggers refuse a seed whose per-secret key row is not
+  owned by, and wrapped under, the owning account's `data_key_id`. They also
+  refuse moving either side afterwards, so the binding cannot be broken once
+  the seed exists.
+- **Recovery reuses the M4.1 table.** Self-service recovery is
+  `password_reset_tokens` with `purpose = 'self_service'`, a bound `email`, and
+  a NULL hash until the sender composes the message. A new request supersedes
+  the account's older unused self-service rows; an administrator code can
+  never be redeemed by the self-service path and vice versa. Open item 2 is
+  still the count/regeneration rule, with one condition on 8B: a recovery code
+  must carry at least 128 bits of randomness, because the stored digest is a
+  bare SHA-256.
+- **Anonymous security mail is budgeted per client.** The change-confirmation
+  and recovery endpoints charge a per-client and installation-hour budget
+  before the per-destination address budget, so one anonymous caller cannot
+  key an unbounded address map between hourly sweeps.
+
+Open item 5 is resolved for accounts and organizations above; repository
+secrets are not in this slice and will follow the owning organization when
+they arrive.
 
 ## Open items
 

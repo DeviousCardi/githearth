@@ -37,6 +37,13 @@ const MINUTE: Duration = Duration::from_secs(60);
 const HOUR: Duration = Duration::from_secs(3_600);
 const DAY: Duration = Duration::from_secs(86_400);
 
+/// An upper bound on the keys one window remembers. A caller-supplied key
+/// (an email address, a client address) must not let anonymous traffic grow a
+/// map without bound between hourly sweeps: at the cap, expired keys are
+/// dropped first and then an unknown key is refused, while keys already
+/// tracked keep working. 50,000 keys is a few megabytes per window.
+const MAX_WINDOW_KEYS: usize = 50_000;
+
 /// A fixed-window counter. One mutex per budget, never held across an await.
 struct Window {
     limit: u64,
@@ -58,6 +65,12 @@ impl Window {
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.contains_key(key) && entries.len() >= MAX_WINDOW_KEYS {
+            entries.retain(|_, (started, _)| now.duration_since(*started) < self.window);
+            if entries.len() >= MAX_WINDOW_KEYS {
+                return false;
+            }
+        }
         let entry = entries.entry(key.to_owned()).or_insert((now, 0));
         if now.duration_since(entry.0) >= self.window {
             *entry = (now, 0);
@@ -92,6 +105,8 @@ pub struct Limits {
     anonymous_fetch_global: Window,
     anonymous_login_address: Window,
     anonymous_login_global: Window,
+    anonymous_security_address: Window,
+    anonymous_security_global: Window,
     organization_creation_account: Window,
     organization_creation_installation: Window,
     email_organization: Window,
@@ -110,6 +125,8 @@ impl Limits {
             anonymous_fetch_global: Window::new(config.anonymous_fetch_global, MINUTE),
             anonymous_login_address: Window::new(config.anonymous_login_per_address, MINUTE),
             anonymous_login_global: Window::new(config.anonymous_login_global, MINUTE),
+            anonymous_security_address: Window::new(config.anonymous_security_per_address, HOUR),
+            anonymous_security_global: Window::new(config.anonymous_security_global, HOUR),
             organization_creation_account: Window::new(
                 config.organization_creation_per_account,
                 DAY,
@@ -248,6 +265,29 @@ impl Limits {
         self.anonymous_login_global.allow_at("installation", now)
     }
 
+    /// Anonymous security mail — the change-of-address confirmation and the
+    /// password-recovery request and confirm. Per client address and across the
+    /// installation, an hour. It is charged **before** the per-destination
+    /// [`Self::allow_email`] budget: the address is caller-supplied, so without
+    /// a client budget one anonymous caller could add one map entry per
+    /// distinct address between hourly sweeps. An unresolved address is
+    /// counted under one shared key rather than bypassing the budget.
+    pub fn allow_anonymous_security(&self, address: Option<IpAddr>) -> bool {
+        self.allow_anonymous_security_at(address, Instant::now())
+    }
+
+    pub fn allow_anonymous_security_at(&self, address: Option<IpAddr>, now: Instant) -> bool {
+        let key = address
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "unresolved".to_owned());
+        // The client budget first: a client already over its share must not
+        // consume the installation's remaining capacity.
+        if !self.anonymous_security_address.allow_at(&key, now) {
+            return false;
+        }
+        self.anonymous_security_global.allow_at("installation", now)
+    }
+
     /// Organization creation: both the account and the installation caps.
     pub fn allow_organization_creation(&self, account: Uuid) -> bool {
         self.allow_organization_creation_at(account, Instant::now())
@@ -312,6 +352,8 @@ impl Limits {
             &self.anonymous_fetch_global,
             &self.anonymous_login_address,
             &self.anonymous_login_global,
+            &self.anonymous_security_address,
+            &self.anonymous_security_global,
             &self.organization_creation_account,
             &self.organization_creation_installation,
             &self.email_organization,
@@ -343,6 +385,8 @@ impl Limits {
             &self.anonymous_fetch_global,
             &self.anonymous_login_address,
             &self.anonymous_login_global,
+            &self.anonymous_security_address,
+            &self.anonymous_security_global,
             &self.organization_creation_account,
             &self.organization_creation_installation,
             &self.email_organization,
@@ -482,6 +526,66 @@ mod tests {
         assert!(
             limits.allow_anonymous_login_at(Some(b), start + MINUTE),
             "the installation window resets"
+        );
+    }
+
+    #[test]
+    fn anonymous_security_mail_is_per_client_and_installation() {
+        let config = Config {
+            anonymous_security_per_address: 2,
+            anonymous_security_global: 3,
+            ..Config::default()
+        };
+        let limits = Limits::from_config(&config);
+        let a: IpAddr = "203.0.113.50".parse().unwrap();
+        let b: IpAddr = "203.0.113.51".parse().unwrap();
+        let start = Instant::now();
+        assert!(limits.allow_anonymous_security_at(Some(a), start));
+        assert!(limits.allow_anonymous_security_at(Some(a), start));
+        assert!(
+            !limits.allow_anonymous_security_at(Some(a), start),
+            "the per-client budget is two per hour"
+        );
+        // The third installation slot is spent by the second client, and the
+        // fourth is refused even though that client is under its own budget.
+        assert!(limits.allow_anonymous_security_at(Some(b), start));
+        assert!(
+            !limits.allow_anonymous_security_at(Some(b), start),
+            "the installation budget bounds a second client"
+        );
+        assert!(
+            limits.allow_anonymous_security_at(Some(b), start + HOUR),
+            "the hour window resets"
+        );
+        // An unresolved address is counted under one shared key, not allowed to
+        // bypass the budget.
+        let unresolved = Limits::from_config(&config);
+        assert!(unresolved.allow_anonymous_security_at(None, start));
+        assert!(unresolved.allow_anonymous_security_at(None, start));
+        assert!(
+            !unresolved.allow_anonymous_security_at(None, start),
+            "an unresolved address is still bounded"
+        );
+    }
+
+    #[test]
+    fn a_window_refuses_new_keys_at_the_cap_and_reclaims_expired_ones() {
+        let window = Window::new(10, MINUTE);
+        let start = Instant::now();
+        for i in 0..MAX_WINDOW_KEYS {
+            assert!(window.allow_at(&format!("key-{i}"), start));
+        }
+        assert!(
+            !window.allow_at("new", start),
+            "a new key is refused at the cap rather than growing the map"
+        );
+        assert!(
+            window.allow_at("key-0", start),
+            "a key already tracked keeps working"
+        );
+        assert!(
+            window.allow_at("new", start + MINUTE),
+            "expired keys are reclaimed to make room"
         );
     }
 

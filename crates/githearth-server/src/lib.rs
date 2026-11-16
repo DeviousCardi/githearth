@@ -23,6 +23,7 @@ pub mod git_hooks;
 pub mod git_http;
 pub mod housekeeping;
 pub mod idempotency;
+pub mod identity;
 pub mod invitations;
 mod invitations_ui;
 pub mod issues;
@@ -509,6 +510,7 @@ pub fn router(state: AppState) -> Router {
         .merge(tokens::router())
         .merge(account_admin::router())
         .merge(email_verification::router())
+        .merge(identity::router())
         .merge(notification_email::router())
         .merge(ssh_keys::router())
         .merge(notifications::router())
